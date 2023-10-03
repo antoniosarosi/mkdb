@@ -5,12 +5,25 @@ struct Node<T> {
 }
 
 impl<T> Node<T> {
-    pub fn new(keys: Vec<T>, children: Vec<Box<Self>>) -> Self {
-        Self { keys, children }
+    pub fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            children: Vec::new(),
+        }
     }
 
-    pub fn new_empty() -> Self {
-        Self::new(vec![], vec![])
+    pub fn with_keys(keys: Vec<T>) -> Self {
+        Self {
+            keys,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn with_children(children: Vec<Box<Node<T>>>) -> Self {
+        Self {
+            keys: Vec::new(),
+            children,
+        }
     }
 }
 
@@ -29,7 +42,7 @@ impl<T: Ord> BTree<T> {
     fn split_child(&self, parent: &mut Box<Node<T>>, index: usize) {
         let target_node = &mut parent.children[index];
 
-        let mut new_node = Box::new(Node::new_empty());
+        let mut new_node = Box::new(Node::new());
 
         // Move keys greater than the median into the new node.
         new_node
@@ -71,25 +84,18 @@ impl<T: Ord> BTree<T> {
     }
 
     pub fn insert(&mut self, key: T) {
-        let Some(ref mut root) = self.root else {
-            self.root = Some(Box::new(Node::new(vec![key], vec![])));
+        let Some(mut root) = self.root.take() else {
+            self.root = Some(Box::new(Node::with_keys(vec![key])));
             return;
         };
 
         if root.keys.len() == (2 * self.degree) - 1 {
-            let old_root = self.root.take().unwrap();
-            let mut new_root = Box::new(Node::new(vec![], vec![old_root]));
-
-            self.split_child(&mut new_root, 0);
-            self.insert_into(&mut new_root, key);
-
-            self.root = Some(new_root);
-        } else {
-            // TODO: Can't borrow as mutable and immutable, so...
-            let mut old_root = self.root.take().unwrap();
-            self.insert_into(&mut old_root, key);
-            self.root = Some(old_root);
+            root = Box::new(Node::with_children(vec![root]));
+            self.split_child(&mut root, 0);
         }
+
+        self.insert_into(&mut root, key);
+        self.root = Some(root);
     }
 }
 
