@@ -29,26 +29,6 @@ impl Node {
     }
 }
 
-/// Serialize 4 byte unsigned integer (endianness is same as machine).
-fn serialize_number(number: usize, buf: &mut [u8]) {
-    buf[0] = (number & 0xFF) as u8;
-    buf[1] = (number >> 8 & 0xFF) as u8;
-    buf[2] = (number >> 16 & 0xFF) as u8;
-    buf[3] = (number >> 24 & 0xFF) as u8;
-}
-
-/// Deserialize unsigned integeres serialized with [`serialize_number`].
-/// TODO: doesn't work if endianness is different than current machine.
-fn deserialize_number(buf: &[u8]) -> usize {
-    let mut number: usize = 0;
-    number |= buf[0] as usize;
-    number |= (buf[1] as usize) << 8;
-    number |= (buf[2] as usize) << 16;
-    number |= (buf[3] as usize) << 24;
-
-    number
-}
-
 /// `degree`: Minimum number of children per node (except root).
 ///
 /// # Properties
@@ -177,25 +157,19 @@ impl BTree {
         let mut node = Node::new();
         node.block = block;
 
-        let mut keys_len = 0;
-        keys_len |= buf[0] as usize;
-        keys_len |= (buf[1] as usize) << 8;
-
-        let mut children_len = 0;
-        children_len |= buf[2] as usize;
-        children_len |= (buf[3] as usize) << 8;
-
         let mut i = 4;
 
-        for _ in 0..keys_len {
-            node.keys.push(deserialize_number(&buf[i..i + 4]));
+        for _ in 0..u16::from_be_bytes(buf[..2].try_into().unwrap()) {
+            node.keys
+                .push(u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize);
             i += 4;
         }
 
         i = self.block_size / 2;
 
-        for _ in 0..children_len {
-            node.children.push(deserialize_number(&buf[i..i + 4]));
+        for _ in 0..u16::from_be_bytes(buf[2..4].try_into().unwrap()) {
+            node.children
+                .push(u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize);
             i += 4;
         }
 
@@ -208,23 +182,20 @@ impl BTree {
         let mut block = Vec::<u8>::with_capacity(self.block_size);
         block.resize(block.capacity(), 0);
 
-        block[0] = (node.keys.len() & 0xFF) as u8;
-        block[1] = (node.keys.len() >> 8 & 0xFF) as u8;
-
-        block[2] = (node.children.len() & 0xFF) as u8;
-        block[3] = (node.children.len() >> 8 & 0xFF) as u8;
+        block[..2].copy_from_slice(&(node.keys.len() as u16).to_be_bytes());
+        block[2..4].copy_from_slice(&(node.children.len() as u16).to_be_bytes());
 
         let mut i = 4;
 
         for key in &node.keys {
-            serialize_number(*key, &mut block[i..i + 4]);
+            block[i..i + 4].copy_from_slice(&(*key as u32).to_be_bytes());
             i += 4;
         }
 
         i = self.block_size / 2;
 
         for child in &node.children {
-            serialize_number(*child, &mut block[i..i + 4]);
+            block[i..i + 4].copy_from_slice(&(*child as u32).to_be_bytes());
             i += 4;
         }
 
