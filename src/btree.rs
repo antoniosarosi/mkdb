@@ -117,6 +117,10 @@ impl<F> BTree<F> {
     fn free_page(&self) -> usize {
         self.len
     }
+
+    fn max_keys(&self) -> usize {
+        (2 * self.degree) - 1
+    }
 }
 
 impl BTree<File> {
@@ -144,7 +148,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     pub fn insert(&mut self, key: u32, value: u32) -> io::Result<()> {
         let mut root = self.read_node(0)?;
 
-        if root.entries.len() == (2 * self.degree) - 1 {
+        if root.entries.len() == self.max_keys() {
             let mut old_root = Node::new_at(self.free_page());
             old_root.entries.extend(root.entries.drain(0..));
             old_root.children.extend(root.children.drain(0..));
@@ -173,7 +177,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
 
         let mut next_node = self.read_node(node.children[index])?;
-        if next_node.entries.len() == (2 * self.degree) - 1 {
+        if next_node.entries.len() == self.max_keys() {
             self.split_child(node, index)?;
             if entry.key > node.entries[index].key {
                 next_node = self.read_node(node.children[index + 1])?;
@@ -247,7 +251,7 @@ impl<F: Seek + Read + Write> BTree<F> {
             i += 8;
         }
 
-        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * (2 * self.degree - 1);
+        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * self.max_keys();
 
         for _ in 0..u16::from_be_bytes(buf[2..4].try_into().unwrap()) {
             node.children
@@ -258,7 +262,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         Ok(node)
     }
 
-    fn write_node(&mut self, node: &mut Node) -> io::Result<()> {
+    fn write_node(&mut self, node: &Node) -> io::Result<()> {
         let mut page = vec![0u8; self.pager.page_size()];
 
         page[..2].copy_from_slice(&(node.entries.len() as u16).to_be_bytes());
@@ -272,7 +276,7 @@ impl<F: Seek + Read + Write> BTree<F> {
             i += 8;
         }
 
-        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * (2 * self.degree - 1);
+        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * self.max_keys();
 
         for child in &node.children {
             page[i..i + 4].copy_from_slice(&(*child as u32).to_be_bytes());
