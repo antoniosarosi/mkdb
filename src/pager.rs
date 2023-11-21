@@ -31,6 +31,10 @@ impl<F: io::Seek> Pager<F> {
         let mut offset = self.page_size * page_number;
         let mut inner_offset = 0;
 
+        // Used for development/debugging in case we mess up. Remove later.
+        if page_number > 1000 {
+            panic!("Page number too high: {page_number}");
+        }
         if self.page_size < self.block_size {
             capacity = self.block_size;
             // Each block contains multiple pages, so align the offset downwards
@@ -58,6 +62,10 @@ impl<F: io::Seek> Pager<F> {
     where
         F: io::Write,
     {
+        // TODO: Used for development/debugging in case we mess up. Remove later.
+        if page_number > 1000 {
+            panic!("Page number too high: {page_number}");
+        }
         let offset = self.page_size * page_number;
         self.file.seek(io::SeekFrom::Start(offset as u64))?;
 

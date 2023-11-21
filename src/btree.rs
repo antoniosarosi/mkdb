@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering,
+    cmp::{min, Ordering},
     fs::File,
     io,
     io::{Read, Seek, Write},
@@ -10,10 +10,19 @@ use std::{
 
 use crate::pager::Pager;
 
-#[derive(Debug, Eq)]
+/// Number of siblings per side to examine when balancing.
+const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
+
+#[derive(Eq, Copy, Clone)]
 struct Entry {
     key: u32,
     value: u32,
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.key)
+    }
 }
 
 impl PartialEq for Entry {
@@ -57,14 +66,19 @@ impl Node {
     }
 }
 
-/// `degree`: Minimum number of children per node (except root).
+/// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
+/// Sorting and Searching" and SQLite 2.X.X
+///
+/// Terminology
+///
+/// `order`: Maximum number of children per node (except root).
 ///
 /// # Properties
 ///
-/// - Min keys:     `degree - 1`
-/// - Min children: `degree`
-/// - Max keys:     `2 * degree - 1`
-/// - Max children: `2 * degree`
+/// - Max children: `order`
+/// - Max keys:     `order - 1`
+/// - Min children: `(order - 1) * 2 / 3 + 1` (except root)
+/// - Min keys:     `(order - 1) * 2 / 3` (except root)
 ///
 /// Page format (suppose page size = 4096):
 ///
@@ -81,45 +95,62 @@ impl Node {
 /// - `V`: Value
 /// - `C`: Child Pointer
 ///
-/// Children pointers start at `4 + 8 * (2 * degree - 1)`. See
+/// Children pointers start at `4 + 8 * (order - 1)`. See
 /// [`optimal_degree_for`] for degree computations.
 pub(crate) struct BTree<F> {
     pager: Pager<F>,
-    degree: usize,
+    order: usize,
     len: usize,
 }
 
 /// See [`BTree`].
-fn optimal_degree_for(page_size: usize) -> usize {
-    let max_children = page_size / (mem::size_of::<Entry>() + mem::size_of::<u32>());
+fn optimal_order_for(page_size: usize) -> usize {
+    let total_size = mem::size_of::<Entry>() + mem::size_of::<u32>();
 
-    max_children / 2
+    // Calculate how many entries + pointers we can fit.
+    let mut order = page_size / total_size;
+    let remainder = page_size % total_size;
+
+    // The number of children is always one more than the number of keys, so
+    // see if we can fit an extra child in the remaining space.
+    if remainder >= mem::size_of::<u32>() {
+        order += 1;
+    }
+
+    order
 }
 
 impl<F> BTree<F> {
     #[allow(dead_code)]
     pub fn new(file: F, page_size: usize, block_size: usize) -> io::Result<Self> {
         let pager = Pager::new(file, page_size, block_size);
-        let degree = optimal_degree_for(page_size);
+        let order = optimal_order_for(page_size);
         let len = 0;
 
-        Ok(Self { pager, degree, len })
+        Ok(Self { pager, order, len })
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn degree(&self) -> usize {
-        self.degree
+    #[inline]
+    pub fn order(&self) -> usize {
+        self.order
     }
 
-    fn free_page(&self) -> usize {
-        self.len
-    }
-
+    #[inline]
     fn max_keys(&self) -> usize {
-        (2 * self.degree) - 1
+        self.order() - 1
+    }
+
+    fn allocate_page(&mut self) -> usize {
+        // TODO: Free list.
+        let page = self.len;
+        self.len += 1;
+
+        page
     }
 }
 
@@ -137,88 +168,226 @@ impl BTree<File> {
 
         // TODO: Add magic number & header to file.
         let pager = Pager::new(file, page_size, block_size);
-        let degree = optimal_degree_for(page_size);
+        let order = optimal_order_for(page_size);
         let len = metadata.len() as usize / page_size;
 
-        Ok(Self { pager, degree, len })
+        Ok(Self { pager, order, len })
     }
 }
 
 impl<F: Seek + Read + Write> BTree<F> {
     pub fn insert(&mut self, key: u32, value: u32) -> io::Result<()> {
-        let mut root = self.read_node(0)?;
+        let root = self.read_node(0)?;
 
-        if root.entries.len() == self.max_keys() {
-            let mut old_root = Node::new_at(self.free_page());
-            old_root.entries.extend(root.entries.drain(0..));
-            old_root.children.extend(root.children.drain(0..));
+        let mut parents = Vec::new();
+        let node = self.insert_into(root, Entry { key, value }, &mut parents)?;
 
-            root.children.push(old_root.page);
-
-            self.write_node(&mut old_root)?;
-        }
-
-        self.insert_into(&mut root, Entry { key, value })
+        self.balance(node, parents)
     }
 
-    fn insert_into(&mut self, node: &mut Node, entry: Entry) -> io::Result<()> {
+    fn insert_into(
+        &mut self,
+        mut node: Node,
+        entry: Entry,
+        parents: &mut Vec<(Node, usize)>,
+    ) -> io::Result<Node> {
         let search = node.entries.binary_search(&entry);
 
+        // Key found, swap value and return.
         if let Ok(index) = search {
             node.entries[index].value = entry.value;
-            return self.write_node(node);
+            self.write_node(&node)?;
+            return Ok(node);
         }
 
+        // Key is not present in current node, get the index where it should be.
         let index = search.unwrap_err();
 
+        // If this node is a leaf node we're done.
         if node.children.is_empty() {
             node.entries.insert(index, entry);
-            return self.write_node(node);
+            if node.entries.len() <= self.max_keys() {
+                self.write_node(&node)?;
+            }
+            return Ok(node);
         }
 
-        let mut next_node = self.read_node(node.children[index])?;
-        if next_node.entries.len() == self.max_keys() {
-            self.split_child(node, index)?;
-            if entry.key > node.entries[index].key {
-                next_node = self.read_node(node.children[index + 1])?;
+        // If it's not a leaf node, we have to go one level below.
+        let next_node = self.read_node(node.children[index])?;
+        parents.push((node, index));
+
+        self.insert_into(next_node, entry, parents)
+    }
+
+    /// B*-Tree balancing algorithm. This algorithm attempts to delay node
+    /// splitting as much as possible and keep all nodes at least 2/3 full
+    /// except the root.
+    ///
+    /// TODO: Explain how.
+    fn balance(&mut self, mut node: Node, mut parents: Vec<(Node, usize)>) -> io::Result<()> {
+        // Done, this node didn't overflow.
+        if node.entries.len() <= self.max_keys() {
+            return Ok(());
+        }
+
+        // The root overflowed, so it must be split.
+        if parents.is_empty() {
+            let mut old_root = Node::new_at(self.allocate_page());
+            old_root.entries.extend(node.entries.drain(..));
+            old_root.children.extend(node.children.drain(..));
+
+            node.children.push(old_root.page);
+
+            parents.push((node, 0));
+            node = old_root;
+        }
+
+        let (mut parent, index) = parents.pop().unwrap();
+
+        // Find all siblings involved in the balancing algorithm.
+        let range = if index == 0 {
+            0..=min(BALANCE_SIBLINGS_PER_SIDE * 2, parent.children.len() - 1)
+        } else if index == parent.children.len() - 1 {
+            index
+                .checked_sub(BALANCE_SIBLINGS_PER_SIDE * 2)
+                .unwrap_or(0)..=index
+        } else {
+            index.checked_sub(BALANCE_SIBLINGS_PER_SIDE).unwrap_or(0)
+                ..=min(index + BALANCE_SIBLINGS_PER_SIDE, parent.children.len() - 1)
+        };
+
+        let mut siblings = Vec::new();
+        for i in range {
+            if parent.children[i] != node.page {
+                siblings.push((self.read_node(parent.children[i])?, i));
             }
         }
 
-        self.insert_into(&mut next_node, entry)
-    }
-
-    fn split_child(&mut self, parent: &mut Node, index: usize) -> io::Result<()> {
-        let mut target_node = self.read_node(parent.children[index])?;
-
-        let mut new_node = Node::new_at(self.free_page());
-
-        // Move keys greater than the median into the new node.
-        new_node.entries.extend(
-            target_node
-                .entries
-                .drain(self.degree..(2 * self.degree - 1)),
+        // TODO: Optimize this. Insert nodes at left, then current node, then right.
+        siblings.insert(
+            siblings
+                .binary_search_by_key(&index, |(_, i)| *i)
+                .unwrap_err(),
+            (node, index),
         );
 
-        // Move median key into parent.
-        parent
-            .entries
-            .insert(index, target_node.entries.remove(self.degree - 1));
+        // All siblings are full, must split.
+        if siblings
+            .iter()
+            .all(|(sibling, _)| sibling.entries.len() >= self.max_keys())
+        {
+            // Only two nodes needed for splitting.
+            if siblings.len() > 2 {
+                if siblings[0].1 == index {
+                    siblings.drain(2..);
+                } else if siblings.last().unwrap().1 == index {
+                    siblings.drain(..siblings.len() - 2);
+                } else {
+                    siblings.retain(|(_, i)| [index, index + 1].contains(i));
+                }
+            }
 
-        // If the target node is not a leaf node, update children pointers.
-        if !target_node.children.is_empty() {
-            new_node
-                .children
-                .extend(target_node.children.drain(self.degree..2 * self.degree));
+            // Allocate new node.
+            let new_node = Node::new_at(self.allocate_page());
+
+            // Prepare terrain for balancing.
+            let rightmost_sibling = siblings.last_mut().unwrap();
+            let new_node_parent_index = rightmost_sibling.1 + 1;
+            parent.entries.insert(
+                rightmost_sibling.1,
+                rightmost_sibling.0.entries.pop().unwrap(),
+            );
+            parent.children.insert(new_node_parent_index, new_node.page);
+
+            // Add new node to balancing list.
+            siblings.push((new_node, new_node_parent_index));
         }
 
-        // Insert new node pointer into parent.
-        parent.children.insert(index + 1, new_node.page);
+        // Redistribute entries and children evenly.
+        let mut entries_to_balance = Vec::new();
+        let mut children_to_balance = Vec::new();
 
-        self.write_node(parent)?;
-        self.write_node(&mut target_node)?;
-        self.write_node(&mut new_node)?;
+        for (node, _) in &mut siblings {
+            entries_to_balance.extend(node.entries.drain(..));
+            children_to_balance.extend(node.children.drain(..));
+        }
 
-        Ok(())
+        let chunk_size = entries_to_balance.len() / siblings.len();
+        let remainder = entries_to_balance.len() % siblings.len();
+
+        // Swap keys with parent.
+        let mut split_point = 0;
+        for (current_iter, (_, divider_idx)) in siblings[..siblings.len() - 1].iter().enumerate() {
+            let mut balanced_chunk_size = chunk_size;
+            if current_iter < remainder {
+                balanced_chunk_size += 1;
+            }
+
+            split_point += balanced_chunk_size;
+
+            let mut swap_key_idx = split_point;
+            if parent.entries[*divider_idx] < entries_to_balance[split_point] {
+                swap_key_idx -= 1;
+            }
+
+            mem::swap(
+                &mut parent.entries[*divider_idx],
+                &mut entries_to_balance[swap_key_idx],
+            );
+
+            // Sort demoted keys
+            while swap_key_idx > 0
+                && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
+            {
+                entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
+            }
+            while swap_key_idx < entries_to_balance.len() - 1
+                && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
+            {
+                entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
+            }
+        }
+
+        // Write keys and children into nodes.
+        // TODO: Reuse this algorithm for both entris and children somehow.
+        let mut start = 0;
+        let mut chld_start = 0;
+        for (current_iter, sibling) in siblings.iter_mut().enumerate() {
+            let mut balanced_chunk_size = chunk_size;
+            if current_iter < remainder {
+                balanced_chunk_size += 1;
+            }
+
+            let end = min(start + balanced_chunk_size, entries_to_balance.len());
+            sibling.0.entries.extend(&entries_to_balance[start..end]);
+
+            if !children_to_balance.is_empty() {
+                // there's always one more child than keys.
+                let chld_chunk = balanced_chunk_size + 1;
+                let end = min(chld_start + chld_chunk, children_to_balance.len());
+                sibling
+                    .0
+                    .children
+                    .extend(&children_to_balance[chld_start..end]);
+                chld_start += chld_chunk;
+            }
+
+            start += balanced_chunk_size;
+        }
+
+        // Write to disk.
+        // TODO: Sequential write queue, cache and stuff.
+        for (node, _) in &siblings {
+            self.write_node(node)?;
+        }
+
+        // If the parent didn't overflow we can terminate here. Otherwise
+        // recurse upwards.
+        if parent.entries.len() <= self.max_keys() {
+            return self.write_node(&parent);
+        }
+
+        self.balance(parent, parents)
     }
 
     pub fn get(&mut self, key: u32) -> io::Result<u32> {
@@ -293,38 +462,46 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     pub fn json(&mut self) -> io::Result<String> {
+        let mut string = String::from('[');
+
         let root = self.read_node(0)?;
-        self.to_json(&root)
+        string.push_str(&self.to_json(&root)?);
+
+        for page in 1..self.len() {
+            let next_node = self.read_node(page as u32)?;
+            string.push(',');
+            string.push_str(&self.to_json(&next_node)?);
+        }
+
+        string.push(']');
+
+        Ok(string)
     }
 
     fn to_json(&mut self, node: &Node) -> io::Result<String> {
         let mut string = format!("{{\"page\":{},\"entries\":[", node.page);
 
         if node.entries.len() >= 1 {
-            // string.push_str(&format!("{}", node.entries[0].key));
-            // let last = node.entries.last().unwrap();
-            // if last.key != node.entries[0].key {
-            //     string.push_str(&format!(",{}", last.key));
-            // }
+            #[allow(unused_variables)]
             let Entry { key, value } = node.entries[0];
-            string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+            // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+            string.push_str(&format!("{}", key));
 
+            #[allow(unused_variables)]
             for Entry { key, value } in &node.entries[1..] {
                 string.push(',');
-                string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+                // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+                string.push_str(&format!("{}", key));
             }
         }
 
         string.push_str("],\"children\":[");
 
         if node.children.len() >= 1 {
-            let subtree = self.read_node(node.children[0])?;
-            string.push_str(&self.to_json(&subtree)?);
+            string.push_str(&format!("{}", node.children[0]));
 
             for child in &node.children[1..] {
-                string.push(',');
-                let subtree = self.read_node(*child)?;
-                string.push_str(&self.to_json(&subtree)?);
+                string.push_str(&format!(",{child}"));
             }
         }
 
@@ -341,26 +518,22 @@ mod tests {
 
     use super::BTree;
 
-    /// This is how a Btree of `degree = 2` should look like if we insert values
-    /// from 1 to 12 included sequentially:
+    /// This is how a B*-Tree of `order = 4` should look like if we insert
+    /// values from 1 to 15 sequentially:
     ///
     /// ```text
-    ///                   +---+
-    ///           +-------| 4 |-------+
-    ///         /         +---+        \
-    ///        /                        \
-    ///     +---+                   +--------+
-    ///     | 2 |              +--- | 6,8,10 |----+
-    ///     +---+             /     +--------+     \
-    ///   /       \          /       /      \       \
-    /// +---+   +---+     +---+   +---+   +---+   +-------+
-    /// | 1 |   | 3 |     | 5 |   | 7 |   | 9 |   | 11,12 |
-    /// +---+   +---+     +---+   +---+   +---+   +-------+
+    ///                 +--------+
+    ///         +-------| 4,8,12 |--------+
+    ///       /         +--------+         \
+    ///     /          /         \          \
+    /// +-------+  +-------+  +---------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    /// +-------+  +-------+  +---------+  +----------+
     /// ```
     #[test]
-    fn insertion() -> Result<(), Box<dyn Error>> {
+    fn basic_insertion() -> Result<(), Box<dyn Error>> {
         let page_size = 48;
-        let max_nodes = 9;
+        let max_nodes = 5;
         let keys: Vec<u32> = (1..=12).collect();
 
         let buf = io::Cursor::new(vec![0; page_size * max_nodes]);
@@ -370,8 +543,8 @@ mod tests {
             btree.insert(*key, 100 + key)?;
         }
 
-        assert_eq!(btree.degree(), 2);
-        assert_eq!(btree.len(), 9);
+        assert_eq!(btree.order(), 4);
+        assert_eq!(btree.len(), max_nodes);
 
         for key in &keys {
             assert_eq!(btree.get(*key)?, 100 + key);
