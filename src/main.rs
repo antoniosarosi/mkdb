@@ -9,7 +9,6 @@ fn main() -> io::Result<()> {
     let mut btree = BTree::new_at("btree.bin", 48)?;
     for i in 1..=46 {
         btree.insert(i, 1000 + i)?;
-        // println!("{}", btree.json()?);
     }
 
     eprintln!("BTree order: {}", btree.order());

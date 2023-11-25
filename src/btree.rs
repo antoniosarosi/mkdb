@@ -4,7 +4,6 @@ use std::{
     io,
     io::{Read, Seek, Write},
     mem,
-    os::unix::prelude::MetadataExt,
     path::Path,
 };
 
@@ -156,15 +155,58 @@ impl<F> BTree<F> {
 
 impl BTree<File> {
     pub fn new_at<P: AsRef<Path>>(path: P, page_size: usize) -> io::Result<Self> {
-        let file = File::options().read(true).write(true).open(path)?;
+        let file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
         let metadata = file.metadata()?;
 
         if !metadata.is_file() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
         }
 
-        // TODO: Windows
-        let block_size = metadata.blksize() as usize;
+        #[cfg(unix)]
+        let block_size = {
+            use std::os::unix::prelude::MetadataExt;
+            metadata.blksize() as usize
+        };
+
+        #[cfg(windows)]
+        let block_size = unsafe {
+            use std::os::windows::ffi::OsStrExt;
+
+            use windows::{
+                core::PCWSTR,
+                Win32::{Foundation::MAX_PATH, Storage::FileSystem},
+            };
+
+            let mut volume = [0u16; MAX_PATH as usize];
+
+            let mut win_file_path = path
+                .as_ref()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<u16>>();
+
+            win_file_path.push(0);
+
+            FileSystem::GetVolumePathNameW(PCWSTR::from_raw(win_file_path.as_ptr()), &mut volume)?;
+
+            let mut bytes_per_sector: u32 = 0;
+            let mut sectors_per_cluster: u32 = 0;
+
+            FileSystem::GetDiskFreeSpaceW(
+                PCWSTR::from_raw(volume.as_ptr()),
+                Some(&mut bytes_per_sector),
+                Some(&mut sectors_per_cluster),
+                None,
+                None,
+            )?;
+
+            (bytes_per_sector * sectors_per_cluster) as usize
+        };
 
         // TODO: Add magic number & header to file.
         let pager = Pager::new(file, page_size, block_size);
