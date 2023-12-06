@@ -379,70 +379,67 @@ impl<F: Seek + Read + Write> BTree<F> {
             children_to_balance.extend(node.children.drain(..));
         }
 
-        let chunk_size = entries_to_balance.len() / siblings.len();
-        let remainder = entries_to_balance.len() % siblings.len();
+        let num_siblings = siblings.len();
 
-        // Swap keys with parent.
-        let mut split_point = 0;
-        for (current_iter, (_, divider_idx)) in siblings[..siblings.len() - 1].iter().enumerate() {
-            let mut balanced_chunk_size = chunk_size;
-            if current_iter < remainder {
-                balanced_chunk_size += 1;
-            }
+        let chunk_size = entries_to_balance.len() / num_siblings;
+        let remainder = entries_to_balance.len() % num_siblings;
 
-            split_point += balanced_chunk_size;
-
-            let mut swap_key_idx = split_point;
-            if parent.entries[*divider_idx] < entries_to_balance[split_point] {
-                swap_key_idx -= 1;
-            }
-
-            mem::swap(
-                &mut parent.entries[*divider_idx],
-                &mut entries_to_balance[swap_key_idx],
-            );
-
-            // Sort demoted keys
-            while swap_key_idx > 0
-                && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
-            {
-                entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
-            }
-            while swap_key_idx < entries_to_balance.len() - 1
-                && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
-            {
-                entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
-            }
-        }
-
-        // Write keys and children into nodes.
         let mut entries_start = 0;
         let mut children_start = 0;
-        for (current_iter, (sibling, _)) in siblings.iter_mut().enumerate() {
+
+        for (i, (sibling, divider_idx)) in siblings.iter_mut().enumerate() {
             let mut balanced_chunk_size = chunk_size;
-            if current_iter < remainder {
+            if i < remainder {
                 balanced_chunk_size += 1;
             }
 
+            // Swap keys with parent.
+            if i < num_siblings - 1 {
+                let mut swap_key_idx = entries_start + balanced_chunk_size;
+                if parent.entries[*divider_idx] < entries_to_balance[swap_key_idx] {
+                    swap_key_idx -= 1;
+                }
+
+                mem::swap(
+                    &mut parent.entries[*divider_idx],
+                    &mut entries_to_balance[swap_key_idx],
+                );
+
+                // Sort demoted keys.
+                while swap_key_idx > 0
+                    && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
+                {
+                    entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
+                }
+                while swap_key_idx < entries_to_balance.len() - 1
+                    && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
+                {
+                    entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
+                }
+            }
+
+            // Distribute entries.
             let entries_end = min(
                 entries_start + balanced_chunk_size,
                 entries_to_balance.len(),
             );
-
             sibling
                 .entries
                 .extend(&entries_to_balance[entries_start..entries_end]);
-
             entries_start += balanced_chunk_size;
 
+            // Distribute children.
             if !children_to_balance.is_empty() {
                 // There's always one more child than keys.
-                let children_chunk = balanced_chunk_size + 1;
-                let children_end = min(children_start + children_chunk, children_to_balance.len());
+                balanced_chunk_size += 1;
+                let children_end = min(
+                    children_start + balanced_chunk_size,
+                    children_to_balance.len(),
+                );
                 sibling
                     .children
                     .extend(&children_to_balance[children_start..children_end]);
-                children_start += children_chunk;
+                children_start += balanced_chunk_size;
             }
         }
     }
