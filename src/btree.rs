@@ -286,32 +286,35 @@ impl<F: Seek + Read + Write> BTree<F> {
 
         let (mut parent, index) = parents.pop().unwrap();
 
-        // Find all siblings involved in the balancing algorithm.
-        let range = if index == 0 {
-            0..=min(BALANCE_SIBLINGS_PER_SIDE * 2, parent.children.len() - 1)
-        } else if index == parent.children.len() - 1 {
-            index
-                .checked_sub(BALANCE_SIBLINGS_PER_SIDE * 2)
-                .unwrap_or(0)..=index
-        } else {
-            index.checked_sub(BALANCE_SIBLINGS_PER_SIDE).unwrap_or(0)
-                ..=min(index + BALANCE_SIBLINGS_PER_SIDE, parent.children.len() - 1)
-        };
+        // Find all siblings involved in the balancing algorithm, including
+        // the given node.
+        let mut siblings = {
+            let mut num_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
 
-        let mut siblings = Vec::new();
-        for i in range {
-            if parent.children[i] != node.page {
+            if index == 0 || index == parent.children.len() - 1 {
+                num_siblings_per_side *= 2;
+            };
+
+            let left_siblings = index.checked_sub(num_siblings_per_side).unwrap_or(0)..index;
+
+            let right_siblings =
+                (index + 1)..min(index + num_siblings_per_side + 1, parent.children.len());
+
+            let mut siblings =
+                Vec::with_capacity(left_siblings.size_hint().0 + 1 + right_siblings.size_hint().0);
+
+            for i in left_siblings {
                 siblings.push((self.read_node(parent.children[i])?, i));
             }
-        }
 
-        // TODO: Optimize this. Insert nodes at left, then current node, then right.
-        siblings.insert(
+            siblings.push((node, index));
+
+            for i in right_siblings {
+                siblings.push((self.read_node(parent.children[i])?, i));
+            }
+
             siblings
-                .binary_search_by_key(&index, |(_, i)| *i)
-                .unwrap_err(),
-            (node, index),
-        );
+        };
 
         // All siblings are full, must split.
         if siblings
@@ -345,11 +348,33 @@ impl<F: Seek + Read + Write> BTree<F> {
             siblings.push((new_node, new_node_parent_index));
         }
 
-        // Redistribute entries and children evenly.
+        self.redistribute_entries_and_children(&mut parent, &mut siblings);
+
+        // Write to disk.
+        // TODO: Sequential write queue, cache and stuff.
+        for (node, _) in &siblings {
+            self.write_node(node)?;
+        }
+
+        // If the parent didn't overflow we can terminate here. Otherwise
+        // recurse upwards.
+        if parent.entries.len() <= self.max_keys() {
+            return self.write_node(&parent);
+        }
+
+        self.balance(parent, parents)
+    }
+
+    /// Redistribute entries and children evenly.
+    fn redistribute_entries_and_children(
+        &self,
+        parent: &mut Node,
+        siblings: &mut Vec<(Node, usize)>,
+    ) {
         let mut entries_to_balance = Vec::new();
         let mut children_to_balance = Vec::new();
 
-        for (node, _) in &mut siblings {
+        for (node, _) in siblings.iter_mut() {
             entries_to_balance.extend(node.entries.drain(..));
             children_to_balance.extend(node.children.drain(..));
         }
@@ -391,45 +416,35 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
 
         // Write keys and children into nodes.
-        // TODO: Reuse this algorithm for both entris and children somehow.
-        let mut start = 0;
-        let mut chld_start = 0;
-        for (current_iter, sibling) in siblings.iter_mut().enumerate() {
+        let mut entries_start = 0;
+        let mut children_start = 0;
+        for (current_iter, (sibling, _)) in siblings.iter_mut().enumerate() {
             let mut balanced_chunk_size = chunk_size;
             if current_iter < remainder {
                 balanced_chunk_size += 1;
             }
 
-            let end = min(start + balanced_chunk_size, entries_to_balance.len());
-            sibling.0.entries.extend(&entries_to_balance[start..end]);
+            let entries_end = min(
+                entries_start + balanced_chunk_size,
+                entries_to_balance.len(),
+            );
+
+            sibling
+                .entries
+                .extend(&entries_to_balance[entries_start..entries_end]);
+
+            entries_start += balanced_chunk_size;
 
             if !children_to_balance.is_empty() {
-                // there's always one more child than keys.
-                let chld_chunk = balanced_chunk_size + 1;
-                let end = min(chld_start + chld_chunk, children_to_balance.len());
+                // There's always one more child than keys.
+                let children_chunk = balanced_chunk_size + 1;
+                let children_end = min(children_start + children_chunk, children_to_balance.len());
                 sibling
-                    .0
                     .children
-                    .extend(&children_to_balance[chld_start..end]);
-                chld_start += chld_chunk;
+                    .extend(&children_to_balance[children_start..children_end]);
+                children_start += children_chunk;
             }
-
-            start += balanced_chunk_size;
         }
-
-        // Write to disk.
-        // TODO: Sequential write queue, cache and stuff.
-        for (node, _) in &siblings {
-            self.write_node(node)?;
-        }
-
-        // If the parent didn't overflow we can terminate here. Otherwise
-        // recurse upwards.
-        if parent.entries.len() <= self.max_keys() {
-            return self.write_node(&parent);
-        }
-
-        self.balance(parent, parents)
     }
 
     pub fn get(&mut self, key: u32) -> io::Result<u32> {
