@@ -50,7 +50,7 @@ struct Node {
 }
 
 impl Node {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             entries: Vec::new(),
             children: Vec::new(),
@@ -58,10 +58,17 @@ impl Node {
         }
     }
 
-    pub fn new_at(page: usize) -> Self {
+    fn new_at(page: usize) -> Self {
         let mut node = Self::new();
         node.page = page as u32;
         node
+    }
+
+    // Consumes all the entries and children in `other` and appends them to
+    // `self`.
+    fn extend_by_draining(&mut self, other: &mut Node) {
+        self.entries.extend(other.entries.drain(..));
+        self.children.extend(other.children.drain(..));
     }
 }
 
@@ -205,7 +212,7 @@ impl BTree<File> {
         let order = optimal_order_for(page_size);
 
         // TODO: Take free pages into account.
-        let len = metadata.len() as usize / page_size;
+        let len = std::cmp::max(metadata.len() as usize / page_size, 1);
 
         Ok(Self { pager, order, len })
     }
@@ -265,11 +272,16 @@ impl<F: Seek + Read + Write> BTree<F> {
     ) -> io::Result<Option<(Entry, Node)>> {
         let search = node.entries.binary_search(&Entry { key, value: 0 });
 
-        // If the key is not present in the current node, recurse downwards.
+        // If the key is not present in the current node, recurse downwards or
+        // return None if we are already at a leaf node.
         if let Err(index) = search {
-            let child = self.read_node(node.children[index])?;
-            parents.push((node, index));
-            return self.remove_from(child, key, parents);
+            if node.children.is_empty() {
+                return Ok(None);
+            } else {
+                let child = self.read_node(node.children[index])?;
+                parents.push((node, index));
+                return self.remove_from(child, key, parents);
+            }
         }
 
         let index = search.unwrap();
@@ -371,42 +383,62 @@ impl<F: Seek + Read + Write> BTree<F> {
     ///
     /// TODO: Explain how.
     fn balance(&mut self, mut node: Node, mut parents: Vec<(Node, usize)>) -> io::Result<()> {
+        // Started from the bottom now we're here :)
+        let is_root = parents.is_empty();
+
+        // A node can only overflow if the number of keys is greater than the
+        // maximum allowed.
+        let is_overflow = node.entries.len() > self.max_keys();
+
+        // A node has underflowed if it contains less than 2/3 of keys. The root
+        // is allowed to underflow past that point, but if it reaches 0 keys it
+        // has completely underflowed and tree height must be decreased.
+        let is_underflow =
+            (node.entries.len() < self.max_keys() * 2 / 3 && !is_root) || node.entries.is_empty();
+
         // Done, this node didn't overflow or underflow.
-        if (self.max_keys() * 2 / 3 <= node.entries.len() || parents.is_empty())
-            && node.entries.len() <= self.max_keys()
-            && !node.entries.is_empty()
-        {
-            return Ok(());
+        if !is_overflow && !is_underflow {
+            return self.write_node(&node);
         }
 
-        if parents.is_empty() {
-            // The root overflowed, so it must be split.
-            if node.entries.len() > self.max_keys() {
-                let mut old_root = Node::new_at(self.allocate_page());
-                old_root.entries.extend(node.entries.drain(..));
-                old_root.children.extend(node.children.drain(..));
+        // Root underflow. Merging internal nodes has consumed the entire root.
+        // Decrease tree height and return.
+        if is_root && is_underflow {
+            // Grab the only child remaining.
+            let mut direct_child = self.read_node(node.children.remove(0))?;
 
-                node.children.push(old_root.page);
+            // Make the child the new root.
+            node.extend_by_draining(&mut direct_child);
 
-                parents.push((node, 0));
-                node = old_root;
-            }
-            // Merging internal nodes has consumed the entire root. Decrease
-            // tree height.
-            else if node.entries.is_empty() {
-                let mut root_child = self.read_node(node.children[0])?;
-                node.children.remove(0);
-                node.entries.extend(root_child.entries.drain(..));
-                node.children.extend(root_child.children.drain(..));
-                self.free_page(root_child.page);
-                return self.write_node(&node);
-            }
+            // Done, no need to fall through the code below. Redistribution is
+            // not necessary.
+            self.free_page(direct_child.page);
+            return self.write_node(&node);
+        }
+
+        // The root overflowed, so it must be split. We're not going to split
+        // it here, we will only prepare the terrain for the splitting algorithm
+        // below.
+        if is_root && is_overflow {
+            // The actual tree root always stays at the same page, it does not
+            // move. First, copy the contents of the root to a new node and
+            // leave the root empty.
+            let mut old_root = Node::new_at(self.allocate_page());
+            old_root.extend_by_draining(&mut node);
+
+            // Now make the new node a child of the empty root.
+            node.children.push(old_root.page);
+
+            // Turn the new node into the balance target. Since this node has
+            // overflowed the code below will split it accordingly.
+            parents.push((node, 0));
+            node = old_root;
         }
 
         let (mut parent, index) = parents.pop().unwrap();
 
         // Find all siblings involved in the balancing algorithm, including
-        // the given node.
+        // the given node (balance target).
         let mut siblings = {
             let mut num_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
 
@@ -435,11 +467,24 @@ impl<F: Seek + Read + Write> BTree<F> {
             siblings
         };
 
-        // All siblings are full, must split.
-        if siblings
+        let total_entries = siblings
             .iter()
-            .all(|(sibling, _)| sibling.entries.len() >= self.max_keys())
-        {
+            .map(|(sibling, _)| sibling.entries.len())
+            .sum::<usize>();
+
+        // We only split nodes if absolutely necessary. Otherwise we can just
+        // move keys around siblings to keep balance. We reach the "must split"
+        // point when all siblings are full and one of them has overflowed.
+        let must_split = total_entries > self.max_keys() * siblings.len();
+
+        // Same as before, merge only if there's no other way to keep balance.
+        // This happens when all the entries can fit into one less node than we
+        // have and one of the nodes has underflowed below 2/3 (integer divsion).
+        // If we can avoid merging while still keeping siblings at 66%, we will.
+        let must_merge =
+            total_entries < (siblings.len() - 1) * self.max_keys() - (self.max_keys() * 2 % 3);
+
+        if must_split {
             // Only two nodes needed for splitting.
             if siblings.len() > 2 {
                 if siblings[0].1 == index {
@@ -454,7 +499,9 @@ impl<F: Seek + Read + Write> BTree<F> {
             // Allocate new node.
             let new_node = Node::new_at(self.allocate_page());
 
-            // Prepare terrain for balancing.
+            // Prepare terrain for the redistribution algorithm below by moving
+            // the greatest key into the parent and adding the new empty child
+            // to the parent.
             let rightmost_sibling = siblings.last_mut().unwrap();
             let new_node_parent_index = rightmost_sibling.1 + 1;
             parent.entries.insert(
@@ -465,43 +512,31 @@ impl<F: Seek + Read + Write> BTree<F> {
 
             // Add new node to balancing list.
             siblings.push((new_node, new_node_parent_index));
-        }
-        // The node has underflowed and none of the siblings can lend a key to
-        // keep it at 66% full. Merge two nodes together to keep balance.
-        else if siblings
-            .iter()
-            .map(|(sibling, _)| sibling.entries.len())
-            .sum::<usize>()
-            < (siblings.len() - 1) * self.max_keys() - (self.max_keys() * 2 % 3)
-        {
+        } else if must_merge {
+            // Merge the first two nodes together, demote the first key in
+            // the parent and let the redistribution algorithm below do its job.
             let (mut deleted_node, _) = siblings.remove(1);
             let (merge_node, divider_idx) = &mut siblings[0];
 
             merge_node.entries.push(parent.entries.remove(*divider_idx));
-            merge_node.entries.extend(deleted_node.entries.drain(..));
-            merge_node.children.extend(deleted_node.children.drain(..));
+            merge_node.extend_by_draining(&mut deleted_node);
 
             parent.children.remove(*divider_idx + 1);
             self.free_page(deleted_node.page);
         }
 
+        // This algorithm does most of the magic here. It prevents us from
+        // splitting and merging by reordering keys around the nodes.
         self.redistribute_entries_and_children(&mut parent, &mut siblings);
 
-        // Write to disk.
+        // Write to disk. Parent is not written yet because it might be in an
+        // overflow or underflow state.
         // TODO: Sequential write queue, cache and stuff.
         for (node, _) in &siblings {
             self.write_node(node)?;
         }
 
-        // If the parent didn't overflow or underflow we can terminate here.
-        if (self.max_keys() * 2 / 3 <= parent.entries.len() || parents.is_empty())
-            && parent.entries.len() <= self.max_keys()
-            && !parent.entries.is_empty()
-        {
-            return self.write_node(&parent);
-        }
-
-        // Otherwise recurse upwards and propagate splits/merges.
+        // Recurse upwards and propagate redistribution/merging/splitting.
         self.balance(parent, parents)
     }
 
@@ -813,8 +848,6 @@ mod tests {
         for key in keys {
             btree.insert(key, key)?;
         }
-
-        println!("INITIAL LEN {}", btree.len());
 
         // Delete from leaf node without overflow
         assert_eq!(btree.remove(46)?, Some(46));
