@@ -121,12 +121,12 @@ fn optimal_order_for(page_size: usize) -> usize {
 
 impl<F> BTree<F> {
     #[allow(dead_code)]
-    pub fn new(file: F, page_size: usize, block_size: usize) -> io::Result<Self> {
+    pub fn new(file: F, page_size: usize, block_size: usize) -> Self {
         let pager = Pager::new(file, page_size, block_size);
         let order = optimal_order_for(page_size);
-        let len = 0;
+        let len = 1;
 
-        Ok(Self { pager, order, len })
+        Self { pager, order, len }
     }
 
     #[inline]
@@ -142,14 +142,6 @@ impl<F> BTree<F> {
     #[inline]
     fn max_keys(&self) -> usize {
         self.order() - 1
-    }
-
-    fn allocate_page(&mut self) -> usize {
-        // TODO: Free list.
-        let page = self.len;
-        self.len += 1;
-
-        page
     }
 }
 
@@ -211,6 +203,8 @@ impl BTree<File> {
         // TODO: Add magic number & header to file.
         let pager = Pager::new(file, page_size, block_size);
         let order = optimal_order_for(page_size);
+
+        // TODO: Take free pages into account.
         let len = metadata.len() as usize / page_size;
 
         Ok(Self { pager, order, len })
@@ -218,6 +212,11 @@ impl BTree<File> {
 }
 
 impl<F: Seek + Read + Write> BTree<F> {
+    pub fn get(&mut self, key: u32) -> io::Result<Option<u32>> {
+        let root = self.read_node(0)?;
+        self.find(&root, key)
+    }
+
     pub fn insert(&mut self, key: u32, value: u32) -> io::Result<()> {
         let root = self.read_node(0)?;
 
@@ -225,6 +224,111 @@ impl<F: Seek + Read + Write> BTree<F> {
         let node = self.insert_into(root, Entry { key, value }, &mut parents)?;
 
         self.balance(node, parents)
+    }
+
+    pub fn remove(&mut self, key: u32) -> io::Result<Option<u32>> {
+        let root = self.read_node(0)?;
+
+        let mut parents = Vec::new();
+
+        let Some((entry, leaf_node)) = self.remove_from(root, key, &mut parents)? else {
+            return Ok(None);
+        };
+
+        self.balance(leaf_node, parents)?;
+
+        return Ok(Some(entry.value));
+    }
+
+    fn allocate_page(&mut self) -> usize {
+        // TODO: Free list.
+        let page = self.len;
+        self.len += 1;
+
+        page
+    }
+
+    fn free_page(&mut self, page: u32) {
+        // TODO: Free list.
+        self.pager
+            .write_page(page as usize, &Vec::from("FREE PAGE".as_bytes()))
+            .unwrap();
+
+        self.len -= 1;
+    }
+
+    fn remove_from(
+        &mut self,
+        mut node: Node,
+        key: u32,
+        parents: &mut Vec<(Node, usize)>,
+    ) -> io::Result<Option<(Entry, Node)>> {
+        let search = node.entries.binary_search(&Entry { key, value: 0 });
+
+        // If the key is not present in the current node, recurse downwards.
+        if let Err(index) = search {
+            let child = self.read_node(node.children[index])?;
+            parents.push((node, index));
+            return self.remove_from(child, key, parents);
+        }
+
+        let index = search.unwrap();
+
+        // If this node is a leaf node, we're done with deleting.
+        if node.children.is_empty() {
+            let entry = node.entries.remove(index);
+            self.write_node(&node)?;
+            return Ok(Some((entry, node)));
+        }
+
+        parents.push((node, index));
+
+        let curr_node_idx = parents.len() - 1;
+
+        // If it's not a leaf node, then find a suitable substitute in a leaf
+        // node (either predecessor in the left subtree or successor in the
+        // right subtree) and return the entire path for balancing purposes.
+        let left_child = self.read_node(parents[curr_node_idx].0.children[index])?;
+        let right_child = self.read_node(parents[curr_node_idx].0.children[index + 1])?;
+
+        let (substitute, leaf_node) = if left_child.entries.len() >= right_child.entries.len() {
+            let mut predecesor = self.find_max(left_child, parents)?;
+            (predecesor.entries.pop().unwrap(), predecesor)
+        } else {
+            let mut successor = self.find_min(right_child, parents)?;
+            (successor.entries.remove(0), successor)
+        };
+
+        let value = mem::replace(&mut parents[curr_node_idx].0.entries[index], substitute);
+
+        self.write_node(&parents[curr_node_idx].0)?;
+        self.write_node(&leaf_node)?;
+
+        return Ok(Some((value, leaf_node)));
+    }
+
+    fn find_max(&mut self, node: Node, parents: &mut Vec<(Node, usize)>) -> io::Result<Node> {
+        if node.children.is_empty() {
+            return Ok(node);
+        }
+
+        let index = node.children.len() - 1;
+
+        let child = self.read_node(node.children[index])?;
+        parents.push((node, index));
+
+        self.find_max(child, parents)
+    }
+
+    fn find_min(&mut self, node: Node, parents: &mut Vec<(Node, usize)>) -> io::Result<Node> {
+        if node.children.is_empty() {
+            return Ok(node);
+        }
+
+        let child = self.read_node(node.children[0])?;
+        parents.push((node, 0));
+
+        self.find_min(child, parents)
     }
 
     fn insert_into(
@@ -262,26 +366,41 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     /// B*-Tree balancing algorithm. This algorithm attempts to delay node
-    /// splitting as much as possible and keep all nodes at least 2/3 full
-    /// except the root.
+    /// splitting and merging as much as possible while keeping all nodes at
+    /// least 2/3 full except the root.
     ///
     /// TODO: Explain how.
     fn balance(&mut self, mut node: Node, mut parents: Vec<(Node, usize)>) -> io::Result<()> {
-        // Done, this node didn't overflow.
-        if node.entries.len() <= self.max_keys() {
+        // Done, this node didn't overflow or underflow.
+        if (self.max_keys() * 2 / 3 <= node.entries.len() || parents.is_empty())
+            && node.entries.len() <= self.max_keys()
+            && !node.entries.is_empty()
+        {
             return Ok(());
         }
 
-        // The root overflowed, so it must be split.
         if parents.is_empty() {
-            let mut old_root = Node::new_at(self.allocate_page());
-            old_root.entries.extend(node.entries.drain(..));
-            old_root.children.extend(node.children.drain(..));
+            // The root overflowed, so it must be split.
+            if node.entries.len() > self.max_keys() {
+                let mut old_root = Node::new_at(self.allocate_page());
+                old_root.entries.extend(node.entries.drain(..));
+                old_root.children.extend(node.children.drain(..));
 
-            node.children.push(old_root.page);
+                node.children.push(old_root.page);
 
-            parents.push((node, 0));
-            node = old_root;
+                parents.push((node, 0));
+                node = old_root;
+            }
+            // Merging internal nodes has consumed the entire root. Decrease
+            // tree height.
+            else if node.entries.is_empty() {
+                let mut root_child = self.read_node(node.children[0])?;
+                node.children.remove(0);
+                node.entries.extend(root_child.entries.drain(..));
+                node.children.extend(root_child.children.drain(..));
+                self.free_page(root_child.page);
+                return self.write_node(&node);
+            }
         }
 
         let (mut parent, index) = parents.pop().unwrap();
@@ -347,6 +466,24 @@ impl<F: Seek + Read + Write> BTree<F> {
             // Add new node to balancing list.
             siblings.push((new_node, new_node_parent_index));
         }
+        // The node has underflowed and none of the siblings can lend a key to
+        // keep it at 66% full. Merge two nodes together to keep balance.
+        else if siblings
+            .iter()
+            .map(|(sibling, _)| sibling.entries.len())
+            .sum::<usize>()
+            < (siblings.len() - 1) * self.max_keys() - (self.max_keys() * 2 % 3)
+        {
+            let (mut deleted_node, _) = siblings.remove(1);
+            let (merge_node, divider_idx) = &mut siblings[0];
+
+            merge_node.entries.push(parent.entries.remove(*divider_idx));
+            merge_node.entries.extend(deleted_node.entries.drain(..));
+            merge_node.children.extend(deleted_node.children.drain(..));
+
+            parent.children.remove(*divider_idx + 1);
+            self.free_page(deleted_node.page);
+        }
 
         self.redistribute_entries_and_children(&mut parent, &mut siblings);
 
@@ -356,16 +493,19 @@ impl<F: Seek + Read + Write> BTree<F> {
             self.write_node(node)?;
         }
 
-        // If the parent didn't overflow we can terminate here. Otherwise
-        // recurse upwards.
-        if parent.entries.len() <= self.max_keys() {
+        // If the parent didn't overflow or underflow we can terminate here.
+        if (self.max_keys() * 2 / 3 <= parent.entries.len() || parents.is_empty())
+            && parent.entries.len() <= self.max_keys()
+            && !parent.entries.is_empty()
+        {
             return self.write_node(&parent);
         }
 
+        // Otherwise recurse upwards and propagate splits/merges.
         self.balance(parent, parents)
     }
 
-    /// Redistribute entries and children evenly.
+    /// Redistribute entries and children evenly. TODO: Explain algorithm.
     fn redistribute_entries_and_children(
         &self,
         parent: &mut Node,
@@ -395,26 +535,41 @@ impl<F: Seek + Read + Write> BTree<F> {
 
             // Swap keys with parent.
             if i < num_siblings - 1 {
-                let mut swap_key_idx = entries_start + balanced_chunk_size;
-                if parent.entries[*divider_idx] < entries_to_balance[swap_key_idx] {
-                    swap_key_idx -= 1;
-                }
+                let swap_key_idx = entries_start + balanced_chunk_size;
 
-                mem::swap(
-                    &mut parent.entries[*divider_idx],
-                    &mut entries_to_balance[swap_key_idx],
-                );
+                let mut keys = [
+                    entries_to_balance[swap_key_idx - 1],
+                    parent.entries[*divider_idx],
+                    entries_to_balance[swap_key_idx],
+                ];
 
-                // Sort demoted keys.
-                while swap_key_idx > 0
-                    && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
-                {
-                    entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
-                }
-                while swap_key_idx < entries_to_balance.len() - 1
-                    && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
-                {
-                    entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
+                keys.sort();
+
+                let maybe_swap = if keys[1] == entries_to_balance[swap_key_idx] {
+                    Some(swap_key_idx)
+                } else if keys[1] == entries_to_balance[swap_key_idx - 1] {
+                    Some(swap_key_idx - 1)
+                } else {
+                    None
+                };
+
+                if let Some(swap_key_idx) = maybe_swap {
+                    mem::swap(
+                        &mut parent.entries[*divider_idx],
+                        &mut entries_to_balance[swap_key_idx],
+                    );
+
+                    // Sort demoted keys.
+                    while swap_key_idx > 0
+                        && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
+                    {
+                        entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
+                    }
+                    while swap_key_idx < entries_to_balance.len() - 1
+                        && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
+                    {
+                        entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
+                    }
                 }
             }
 
@@ -444,20 +599,24 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
     }
 
-    pub fn get(&mut self, key: u32) -> io::Result<u32> {
-        let root = self.read_node(0)?;
-        self.find(&root, key)
-    }
+    fn find(&mut self, node: &Node, key: u32) -> io::Result<Option<u32>> {
+        let search = node.entries.binary_search(&Entry { key, value: 0 });
 
-    fn find(&mut self, node: &Node, key: u32) -> io::Result<u32> {
-        match node.entries.binary_search(&Entry { key, value: 0 }) {
-            Ok(index) => Ok(node.entries[index].value),
-
-            Err(index) => {
-                let next_node = self.read_node(node.children[index])?;
-                self.find(&next_node, key)
-            }
+        // If the key is here, bail out.
+        if let Ok(index) = search {
+            return Ok(Some(node.entries[index].value));
         }
+
+        let index = search.unwrap_err();
+
+        // If the key is not in this leaf node, bad luck.
+        if node.children.is_empty() {
+            return Ok(None);
+        }
+
+        // Otherwise recurse downwards.
+        let next_node = self.read_node(node.children[index])?;
+        self.find(&next_node, key)
     }
 
     fn read_node(&mut self, page: u32) -> io::Result<Node> {
@@ -508,23 +667,43 @@ impl<F: Seek + Read + Write> BTree<F> {
 
         self.pager.write_page(node.page as usize, &page)?;
 
-        if node.page as usize == self.len {
-            self.len += 1;
+        // TODO: Length increment is confirmed when writing, but one node can
+        // be written multiple times from different functions. Do something
+        // about it.
+        // if node.page as usize == self.len {
+        //     self.len += 1;
+        // }
+
+        Ok(())
+    }
+
+    // Testing/Debugging only.
+    fn read_into_mem(&mut self, node: Node, buf: &mut Vec<Node>) -> io::Result<()> {
+        for page in &node.children {
+            let child = self.read_node(*page)?;
+            self.read_into_mem(child, buf)?;
         }
+
+        buf.push(node);
 
         Ok(())
     }
 
     pub fn json(&mut self) -> io::Result<String> {
+        let root = self.read_node(0)?;
+
+        let mut nodes = Vec::new();
+        self.read_into_mem(root, &mut nodes)?;
+
+        nodes.sort_by(|n1, n2| n1.page.cmp(&n2.page));
+
         let mut string = String::from('[');
 
-        let root = self.read_node(0)?;
-        string.push_str(&self.to_json(&root)?);
+        string.push_str(&self.to_json(&nodes[0])?);
 
-        for page in 1..self.len() {
-            let next_node = self.read_node(page as u32)?;
+        for node in &nodes[1..] {
             string.push(',');
-            string.push_str(&self.to_json(&next_node)?);
+            string.push_str(&self.to_json(&node)?);
         }
 
         string.push(']');
@@ -568,9 +747,28 @@ impl<F: Seek + Read + Write> BTree<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, io};
+    use std::{
+        error::Error,
+        io::{self, Cursor},
+        mem,
+    };
 
-    use super::BTree;
+    use super::{BTree, Entry};
+
+    fn optimal_page_size_for(order: usize) -> usize {
+        mem::size_of::<u32>() * 2
+            + mem::size_of::<u32>() * order
+            + mem::size_of::<Entry>() * (order - 1)
+    }
+
+    impl BTree<Cursor<Vec<u8>>> {
+        fn with_order(order: usize, max_nodes: usize) -> Self {
+            let page_size = optimal_page_size_for(order);
+            let buf = io::Cursor::new(vec![0; page_size * max_nodes]);
+
+            BTree::new(buf, page_size, page_size)
+        }
+    }
 
     /// This is how a B*-Tree of `order = 4` should look like if we insert
     /// values from 1 to 15 sequentially:
@@ -586,23 +784,93 @@ mod tests {
     /// ```
     #[test]
     fn basic_insertion() -> Result<(), Box<dyn Error>> {
-        let page_size = 48;
         let max_nodes = 5;
         let keys: Vec<u32> = (1..=12).collect();
 
-        let buf = io::Cursor::new(vec![0; page_size * max_nodes]);
-        let mut btree = BTree::new(buf, page_size, page_size)?;
+        let mut btree = BTree::with_order(4, max_nodes);
 
         for key in &keys {
             btree.insert(*key, 100 + key)?;
         }
 
-        assert_eq!(btree.order(), 4);
         assert_eq!(btree.len(), max_nodes);
 
         for key in &keys {
-            assert_eq!(btree.get(*key)?, 100 + key);
+            assert_eq!(btree.get(*key)?.unwrap(), 100 + key);
         }
+
+        Ok(())
+    }
+
+    // TODO: Clean/refactor.
+    #[test]
+    fn remove() -> Result<(), Box<dyn Error>> {
+        let max_nodes = 16;
+        let keys: Vec<u32> = (1..=46).collect();
+
+        let mut btree = BTree::with_order(4, max_nodes);
+
+        for key in keys {
+            btree.insert(key, key)?;
+        }
+
+        println!("INITIAL LEN {}", btree.len());
+
+        // Delete from leaf node without overflow
+        assert_eq!(btree.remove(46)?, Some(46));
+        assert_eq!(btree.len(), max_nodes);
+
+        // Delete from another leaf node without overflow
+        assert_eq!(btree.remove(1)?, Some(1));
+        assert_eq!(btree.len(), max_nodes);
+
+        // Delete from leaf node causing underflow. Siblings can lend keys.
+        assert_eq!(btree.remove(2)?, Some(2));
+        assert_eq!(btree.len(), max_nodes);
+
+        // Delete from leaf node causing underflow. This time must merge.
+        assert_eq!(btree.remove(3)?, Some(3));
+        assert_eq!(btree.len(), max_nodes - 1);
+
+        // Delete from internal node.
+        assert_eq!(btree.remove(7)?, Some(7));
+        assert_eq!(btree.len(), max_nodes - 1);
+
+        // Delete from internal node.
+        assert_eq!(btree.remove(6)?, Some(6));
+        assert_eq!(btree.len(), max_nodes - 1);
+
+        // Delete from internal node.
+        assert_eq!(btree.remove(8)?, Some(8));
+        assert_eq!(btree.len(), max_nodes - 1);
+
+        // Delete from internal node. Merge & propagate lending/redistribution.
+        assert_eq!(btree.remove(11)?, Some(11));
+        assert_eq!(btree.len(), max_nodes - 2);
+
+        assert_eq!(btree.remove(4)?, Some(4));
+        assert_eq!(btree.remove(5)?, Some(5));
+        assert_eq!(btree.remove(9)?, Some(9));
+        assert_eq!(btree.remove(10)?, Some(10));
+        assert_eq!(btree.len(), max_nodes - 3);
+
+        assert_eq!(btree.remove(12)?, Some(12));
+        assert_eq!(btree.remove(13)?, Some(13));
+        assert_eq!(btree.remove(14)?, Some(14));
+        assert_eq!(btree.len(), max_nodes - 3);
+
+        // Merge propagates twice. Loose 2 nodes.
+        assert_eq!(btree.remove(15)?, Some(15));
+        assert_eq!(btree.len(), max_nodes - 5);
+
+        // Merge decreases tree height (root is consumed).
+        for k in 16..=32 {
+            assert_eq!(btree.remove(k)?, Some(k));
+        }
+
+        assert_eq!(btree.len(), 5);
+
+        // println!("{}", btree.json()?);
 
         Ok(())
     }

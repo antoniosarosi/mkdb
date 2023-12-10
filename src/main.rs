@@ -13,7 +13,11 @@ fn main() -> io::Result<()> {
 
     eprintln!("BTree order: {}", btree.order());
     eprintln!("Number of nodes: {}", btree.len());
-    eprintln!("Sanity check: btree.get({}) = {}", 5, btree.get(5)?);
+    eprintln!(
+        "Sanity check: btree.get({}) = {}",
+        5,
+        btree.get(5)?.unwrap()
+    );
     eprintln!("BTree in JSON format goes to STDOUT\n");
 
     println!("{}", btree.json()?);
