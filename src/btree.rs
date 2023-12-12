@@ -778,6 +778,20 @@ impl<F: Seek + Read + Write> BTree<F> {
 
         Ok(string)
     }
+
+    fn try_drain<'k, K: IntoIterator<Item = u32> + 'k>(
+        &'k mut self,
+        keys: K,
+    ) -> impl Iterator<Item = io::Result<Option<u32>>> + 'k {
+        keys.into_iter().map(|k| self.remove(k))
+    }
+
+    fn try_remove_all<K: IntoIterator<Item = u32>>(
+        &mut self,
+        keys: K,
+    ) -> io::Result<Vec<Option<u32>>> {
+        self.try_drain(keys).collect()
+    }
 }
 
 impl<F: Seek + Read + Write> Extend<(u32, u32)> for BTree<F> {
@@ -1367,6 +1381,180 @@ mod tests {
                             Node::leaf([44, 45, 46]),
                         ]
                     },
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Deleting from leaf nodes is the simplest case.
+    ///
+    /// ```text
+    ///                           DELETE 13
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /           /       \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                             RESULT
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 14,15    |
+    ///           +-------+  +-------+  +---------+  +----------+
+    /// ```
+    #[test]
+    fn delete_from_leaf_node() -> io::Result<()> {
+        let mut btree = MemBufBTree::builder()
+            .keys(1..=15)
+            .max_nodes(5)
+            .try_build()?;
+
+        btree.remove(13)?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4, 8, 12],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10, 11]),
+                    Node::leaf([14, 15]),
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// When a leaf node falls under 66% capacity it should not be merged with
+    /// one of its siblings if the siblings can lend keys without underflowing.
+    ///
+    /// ```text
+    ///
+    ///                           DELETE 15
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                           DELETE 14
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14    |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                          FINAL RESULT
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,11 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10    |  | 12,13    |
+    ///           +-------+  +-------+  +---------+  +----------+
+    /// ```
+    #[test]
+    fn delay_leaf_node_merge() -> io::Result<()> {
+        let mut btree = MemBufBTree::builder()
+            .keys(1..=15)
+            .max_nodes(5)
+            .try_build()?;
+
+        btree.try_remove_all((14..=15).rev())?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4, 8, 11],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10]),
+                    Node::leaf([12, 13]),
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Leaf nodes should be merged when keys can't be reordered across
+    /// siblings.
+    ///
+    /// ```text
+    ///                     DELETE (15,14,13) -> No Merge
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                           DELETE 12
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,7,10 |------+
+    ///                  /        +--------+       \
+    ///                 /          /      \         \
+    ///            +-------+  +-----+  +-----+  +-------+
+    ///            | 1,2,3 |  | 5,6 |  | 8,9 |  | 11,12 |
+    ///            +-------+  +-----+  +-----+  +-------+
+    ///
+    ///                          FINAL RESULT
+    ///                               |
+    ///                               V
+    ///                            +-----+
+    ///                       +----| 4,8 |-----+
+    ///                      /     +-----+      \  
+    ///                     /         |          \    
+    ///                +-------+  +-------+  +---------+  
+    ///                | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  
+    ///                +-------+  +-------+  +---------+  
+    /// ```
+    #[test]
+    fn merge_leaf_node() -> io::Result<()> {
+        let mut btree = MemBufBTree::builder()
+            .keys(1..=15)
+            .max_nodes(5)
+            .try_build()?;
+
+        btree.try_remove_all((12..=15).rev())?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4, 8],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10, 11]),
                 ]
             }
         );
