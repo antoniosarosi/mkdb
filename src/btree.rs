@@ -780,29 +780,291 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 }
 
+impl<F: Seek + Read + Write> Extend<(u32, u32)> for BTree<F> {
+    fn extend<T: IntoIterator<Item = (u32, u32)>>(&mut self, iter: T) {
+        for (key, value) in iter {
+            self.insert(key, value).unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        error::Error,
-        io::{self, Cursor},
-        mem,
-    };
+    use std::{io, mem};
 
-    use super::{BTree, Entry};
-
-    fn optimal_page_size_for(order: usize) -> usize {
-        mem::size_of::<u32>() * 2
-            + mem::size_of::<u32>() * order
-            + mem::size_of::<Entry>() * (order - 1)
+    /// Allows us to build an entire tree manually and then compare it to an
+    /// actual [`BTree`] structure. See tests below for examples.
+    #[derive(Debug, PartialEq)]
+    struct Node {
+        keys: Vec<u32>,
+        children: Vec<Self>,
     }
 
-    impl BTree<Cursor<Vec<u8>>> {
-        fn with_order(order: usize, max_nodes: usize) -> Self {
-            let page_size = optimal_page_size_for(order);
-            let buf = io::Cursor::new(vec![0; page_size * max_nodes]);
-
-            BTree::new(buf, page_size, page_size)
+    impl Node {
+        /// Leaf nodes have no children. This method saves us some unecessary
+        /// typing and makes the tree structure more readable.
+        fn leaf<K: IntoIterator<Item = u32>>(keys: K) -> Self {
+            Self {
+                keys: keys.into_iter().collect(),
+                children: Vec::new(),
+            }
         }
+    }
+
+    /// Inverse of [`super::optimal_order_for`].
+    fn optimal_page_size_for(order: usize) -> usize {
+        mem::size_of::<u16>() * 2
+            + mem::size_of::<u32>() * order
+            + mem::size_of::<super::Entry>() * (order - 1)
+    }
+
+    /// Config/Builder for [`MemBufBTree`]. Can be used with
+    /// [`TryFrom::try_from`] or [`MemBufBTree::builder`].
+    struct Config {
+        keys: Vec<u32>,
+        order: usize,
+        max_nodes: usize,
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Config {
+                keys: vec![],
+                order: 4,
+                max_nodes: 1,
+            }
+        }
+    }
+
+    impl Config {
+        fn keys<K: IntoIterator<Item = u32>>(mut self, keys: K) -> Self {
+            self.keys = keys.into_iter().collect();
+            self
+        }
+
+        fn max_nodes(mut self, max_nodes: usize) -> Self {
+            self.max_nodes = max_nodes;
+            self
+        }
+
+        fn order(mut self, order: usize) -> Self {
+            self.order = order;
+            self
+        }
+
+        fn try_build(self) -> io::Result<MemBufBTree> {
+            MemBufBTree::try_from(self)
+        }
+    }
+
+    /// We use in-memory buffers instead of disk files for testing. This speeds
+    /// up tests as it avoids disk IO and system calls.
+    type MemBufBTree = super::BTree<io::Cursor<Vec<u8>>>;
+
+    impl MemBufBTree {
+        fn into_test_nodes(&mut self, node: &super::Node) -> io::Result<Node> {
+            let mut test_node = Node {
+                keys: node.entries.iter().map(|e| e.key).collect(),
+                children: vec![],
+            };
+
+            for page in &node.children {
+                let child = self.read_node(*page)?;
+                test_node.children.push(self.into_test_nodes(&child)?);
+            }
+
+            Ok(test_node)
+        }
+
+        fn extend_from_keys_only<K: IntoIterator<Item = u32>>(
+            &mut self,
+            keys: K,
+        ) -> io::Result<()> {
+            for key in keys {
+                self.insert(key, key)?;
+            }
+
+            Ok(())
+        }
+
+        fn builder() -> Config {
+            Config::default()
+        }
+    }
+
+    impl TryFrom<Config> for MemBufBTree {
+        type Error = io::Error;
+
+        fn try_from(config: Config) -> Result<Self, Self::Error> {
+            let page_size = optimal_page_size_for(config.order);
+            let buf = io::Cursor::new(vec![0; page_size * config.max_nodes]);
+
+            let mut btree = MemBufBTree::new(buf, page_size, page_size);
+            btree.extend_from_keys_only(config.keys)?;
+
+            Ok(btree)
+        }
+    }
+
+    impl TryFrom<MemBufBTree> for Node {
+        type Error = io::Error;
+
+        fn try_from(mut btree: MemBufBTree) -> Result<Self, Self::Error> {
+            let root = btree.read_node(0)?;
+
+            btree.into_test_nodes(&root)
+        }
+    }
+
+    /// When `order = 4` the root should be able to sustain 3 keys without
+    /// splitting.
+    ///
+    /// ```text
+    ///                  ROOT
+    ///                    |
+    ///                    V
+    ///                +-------+
+    ///                | 1,2,3 |
+    ///                +-------+
+    /// ```
+    #[test]
+    fn fill_root() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=3)
+            .max_nodes(1)
+            .try_build()?;
+
+        assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
+
+        Ok(())
+    }
+
+    /// When `order = 4` and the root gets filled with 3 keys, inserting an
+    /// additional key should cause it to split.
+    ///
+    /// ```text
+    ///                INSERT 4
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///                | 1,2,3 |
+    ///                +-------+
+    ///
+    ///                 RESULT
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///                |   3   |
+    ///                +-------+
+    ///               /         \
+    ///           +-------+  +-------+
+    ///           |  1,2  |  |   4   |
+    ///           +-------+  +-------+
+    /// ```
+    #[test]
+    fn split_root() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=4)
+            .max_nodes(3)
+            .try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![3],
+                children: vec![Node::leaf([1, 2]), Node::leaf([4])]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Non-full sibling nodes can borrow keys from overflow nodes. See this
+    /// example where `order = 4`:
+    ///
+    /// ```text
+    ///                INSERT 7
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///                |   3   |
+    ///                +-------+
+    ///               /         \
+    ///           +-------+  +-------+
+    ///           |  1,2  |  | 4,5,6 |
+    ///           +-------+  +-------+
+    ///
+    ///                 RESULT
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///                |   4   |
+    ///                +-------+
+    ///               /         \
+    ///           +-------+  +-------+
+    ///           | 1,2,3 |  | 5,6,7 |
+    ///           +-------+  +-------+
+    /// ```
+    #[test]
+    fn delay_leaf_node_split() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=7)
+            .max_nodes(3)
+            .try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4],
+                children: vec![Node::leaf([1, 2, 3]), Node::leaf([5, 6, 7])]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Leaf node should split when keys can't be moved around siblings. See
+    /// this example where `order = 4`:
+    ///
+    /// ```text
+    ///                INSERT 8
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///                |   4   |
+    ///                +-------+
+    ///               /         \
+    ///           +-------+  +-------+
+    ///           | 1,2,3 |  | 5,6,7 |
+    ///           +-------+  +-------+
+    ///
+    ///                 RESULT
+    ///                    |
+    ///                    v
+    ///                +-------+
+    ///            +---|  3,6  |---+
+    ///           /    +-------+    \
+    ///          /         |         \
+    ///     +-------+  +-------+  +-------+
+    ///     |  1,2  |  |  4,5  |  |  7,8  |
+    ///     +-------+  +-------+  +-------+
+    /// ```
+    #[test]
+    fn split_leaf_node() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=8)
+            .max_nodes(4)
+            .try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![3, 6],
+                children: vec![Node::leaf([1, 2]), Node::leaf([4, 5]), Node::leaf([7, 8])]
+            }
+        );
+
+        Ok(())
     }
 
     /// This is how a B*-Tree of `order = 4` should look like if we insert
@@ -818,92 +1080,296 @@ mod tests {
     /// +-------+  +-------+  +---------+  +----------+
     /// ```
     #[test]
-    fn basic_insertion() -> Result<(), Box<dyn Error>> {
-        let max_nodes = 5;
-        let keys: Vec<u32> = (1..=12).collect();
+    fn basic_insertion() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=15)
+            .max_nodes(5)
+            .try_build()?;
 
-        let mut btree = BTree::with_order(4, max_nodes);
-
-        for key in &keys {
-            btree.insert(*key, 100 + key)?;
-        }
-
-        assert_eq!(btree.len(), max_nodes);
-
-        for key in &keys {
-            assert_eq!(btree.get(*key)?.unwrap(), 100 + key);
-        }
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4, 8, 12],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10, 11]),
+                    Node::leaf([13, 14, 15]),
+                ]
+            }
+        );
 
         Ok(())
     }
 
-    // TODO: Clean/refactor.
+    /// When a node splits and causes the parent to overflow, the parent should
+    /// split as well.
+    ///
+    /// ```text
+    ///                           INSERT 16
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /          /         \          \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                            RESULT
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------|   11   |-------+
+    ///                  /        +--------+        \
+    ///                 /                            \
+    ///            +-------+                     +--------+
+    ///       +----|  4,8  |----+                |   14   |
+    ///      /     +-------+     \               +--------+
+    ///     /          |          \               /      \
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    /// ```
     #[test]
-    fn remove() -> Result<(), Box<dyn Error>> {
-        let max_nodes = 16;
-        let keys: Vec<u32> = (1..=46).collect();
+    fn propagate_split_to_root() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=16)
+            .max_nodes(8)
+            .try_build()?;
 
-        let mut btree = BTree::with_order(4, max_nodes);
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![11],
+                children: vec![
+                    Node {
+                        keys: vec![4, 8],
+                        children: vec![
+                            Node::leaf([1, 2, 3]),
+                            Node::leaf([5, 6, 7]),
+                            Node::leaf([9, 10]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![14],
+                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                    }
+                ]
+            }
+        );
 
-        for key in keys {
-            btree.insert(key, key)?;
-        }
+        Ok(())
+    }
 
-        // Delete from leaf node without overflow
-        assert_eq!(btree.remove(46)?, Some(46));
-        assert_eq!(btree.len(), max_nodes);
+    /// Same as [`delay_leaf_node_split`] but with internal nodes. In this
+    /// example, the second child of the root should not split because its
+    /// left sibling can take one additional key and child.
+    ///
+    /// ```text
+    ///                                    INSERT 27
+    ///                                        |
+    ///                                        V
+    ///                                    +--------+
+    ///                   +----------------|   11   |---------------+
+    ///                  /                 +--------+                \
+    ///                 /                                             \
+    ///            +-------+                                     +----------+
+    ///       +----|  4,8  |----+                   +------------| 15,19,23 |------------+
+    ///      /     +-------+     \                 /             +----------+              \
+    ///     /          |          \               /               /        \                \
+    /// +-------+  +-------+  +-------+     +----------+  +----------+  +----------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13,14 |  | 16,17,18 |  | 20,21,22 |  | 24,25,26 |
+    /// +-------+  +-------+  +-------+     +----------+  +----------+  +----------+  +----------+
+    ///
+    ///                                              RESULT
+    ///                                                |
+    ///                                                V
+    ///                                            +--------+
+    ///                         +------------------|   15   |-----------------+
+    ///                        /                   +--------+                  \
+    ///                       /                                                 \
+    ///                  +--------+                                         +----------+
+    ///       +----------| 4,8,11 |---------+                     +---------| 19,22,25 |--------+
+    ///      /           +--------+          \                   /          +----------+         \
+    ///     /             /     \             \                 /             /      \            \
+    /// +-------+  +-------+  +-------+  +----------+     +----------+  +-------+  +-------+  +-------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |  | 12,13,14 |     | 16,17,18 |  | 20,21 |  | 23,24 |  | 26,27 |
+    /// +-------+  +-------+  +-------+  +----------+     +----------+  +-------+  +-------+  +-------+
+    /// ```
+    #[test]
+    fn delay_internal_node_split() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=27)
+            .max_nodes(11)
+            .try_build()?;
 
-        // Delete from another leaf node without overflow
-        assert_eq!(btree.remove(1)?, Some(1));
-        assert_eq!(btree.len(), max_nodes);
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![15],
+                children: vec![
+                    Node {
+                        keys: vec![4, 8, 11],
+                        children: vec![
+                            Node::leaf([1, 2, 3]),
+                            Node::leaf([5, 6, 7]),
+                            Node::leaf([9, 10]),
+                            Node::leaf([12, 13, 14]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![19, 22, 25],
+                        children: vec![
+                            Node::leaf([16, 17, 18]),
+                            Node::leaf([20, 21]),
+                            Node::leaf([23, 24]),
+                            Node::leaf([26, 27]),
+                        ]
+                    },
+                ]
+            }
+        );
 
-        // Delete from leaf node causing underflow. Siblings can lend keys.
-        assert_eq!(btree.remove(2)?, Some(2));
-        assert_eq!(btree.len(), max_nodes);
+        Ok(())
+    }
 
-        // Delete from leaf node causing underflow. This time must merge.
-        assert_eq!(btree.remove(3)?, Some(3));
-        assert_eq!(btree.len(), max_nodes - 1);
+    /// When internal nodes can't move keys around siblings they should split as
+    /// well.
+    ///
+    /// ```text
+    ///                                             INSERT 31
+    ///                                                |
+    ///                                                V
+    ///                                            +--------+
+    ///                         +------------------|   15   |-----------------+
+    ///                        /                   +--------+                  \
+    ///                       /                                                 \
+    ///                  +--------+                                            +----------+
+    ///       +----------| 4,8,11 |---------+                     +------------| 19,23,27 |-----------+
+    ///      /           +--------+          \                   /             +----------+            \
+    ///     /             /     \             \                 /               /        \              \
+    /// +-------+  +-------+  +-------+  +----------+     +----------+  +----------+  +----------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |  | 12,13,14 |     | 16,17,18 |  | 20,21,22 |  | 24,25,26 |  | 28,29,30 |
+    /// +-------+  +-------+  +-------+  +----------+     +----------+  +----------+  +----------+  +----------+
+    ///
+    ///                                                     RESULT
+    ///                                                        |
+    ///                                                        V
+    ///                                                    +-------+
+    ///                  +---------------------------------| 11,23 |--------------------------------+
+    ///                 /                                  +-------+                                 \
+    ///                /                                       |                                      \
+    ///             +-----+                                +-------+                              +-------+
+    ///        +----| 4,8 |-----+                  +-------| 15,19 |-------+                 +----| 26,29 |----+
+    ///       /     +-----+      \                /        +-------+        \               /     +-------+     \
+    ///      /         |          \              /             |             \             /          |          \
+    /// +-------+  +-------+  +-------+    +----------+  +----------+  +----------+    +-------+  +-------+  +-------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |    | 12,13,14 |  | 16,17,18 |  | 20,21,22 |    | 24,25 |  | 27,28 |  | 30,31 |
+    /// +-------+  +-------+  +-------+    +----------+  +----------+  +----------+    +-------+  +-------+  +-------+
+    /// ```
+    #[test]
+    fn propagate_split_to_internal_nodes() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=31)
+            .max_nodes(13)
+            .try_build()?;
 
-        // Delete from internal node.
-        assert_eq!(btree.remove(7)?, Some(7));
-        assert_eq!(btree.len(), max_nodes - 1);
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![11, 23],
+                children: vec![
+                    Node {
+                        keys: vec![4, 8],
+                        children: vec![
+                            Node::leaf([1, 2, 3]),
+                            Node::leaf([5, 6, 7]),
+                            Node::leaf([9, 10]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![15, 19],
+                        children: vec![
+                            Node::leaf([12, 13, 14]),
+                            Node::leaf([16, 17, 18]),
+                            Node::leaf([20, 21, 22]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![26, 29],
+                        children: vec![
+                            Node::leaf([24, 25]),
+                            Node::leaf([27, 28]),
+                            Node::leaf([30, 31]),
+                        ]
+                    },
+                ]
+            }
+        );
 
-        // Delete from internal node.
-        assert_eq!(btree.remove(6)?, Some(6));
-        assert_eq!(btree.len(), max_nodes - 1);
+        Ok(())
+    }
 
-        // Delete from internal node.
-        assert_eq!(btree.remove(8)?, Some(8));
-        assert_eq!(btree.len(), max_nodes - 1);
+    /// This is how a [`super::BTree`] of `order = 4` should look like after
+    /// inserting values 1 to 46 included sequentially:
+    ///
+    /// ```text
+    ///                                                                        +-------+
+    ///                        +-----------------------------------------------| 15,31 |---------------------------------------------------+
+    ///                       /                                                +-------+                                                    \
+    ///                      /                                                     |                                                         \
+    ///                 +--------+                                            +----------+                                              +----------+
+    ///        +--------| 4,8,11 |---------+                     +------------| 19,23,27 |-----------+                     +------------| 35,39,43 |-----------+
+    ///       /         +--------+          \                   /             +----------+            \                   /             +----------+            \
+    ///      /           /     \             \                 /               /       \               \                 /               /       \               \
+    /// +-------+  +-------+  +-------+  +----------+    +----------+  +----------+  +----------+  +----------+    +----------+  +----------+  +----------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |  | 12,13,14 |    | 16,17,18 |  | 20,21,22 |  | 24,25,26 |  | 28,29,30 |    | 32,33,34 |  | 36,37,38 |  | 40,41,42 |  | 44,45,46 |
+    /// +-------+  +-------+  +-------+  +----------+    +----------+  +----------+  +----------+  +----------+    +----------+  +----------+  +----------+  +----------+
+    /// ```
+    #[test]
+    fn sequential_insertion() -> io::Result<()> {
+        let btree = MemBufBTree::builder()
+            .keys(1..=46)
+            .max_nodes(16)
+            .try_build()?;
 
-        // Delete from internal node. Merge & propagate lending/redistribution.
-        assert_eq!(btree.remove(11)?, Some(11));
-        assert_eq!(btree.len(), max_nodes - 2);
-
-        assert_eq!(btree.remove(4)?, Some(4));
-        assert_eq!(btree.remove(5)?, Some(5));
-        assert_eq!(btree.remove(9)?, Some(9));
-        assert_eq!(btree.remove(10)?, Some(10));
-        assert_eq!(btree.len(), max_nodes - 3);
-
-        assert_eq!(btree.remove(12)?, Some(12));
-        assert_eq!(btree.remove(13)?, Some(13));
-        assert_eq!(btree.remove(14)?, Some(14));
-        assert_eq!(btree.len(), max_nodes - 3);
-
-        // Merge propagates twice. Loose 2 nodes.
-        assert_eq!(btree.remove(15)?, Some(15));
-        assert_eq!(btree.len(), max_nodes - 5);
-
-        // Merge decreases tree height (root is consumed).
-        for k in 16..=32 {
-            assert_eq!(btree.remove(k)?, Some(k));
-        }
-
-        assert_eq!(btree.len(), 5);
-
-        // println!("{}", btree.json()?);
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![15, 31],
+                children: vec![
+                    Node {
+                        keys: vec![4, 8, 11],
+                        children: vec![
+                            Node::leaf([1, 2, 3]),
+                            Node::leaf([5, 6, 7]),
+                            Node::leaf([9, 10]),
+                            Node::leaf([12, 13, 14]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![19, 23, 27],
+                        children: vec![
+                            Node::leaf([16, 17, 18]),
+                            Node::leaf([20, 21, 22]),
+                            Node::leaf([24, 25, 26]),
+                            Node::leaf([28, 29, 30]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![35, 39, 43],
+                        children: vec![
+                            Node::leaf([32, 33, 34]),
+                            Node::leaf([36, 37, 38]),
+                            Node::leaf([40, 41, 42]),
+                            Node::leaf([44, 45, 46]),
+                        ]
+                    },
+                ]
+            }
+        );
 
         Ok(())
     }
