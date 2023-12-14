@@ -806,6 +806,8 @@ impl<F: Seek + Read + Write> Extend<(u32, u32)> for BTree<F> {
 mod tests {
     use std::{io, mem};
 
+    use super::BTree;
+
     /// Allows us to build an entire tree manually and then compare it to an
     /// actual [`BTree`] structure. See tests below for examples.
     #[derive(Debug, PartialEq)]
@@ -832,8 +834,8 @@ mod tests {
             + mem::size_of::<super::Entry>() * (order - 1)
     }
 
-    /// Config/Builder for [`MemBufBTree`]. Can be used with
-    /// [`TryFrom::try_from`] or [`MemBufBTree::builder`].
+    /// Config/Builder for [`BTree<MemBuf>`]. Can be used with
+    /// [`TryFrom::try_from`] or [`BTree::builder`].
     struct Config {
         keys: Vec<u32>,
         order: usize,
@@ -866,16 +868,16 @@ mod tests {
             self
         }
 
-        fn try_build(self) -> io::Result<MemBufBTree> {
-            MemBufBTree::try_from(self)
+        fn try_build(self) -> io::Result<BTree<MemBuf>> {
+            BTree::try_from(self)
         }
     }
 
     /// We use in-memory buffers instead of disk files for testing. This speeds
     /// up tests as it avoids disk IO and system calls.
-    type MemBufBTree = super::BTree<io::Cursor<Vec<u8>>>;
+    type MemBuf = io::Cursor<Vec<u8>>;
 
-    impl MemBufBTree {
+    impl BTree<MemBuf> {
         fn into_test_nodes(&mut self, node: &super::Node) -> io::Result<Node> {
             let mut test_node = Node {
                 keys: node.entries.iter().map(|e| e.key).collect(),
@@ -906,24 +908,24 @@ mod tests {
         }
     }
 
-    impl TryFrom<Config> for MemBufBTree {
+    impl TryFrom<Config> for BTree<MemBuf> {
         type Error = io::Error;
 
         fn try_from(config: Config) -> Result<Self, Self::Error> {
             let page_size = optimal_page_size_for(config.order);
             let buf = io::Cursor::new(vec![0; page_size * config.max_nodes]);
 
-            let mut btree = MemBufBTree::new(buf, page_size, page_size);
+            let mut btree = BTree::new(buf, page_size, page_size);
             btree.extend_from_keys_only(config.keys)?;
 
             Ok(btree)
         }
     }
 
-    impl TryFrom<MemBufBTree> for Node {
+    impl TryFrom<BTree<MemBuf>> for Node {
         type Error = io::Error;
 
-        fn try_from(mut btree: MemBufBTree) -> Result<Self, Self::Error> {
+        fn try_from(mut btree: BTree<MemBuf>) -> Result<Self, Self::Error> {
             let root = btree.read_node(0)?;
 
             btree.into_test_nodes(&root)
@@ -943,10 +945,7 @@ mod tests {
     /// ```
     #[test]
     fn fill_root() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=3)
-            .max_nodes(1)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=3).max_nodes(1).try_build()?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
 
@@ -977,10 +976,7 @@ mod tests {
     /// ```
     #[test]
     fn split_root() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=4)
-            .max_nodes(3)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=4).max_nodes(3).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1021,10 +1017,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_split() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=7)
-            .max_nodes(3)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=7).max_nodes(3).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1065,10 +1058,7 @@ mod tests {
     /// ```
     #[test]
     fn split_leaf_node() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=8)
-            .max_nodes(4)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=8).max_nodes(4).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1095,10 +1085,7 @@ mod tests {
     /// ```
     #[test]
     fn basic_insertion() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=15)
-            .max_nodes(5)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1148,10 +1135,7 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_root() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=16)
-            .max_nodes(8)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1214,10 +1198,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_split() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=27)
-            .max_nodes(11)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=27).max_nodes(11).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1285,10 +1266,7 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_internal_nodes() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=31)
-            .max_nodes(13)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=31).max_nodes(13).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1326,7 +1304,7 @@ mod tests {
         Ok(())
     }
 
-    /// This is how a [`super::BTree`] of `order = 4` should look like after
+    /// This is how a [`BTree`] structure of `order = 4` should look like after
     /// inserting values 1 to 46 included sequentially:
     ///
     /// ```text
@@ -1344,10 +1322,7 @@ mod tests {
     /// ```
     #[test]
     fn sequential_insertion() -> io::Result<()> {
-        let btree = MemBufBTree::builder()
-            .keys(1..=46)
-            .max_nodes(16)
-            .try_build()?;
+        let btree = BTree::builder().keys(1..=46).max_nodes(16).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1415,10 +1390,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_leaf_node() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=15)
-            .max_nodes(5)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
 
         btree.remove(13)?;
 
@@ -1474,10 +1446,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_internal_node() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=16)
-            .max_nodes(8)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
 
         btree.remove(8)?;
 
@@ -1540,10 +1509,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_root() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=16)
-            .max_nodes(8)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
 
         btree.remove(11)?;
 
@@ -1608,10 +1574,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_using_successor_instead_of_predecessor() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=26)
-            .max_nodes(8)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=26).max_nodes(8).try_build()?;
 
         btree.remove(11)?;
 
@@ -1648,7 +1611,7 @@ mod tests {
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
-    ///
+    /// 
     ///                           DELETE 15
     ///                               |
     ///                               V
@@ -1684,10 +1647,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_merge() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=15)
-            .max_nodes(5)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
 
         btree.try_remove_all((14..=15).rev())?;
 
@@ -1746,10 +1706,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_leaf_node() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=15)
-            .max_nodes(5)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
 
         btree.try_remove_all((12..=15).rev())?;
 
@@ -1792,10 +1749,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_root() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=4)
-            .max_nodes(3)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=4).max_nodes(3).try_build()?;
 
         btree.remove(4)?;
 
@@ -1839,10 +1793,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_merge() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=35)
-            .max_nodes(14)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=35).max_nodes(14).try_build()?;
 
         btree.try_remove_all(1..=3)?;
 
@@ -1932,10 +1883,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_internal_node() -> io::Result<()> {
-        let mut btree = MemBufBTree::builder()
-            .keys(1..=35)
-            .max_nodes(14)
-            .try_build()?;
+        let mut btree = BTree::builder().keys(1..=35).max_nodes(14).try_build()?;
 
         btree.try_remove_all(1..=3).and_then(|_| btree.remove(35))?;
 
