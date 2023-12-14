@@ -404,15 +404,19 @@ impl<F: Seek + Read + Write> BTree<F> {
         // Root underflow. Merging internal nodes has consumed the entire root.
         // Decrease tree height and return.
         if is_root && is_underflow {
-            // Grab the only child remaining.
-            let mut direct_child = self.read_node(node.children.remove(0))?;
+            if let Some(page) = node.children.pop() {
+                // Grab the only child remaining.
+                let mut direct_child = self.read_node(page)?;
 
-            // Make the child the new root.
-            node.extend_by_draining(&mut direct_child);
+                // Make the child the new root.
+                node.extend_by_draining(&mut direct_child);
+
+                // Free child page.
+                self.free_page(direct_child.page);
+            }
 
             // Done, no need to fall through the code below. Redistribution is
             // not necessary.
-            self.free_page(direct_child.page);
             return self.write_node(&node);
         }
 
@@ -1915,5 +1919,33 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn check_return_value(
+        method: fn(btree: &mut BTree<MemBuf>, key: u32) -> io::Result<Option<u32>>,
+    ) -> io::Result<()> {
+        let compute_value = |key| key + 1000;
+        let keys = 1..=46;
+
+        let mut btree = BTree::builder().max_nodes(16).try_build()?;
+        btree.extend(keys.clone().map(|key| (key, compute_value(key))));
+
+        for key in keys {
+            assert_eq!(method(&mut btree, key)?, Some(compute_value(key)));
+        }
+
+        assert_eq!(method(&mut btree, 1000)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_value() -> io::Result<()> {
+        check_return_value(BTree::get)
+    }
+
+    #[test]
+    fn remove_value() -> io::Result<()> {
+        check_return_value(BTree::remove)
     }
 }
