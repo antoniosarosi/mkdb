@@ -2,8 +2,8 @@ use std::io;
 
 pub(crate) struct Pager<F> {
     file: F,
-    block_size: usize,
-    page_size: usize,
+    pub block_size: usize,
+    pub page_size: usize,
 }
 
 impl<F> Pager<F> {

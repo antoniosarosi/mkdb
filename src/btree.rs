@@ -9,9 +9,10 @@ use std::{
 
 use crate::pager::Pager;
 
-/// Number of siblings per side to examine when balancing.
+/// Default value for [`BTree::balance_siblings_per_side`].
 const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 
+/// Key-Value pair stored in the [`BTree`] nodes.
 #[derive(Eq, Copy, Clone)]
 struct Entry {
     key: u32,
@@ -42,10 +43,17 @@ impl Ord for Entry {
     }
 }
 
+/// Each of the nodes that compose the [`BTree`]. One [`Node`] should always map
+/// to a single page in the disk.
 #[derive(Debug)]
 struct Node {
+    /// The number of the page where this node is stored in disk.
     page: u32,
+
+    /// Key-Value pairs stored by this node.
     entries: Vec<Entry>,
+
+    /// Children pointers. Each child has its own page number.
     children: Vec<u32>,
 }
 
@@ -58,6 +66,7 @@ impl Node {
         }
     }
 
+    /// Automatically sets the page number when creating the node.
     fn new_at(page: usize) -> Self {
         let mut node = Self::new();
         node.page = page as u32;
@@ -104,8 +113,16 @@ impl Node {
 /// Children pointers start at `4 + 8 * (order - 1)`. See
 /// [`optimal_degree_for`] for degree computations.
 pub(crate) struct BTree<F> {
+    /// Underlying IO device pager.
     pager: Pager<F>,
+
+    /// Maximum number of children per node.
     order: usize,
+
+    /// Number of siblings to examine at each side when balancing a node.
+    balance_siblings_per_side: usize,
+
+    /// Number of nodes (or pages) in the tree.
     len: usize,
 }
 
@@ -128,12 +145,16 @@ fn optimal_order_for(page_size: usize) -> usize {
 
 impl<F> BTree<F> {
     #[allow(dead_code)]
-    pub fn new(file: F, page_size: usize, block_size: usize) -> Self {
-        let pager = Pager::new(file, page_size, block_size);
-        let order = optimal_order_for(page_size);
+    pub fn new(pager: Pager<F>, balance_siblings_per_side: usize) -> Self {
+        let order = optimal_order_for(pager.page_size);
         let len = 1;
 
-        Self { pager, order, len }
+        Self {
+            pager,
+            order,
+            len,
+            balance_siblings_per_side,
+        }
     }
 
     #[inline]
@@ -210,11 +231,17 @@ impl BTree<File> {
         // TODO: Add magic number & header to file.
         let pager = Pager::new(file, page_size, block_size);
         let order = optimal_order_for(page_size);
+        let balance_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
 
         // TODO: Take free pages into account.
         let len = std::cmp::max(metadata.len() as usize / page_size, 1);
 
-        Ok(Self { pager, order, len })
+        Ok(Self {
+            pager,
+            order,
+            len,
+            balance_siblings_per_side,
+        })
     }
 }
 
@@ -444,7 +471,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         // Find all siblings involved in the balancing algorithm, including
         // the given node (balance target).
         let mut siblings = {
-            let mut num_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
+            let mut num_siblings_per_side = self.balance_siblings_per_side;
 
             if index == 0 || index == parent.children.len() - 1 {
                 num_siblings_per_side *= 2;
@@ -482,11 +509,14 @@ impl<F: Seek + Read + Write> BTree<F> {
         let must_split = total_entries > self.max_keys() * siblings.len();
 
         // Same as before, merge only if there's no other way to keep balance.
-        // This happens when all the entries can fit into one less node than we
-        // have and one of the nodes has underflowed below 2/3 (integer divsion).
-        // If we can avoid merging while still keeping siblings at 66%, we will.
-        let must_merge =
-            total_entries < (siblings.len() - 1) * self.max_keys() - (self.max_keys() * 2 % 3);
+        // This happens when the node has underflowed below 66% and none of the
+        // siblings can lend a key. When the root has only 2 children those are
+        // considered an exception, they'll be merged as soon as possible.
+        let must_merge = if siblings.len() == 2 {
+            total_entries < self.max_keys()
+        } else {
+            total_entries < self.max_keys() * 2 / 3 * siblings.len()
+        };
 
         if must_split {
             // Only two nodes needed for splitting.
@@ -592,7 +622,7 @@ impl<F: Seek + Read + Write> BTree<F> {
                     None
                 };
 
-                if let Some(swap_key_idx) = maybe_swap {
+                if let Some(mut swap_key_idx) = maybe_swap {
                     mem::swap(
                         &mut parent.entries[*divider_idx],
                         &mut entries_to_balance[swap_key_idx],
@@ -603,11 +633,13 @@ impl<F: Seek + Read + Write> BTree<F> {
                         && entries_to_balance[swap_key_idx - 1] > entries_to_balance[swap_key_idx]
                     {
                         entries_to_balance.swap(swap_key_idx - 1, swap_key_idx);
+                        swap_key_idx -= 1;
                     }
                     while swap_key_idx < entries_to_balance.len() - 1
                         && entries_to_balance[swap_key_idx + 1] < entries_to_balance[swap_key_idx]
                     {
                         entries_to_balance.swap(swap_key_idx + 1, swap_key_idx);
+                        swap_key_idx += 1;
                     }
                 }
             }
@@ -810,7 +842,8 @@ impl<F: Seek + Read + Write> Extend<(u32, u32)> for BTree<F> {
 mod tests {
     use std::{io, mem};
 
-    use super::BTree;
+    use super::{BTree, BALANCE_SIBLINGS_PER_SIDE};
+    use crate::pager::Pager;
 
     /// Allows us to build an entire tree manually and then compare it to an
     /// actual [`BTree`] structure. See tests below for examples.
@@ -843,7 +876,7 @@ mod tests {
     struct Config {
         keys: Vec<u32>,
         order: usize,
-        max_nodes: usize,
+        balance_siblings_per_side: usize,
     }
 
     impl Default for Config {
@@ -851,7 +884,7 @@ mod tests {
             Config {
                 keys: vec![],
                 order: 4,
-                max_nodes: 1,
+                balance_siblings_per_side: BALANCE_SIBLINGS_PER_SIDE,
             }
         }
     }
@@ -862,13 +895,13 @@ mod tests {
             self
         }
 
-        fn max_nodes(mut self, max_nodes: usize) -> Self {
-            self.max_nodes = max_nodes;
+        fn order(mut self, order: usize) -> Self {
+            self.order = order;
             self
         }
 
-        fn order(mut self, order: usize) -> Self {
-            self.order = order;
+        fn balance_siblings_per_side(mut self, balance_siblings_per_side: usize) -> Self {
+            self.balance_siblings_per_side = balance_siblings_per_side;
             self
         }
 
@@ -896,6 +929,10 @@ mod tests {
             Ok(test_node)
         }
 
+        fn builder() -> Config {
+            Config::default()
+        }
+
         fn extend_from_keys_only<K: IntoIterator<Item = u32>>(
             &mut self,
             keys: K,
@@ -906,10 +943,6 @@ mod tests {
 
             Ok(())
         }
-
-        fn builder() -> Config {
-            Config::default()
-        }
     }
 
     impl TryFrom<Config> for BTree<MemBuf> {
@@ -917,9 +950,12 @@ mod tests {
 
         fn try_from(config: Config) -> Result<Self, Self::Error> {
             let page_size = optimal_page_size_for(config.order);
-            let buf = io::Cursor::new(vec![0; page_size * config.max_nodes]);
+            let buf = io::Cursor::new(Vec::new());
 
-            let mut btree = BTree::new(buf, page_size, page_size);
+            let mut btree = BTree::new(
+                Pager::new(buf, page_size, page_size),
+                config.balance_siblings_per_side,
+            );
             btree.extend_from_keys_only(config.keys)?;
 
             Ok(btree)
@@ -949,7 +985,7 @@ mod tests {
     /// ```
     #[test]
     fn fill_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=3).max_nodes(1).try_build()?;
+        let btree = BTree::builder().keys(1..=3).try_build()?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
 
@@ -980,7 +1016,7 @@ mod tests {
     /// ```
     #[test]
     fn split_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=4).max_nodes(3).try_build()?;
+        let btree = BTree::builder().keys(1..=4).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1021,7 +1057,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_split() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=7).max_nodes(3).try_build()?;
+        let btree = BTree::builder().keys(1..=7).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1062,7 +1098,7 @@ mod tests {
     /// ```
     #[test]
     fn split_leaf_node() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=8).max_nodes(4).try_build()?;
+        let btree = BTree::builder().keys(1..=8).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1089,7 +1125,7 @@ mod tests {
     /// ```
     #[test]
     fn basic_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
+        let btree = BTree::builder().keys(1..=15).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1139,7 +1175,7 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
+        let btree = BTree::builder().keys(1..=16).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1202,7 +1238,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_split() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=27).max_nodes(11).try_build()?;
+        let btree = BTree::builder().keys(1..=27).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1270,7 +1306,7 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_internal_nodes() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=31).max_nodes(13).try_build()?;
+        let btree = BTree::builder().keys(1..=31).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1326,7 +1362,7 @@ mod tests {
     /// ```
     #[test]
     fn sequential_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=46).max_nodes(16).try_build()?;
+        let btree = BTree::builder().keys(1..=46).try_build()?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1394,7 +1430,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_leaf_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
         btree.remove(13)?;
 
@@ -1450,7 +1486,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_internal_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
+        let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
         btree.remove(8)?;
 
@@ -1513,7 +1549,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_root() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=16).max_nodes(8).try_build()?;
+        let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
         btree.remove(11)?;
 
@@ -1578,7 +1614,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_using_successor_instead_of_predecessor() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=26).max_nodes(8).try_build()?;
+        let mut btree = BTree::builder().keys(1..=26).try_build()?;
 
         btree.remove(11)?;
 
@@ -1651,7 +1687,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_merge() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
         btree.try_remove_all((14..=15).rev())?;
 
@@ -1710,7 +1746,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_leaf_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).max_nodes(5).try_build()?;
+        let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
         btree.try_remove_all((12..=15).rev())?;
 
@@ -1753,7 +1789,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_root() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=4).max_nodes(3).try_build()?;
+        let mut btree = BTree::builder().keys(1..=4).try_build()?;
 
         btree.remove(4)?;
 
@@ -1797,7 +1833,7 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_merge() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=35).max_nodes(14).try_build()?;
+        let mut btree = BTree::builder().keys(1..=35).try_build()?;
 
         btree.try_remove_all(1..=3)?;
 
@@ -1887,7 +1923,7 @@ mod tests {
     /// ```
     #[test]
     fn merge_internal_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=35).max_nodes(14).try_build()?;
+        let mut btree = BTree::builder().keys(1..=35).try_build()?;
 
         btree.try_remove_all(1..=3).and_then(|_| btree.remove(35))?;
 
@@ -1927,7 +1963,7 @@ mod tests {
         let compute_value = |key| key + 1000;
         let keys = 1..=46;
 
-        let mut btree = BTree::builder().max_nodes(16).try_build()?;
+        let mut btree = BTree::builder().try_build()?;
         btree.extend(keys.clone().map(|key| (key, compute_value(key))));
 
         for key in keys {
@@ -1947,5 +1983,179 @@ mod tests {
     #[test]
     fn remove_value() -> io::Result<()> {
         check_return_value(BTree::remove)
+    }
+
+    /// Most tests use `order = 4` for simplicty. This one uses `order = 6` to
+    /// check if everything still works. This is what we're going to build:
+    ///
+    /// ```text
+    /// 
+    ///                                                INSERT 36
+    ///                                                    |
+    ///                                                    v
+    ///                                            +---------------+
+    ///           +--------------------------------| 6,12,18,24,30 |------------------------------------+
+    ///          /                                 +---------------+                                     \
+    ///         /                                    |  |     |  |                                        \
+    ///        /                +--------------------+  |     |  +----------------------+                  \
+    ///       /                /                        |     |                          \                  \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +----------------+  +----------------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10,11 |  | 13,14,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28,29 |  | 31,32,33,34,35 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +----------------+  +----------------+
+    ///
+    ///                                                           RESULT
+    ///                                                              |
+    ///                                                              V
+    ///                                                           +----+
+    ///                                  +------------------------| 24 |---------------------------+
+    ///                                 /                         +----+                            \
+    ///                                /                                                             \
+    ///                           +---------+                                                     +-------+
+    ///          +----------------| 6,12,18 |---------------------+                         +-----| 29,33 |-----+
+    ///         /                 +---------+                      \                       /      +-------+      \
+    ///        /                   /      \                         \                     /           |           \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10,11 |  | 13,14,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28 |  | 30,31,32 |  | 34,35,36 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// ```
+    #[test]
+    fn greater_order_insertion() -> io::Result<()> {
+        let btree = BTree::builder().order(6).keys(1..=36).try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![24],
+                children: vec![
+                    Node {
+                        keys: vec![6, 12, 18],
+                        children: vec![
+                            Node::leaf([1, 2, 3, 4, 5]),
+                            Node::leaf([7, 8, 9, 10, 11]),
+                            Node::leaf([13, 14, 15, 16, 17]),
+                            Node::leaf([19, 20, 21, 22, 23]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![29, 33],
+                        children: vec![
+                            Node::leaf([25, 26, 27, 28]),
+                            Node::leaf([30, 31, 32]),
+                            Node::leaf([34, 35, 36]),
+                        ]
+                    },
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Delete on `order = 6`.
+    ///
+    /// ```text
+    /// 
+    ///                                                      DELETE (34,35,36)
+    ///                                                              |
+    ///                                                              V
+    ///                                                           +----+
+    ///                                  +------------------------| 24 |---------------------------+
+    ///                                 /                         +----+                            \
+    ///                                /                                                             \
+    ///                           +---------+                                                     +-------+
+    ///          +----------------| 6,12,18 |---------------------+                         +-----| 29,33 |-----+
+    ///         /                 +---------+                      \                       /      +-------+      \
+    ///        /                   /      \                         \                     /           |           \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10,11 |  | 13,14,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28 |  | 30,31,32 |  | 34,35,36 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    ///
+    ///                                                 RESULT
+    ///                                                    |
+    ///                                                    V
+    ///                                            +---------------+
+    ///           +--------------------------------| 6,12,18,24,30 |---------------------------------+
+    ///          /                                 +---------------+                                  \
+    ///         /                                    |  |     |  |                                     \
+    ///        /                +--------------------+  |     |  +----------------------+               \
+    ///       /                /                        |     |                          \               \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +----------------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10,11 |  | 13,14,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28,29 |  | 31,32,33 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +----------------+  +----------+
+    /// ```
+    #[test]
+    fn greater_order_deletion() -> io::Result<()> {
+        let mut btree = BTree::builder().order(6).keys(1..=36).try_build()?;
+
+        btree.try_remove_all(34..=36)?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![6, 12, 18, 24, 30],
+                children: vec![
+                    Node::leaf([1, 2, 3, 4, 5]),
+                    Node::leaf([7, 8, 9, 10, 11]),
+                    Node::leaf([13, 14, 15, 16, 17]),
+                    Node::leaf([19, 20, 21, 22, 23]),
+                    Node::leaf([25, 26, 27, 28, 29]),
+                    Node::leaf([31, 32, 33]),
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// See [`merge_leaf_node`]. In that test `balance_siblings_per_side = 1`,
+    /// in this case `balance_siblings_per_side = 2` which will delay merging
+    /// and splitting even further (increasing IO, so it's a tradeoff).
+    ///
+    /// ```text
+    ///                   DELETE (15,14,13,12) -> No Merge
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------| 4,8,12 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    ///           +-------+  +-------+  +---------+  +----------+
+    ///
+    ///                           FINAL RESULT
+    ///                                |
+    ///                                V
+    ///                            +-------+
+    ///                      +-----| 3,6,9 |------+
+    ///                     /      +-------+       \
+    ///                    /        /     \         \
+    ///               +-----+  +-----+  +-----+  +-------+
+    ///               | 1,2 |  | 4,5 |  | 7,8 |  | 10,11 |
+    ///               +-----+  +-----+  +-----+  +-------+
+    /// ```
+    #[test]
+    fn increased_balance_siblings_per_side() -> io::Result<()> {
+        let mut btree = BTree::builder()
+            .balance_siblings_per_side(2)
+            .keys(1..=15)
+            .try_build()?;
+
+        btree.try_remove_all((12..=15).rev())?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![3, 6, 9],
+                children: vec![
+                    Node::leaf([1, 2]),
+                    Node::leaf([4, 5]),
+                    Node::leaf([7, 8]),
+                    Node::leaf([10, 11]),
+                ]
+            }
+        );
+
+        Ok(())
     }
 }
