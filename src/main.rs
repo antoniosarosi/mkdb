@@ -1,4 +1,5 @@
 mod btree;
+mod node;
 mod pager;
 
 use std::io;
@@ -15,11 +16,11 @@ fn main() -> io::Result<()> {
     eprintln!("Number of nodes: {}", btree.len());
     eprintln!("Get check: btree.get({}) = {}", 5, btree.get(5)?.unwrap());
 
-    // eprintln!(
-    //     "Remove check: btree.remove({}) = {}",
-    //     46,
-    //     btree.remove(46)?.unwrap()
-    // );
+    eprintln!(
+        "Remove check: btree.remove({}) = {}",
+        46,
+        btree.remove(46)?.unwrap()
+    );
     eprintln!("BTree in JSON format goes to STDOUT\n");
 
     println!("{}", btree.json()?);

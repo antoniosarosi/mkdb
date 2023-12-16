@@ -1,5 +1,5 @@
 use std::{
-    cmp::{min, Ordering},
+    cmp::min,
     fs::File,
     io,
     io::{Read, Seek, Write},
@@ -7,79 +7,13 @@ use std::{
     path::Path,
 };
 
-use crate::pager::Pager;
+use crate::{
+    node::{Entry, Node},
+    pager::Pager,
+};
 
 /// Default value for [`BTree::balance_siblings_per_side`].
 const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
-
-/// Key-Value pair stored in the [`BTree`] nodes.
-#[derive(Eq, Copy, Clone)]
-struct Entry {
-    key: u32,
-    value: u32,
-}
-
-impl std::fmt::Debug for Entry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.key)
-    }
-}
-
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.key.eq(&other.key)
-    }
-}
-
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-/// Each of the nodes that compose the [`BTree`]. One [`Node`] should always map
-/// to a single page in the disk.
-#[derive(Debug)]
-struct Node {
-    /// The number of the page where this node is stored in disk.
-    page: u32,
-
-    /// Key-Value pairs stored by this node.
-    entries: Vec<Entry>,
-
-    /// Children pointers. Each child has its own page number.
-    children: Vec<u32>,
-}
-
-impl Node {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            children: Vec::new(),
-            page: 0,
-        }
-    }
-
-    /// Automatically sets the page number when creating the node.
-    fn new_at(page: usize) -> Self {
-        let mut node = Self::new();
-        node.page = page as u32;
-        node
-    }
-
-    // Consumes all the entries and children in `other` and appends them to
-    // `self`.
-    fn extend_by_draining(&mut self, other: &mut Node) {
-        self.entries.extend(other.entries.drain(..));
-        self.children.extend(other.children.drain(..));
-    }
-}
 
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
 /// Sorting and Searching" and SQLite 2.X.X
@@ -111,7 +45,7 @@ impl Node {
 /// - `C`: Child Pointer
 ///
 /// Children pointers start at `4 + 8 * (order - 1)`. See
-/// [`optimal_degree_for`] for degree computations.
+/// [`optimal_order_for`] for degree computations.
 pub(crate) struct BTree<F> {
     /// Underlying IO device pager.
     pager: Pager<F>,
@@ -247,12 +181,12 @@ impl BTree<File> {
 
 impl<F: Seek + Read + Write> BTree<F> {
     pub fn get(&mut self, key: u32) -> io::Result<Option<u32>> {
-        let root = self.read_node(0)?;
+        let root = self.read_root()?;
         self.find(&root, key)
     }
 
     pub fn insert(&mut self, key: u32, value: u32) -> io::Result<()> {
-        let root = self.read_node(0)?;
+        let root = self.read_root()?;
 
         let mut parents = Vec::new();
         let node = self.insert_into(root, Entry { key, value }, &mut parents)?;
@@ -261,7 +195,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     pub fn remove(&mut self, key: u32) -> io::Result<Option<u32>> {
-        let root = self.read_node(0)?;
+        let root = self.read_root()?;
 
         let mut parents = Vec::new();
 
@@ -274,107 +208,31 @@ impl<F: Seek + Read + Write> BTree<F> {
         return Ok(Some(entry.value));
     }
 
-    fn allocate_page(&mut self) -> usize {
-        // TODO: Free list.
-        let page = self.len;
-        self.len += 1;
+    fn find(&mut self, node: &Node, key: u32) -> io::Result<Option<u32>> {
+        let search = node.entries.binary_search_by_key(&key, |e| e.key);
 
-        page
-    }
-
-    fn free_page(&mut self, page: u32) {
-        // TODO: Free list.
-        self.pager
-            .write_page(page as usize, &Vec::from("FREE PAGE".as_bytes()))
-            .unwrap();
-
-        self.len -= 1;
-    }
-
-    fn remove_from(
-        &mut self,
-        mut node: Node,
-        key: u32,
-        parents: &mut Vec<(Node, usize)>,
-    ) -> io::Result<Option<(Entry, Node)>> {
-        let search = node.entries.binary_search(&Entry { key, value: 0 });
-
-        // If the key is not present in the current node, recurse downwards or
-        // return None if we are already at a leaf node.
-        if let Err(index) = search {
-            if node.children.is_empty() {
-                return Ok(None);
-            } else {
-                let child = self.read_node(node.children[index])?;
-                parents.push((node, index));
-                return self.remove_from(child, key, parents);
-            }
+        // If the key is here, bail out.
+        if let Ok(index) = search {
+            return Ok(Some(node.entries[index].value));
         }
 
-        let index = search.unwrap();
+        let index = search.unwrap_err();
 
-        // If this node is a leaf node, we're done with deleting.
-        if node.children.is_empty() {
-            let entry = node.entries.remove(index);
-            self.write_node(&node)?;
-            return Ok(Some((entry, node)));
+        // If the key is not in this leaf node, bad luck.
+        if node.is_leaf() {
+            return Ok(None);
         }
 
-        parents.push((node, index));
-
-        let curr_node_idx = parents.len() - 1;
-
-        // If it's not a leaf node, then find a suitable substitute in a leaf
-        // node (either predecessor in the left subtree or successor in the
-        // right subtree) and return the entire path for balancing purposes.
-        let left_child = self.read_node(parents[curr_node_idx].0.children[index])?;
-        let right_child = self.read_node(parents[curr_node_idx].0.children[index + 1])?;
-
-        let (substitute, leaf_node) = if left_child.entries.len() >= right_child.entries.len() {
-            let mut predecesor = self.find_max(left_child, parents)?;
-            (predecesor.entries.pop().unwrap(), predecesor)
-        } else {
-            let mut successor = self.find_min(right_child, parents)?;
-            (successor.entries.remove(0), successor)
-        };
-
-        let value = mem::replace(&mut parents[curr_node_idx].0.entries[index], substitute);
-
-        self.write_node(&parents[curr_node_idx].0)?;
-        self.write_node(&leaf_node)?;
-
-        return Ok(Some((value, leaf_node)));
-    }
-
-    fn find_max(&mut self, node: Node, parents: &mut Vec<(Node, usize)>) -> io::Result<Node> {
-        if node.children.is_empty() {
-            return Ok(node);
-        }
-
-        let index = node.children.len() - 1;
-
-        let child = self.read_node(node.children[index])?;
-        parents.push((node, index));
-
-        self.find_max(child, parents)
-    }
-
-    fn find_min(&mut self, node: Node, parents: &mut Vec<(Node, usize)>) -> io::Result<Node> {
-        if node.children.is_empty() {
-            return Ok(node);
-        }
-
-        let child = self.read_node(node.children[0])?;
-        parents.push((node, 0));
-
-        self.find_min(child, parents)
+        // Otherwise recurse downwards.
+        let next_node = self.read_node(node.children[index])?;
+        self.find(&next_node, key)
     }
 
     fn insert_into(
         &mut self,
         mut node: Node,
         entry: Entry,
-        parents: &mut Vec<(Node, usize)>,
+        parents: &mut Vec<Node>,
     ) -> io::Result<Node> {
         let search = node.entries.binary_search(&entry);
 
@@ -389,7 +247,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         let index = search.unwrap_err();
 
         // If this node is a leaf node we're done.
-        if node.children.is_empty() {
+        if node.is_leaf() {
             node.entries.insert(index, entry);
             if node.entries.len() <= self.max_keys() {
                 self.write_node(&node)?;
@@ -398,10 +256,89 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
 
         // If it's not a leaf node, we have to go one level below.
-        let next_node = self.read_node(node.children[index])?;
-        parents.push((node, index));
+        let next_node = self.read_child(&node, index)?;
+        parents.push(node);
 
         self.insert_into(next_node, entry, parents)
+    }
+
+    fn remove_from(
+        &mut self,
+        mut node: Node,
+        key: u32,
+        parents: &mut Vec<Node>,
+    ) -> io::Result<Option<(Entry, Node)>> {
+        let search = node.entries.binary_search(&Entry { key, value: 0 });
+
+        // If the key is not present in the current node, recurse downwards or
+        // return None if we are already at a leaf node.
+        if let Err(index) = search {
+            if node.is_leaf() {
+                return Ok(None);
+            } else {
+                let child = self.read_child(&node, index)?;
+                parents.push(node);
+                return self.remove_from(child, key, parents);
+            }
+        }
+
+        let index = search.unwrap();
+
+        // If this node is a leaf node, we're done with deleting.
+        if node.is_leaf() {
+            let entry = node.entries.remove(index);
+            self.write_node(&node)?;
+            return Ok(Some((entry, node)));
+        }
+
+        // If it's not a leaf node, then find a suitable substitute in a leaf
+        // node (either predecessor in the left subtree or successor in the
+        // right subtree) and return the entire path for balancing purposes.
+        let left_child = self.read_child(&node, index)?;
+        let right_child = self.read_child(&node, index + 1)?;
+
+        parents.push(node);
+        let curr_node_idx = parents.len() - 1;
+
+        let (substitute, leaf_node) = if left_child.entries.len() >= right_child.entries.len() {
+            let mut predecesor = self.find_max(left_child, parents)?;
+            (predecesor.entries.pop().unwrap(), predecesor)
+        } else {
+            let mut successor = self.find_min(right_child, parents)?;
+            (successor.entries.remove(0), successor)
+        };
+
+        let node = &mut parents[curr_node_idx];
+        let value = mem::replace(&mut node.entries[index], substitute);
+
+        self.write_node(&node)?;
+        self.write_node(&leaf_node)?;
+
+        return Ok(Some((value, leaf_node)));
+    }
+
+    fn find_max(&mut self, node: Node, parents: &mut Vec<Node>) -> io::Result<Node> {
+        if node.is_leaf() {
+            return Ok(node);
+        }
+
+        let index = node.children.len() - 1;
+
+        let child = self.read_child(&node, index)?;
+        parents.push(node);
+
+        self.find_max(child, parents)
+    }
+
+    fn find_min(&mut self, node: Node, parents: &mut Vec<Node>) -> io::Result<Node> {
+        if node.is_leaf() {
+            return Ok(node);
+        }
+
+        let child = self.read_child(&node, 0)?;
+        parents.push(node);
+
+        self.find_min(child, parents)
     }
 
     /// B*-Tree balancing algorithm. This algorithm attempts to delay node
@@ -409,10 +346,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// least 2/3 full except the root.
     ///
     /// TODO: Explain how.
-    fn balance(&mut self, mut node: Node, mut parents: Vec<(Node, usize)>) -> io::Result<()> {
-        // Started from the bottom now we're here :)
-        let is_root = parents.is_empty();
-
+    fn balance(&mut self, mut node: Node, mut parents: Vec<Node>) -> io::Result<()> {
         // A node can only overflow if the number of keys is greater than the
         // maximum allowed.
         let is_overflow = node.entries.len() > self.max_keys();
@@ -420,8 +354,8 @@ impl<F: Seek + Read + Write> BTree<F> {
         // A node has underflowed if it contains less than 2/3 of keys. The root
         // is allowed to underflow past that point, but if it reaches 0 keys it
         // has completely underflowed and tree height must be decreased.
-        let is_underflow =
-            (node.entries.len() < self.max_keys() * 2 / 3 && !is_root) || node.entries.is_empty();
+        let is_underflow = (node.entries.len() < self.max_keys() * 2 / 3 && !node.is_root())
+            || node.entries.is_empty();
 
         // Done, this node didn't overflow or underflow.
         if !is_overflow && !is_underflow {
@@ -430,7 +364,7 @@ impl<F: Seek + Read + Write> BTree<F> {
 
         // Root underflow. Merging internal nodes has consumed the entire root.
         // Decrease tree height and return.
-        if is_root && is_underflow {
+        if node.is_root() && is_underflow {
             if let Some(page) = node.children.pop() {
                 // Grab the only child remaining.
                 let mut direct_child = self.read_node(page)?;
@@ -450,11 +384,11 @@ impl<F: Seek + Read + Write> BTree<F> {
         // The root overflowed, so it must be split. We're not going to split
         // it here, we will only prepare the terrain for the splitting algorithm
         // below.
-        if is_root && is_overflow {
+        if node.is_root() && is_overflow {
             // The actual tree root always stays at the same page, it does not
             // move. First, copy the contents of the root to a new node and
             // leave the root empty.
-            let mut old_root = Node::new_at(self.allocate_page());
+            let mut old_root = Node::new_at(self.allocate_page()).with_parent_index(0);
             old_root.extend_by_draining(&mut node);
 
             // Now make the new node a child of the empty root.
@@ -462,11 +396,12 @@ impl<F: Seek + Read + Write> BTree<F> {
 
             // Turn the new node into the balance target. Since this node has
             // overflowed the code below will split it accordingly.
-            parents.push((node, 0));
+            parents.push(node);
             node = old_root;
         }
 
-        let (mut parent, index) = parents.pop().unwrap();
+        let mut parent = parents.pop().unwrap();
+        let index = node.parent_index;
 
         // Find all siblings involved in the balancing algorithm, including
         // the given node (balance target).
@@ -486,22 +421,19 @@ impl<F: Seek + Read + Write> BTree<F> {
                 Vec::with_capacity(left_siblings.size_hint().0 + 1 + right_siblings.size_hint().0);
 
             for i in left_siblings {
-                siblings.push((self.read_node(parent.children[i])?, i));
+                siblings.push(self.read_child(&parent, i)?);
             }
 
-            siblings.push((node, index));
+            siblings.push(node);
 
             for i in right_siblings {
-                siblings.push((self.read_node(parent.children[i])?, i));
+                siblings.push(self.read_child(&parent, i)?);
             }
 
             siblings
         };
 
-        let total_entries = siblings
-            .iter()
-            .map(|(sibling, _)| sibling.entries.len())
-            .sum::<usize>();
+        let total_entries = siblings.iter().map(|s| s.entries.len()).sum::<usize>();
 
         // We only split nodes if absolutely necessary. Otherwise we can just
         // move keys around siblings to keep balance. We reach the "must split"
@@ -521,41 +453,44 @@ impl<F: Seek + Read + Write> BTree<F> {
         if must_split {
             // Only two nodes needed for splitting.
             if siblings.len() > 2 {
-                if siblings[0].1 == index {
+                if siblings[0].parent_index == index {
                     siblings.drain(2..);
-                } else if siblings.last().unwrap().1 == index {
+                } else if siblings.last().unwrap().parent_index == index {
                     siblings.drain(..siblings.len() - 2);
                 } else {
-                    siblings.retain(|(_, i)| [index, index + 1].contains(i));
+                    siblings.retain(|s| [index, index + 1].contains(&s.parent_index));
                 }
             }
 
+            // The last node is the one that splits.
+            let rightmost_sibling = siblings.last_mut().unwrap();
+
             // Allocate new node.
-            let new_node = Node::new_at(self.allocate_page());
+            let new_node = Node::new_at(self.allocate_page())
+                .with_parent_index(rightmost_sibling.parent_index + 1);
 
             // Prepare terrain for the redistribution algorithm below by moving
             // the greatest key into the parent and adding the new empty child
             // to the parent.
-            let rightmost_sibling = siblings.last_mut().unwrap();
-            let new_node_parent_index = rightmost_sibling.1 + 1;
             parent.entries.insert(
-                rightmost_sibling.1,
-                rightmost_sibling.0.entries.pop().unwrap(),
+                rightmost_sibling.parent_index,
+                rightmost_sibling.entries.pop().unwrap(),
             );
-            parent.children.insert(new_node_parent_index, new_node.page);
+            parent.children.insert(new_node.parent_index, new_node.page);
 
             // Add new node to balancing list.
-            siblings.push((new_node, new_node_parent_index));
+            siblings.push(new_node);
         } else if must_merge {
             // Merge the first two nodes together, demote the first key in
             // the parent and let the redistribution algorithm below do its job.
-            let (mut deleted_node, _) = siblings.remove(1);
-            let (merge_node, divider_idx) = &mut siblings[0];
+            let mut deleted_node = siblings.remove(1);
+            let merge_node = &mut siblings[0];
+            let divider_idx = merge_node.parent_index;
 
-            merge_node.entries.push(parent.entries.remove(*divider_idx));
+            merge_node.entries.push(parent.entries.remove(divider_idx));
             merge_node.extend_by_draining(&mut deleted_node);
 
-            parent.children.remove(*divider_idx + 1);
+            parent.children.remove(divider_idx + 1);
             self.free_page(deleted_node.page);
         }
 
@@ -566,7 +501,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         // Write to disk. Parent is not written yet because it might be in an
         // overflow or underflow state.
         // TODO: Sequential write queue, cache and stuff.
-        for (node, _) in &siblings {
+        for node in &siblings {
             self.write_node(node)?;
         }
 
@@ -575,15 +510,11 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     /// Redistribute entries and children evenly. TODO: Explain algorithm.
-    fn redistribute_entries_and_children(
-        &self,
-        parent: &mut Node,
-        siblings: &mut Vec<(Node, usize)>,
-    ) {
+    fn redistribute_entries_and_children(&self, parent: &mut Node, siblings: &mut Vec<Node>) {
         let mut entries_to_balance = Vec::new();
         let mut children_to_balance = Vec::new();
 
-        for (node, _) in siblings.iter_mut() {
+        for node in siblings.iter_mut() {
             entries_to_balance.extend(node.entries.drain(..));
             children_to_balance.extend(node.children.drain(..));
         }
@@ -596,7 +527,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         let mut entries_start = 0;
         let mut children_start = 0;
 
-        for (i, (sibling, divider_idx)) in siblings.iter_mut().enumerate() {
+        for (i, sibling) in siblings.iter_mut().enumerate() {
             let mut balanced_chunk_size = chunk_size;
             if i < remainder {
                 balanced_chunk_size += 1;
@@ -608,7 +539,7 @@ impl<F: Seek + Read + Write> BTree<F> {
 
                 let mut keys = [
                     entries_to_balance[swap_key_idx - 1],
-                    parent.entries[*divider_idx],
+                    parent.entries[sibling.parent_index],
                     entries_to_balance[swap_key_idx],
                 ];
 
@@ -624,7 +555,7 @@ impl<F: Seek + Read + Write> BTree<F> {
 
                 if let Some(mut swap_key_idx) = maybe_swap {
                     mem::swap(
-                        &mut parent.entries[*divider_idx],
+                        &mut parent.entries[sibling.parent_index],
                         &mut entries_to_balance[swap_key_idx],
                     );
 
@@ -670,24 +601,32 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
     }
 
-    fn find(&mut self, node: &Node, key: u32) -> io::Result<Option<u32>> {
-        let search = node.entries.binary_search(&Entry { key, value: 0 });
+    fn allocate_page(&mut self) -> usize {
+        // TODO: Free list.
+        let page = self.len;
+        self.len += 1;
 
-        // If the key is here, bail out.
-        if let Ok(index) = search {
-            return Ok(Some(node.entries[index].value));
-        }
+        page
+    }
 
-        let index = search.unwrap_err();
+    fn free_page(&mut self, page: u32) {
+        // TODO: Free list.
+        self.pager
+            .write_page(page as usize, &Vec::from("FREE PAGE".as_bytes()))
+            .unwrap();
 
-        // If the key is not in this leaf node, bad luck.
-        if node.children.is_empty() {
-            return Ok(None);
-        }
+        self.len -= 1;
+    }
 
-        // Otherwise recurse downwards.
-        let next_node = self.read_node(node.children[index])?;
-        self.find(&next_node, key)
+    fn read_root(&mut self) -> io::Result<Node> {
+        self.read_node(0)
+    }
+
+    fn read_child(&mut self, parent: &Node, index: usize) -> io::Result<Node> {
+        let mut node = self.read_node(parent.children[index])?;
+        node.parent_index = index;
+
+        Ok(node)
     }
 
     fn read_node(&mut self, page: u32) -> io::Result<Node> {
@@ -761,7 +700,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     pub fn json(&mut self) -> io::Result<String> {
-        let root = self.read_node(0)?;
+        let root = self.read_root()?;
 
         let mut nodes = Vec::new();
         self.read_into_mem(root, &mut nodes)?;
@@ -966,8 +905,7 @@ mod tests {
         type Error = io::Error;
 
         fn try_from(mut btree: BTree<MemBuf>) -> Result<Self, Self::Error> {
-            let root = btree.read_node(0)?;
-
+            let root = btree.read_root()?;
             btree.into_test_nodes(&root)
         }
     }
@@ -1651,7 +1589,7 @@ mod tests {
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
-    /// 
+    ///
     ///                           DELETE 15
     ///                               |
     ///                               V
@@ -1989,7 +1927,7 @@ mod tests {
     /// check if everything still works. This is what we're going to build:
     ///
     /// ```text
-    /// 
+    ///
     ///                                                INSERT 36
     ///                                                    |
     ///                                                    v
@@ -2054,7 +1992,7 @@ mod tests {
     /// Delete on `order = 6`.
     ///
     /// ```text
-    /// 
+    ///
     ///                                                      DELETE (34,35,36)
     ///                                                              |
     ///                                                              V
