@@ -1,4 +1,5 @@
 mod btree;
+mod cache;
 mod node;
 mod pager;
 

@@ -601,12 +601,12 @@ impl<F: Seek + Read + Write> BTree<F> {
         }
     }
 
-    fn allocate_page(&mut self) -> usize {
+    fn allocate_page(&mut self) -> u32 {
         // TODO: Free list.
         let page = self.len;
         self.len += 1;
 
-        page
+        page as u32
     }
 
     fn free_page(&mut self, page: u32) {
@@ -630,9 +630,9 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     fn read_node(&mut self, page: u32) -> io::Result<Node> {
-        let buf = self.pager.read_page(page as usize)?;
+        let buf = self.pager.read_page(page)?;
 
-        let mut node = Node::new_at(page as usize);
+        let mut node = Node::new_at(page);
 
         let mut i = 4;
 
@@ -642,8 +642,6 @@ impl<F: Seek + Read + Write> BTree<F> {
             node.entries.push(Entry { key, value });
             i += 8;
         }
-
-        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * self.max_keys();
 
         for _ in 0..u16::from_be_bytes(buf[2..4].try_into().unwrap()) {
             node.children
@@ -667,8 +665,6 @@ impl<F: Seek + Read + Write> BTree<F> {
             page[i + 4..i + 8].copy_from_slice(&entry.value.to_be_bytes());
             i += 8;
         }
-
-        i = mem::size_of::<u16>() * 2 + mem::size_of::<Entry>() * self.max_keys();
 
         for child in &node.children {
             page[i..i + 4].copy_from_slice(&(*child as u32).to_be_bytes());

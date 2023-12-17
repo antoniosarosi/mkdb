@@ -1,10 +1,16 @@
 use std::cmp::Ordering;
 
 /// Key-Value pairs stored in [`Node::entries`].
-#[derive(Eq, Copy, Clone)]
+#[derive(Eq, Copy, Clone, Debug)]
 pub(crate) struct Entry {
     pub key: u32,
     pub value: u32,
+}
+
+impl Entry {
+    pub fn new(key: u32, value: u32) -> Self {
+        Self { key, value }
+    }
 }
 
 impl PartialEq for Entry {
@@ -45,6 +51,7 @@ pub(crate) enum NodeKind {
 
 /// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
 /// [`Node`] should always map to a single page in the disk.
+#[derive(Debug, PartialEq)]
 pub(crate) struct Node {
     /// The number of the page where this node is stored in disk.
     pub page: u32,
@@ -78,9 +85,9 @@ impl Node {
     }
 
     /// Automatically sets the page number when creating the node.
-    pub fn new_at(page: usize) -> Self {
+    pub fn new_at(page: u32) -> Self {
         let mut node = Self::new();
-        node.page = page as u32;
+        node.page = page;
         node
     }
 
