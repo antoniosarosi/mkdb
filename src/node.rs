@@ -51,7 +51,7 @@ pub(crate) enum NodeKind {
 
 /// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
 /// [`Node`] should always map to a single page in the disk.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Node {
     /// The number of the page where this node is stored in disk.
     pub page: u32,

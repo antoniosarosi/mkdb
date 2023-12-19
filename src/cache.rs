@@ -51,11 +51,11 @@ impl Frame {
 }
 
 pub(crate) struct Cache<F> {
+    /// IO device pager.
+    pub pager: Pager<F>,
+
     /// Maximum number of pages that can be stored in memory.
     max_size: usize,
-
-    /// IO device pager.
-    pager: Pager<F>,
 
     /// Buffer pool.
     buffer: Vec<Frame>,
@@ -82,9 +82,10 @@ impl<F> Cache<F> {
         }
     }
 
+    /// Max size 3: Root, overflow node, cache overflow. Explain.
     pub fn with_max_size(mut self, max_size: usize) -> Self {
-        if max_size < 1 {
-            panic!("Buffer pool size must be at least 1");
+        if max_size < 3 {
+            panic!("Buffer pool size must be at least 3");
         }
 
         self.max_size = max_size;
@@ -109,30 +110,30 @@ impl<F> Cache<F> {
 
 impl<F: Seek + Read + Write> Cache<F> {
     pub fn get(&mut self, page: u32) -> io::Result<&Node> {
-        self.get_mut(page).map(|node| &*node)
+        self.frame_mut(page).map(|frame| &frame.node)
     }
 
     pub fn get_mut(&mut self, page: u32) -> io::Result<&mut Node> {
-        // Page is present in the buffer pool, set reference bit to 1 and return.
-        if let Some(index) = self.pages.get(&page) {
-            let frame = &mut self.buffer[*index];
-            frame.reference();
-            return Ok(&mut frame.node);
-        }
+        self.push_to_write_queue(page);
+        self.frame_mut(page).map(|frame| &mut frame.node)
+    }
 
-        // Page is not in-memory, must read from disk.
-        let node = self.pager.read_node(page)?;
+    fn frame_mut(&mut self, page: u32) -> io::Result<&mut Frame> {
+        self.load_disk_page_into_mem_frame(page)
+            .map(|index| &mut self.buffer[index])
+    }
 
+    fn load_node(&mut self, node: Node) -> io::Result<usize> {
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
+            self.pages.insert(node.page, self.buffer.len());
             self.buffer.push(Frame::new_unreferenced(node));
-            self.pages.insert(page, self.buffer.len() - 1);
             let index = self.buffer.len() - 1;
 
-            return Ok(&mut self.buffer[index].node);
+            return Ok(index);
         }
 
-        // Buffer is full, evict using clock algorithm.
+        // Buffer is full, evict using clock algorithm. TODO: Overflow node.
         if self.max_size > 1 {
             while self.buffer[self.clock].reference || self.buffer[self.clock].node.page == 0 {
                 self.buffer[self.clock].unreference();
@@ -149,7 +150,28 @@ impl<F: Seek + Read + Write> Cache<F> {
         let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(node));
         self.pages.remove(&evict.node.page);
 
-        Ok(&mut self.buffer[self.clock].node)
+        Ok(self.clock)
+    }
+
+    fn try_reference_page(&mut self, page: u32) -> Result<usize, ()> {
+        if let Some(index) = self.pages.get(&page) {
+            self.buffer[*index].reference();
+            return Ok(*index);
+        }
+
+        Err(())
+    }
+
+    fn load_disk_page_into_mem_frame(&mut self, page: u32) -> io::Result<usize> {
+        self.try_reference_page(page).or_else(|_| {
+            let node = self.pager.read_node(page)?;
+            self.load_node(node)
+        })
+    }
+
+    pub fn load_from_mem(&mut self, node: Node) -> io::Result<usize> {
+        self.try_reference_page(node.page)
+            .or_else(|_| self.load_node(node))
     }
 
     pub fn flush_write_queue_to_disk(&mut self) -> io::Result<()> {
@@ -277,7 +299,7 @@ mod tests {
     impl Cache<MemBuf> {
         fn load<P: IntoIterator<Item = u32>>(&mut self, pages: P) -> io::Result<()> {
             for page in pages {
-                self.get_mut(page)?;
+                self.get(page)?;
             }
 
             Ok(())
@@ -371,7 +393,7 @@ mod tests {
         cache.load(nodes[..cache.max_size - 1].iter().map(|n| n.page))?;
 
         // Should evict page 3 and replace it with page 4.
-        cache.get_mut(nodes.last().unwrap().page)?;
+        cache.get(nodes.last().unwrap().page)?;
 
         assert_eq!(cache.clock, cache.max_size - 1);
 
@@ -412,8 +434,8 @@ mod tests {
             .prefetch_all_nodes()
             .build()?;
 
-        cache.push_to_write_queue(1);
-        cache.push_to_write_queue(2);
+        cache.get_mut(1);
+        cache.get_mut(2);
 
         assert_eq!(cache.write_queue.len(), 2);
         assert!(cache.buffer[0].dirty);
@@ -433,7 +455,7 @@ mod tests {
         for page in [1, 2] {
             let node = cache.get_mut(page)?;
             node.entries.push(Entry::new(10, 10));
-            cache.push_to_write_queue(page);
+            cache.get_mut(page);
         }
 
         cache.flush_write_queue_to_disk()?;
@@ -463,7 +485,6 @@ mod tests {
 
         // Reference and modify page 1
         cache.get_mut(1)?.entries.push(Entry::new(10, 10));
-        cache.push_to_write_queue(1);
 
         // Reference pages 2 and 3
         cache.get(2)?;
