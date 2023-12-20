@@ -494,6 +494,7 @@ impl<F: Seek + Read + Write> BTree<F> {
 
             // Allocate new node.
             let new_page = self.allocate_page();
+            let new_node_parent_index = rightmost_sibling.1 + 1;
             self.cache.load_from_mem(Node::new_at(new_page))?;
 
             let new_entry = self.node_mut(rightmost_sibling.0)?.entries.pop().unwrap();
@@ -504,10 +505,10 @@ impl<F: Seek + Read + Write> BTree<F> {
             // the greatest key into the parent and adding the new empty child
             // to the parent.
             parent.entries.insert(rightmost_sibling.1, new_entry);
-            parent.children.insert(rightmost_sibling.1 + 1, new_page);
+            parent.children.insert(new_node_parent_index, new_page);
 
             // Add new node to balancing list.
-            siblings.push((new_page, 0));
+            siblings.push((new_page, new_node_parent_index));
         } else if must_merge {
             // Merge the first two nodes together, demote the first key in
             // the parent and let the redistribution algorithm below do its job.
@@ -644,6 +645,8 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     fn free_page(&mut self, page: u32) {
+        self.cache.invalidate(page);
+
         // TODO: Free list.
         self.cache
             .pager
@@ -859,7 +862,7 @@ mod tests {
             let buf = io::Cursor::new(Vec::new());
 
             let mut btree = BTree::new(
-                Cache::new(Pager::new(buf, page_size, page_size)),
+                Cache::new(Pager::new(buf, page_size, page_size)).with_order(config.order),
                 config.balance_siblings_per_side,
             );
             btree.extend_from_keys_only(config.keys)?;

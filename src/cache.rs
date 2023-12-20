@@ -5,7 +5,11 @@ use std::{
     mem,
 };
 
+/// Default value for [`Cache::max_size`].
 const MAX_CACHE_SIZE: usize = 1024;
+
+/// Minimum allowed cache size.
+const MIN_CACHE_SIZE: usize = 3;
 
 use crate::{node::Node, pager::Pager};
 
@@ -54,6 +58,9 @@ pub(crate) struct Cache<F> {
     /// IO device pager.
     pub pager: Pager<F>,
 
+    /// BTree order. Used to calculate overflows on nodes.
+    order: usize,
+
     /// Maximum number of pages that can be stored in memory.
     max_size: usize,
 
@@ -75,6 +82,7 @@ impl<F> Cache<F> {
         Self {
             pager,
             clock: 0,
+            order: 0,
             max_size: MAX_CACHE_SIZE,
             pages: HashMap::new(),
             buffer: Vec::new(),
@@ -84,11 +92,16 @@ impl<F> Cache<F> {
 
     /// Max size 3: Root, overflow node, cache overflow. Explain.
     pub fn with_max_size(mut self, max_size: usize) -> Self {
-        if max_size < 3 {
-            panic!("Buffer pool size must be at least 3");
+        if max_size < MIN_CACHE_SIZE {
+            panic!("Buffer pool size must be at least {MIN_CACHE_SIZE}");
         }
 
         self.max_size = max_size;
+        self
+    }
+
+    pub fn with_order(mut self, order: usize) -> Self {
+        self.order = order;
         self
     }
 
@@ -110,42 +123,61 @@ impl<F> Cache<F> {
 
 impl<F: Seek + Read + Write> Cache<F> {
     pub fn get(&mut self, page: u32) -> io::Result<&Node> {
-        self.frame_mut(page).map(|frame| &frame.node)
+        self.load_disk_page_into_mem_frame(page)
+            .map(|index| &self.buffer[index].node)
     }
 
     pub fn get_mut(&mut self, page: u32) -> io::Result<&mut Node> {
-        self.push_to_write_queue(page);
-        self.frame_mut(page).map(|frame| &mut frame.node)
+        let index = self.load_disk_page_into_mem_frame(page)?;
+
+        let frame = &mut self.buffer[index];
+        frame.mark_dirty();
+
+        self.write_queue.push(Reverse(index));
+
+        Ok(&mut frame.node)
     }
 
-    fn frame_mut(&mut self, page: u32) -> io::Result<&mut Frame> {
-        self.load_disk_page_into_mem_frame(page)
-            .map(|index| &mut self.buffer[index])
+    pub fn invalidate(&mut self, page: u32) {
+        if let Some(index) = self.pages.remove(&page) {
+            let frame = &mut self.buffer[index];
+            frame.unreference();
+            frame.mark_clean();
+
+            frame.node.entries.clear();
+            frame.node.children.clear();
+        }
+    }
+
+    fn is_evictable(&self, frame: &Frame) -> bool {
+        let is_overflow = self.order > 0 && frame.node.entries.len() > self.order - 1;
+
+        !frame.reference && frame.node.page != 0 && !is_overflow
     }
 
     fn load_node(&mut self, node: Node) -> io::Result<usize> {
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
-            self.pages.insert(node.page, self.buffer.len());
+            let index = self.buffer.len();
+            self.pages.insert(node.page, index);
             self.buffer.push(Frame::new_unreferenced(node));
-            let index = self.buffer.len() - 1;
 
             return Ok(index);
         }
 
-        // Buffer is full, evict using clock algorithm. TODO: Overflow node.
-        if self.max_size > 1 {
-            while self.buffer[self.clock].reference || self.buffer[self.clock].node.page == 0 {
-                self.buffer[self.clock].unreference();
-                self.tick();
-            }
+        // Buffer is full, evict using clock algorithm.
+        while !self.is_evictable(&self.buffer[self.clock]) {
+            self.buffer[self.clock].unreference();
+            self.tick();
         }
 
-        // Can't evict if dirty. Flush all the writes and continue later.
+        // Can't evict if dirty. Write to disk first.
         // TODO: Better algorithm for deciding which pages are safe to write.
         if self.buffer[self.clock].dirty {
-            self.flush_write_queue_to_disk()?;
+            self.write_frame(self.clock)?;
         }
+
+        self.pages.insert(node.page, self.clock);
 
         let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(node));
         self.pages.remove(&evict.node.page);
@@ -170,8 +202,14 @@ impl<F: Seek + Read + Write> Cache<F> {
     }
 
     pub fn load_from_mem(&mut self, node: Node) -> io::Result<usize> {
-        self.try_reference_page(node.page)
-            .or_else(|_| self.load_node(node))
+        let index = self
+            .try_reference_page(node.page)
+            .or_else(|_| self.load_node(node))?;
+
+        self.buffer[index].mark_dirty();
+        self.write_queue.push(Reverse(index));
+
+        Ok(index)
     }
 
     pub fn flush_write_queue_to_disk(&mut self) -> io::Result<()> {
@@ -338,6 +376,7 @@ mod tests {
 
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(*node, cache.buffer[i].node);
+            assert_eq!(cache.pages[&node.page], i);
             assert!(!cache.buffer[i].reference);
         }
 
@@ -357,6 +396,7 @@ mod tests {
 
         for (i, node) in nodes[cache.max_size..].iter().enumerate() {
             assert_eq!(*node, cache.buffer[i].node);
+            assert_eq!(cache.pages[&node.page], i);
         }
 
         Ok(())
@@ -402,8 +442,14 @@ mod tests {
             nodes[nodes.len() - 1]
         );
 
+        assert_eq!(
+            cache.pages[&nodes[nodes.len() - 1].page],
+            cache.max_size - 1
+        );
+
         for (i, node) in nodes[..cache.max_size - 1].iter().enumerate() {
             assert_eq!(*node, cache.buffer[i].node);
+            assert_eq!(cache.pages[&node.page], i);
         }
 
         Ok(())
@@ -434,8 +480,8 @@ mod tests {
             .prefetch_all_nodes()
             .build()?;
 
-        cache.get_mut(1);
-        cache.get_mut(2);
+        cache.get_mut(1)?;
+        cache.get_mut(2)?;
 
         assert_eq!(cache.write_queue.len(), 2);
         assert!(cache.buffer[0].dirty);
@@ -455,7 +501,7 @@ mod tests {
         for page in [1, 2] {
             let node = cache.get_mut(page)?;
             node.entries.push(Entry::new(10, 10));
-            cache.get_mut(page);
+            cache.get_mut(page)?;
         }
 
         cache.flush_write_queue_to_disk()?;
@@ -476,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_writes_if_can_only_evict_dirty_page() -> io::Result<()> {
+    fn flush_to_disk_if_can_only_evict_dirty_page() -> io::Result<()> {
         let (mut cache, nodes) = Cache::builder()
             .total_nodes(4)
             .max_size(3)
@@ -494,7 +540,7 @@ mod tests {
         cache.get(4)?;
 
         assert_eq!(cache.clock, 0);
-        assert_eq!(cache.write_queue.len(), 0);
+        assert_eq!(cache.write_queue.len(), 1);
         assert_eq!(cache.buffer[0].node, nodes[3]);
 
         let evicted_page = cache.pager.read_node(1)?;

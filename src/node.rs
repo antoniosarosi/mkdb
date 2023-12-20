@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, mem};
 
 /// Key-Value pairs stored in [`Node::entries`].
 #[derive(Eq, Copy, Clone, Debug)]
@@ -51,9 +51,9 @@ pub(crate) enum NodeKind {
 
 /// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
 /// [`Node`] should always map to a single page in the disk.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Node {
-    /// The number of the page where this node is stored in disk.
+    /// Disk page number of this node. Stored only in memory.
     pub page: u32,
 
     /// Key-Value pairs stored by this node.
@@ -61,9 +61,6 @@ pub(crate) struct Node {
 
     /// Children pointers. Each child has its own page number.
     pub children: Vec<u32>,
-
-    /// The index of this node in the parent's children list.
-    pub parent_index: usize,
 }
 
 impl Default for Node {
@@ -78,7 +75,6 @@ impl Node {
     pub fn new() -> Self {
         Self {
             page: 0,
-            parent_index: 0,
             entries: Vec::new(),
             children: Vec::new(),
         }
@@ -89,12 +85,6 @@ impl Node {
         let mut node = Self::new();
         node.page = page;
         node
-    }
-
-    /// Sets the value of [`Self::parent_index`].
-    pub fn with_parent_index(mut self, parent_index: usize) -> Self {
-        self.parent_index = parent_index;
-        self
     }
 
     /// Consumes all the entries and children in `other` and appends them to
