@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, mem};
+use std::cmp::Ordering;
 
 /// Key-Value pairs stored in [`Node::entries`].
 #[derive(Eq, Copy, Clone, Debug)]
@@ -70,8 +70,7 @@ impl Default for Node {
 }
 
 impl Node {
-    /// Creates an empty default [`Node`] with [`Self::page`] and
-    /// [`Self::parent_index`] set to 0.
+    /// Creates an empty default [`Node`].
     pub fn new() -> Self {
         Self {
             page: 0,
