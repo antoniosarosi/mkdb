@@ -12,7 +12,7 @@ use std::{
 use crate::{
     cache::Cache,
     node::{Entry, Node},
-    pager::Pager,
+    pager::{PageNumber, Pager},
 };
 
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
@@ -36,7 +36,7 @@ use crate::{
 /// | EL | CL |   K1   |   V1   |   K2   |   V2   | ... |   C1   |   C2   | ...
 /// +---------+--------+--------+--------+--------+     +--------+--------+
 ///   2    2      4        4        4        4              4        4
-/// ````
+/// ```
 ///
 /// - `KL`: Keys Length
 /// - `CL`: Children Length
@@ -64,7 +64,7 @@ const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 /// The result of a search in the [`BTree`] structure.
 struct Search {
     /// Page number of the node where the search ended.
-    page: u32,
+    page: PageNumber,
 
     /// Index where the searched [`Entry`] should be located in [`Node::entries`] array.
     index: usize,
@@ -454,7 +454,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// 1. Read page 5 into memory.
     /// 2. Binary search results in [`Ok(0)`].
     /// 3. Done, construct the [`Search`] result and return.
-    fn search(&mut self, page: u32, key: u32, parents: &mut Vec<u32>) -> io::Result<Search> {
+    fn search(&mut self, page: PageNumber, key: u32, parents: &mut Vec<u32>) -> io::Result<Search> {
         let node = self.cache.get(page)?;
 
         // Search key in this node.
@@ -531,7 +531,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// or predecessors of keys in internal nodes.
     fn search_leaf_key(
         &mut self,
-        page: u32,
+        page: PageNumber,
         parents: &mut Vec<u32>,
         leaf_key_type: LeafKeyType,
     ) -> io::Result<(u32, usize)> {
@@ -554,13 +554,21 @@ impl<F: Seek + Read + Write> BTree<F> {
 
     /// Returns the page and index in [`Node::entries`] where the greatest key
     /// of the given subtree is located.
-    fn search_max_key(&mut self, page: u32, parents: &mut Vec<u32>) -> io::Result<(u32, usize)> {
+    fn search_max_key(
+        &mut self,
+        page: PageNumber,
+        parents: &mut Vec<u32>,
+    ) -> io::Result<(u32, usize)> {
         self.search_leaf_key(page, parents, LeafKeyType::Max)
     }
 
     /// Returns the page and index in [`Node::entries`] where the smallest key
     /// of the given subtree is located.
-    fn search_min_key(&mut self, page: u32, parents: &mut Vec<u32>) -> io::Result<(u32, usize)> {
+    fn search_min_key(
+        &mut self,
+        page: PageNumber,
+        parents: &mut Vec<u32>,
+    ) -> io::Result<(u32, usize)> {
         self.search_leaf_key(page, parents, LeafKeyType::Min)
     }
 
@@ -569,7 +577,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// least 2/3 full except the root.
     ///
     /// TODO: Explain how.
-    fn balance(&mut self, mut page: u32, mut parents: Vec<u32>) -> io::Result<()> {
+    fn balance(&mut self, mut page: PageNumber, mut parents: Vec<u32>) -> io::Result<()> {
         let max_keys = self.max_keys();
         let node = self.node(page)?;
 
@@ -733,8 +741,8 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// big enough, all siblings can be loaded into memory at once.
     fn load_siblings(
         &mut self,
-        page: u32,
-        parent_page: u32,
+        page: PageNumber,
+        parent_page: PageNumber,
     ) -> io::Result<(Vec<(u32, usize)>, usize)> {
         let mut num_siblings_per_side = self.balance_siblings_per_side;
 
@@ -771,7 +779,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// Redistribute entries and children evenly. TODO: Explain algorithm.
     fn redistribute_entries_and_children(
         &mut self,
-        parent_page: u32,
+        parent_page: PageNumber,
         siblings: &mut Vec<(u32, usize)>,
     ) -> io::Result<()> {
         let mut entries_to_balance = Vec::new();
@@ -873,7 +881,7 @@ impl<F: Seek + Read + Write> BTree<F> {
 
     /// Returns a read only reference to a [`Node`] in memory. If the node is not
     /// present in memory it will be loaded into cache from disk.
-    fn node(&mut self, page: u32) -> io::Result<&Node> {
+    fn node(&mut self, page: PageNumber) -> io::Result<&Node> {
         self.cache.get(page)
     }
 
@@ -881,7 +889,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     /// cached it will be loaded from disk. Acquiring a mutable reference
     /// automatically appends the node to the write queue. See [`Cache`] for
     /// more details.
-    fn node_mut(&mut self, page: u32) -> io::Result<&mut Node> {
+    fn node_mut(&mut self, page: PageNumber) -> io::Result<&mut Node> {
         self.cache.get_mut(page)
     }
 
@@ -909,13 +917,16 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     /// Drops a currently allocated page.
-    fn free_page(&mut self, page: u32) {
+    fn free_page(&mut self, page: PageNumber) {
         self.cache.invalidate(page);
 
         // TODO: Free list.
         self.cache
             .pager
-            .write_page(page as usize, &Vec::from("FREE PAGE".as_bytes()))
+            .write_page(crate::pager::Page {
+                number: page,
+                content: Vec::from("FREE PAGE".as_bytes()),
+            })
             .unwrap();
 
         self.len -= 1;
@@ -924,7 +935,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     // Testing/Debugging only.
     fn read_into_mem(&mut self, node: Node, buf: &mut Vec<Node>) -> io::Result<()> {
         for page in &node.children {
-            let child = self.cache.pager.read_node(*page)?;
+            let child = self.cache.pager.read::<Node>(*page)?;
             self.read_into_mem(child, buf)?;
         }
 
@@ -934,7 +945,7 @@ impl<F: Seek + Read + Write> BTree<F> {
     }
 
     pub fn json(&mut self) -> io::Result<String> {
-        let root = self.cache.pager.read_node(0)?;
+        let root = self.cache.pager.read::<Node>(0)?;
 
         let mut nodes = Vec::new();
         self.read_into_mem(root, &mut nodes)?;
@@ -1089,14 +1100,14 @@ mod tests {
 
     impl BTree<MemBuf> {
         fn into_test_nodes(&mut self, root: u32) -> io::Result<Node> {
-            let node = self.cache.pager.read_node(root)?;
+            let node = self.cache.pager.read::<super::Node>(root)?;
             let mut test_node = Node {
                 keys: node.entries.iter().map(|e| e.key).collect(),
                 children: vec![],
             };
 
             for page in &node.children {
-                let child = self.cache.pager.read_node(*page)?;
+                let child = self.cache.pager.read::<super::Node>(*page)?;
                 test_node.children.push(self.into_test_nodes(child.page)?);
             }
 

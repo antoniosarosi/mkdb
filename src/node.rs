@@ -1,10 +1,38 @@
 use std::cmp::Ordering;
 
+use crate::pager::Page;
+
 /// Key-Value pairs stored in [`Node::entries`].
 #[derive(Eq, Copy, Clone, Debug)]
 pub(crate) struct Entry {
     pub key: u32,
     pub value: u32,
+}
+
+/// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
+/// [`Node`] should always map to a single page in the disk.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Node {
+    /// Disk page number of this node. Stored only in memory.
+    pub page: u32,
+
+    /// Key-Value pairs stored by this node.
+    pub entries: Vec<Entry>,
+
+    /// Children pointers. Each child has its own page number.
+    pub children: Vec<u32>,
+}
+
+/// We know the type of a node based on whether it has children and whether it
+/// has a parent.
+#[derive(PartialEq)]
+pub(crate) enum NodeKind {
+    /// The root node may or may not have children but it never has a parent.
+    Root,
+    /// Internal nodes have both children and a parent.
+    Internal,
+    /// Leaf nodes have no children and have a parent.
+    Leaf,
 }
 
 impl Entry {
@@ -35,32 +63,6 @@ impl Ord for Entry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key.cmp(&other.key)
     }
-}
-
-/// We know the type of a node based on whether it has children and whether it
-/// has a parent.
-#[derive(PartialEq)]
-pub(crate) enum NodeKind {
-    /// The root node may or may not have children but it never has a parent.
-    Root,
-    /// Internal nodes have both children and a parent.
-    Internal,
-    /// Leaf nodes have no children and have a parent.
-    Leaf,
-}
-
-/// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
-/// [`Node`] should always map to a single page in the disk.
-#[derive(Debug, PartialEq)]
-pub(crate) struct Node {
-    /// Disk page number of this node. Stored only in memory.
-    pub page: u32,
-
-    /// Key-Value pairs stored by this node.
-    pub entries: Vec<Entry>,
-
-    /// Children pointers. Each child has its own page number.
-    pub children: Vec<u32>,
 }
 
 impl Default for Node {
@@ -112,5 +114,54 @@ impl Node {
     /// also be a leaf node if it has no children.
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
+    }
+}
+
+impl From<Page> for Node {
+    fn from(page: Page) -> Self {
+        let mut node = Node::new_at(page.number);
+
+        let mut i = 4;
+
+        for _ in 0..u16::from_le_bytes(page.content[..2].try_into().unwrap()) {
+            let key = u32::from_le_bytes(page.content[i..i + 4].try_into().unwrap());
+            let value = u32::from_le_bytes(page.content[i + 4..i + 8].try_into().unwrap());
+            node.entries.push(Entry { key, value });
+            i += 8;
+        }
+
+        for _ in 0..u16::from_le_bytes(page.content[2..4].try_into().unwrap()) {
+            node.children.push(u32::from_le_bytes(
+                page.content[i..i + 4].try_into().unwrap(),
+            ));
+            i += 4;
+        }
+
+        node
+    }
+}
+
+impl From<&Node> for Page {
+    fn from(node: &Node) -> Self {
+        let mut page = Page {
+            number: node.page,
+            content: Vec::new(),
+        };
+
+        page.content
+            .extend(&(node.entries.len() as u16).to_le_bytes());
+        page.content
+            .extend(&(node.children.len() as u16).to_le_bytes());
+
+        for entry in &node.entries {
+            page.content.extend(&entry.key.to_le_bytes());
+            page.content.extend(&entry.value.to_le_bytes());
+        }
+
+        for child in &node.children {
+            page.content.extend(&child.to_le_bytes());
+        }
+
+        page
     }
 }

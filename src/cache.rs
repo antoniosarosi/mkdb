@@ -274,7 +274,7 @@ impl<F: Seek + Read + Write> Cache<F> {
     /// at this point, it will be loaded from disk.
     fn load_from_disk(&mut self, page: u32) -> io::Result<usize> {
         self.try_reference_page(page).or_else(|_| {
-            let node = self.pager.read_node(page)?;
+            let node = self.pager.read::<Node>(page)?;
             self.load_node(node)
         })
     }
@@ -374,7 +374,7 @@ impl<F: Seek + Read + Write> Cache<F> {
         let frame = &mut self.buffer[index];
 
         if frame.dirty {
-            self.pager.write_node(&frame.node)?;
+            self.pager.write(&frame.node)?;
             frame.mark_clean();
         }
 
@@ -467,7 +467,7 @@ mod tests {
             let mut pager = Pager::new(io::Cursor::new(Vec::new()), page_size, page_size);
 
             for node in &nodes {
-                pager.write_node(node)?;
+                pager.write(node)?;
             }
 
             let mut cache = Cache::new(pager).with_max_size(self.max_size);
@@ -660,7 +660,7 @@ mod tests {
         assert!(!cache.buffer[1].dirty);
 
         for page in [1, 2] {
-            let node = cache.pager.read_node(page)?;
+            let node = cache.pager.read::<Node>(page)?;
 
             assert_eq!(
                 node.entries,
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(cache.write_queue.len(), 1);
         assert_eq!(cache.buffer[0].node, nodes[3]);
 
-        let evicted_page = cache.pager.read_node(1)?;
+        let evicted_page = cache.pager.read::<Node>(1)?;
 
         assert_eq!(
             evicted_page.entries,
