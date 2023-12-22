@@ -28,24 +28,9 @@ use crate::{
 /// - Max keys:     `order - 1`
 /// - Min children: `(order - 1) * 2 / 3 + 1` (except root)
 /// - Min keys:     `(order - 1) * 2 / 3` (except root)
-///
-/// Page format:
-///
-/// ```text
-/// +---------+--------+--------+--------+--------+     +--------+--------+
-/// | EL | CL |   K1   |   V1   |   K2   |   V2   | ... |   C1   |   C2   | ...
-/// +---------+--------+--------+--------+--------+     +--------+--------+
-///   2    2      4        4        4        4              4        4
-/// ```
-///
-/// - `KL`: Keys Length
-/// - `CL`: Children Length
-/// - `K`: Key
-/// - `V`: Value
-/// - `C`: Child Pointer
 pub(crate) struct BTree<F> {
     /// Read-Write page cache.
-    cache: Cache<F>,
+    cache: Cache<F, Node>,
 
     /// Maximum number of children per node.
     order: usize,
@@ -84,7 +69,7 @@ enum LeafKeyType {
 
 /// See [`BTree`].
 fn optimal_order_for(page_size: usize) -> usize {
-    let total_size = mem::size_of::<Entry>() + mem::size_of::<u32>();
+    let total_size = mem::size_of::<Entry>() + mem::size_of::<PageNumber>();
 
     // Calculate how many entries + pointers we can fit.
     let mut order = page_size / total_size;
@@ -92,7 +77,7 @@ fn optimal_order_for(page_size: usize) -> usize {
 
     // The number of children is always one more than the number of keys, so
     // see if we can fit an extra child in the remaining space.
-    if remainder >= mem::size_of::<u32>() {
+    if remainder >= mem::size_of::<PageNumber>() {
         order += 1;
     }
 
@@ -101,7 +86,7 @@ fn optimal_order_for(page_size: usize) -> usize {
 
 impl<F> BTree<F> {
     #[allow(dead_code)]
-    pub fn new(cache: Cache<F>, balance_siblings_per_side: usize) -> Self {
+    pub fn new(cache: Cache<F, Node>, balance_siblings_per_side: usize) -> Self {
         let order = optimal_order_for(cache.pager.page_size);
         let len = 1;
 
@@ -1138,7 +1123,7 @@ mod tests {
             let buf = io::Cursor::new(Vec::new());
 
             let mut btree = BTree::new(
-                Cache::new(Pager::new(buf, page_size, page_size)).with_order(config.order),
+                Cache::new(Pager::new(buf, page_size, page_size)),
                 config.balance_siblings_per_side,
             );
             btree.extend_from_keys_only(config.keys)?;

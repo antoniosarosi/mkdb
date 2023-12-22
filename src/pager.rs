@@ -152,7 +152,7 @@ impl<F: Seek + Read> Pager<F> {
 
     /// Reads the raw page from disk and parses it into any type `T` that
     /// implements [`From<Page>`].
-    pub fn read<T: From<Page>>(&mut self, page_number: u32) -> io::Result<T> {
+    pub fn read<T: From<Page>>(&mut self, page_number: PageNumber) -> io::Result<T> {
         self.read_page(page_number).map(From::from)
     }
 }
@@ -174,7 +174,10 @@ impl<F: Seek + Write> Pager<F> {
 
     /// Writes the in-memory representation of a page to disk. The generic type
     /// `T` needs to implement [`Into<Page>`].
-    pub fn write<T: Into<Page>>(&mut self, mem_page: T) -> io::Result<usize> {
+    pub fn write<T>(&mut self, mem_page: &T) -> io::Result<usize>
+    where
+        for<'m> &'m T: Into<Page>,
+    {
         self.write_page(mem_page.into())
     }
 }

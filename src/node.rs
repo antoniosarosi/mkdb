@@ -1,6 +1,9 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, mem};
 
-use crate::pager::Page;
+use crate::{
+    cache::MemPage,
+    pager::{Page, PageNumber},
+};
 
 /// Key-Value pairs stored in [`Node::entries`].
 #[derive(Eq, Copy, Clone, Debug)]
@@ -11,16 +14,31 @@ pub(crate) struct Entry {
 
 /// Each of the nodes that compose the [`crate::btree::BTree`] structure. One
 /// [`Node`] should always map to a single page in the disk.
+///
+/// Page format:
+///
+/// ```text
+/// +---------+--------+--------+--------+--------+     +--------+--------+
+/// | EL | CL |   K1   |   V1   |   K2   |   V2   | ... |   C1   |   C2   | ...
+/// +---------+--------+--------+--------+--------+     +--------+--------+
+///   2    2      4        4        4        4              4        4
+/// ```
+///
+/// - `KL`: Keys Length
+/// - `CL`: Children Length
+/// - `K`: Key
+/// - `V`: Value
+/// - `C`: Child Pointer
 #[derive(Debug, PartialEq)]
 pub(crate) struct Node {
     /// Disk page number of this node. Stored only in memory.
-    pub page: u32,
+    pub page: PageNumber,
 
     /// Key-Value pairs stored by this node.
     pub entries: Vec<Entry>,
 
     /// Children pointers. Each child has its own page number.
-    pub children: Vec<u32>,
+    pub children: Vec<PageNumber>,
 }
 
 /// We know the type of a node based on whether it has children and whether it
@@ -82,7 +100,7 @@ impl Node {
     }
 
     /// Automatically sets the page number when creating the node.
-    pub fn new_at(page: u32) -> Self {
+    pub fn new_at(page: PageNumber) -> Self {
         let mut node = Self::new();
         node.page = page;
         node
@@ -117,8 +135,8 @@ impl Node {
     }
 }
 
-impl From<Page> for Node {
-    fn from(page: Page) -> Self {
+impl From<&Page> for Node {
+    fn from(page: &Page) -> Self {
         let mut node = Node::new_at(page.number);
 
         let mut i = 4;
@@ -138,6 +156,12 @@ impl From<Page> for Node {
         }
 
         node
+    }
+}
+
+impl From<Page> for Node {
+    fn from(page: Page) -> Self {
+        Node::from(&page)
     }
 }
 
@@ -163,5 +187,23 @@ impl From<&Node> for Page {
         }
 
         page
+    }
+}
+
+impl From<Node> for Page {
+    fn from(node: Node) -> Self {
+        Page::from(&node)
+    }
+}
+
+impl MemPage for Node {
+    fn size_on_disk(&self) -> usize {
+        2 * mem::size_of::<u16>()
+            + mem::size_of::<Entry>() * self.entries.len()
+            + mem::size_of::<PageNumber>() * self.children.len()
+    }
+
+    fn disk_page_number(&self) -> PageNumber {
+        self.page
     }
 }
