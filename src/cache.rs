@@ -1,3 +1,5 @@
+//! Page read-write cache implementation.
+
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},

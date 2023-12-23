@@ -1,3 +1,5 @@
+//! IO pager implementation.
+
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
@@ -105,7 +107,7 @@ impl<F: Seek + Read> Pager<F> {
     /// to block size. For example, if we want page 6, first we compute
     /// `1024 * 6 = 6144` and then align `6144` downwards to `4096` to read the
     /// block in memory. Alignment on powers of two can be computed using XOR
-    /// and a bitmask. Check [address alignment] for more details:
+    /// and a bitmask. Check [address alignment] for more details.
     ///
     /// [address alignment]: https://os.phil-opp.com/allocator-designs/#address-alignment
     pub fn read_page(&mut self, page_number: PageNumber) -> io::Result<Page> {
@@ -184,13 +186,12 @@ impl<F: Seek + Write> Pager<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, io};
+    use std::io;
 
-    use super::Pager;
-    use crate::pager::Page;
+    use super::{Page, Pager};
 
     #[test]
-    fn pager_write_read() -> Result<(), Box<dyn Error>> {
+    fn pager_write_read() -> io::Result<()> {
         let sizes = [(4, 4), (4, 16), (16, 4)];
 
         for (page_size, block_size) in sizes {
@@ -208,7 +209,6 @@ mod tests {
             }
 
             for i in 1..=max_pages {
-                let expected = vec![i as u8; page_size];
                 assert_eq!(
                     pager.read_page((i - 1) as u32)?,
                     Page {

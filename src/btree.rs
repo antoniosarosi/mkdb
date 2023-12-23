@@ -12,6 +12,7 @@ use std::{
 use crate::{
     cache::Cache,
     node::{Entry, Node},
+    os::{Disk, HardwareBlockSize},
     pager::{PageNumber, Pager},
 };
 
@@ -132,46 +133,7 @@ impl BTree<File> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
         }
 
-        #[cfg(unix)]
-        let block_size = {
-            use std::os::unix::prelude::MetadataExt;
-            metadata.blksize() as usize
-        };
-
-        #[cfg(windows)]
-        let block_size = unsafe {
-            use std::os::windows::ffi::OsStrExt;
-
-            use windows::{
-                core::PCWSTR,
-                Win32::{Foundation::MAX_PATH, Storage::FileSystem},
-            };
-
-            let mut volume = [0u16; MAX_PATH as usize];
-
-            let mut win_file_path = path
-                .as_ref()
-                .as_os_str()
-                .encode_wide()
-                .collect::<Vec<u16>>();
-
-            win_file_path.push(0);
-
-            FileSystem::GetVolumePathNameW(PCWSTR::from_raw(win_file_path.as_ptr()), &mut volume)?;
-
-            let mut bytes_per_sector: u32 = 0;
-            let mut sectors_per_cluster: u32 = 0;
-
-            FileSystem::GetDiskFreeSpaceW(
-                PCWSTR::from_raw(volume.as_ptr()),
-                Some(&mut bytes_per_sector),
-                Some(&mut sectors_per_cluster),
-                None,
-                None,
-            )?;
-
-            (bytes_per_sector * sectors_per_cluster) as usize
-        };
+        let block_size = Disk::from(&path).block_size()?;
 
         // TODO: Add magic number & header to file.
         let cache = Cache::new(Pager::new(file, page_size, block_size));

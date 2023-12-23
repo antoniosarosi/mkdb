@@ -1,6 +1,7 @@
 mod btree;
 mod cache;
 mod node;
+mod os;
 mod pager;
 
 use std::io;
@@ -9,7 +10,7 @@ use btree::BTree;
 
 fn main() -> io::Result<()> {
     let mut btree = BTree::new_at("btree.bin", 48)?;
-    for i in 1..=35 {
+    for i in 1..=46 {
         btree.insert(i, 1000 + i)?;
     }
 
