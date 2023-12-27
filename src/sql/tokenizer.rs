@@ -7,21 +7,21 @@ use std::{
 
 use super::token::{Keyword, Token, Whitespace};
 
-/// Token stream. Wraps a [`Peekable<Chars>`] instance and allows reading the
-/// next character in the stream without consuming it.
-struct Stream<'c> {
-    /// Current location in the stream.
-    location: Location,
-    /// Character input.
-    chars: Peekable<Chars<'c>>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Location {
     /// Line number.
     line: usize,
     /// Column number.
     col: usize,
+}
+
+/// Token stream. Wraps a [`Peekable<Chars>`] instance and allows reading the
+/// next character in the stream without consuming it.
+struct Stream<'i> {
+    /// Current location in the stream.
+    location: Location,
+    /// Character input.
+    chars: Peekable<Chars<'i>>,
 }
 
 impl<'i> Stream<'i> {
@@ -51,18 +51,36 @@ impl<'i> Stream<'i> {
         self.chars.peek()
     }
 
-    /// Consumes the next value only if `predicate` returns `true`.
-    fn next_if(&mut self, predicate: impl FnOnce(&char) -> bool) -> Option<char> {
-        if self.peek().is_some_and(predicate) {
-            self.next()
-        } else {
-            None
+    /// Safe version of [`std::iter::TakeWhile`] that does not discard elements
+    /// when `predicate` returns `false`
+    fn take_while<P: FnMut(&char) -> bool>(&mut self, predicate: P) -> TakeWhile<'_, 'i, P> {
+        TakeWhile {
+            stream: self,
+            predicate,
         }
     }
 
     /// Current location in the stream.
     fn location(&self) -> Location {
         self.location
+    }
+}
+
+/// See [`Stream::take_while`] for more details.
+struct TakeWhile<'s, 'i, P> {
+    stream: &'s mut Stream<'i>,
+    predicate: P,
+}
+
+impl<'s, 'c, P: FnMut(&char) -> bool> Iterator for TakeWhile<'s, 'c, P> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if (self.predicate)(self.stream.peek()?) {
+            self.stream.next()
+        } else {
+            None
+        }
     }
 }
 
@@ -105,6 +123,9 @@ impl<'i> Tokenizer<'i> {
         }
     }
 
+    /// Creates an iterator over [`Self`]. Used mainly to parse tokens as they
+    /// are found instead of waiting for the tokenizer to consume the entire
+    /// input string.
     pub fn iter_mut<'t>(&'t mut self) -> IterMut<'t, 'i> {
         self.into_iter()
     }
@@ -194,36 +215,36 @@ impl<'i> Tokenizer<'i> {
 
     /// Parses a double quoted string like `"this one"` into [`Token::String`].
     fn tokenize_string(&mut self) -> Result<Token, TokenizerError> {
-        let string = iter::from_fn(|| self.stream.next_if(|chr| *chr != '"')).collect();
+        let string = self.stream.take_while(|chr| *chr != '"').collect();
 
         match self.stream.next() {
             Some('"') => Ok(Token::String(string)),
-            _ => Err(self.error("double quoted string not closed".into())),
+            _ => Err(self.error("double quoted string not closed")),
         }
     }
 
     /// Tokenizes numbers like `1234`. Floats and negatives not supported.
     fn tokenize_number(&mut self, first_digit: char) -> Result<Token, TokenizerError> {
-        let mut number = String::from(first_digit);
-        number.extend(iter::from_fn(|| self.stream.next_if(char::is_ascii_digit)));
-
-        Ok(Token::Number(number))
+        Ok(Token::Number(
+            iter::once(first_digit)
+                .chain(self.stream.take_while(char::is_ascii_digit))
+                .collect(),
+        ))
     }
 
-    /// Parses the next [`Word`] in the stream.
+    /// Attempts to parse an instance of [`Token::Keyword`] or
+    /// [`Token::Identifier`].
     fn tokenize_keyword_or_identifier(
         &mut self,
         first_char: char,
     ) -> Result<Token, TokenizerError> {
         if !Token::is_part_of_ident_or_keyword(&first_char) {
-            return Err(self.error("unexpected keyword or identifier part".into()));
+            return Err(self.error("unexpected keyword or identifier part"));
         }
 
-        let mut value = String::from(first_char);
-
-        value.extend(iter::from_fn(|| {
-            self.stream.next_if(Token::is_part_of_ident_or_keyword)
-        }));
+        let value: String = iter::once(first_char)
+            .chain(self.stream.take_while(Token::is_part_of_ident_or_keyword))
+            .collect();
 
         let keyword = match value.to_uppercase().as_str() {
             "SELECT" => Keyword::Select,
@@ -251,8 +272,8 @@ impl<'i> Tokenizer<'i> {
     }
 
     /// Builds a [`TokenizerError`] giving it the current location.
-    fn error(&self, message: String) -> TokenizerError {
-        TokenizerError::new(message, self.stream.location())
+    fn error<S: Into<String>>(&self, message: S) -> TokenizerError {
+        TokenizerError::new(message.into(), self.stream.location())
     }
 }
 
@@ -261,20 +282,7 @@ pub(super) struct IterMut<'t, 'i> {
     tokenizer: &'t mut Tokenizer<'i>,
 }
 
-/// Used to implement [`IntoIterator`] for [`Tokenizer`].
-pub(super) struct IntoIter<'i> {
-    tokenizer: Tokenizer<'i>,
-}
-
 impl<'t, 'i> Iterator for IterMut<'t, 'i> {
-    type Item = Result<Token, TokenizerError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.tokenizer.optional_next_token()
-    }
-}
-
-impl<'i> Iterator for IntoIter<'i> {
     type Item = Result<Token, TokenizerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -288,6 +296,19 @@ impl<'t, 'i> IntoIterator for &'t mut Tokenizer<'i> {
 
     fn into_iter(self) -> Self::IntoIter {
         IterMut { tokenizer: self }
+    }
+}
+
+/// Used to implement [`IntoIterator`] for [`Tokenizer`].
+pub(super) struct IntoIter<'i> {
+    tokenizer: Tokenizer<'i>,
+}
+
+impl<'i> Iterator for IntoIter<'i> {
+    type Item = Result<Token, TokenizerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.tokenizer.optional_next_token()
     }
 }
 

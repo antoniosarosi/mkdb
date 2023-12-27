@@ -137,7 +137,7 @@ impl<'i> Parser<'i> {
             },
 
             unexpected => Err(ParserError::new(format!(
-                "unexpected first token {unexpected}"
+                "unexpected first token {unexpected}. Should be a keyword."
             ))),
         }
     }
