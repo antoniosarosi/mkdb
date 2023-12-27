@@ -3,6 +3,7 @@ mod cache;
 mod node;
 mod os;
 mod pager;
+mod sql;
 
 use std::io;
 
