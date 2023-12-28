@@ -7,12 +7,35 @@ use std::{
 
 use super::token::{Keyword, Token, Whitespace};
 
-#[derive(Clone, Copy, Debug)]
-struct Location {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Location {
     /// Line number.
     line: usize,
     /// Column number.
     col: usize,
+}
+
+impl Default for Location {
+    fn default() -> Self {
+        Self { line: 1, col: 1 }
+    }
+}
+
+/// Stores both the [`Token`] and its starting location in the input string.
+#[derive(Debug, PartialEq)]
+pub(super) struct TokenWithLocation {
+    pub token: Token,
+    pub location: Location,
+}
+
+impl TokenWithLocation {
+    pub fn token_only(self) -> Token {
+        self.token
+    }
+
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
 }
 
 /// Token stream. Wraps a [`Peekable<Chars>`] instance and allows reading the
@@ -52,7 +75,7 @@ impl<'i> Stream<'i> {
     }
 
     /// Safe version of [`std::iter::TakeWhile`] that does not discard elements
-    /// when `predicate` returns `false`
+    /// when `predicate` returns `false`.
     fn take_while<P: FnMut(&char) -> bool>(&mut self, predicate: P) -> TakeWhile<'_, 'i, P> {
         TakeWhile {
             stream: self,
@@ -85,10 +108,10 @@ impl<'s, 'c, P: FnMut(&char) -> bool> Iterator for TakeWhile<'s, 'c, P> {
 }
 
 /// Syntax error.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct TokenizerError {
-    message: String,
-    location: Location,
+    pub message: String,
+    pub location: Location,
 }
 
 impl Display for TokenizerError {
@@ -116,6 +139,8 @@ pub(super) struct Tokenizer<'i> {
     stream: Stream<'i>,
 }
 
+type TokenResult = Result<Token, TokenizerError>;
+
 impl<'i> Tokenizer<'i> {
     pub fn new(input: &'i str) -> Self {
         Self {
@@ -134,11 +159,24 @@ impl<'i> Tokenizer<'i> {
     /// into [`Token`] variants. If an error is encountered in the process, this
     /// function returns immediately.
     pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
-        self.iter_mut().collect()
+        self.iter_mut()
+            .map(|result| result.map(TokenWithLocation::token_only))
+            .collect()
+    }
+
+    /// Same as [`Self::optional_next_token`] but stores the starting location
+    /// of the token as well.
+    fn optional_next_token_with_location(
+        &mut self,
+    ) -> Option<Result<TokenWithLocation, TokenizerError>> {
+        let location = self.stream.location();
+
+        self.optional_next_token()
+            .map(|result| result.map(|token| TokenWithLocation { token, location }))
     }
 
     /// Discards [`Token::Eof`] as [`Option::None`]. Useful for iterators.
-    fn optional_next_token(&mut self) -> Option<Result<Token, TokenizerError>> {
+    fn optional_next_token(&mut self) -> Option<TokenResult> {
         match self.next_token() {
             Ok(Token::Eof) => None,
             result => Some(result),
@@ -146,7 +184,7 @@ impl<'i> Tokenizer<'i> {
     }
 
     /// Consumes and returns the next [`Token`] variant in [`Self::stream`].
-    fn next_token(&mut self) -> Result<Token, TokenizerError> {
+    fn next_token(&mut self) -> TokenResult {
         // Done, no more chars.
         let Some(chr) = self.stream.next() else {
             return Ok(Token::Eof);
@@ -184,8 +222,12 @@ impl<'i> Tokenizer<'i> {
 
             '!' => match self.stream.peek().copied() {
                 Some('=') => self.consume(Token::Neq),
-                Some(unexpected) => Err(self.error(format!("unexpected token '{unexpected}'"))),
-                None => Err(self.error(format!("'{}' operator not closed", Token::Neq))),
+
+                Some(unexpected) => Err(self.error(format!(
+                    "unexpected token '{unexpected}' while parsing '!=' operator"
+                ))),
+
+                None => Err(self.error(format!("'!=' operator not closed"))),
             },
 
             '(' => Ok(Token::LeftParen),
@@ -208,13 +250,13 @@ impl<'i> Tokenizer<'i> {
     /// the given [`Token`] variant. This is used for parsing operators like
     /// `<=` where we have to peek the second character and consume it
     /// afterwards if it matches what we expect.
-    fn consume(&mut self, token: Token) -> Result<Token, TokenizerError> {
+    fn consume(&mut self, token: Token) -> TokenResult {
         self.stream.next();
         Ok(token)
     }
 
     /// Parses a double quoted string like `"this one"` into [`Token::String`].
-    fn tokenize_string(&mut self) -> Result<Token, TokenizerError> {
+    fn tokenize_string(&mut self) -> TokenResult {
         let string = self.stream.take_while(|chr| *chr != '"').collect();
 
         match self.stream.next() {
@@ -224,7 +266,7 @@ impl<'i> Tokenizer<'i> {
     }
 
     /// Tokenizes numbers like `1234`. Floats and negatives not supported.
-    fn tokenize_number(&mut self, first_digit: char) -> Result<Token, TokenizerError> {
+    fn tokenize_number(&mut self, first_digit: char) -> TokenResult {
         Ok(Token::Number(
             iter::once(first_digit)
                 .chain(self.stream.take_while(char::is_ascii_digit))
@@ -234,10 +276,7 @@ impl<'i> Tokenizer<'i> {
 
     /// Attempts to parse an instance of [`Token::Keyword`] or
     /// [`Token::Identifier`].
-    fn tokenize_keyword_or_identifier(
-        &mut self,
-        first_char: char,
-    ) -> Result<Token, TokenizerError> {
+    fn tokenize_keyword_or_identifier(&mut self, first_char: char) -> TokenResult {
         if !Token::is_part_of_ident_or_keyword(&first_char) {
             return Err(self.error("unexpected keyword or identifier part"));
         }
@@ -252,6 +291,9 @@ impl<'i> Tokenizer<'i> {
             "UPDATE" => Keyword::Update,
             "DELETE" => Keyword::Delete,
             "INSERT" => Keyword::Insert,
+            "VALUES" => Keyword::Values,
+            "INTO" => Keyword::Into,
+            "SET" => Keyword::Set,
             "DROP" => Keyword::Drop,
             "FROM" => Keyword::From,
             "WHERE" => Keyword::Where,
@@ -271,8 +313,9 @@ impl<'i> Tokenizer<'i> {
         })
     }
 
-    /// Builds a [`TokenizerError`] giving it the current location.
-    fn error<S: Into<String>>(&self, message: S) -> TokenizerError {
+    /// Builds an instance of [`Err(TokenizerError)`] giving it the current
+    /// location.
+    fn error(&self, message: impl Into<String>) -> TokenizerError {
         TokenizerError::new(message.into(), self.stream.location())
     }
 }
@@ -283,16 +326,16 @@ pub(super) struct IterMut<'t, 'i> {
 }
 
 impl<'t, 'i> Iterator for IterMut<'t, 'i> {
-    type Item = Result<Token, TokenizerError>;
+    type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.tokenizer.optional_next_token()
+        self.tokenizer.optional_next_token_with_location()
     }
 }
 
 impl<'t, 'i> IntoIterator for &'t mut Tokenizer<'i> {
     type IntoIter = IterMut<'t, 'i>;
-    type Item = Result<Token, TokenizerError>;
+    type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn into_iter(self) -> Self::IntoIter {
         IterMut { tokenizer: self }
@@ -305,16 +348,16 @@ pub(super) struct IntoIter<'i> {
 }
 
 impl<'i> Iterator for IntoIter<'i> {
-    type Item = Result<Token, TokenizerError>;
+    type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.tokenizer.optional_next_token()
+        self.tokenizer.optional_next_token_with_location()
     }
 }
 
 impl<'i> IntoIterator for Tokenizer<'i> {
     type IntoIter = IntoIter<'i>;
-    type Item = Result<Token, TokenizerError>;
+    type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter { tokenizer: self }
@@ -323,15 +366,16 @@ impl<'i> IntoIterator for Tokenizer<'i> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Keyword, Token, Tokenizer, Whitespace};
+    use crate::sql::tokenizer::{Location, TokenizerError};
 
     #[test]
     fn tokenize_simple_select() {
         let sql = "SELECT id, name FROM users;";
 
         assert_eq!(
-            Tokenizer::new(sql).tokenize().unwrap(),
-            vec![
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
                 Token::Keyword(Keyword::Select),
                 Token::Whitespace(Whitespace::Space),
                 Token::Identifier("id".into()),
@@ -343,7 +387,7 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Identifier("users".into()),
                 Token::SemiColon,
-            ]
+            ])
         );
     }
 
@@ -352,8 +396,8 @@ mod tests {
         let sql = "SELECT id, price, discount FROM products WHERE price >= 100;";
 
         assert_eq!(
-            Tokenizer::new(sql).tokenize().unwrap(),
-            vec![
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
                 Token::Keyword(Keyword::Select),
                 Token::Whitespace(Whitespace::Space),
                 Token::Identifier("id".into()),
@@ -376,7 +420,7 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("100".into()),
                 Token::SemiColon,
-            ]
+            ])
         );
     }
 
@@ -385,8 +429,8 @@ mod tests {
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
 
         assert_eq!(
-            Tokenizer::new(sql).tokenize().unwrap(),
-            vec![
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
                 Token::Keyword(Keyword::Create),
                 Token::Whitespace(Whitespace::Space),
                 Token::Keyword(Keyword::Table),
@@ -411,13 +455,96 @@ mod tests {
                 Token::RightParen,
                 Token::RightParen,
                 Token::SemiColon,
-            ]
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_update_table() {
+        let sql = r#"UPDATE products SET code = "promo", discount = 10 WHERE price < 100;"#;
+
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
+                Token::Keyword(Keyword::Update),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("products".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Set),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("code".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Eq,
+                Token::Whitespace(Whitespace::Space),
+                Token::String("promo".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("discount".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Eq,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("10".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Where),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("price".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Lt,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("100".into()),
+                Token::SemiColon,
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_insert_into() {
+        let sql = r#"INSERT INTO users (name, email, age) VALUES ("Test", "test@test.com", 20);"#;
+
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
+                Token::Keyword(Keyword::Insert),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Into),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("users".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::LeftParen,
+                Token::Identifier("name".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("email".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("age".into()),
+                Token::RightParen,
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Values),
+                Token::Whitespace(Whitespace::Space),
+                Token::LeftParen,
+                Token::String("Test".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::String("test@test.com".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("20".into()),
+                Token::RightParen,
+                Token::SemiColon,
+            ])
         );
     }
 
     #[test]
     fn tokenizer_error() {
         let sql = "SELECT * FROM table WHERE column ! other";
-        assert!(Tokenizer::new(sql).tokenize().is_err());
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Err(TokenizerError {
+                message: "unexpected token ' ' while parsing '!=' operator".into(),
+                location: Location { line: 1, col: 35 }
+            })
+        );
     }
 }

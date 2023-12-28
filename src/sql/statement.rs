@@ -1,4 +1,4 @@
-enum BinaryOperator {
+pub(super) enum BinaryOperator {
     Lt,
     LtEq,
     Gt,
@@ -10,6 +10,8 @@ enum BinaryOperator {
 
 pub(super) enum Expression {
     Identifier(String),
+
+    Value(Value),
 
     BinaryOperation {
         left: Box<Self>,
@@ -29,21 +31,26 @@ enum DataType {
     Varchar(usize),
 }
 
-enum Value {
+pub(super) enum Value {
     Number(String),
     String(String),
     Bool(bool),
 }
 
-struct Column {
+pub(super) struct Column {
     name: String,
     data_type: DataType,
     constraints: Vec<Constraint>,
 }
 
-enum Create {
+pub(super) enum Create {
     Table { name: String, columns: Vec<Column> },
-    Database { name: String },
+    Database(String),
+}
+
+pub(super) enum Drop {
+    Table(String),
+    Database(String),
 }
 
 pub(crate) enum Statement {
@@ -62,6 +69,7 @@ pub(crate) enum Statement {
 
     Update {
         table: String,
+        columns: Vec<Expression>,
         r#where: Option<Expression>,
     },
 
@@ -70,4 +78,6 @@ pub(crate) enum Statement {
         columns: Vec<String>,
         values: Vec<Value>,
     },
+
+    Drop(Drop),
 }

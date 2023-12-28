@@ -1,2 +1,3 @@
 group_imports = "StdExternalCrate"
 imports_granularity = "Crate"
+format_code_in_doc_comments = true
