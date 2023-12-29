@@ -214,6 +214,8 @@ impl<'i> Tokenizer<'i> {
 
             '*' => Ok(Token::Mul),
 
+            '/' => Ok(Token::Div),
+
             '+' => Ok(Token::Plus),
 
             '-' => Ok(Token::Minus),
@@ -297,6 +299,8 @@ impl<'i> Tokenizer<'i> {
             "DROP" => Keyword::Drop,
             "FROM" => Keyword::From,
             "WHERE" => Keyword::Where,
+            "AND" => Keyword::And,
+            "OR" => Keyword::Or,
             "PRIMARY" => Keyword::Primary,
             "KEY" => Keyword::Key,
             "UNIQUE" => Keyword::Unique,
@@ -420,6 +424,52 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("100".into()),
                 Token::SemiColon,
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_select_where_with_and_or() {
+        let sql = "SELECT id, name FROM users WHERE age >= 20 AND age <= 30 OR is_admin = 1;";
+
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
+                Token::Keyword(Keyword::Select),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("id".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("name".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::From),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("users".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Where),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("age".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::GtEq,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("20".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::And),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("age".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::LtEq,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("30".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Or),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("is_admin".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Eq,
+                Token::Whitespace(Whitespace::Space),
+                Token::Number("1".into()),
+                Token::SemiColon
             ])
         );
     }

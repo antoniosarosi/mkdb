@@ -1,4 +1,7 @@
+#[derive(Debug, PartialEq)]
 pub(super) enum BinaryOperator {
+    Eq,
+    Neq,
     Lt,
     LtEq,
     Gt,
@@ -6,12 +9,18 @@ pub(super) enum BinaryOperator {
     Plus,
     Minus,
     Mul,
+    Div,
+    And,
+    Or,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) enum Expression {
     Identifier(String),
 
     Value(Value),
+
+    Wildcard,
 
     BinaryOperation {
         left: Box<Self>,
@@ -20,39 +29,46 @@ pub(super) enum Expression {
     },
 }
 
-enum Constraint {
+#[derive(Debug, PartialEq)]
+pub(super) enum Constraint {
     PrimaryKey,
     Unique,
 }
 
-enum DataType {
+#[derive(Debug, PartialEq)]
+pub(super) enum DataType {
     Int,
     Bool,
     Varchar(usize),
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) enum Value {
     Number(String),
     String(String),
     Bool(bool),
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct Column {
-    name: String,
-    data_type: DataType,
-    constraints: Vec<Constraint>,
+    pub name: String,
+    pub data_type: DataType,
+    pub constraint: Option<Constraint>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) enum Create {
     Table { name: String, columns: Vec<Column> },
     Database(String),
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) enum Drop {
     Table(String),
     Database(String),
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum Statement {
     Create(Create),
 
@@ -76,7 +92,7 @@ pub(crate) enum Statement {
     Insert {
         into: String,
         columns: Vec<String>,
-        values: Vec<Value>,
+        values: Vec<Expression>,
     },
 
     Drop(Drop),

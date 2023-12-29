@@ -15,6 +15,7 @@ pub(crate) enum Token {
     LtEq,
     GtEq,
     Mul,
+    Div,
     Plus,
     Minus,
     LeftParen,
@@ -26,7 +27,7 @@ pub(crate) enum Token {
 }
 
 /// SQL keywords.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum Keyword {
     Select,
     Create,
@@ -39,6 +40,8 @@ pub(crate) enum Keyword {
     Drop,
     From,
     Where,
+    And,
+    Or,
     Primary,
     Key,
     Unique,
@@ -82,6 +85,7 @@ impl Display for Token {
             Self::LtEq => f.write_str("<="),
             Self::GtEq => f.write_str(">="),
             Self::Mul => f.write_str("*"),
+            Self::Div => f.write_str("/"),
             Self::Plus => f.write_str("+"),
             Self::Minus => f.write_str("-"),
             Self::LeftParen => f.write_str("("),
@@ -106,6 +110,8 @@ impl Display for Keyword {
             Self::Drop => f.write_str("DROP"),
             Self::From => f.write_str("FROM"),
             Self::Where => f.write_str("WHERE"),
+            Self::And => f.write_str("AND"),
+            Self::Or => f.write_str("OR"),
             Self::Primary => f.write_str("PRIMARY"),
             Self::Key => f.write_str("KEY"),
             Self::Unique => f.write_str("UNIQUE"),
