@@ -9,7 +9,7 @@ use super::{
 };
 
 #[derive(Debug, PartialEq)]
-struct ParserError {
+pub(crate) struct ParserError {
     message: String,
     location: Location,
 }
@@ -32,7 +32,7 @@ impl From<TokenizerError> for ParserError {
     }
 }
 
-type ParseResult<T> = Result<T, ParserError>;
+pub(crate) type ParseResult<T> = Result<T, ParserError>;
 
 /// TODP (Top-Down Operator Precedence) recursive descent parser. See this
 /// [tutorial] for an introduction to the algorithms used here and see also the
@@ -41,7 +41,7 @@ type ParseResult<T> = Result<T, ParserError>;
 ///
 /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
 /// [sqlparser]: https://github.com/sqlparser-rs/sqlparser-rs
-pub(super) struct Parser<'i> {
+pub(crate) struct Parser<'i> {
     /// [`Token`] peekable iterator.
     tokenizer: Peekable<tokenizer::IntoIter<'i>>,
     /// Location of the last token we've consumed from the iterator.
@@ -63,7 +63,7 @@ impl<'i> Parser<'i> {
         let mut statements = Vec::new();
 
         loop {
-            match self.peek_after_whitespaces() {
+            match self.peek_token() {
                 Some(Ok(Token::Eof)) | None => return Ok(statements),
                 _ => statements.push(self.parse_statement()?),
             }
@@ -73,7 +73,7 @@ impl<'i> Parser<'i> {
     /// Parses a single SQL statement in the input string. If the statement
     /// terminator is not found then it returns [`Err`].
     fn parse_statement(&mut self) -> ParseResult<Statement> {
-        let Token::Keyword(keyword) = self.next_after_whitespaces()? else {
+        let Token::Keyword(keyword) = self.next_token()? else {
             return Err(self.error(format!(
                 "unexpected initial token. Statements must start with one of the supported keywords."
             )));
@@ -168,7 +168,24 @@ impl<'i> Parser<'i> {
         statement
     }
 
-    fn parse_expression(&mut self, precedence: u8) -> ParseResult<Expression> {
+    /// TODP recursive descent consists of 3 functions that call each other
+    /// recursively:
+    ///
+    /// - [`Self::parse_expr`]
+    /// - [`Self::parse_prefix`]
+    /// - [`Self::parse_infix`]
+    ///
+    /// This one simply initiates the process, see the others for details and
+    /// see the [tutorial] mentioned above to understand how the algorithm
+    /// works.
+    ///
+    /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
+    fn parse_expression(&mut self) -> ParseResult<Expression> {
+        self.parse_expr(0)
+    }
+
+    /// Main TODP loop.
+    fn parse_expr(&mut self, precedence: u8) -> ParseResult<Expression> {
         let mut expr = self.parse_prefix()?;
         let mut next_precedence = self.get_next_precedence();
 
@@ -180,30 +197,16 @@ impl<'i> Parser<'i> {
         Ok(expr)
     }
 
-    fn get_next_precedence(&mut self) -> u8 {
-        let Some(Ok(token)) = self.peek_after_whitespaces() else {
-            return 0;
-        };
-
-        match token {
-            Token::Keyword(Keyword::Or) => 5,
-            Token::Keyword(Keyword::And) => 10,
-            Token::Eq | Token::Neq | Token::Gt | Token::GtEq | Token::Lt | Token::LtEq => 20,
-            Token::Plus | Token::Minus => 30,
-            Token::Mul | Token::Div => 40,
-            _ => 0,
-        }
-    }
-
+    /// Parses the beginning of an expression.
     fn parse_prefix(&mut self) -> ParseResult<Expression> {
-        match self.next_after_whitespaces()? {
+        match self.next_token()? {
             Token::Identifier(ident) => Ok(Expression::Identifier(ident)),
             Token::Mul => Ok(Expression::Wildcard),
             Token::Number(num) => Ok(Expression::Value(Value::Number(num))),
             Token::String(string) => Ok(Expression::Value(Value::String(string))),
 
             Token::LeftParen => {
-                let expr = self.parse_expression(0)?;
+                let expr = self.parse_expression()?;
                 self.expect_token(Token::RightParen)?;
                 Ok(expr)
             }
@@ -214,8 +217,10 @@ impl<'i> Parser<'i> {
         }
     }
 
+    /// Parses an infix expression in the form of
+    /// (left expr | operator | right expr).
     fn parse_infix(&mut self, left: Expression, precedence: u8) -> ParseResult<Expression> {
-        let token = self.next_after_whitespaces()?;
+        let token = self.next_token()?;
 
         let operator = match token {
             Token::Plus => BinaryOperator::Plus,
@@ -239,29 +244,31 @@ impl<'i> Parser<'i> {
         Ok(Expression::BinaryOperation {
             left: Box::new(left),
             operator,
-            right: Box::new(self.parse_expression(precedence)?),
+            right: Box::new(self.parse_expr(precedence)?),
         })
     }
 
-    fn parse_comma_separated_expressions(&mut self) -> ParseResult<Vec<Expression>> {
-        let expect_right_paren = self.consume_optional_token(Token::LeftParen);
+    /// Returns the precedence value of the next operator in the stream.
+    fn get_next_precedence(&mut self) -> u8 {
+        let Some(Ok(token)) = self.peek_token() else {
+            return 0;
+        };
 
-        let mut vec = vec![self.parse_expression(0)?];
-        while self.consume_optional_token(Token::Comma) {
-            vec.push(self.parse_expression(0)?);
+        match token {
+            Token::Keyword(Keyword::Or) => 5,
+            Token::Keyword(Keyword::And) => 10,
+            Token::Eq | Token::Neq | Token::Gt | Token::GtEq | Token::Lt | Token::LtEq => 20,
+            Token::Plus | Token::Minus => 30,
+            Token::Mul | Token::Div => 40,
+            _ => 0,
         }
-
-        if expect_right_paren {
-            self.expect_token(Token::RightParen)?;
-        }
-
-        Ok(vec)
     }
 
+    /// Parses a column definition for `CREATE TABLE` statements.
     fn parse_column(&mut self) -> ParseResult<Column> {
         let name = self.parse_identifier()?;
 
-        let Token::Keyword(keyword) = self.next_after_whitespaces()? else {
+        let Token::Keyword(keyword) = self.next_token()? else {
             return Err(self.error("expected data type"));
         };
 
@@ -271,7 +278,7 @@ impl<'i> Parser<'i> {
             Keyword::Varchar => {
                 self.expect_token(Token::LeftParen)?;
 
-                let length = match self.next_after_whitespaces()? {
+                let length = match self.next_token()? {
                     Token::Number(num) => num
                         .parse()
                         .map_err(|_| self.error("incorrect varchar length"))?,
@@ -285,7 +292,7 @@ impl<'i> Parser<'i> {
             unexpected => Err(self.error(format!("unexpected keyword {unexpected}")))?,
         };
 
-        let constraint = match self.consume_one_of_keywords(&[Keyword::Primary, Keyword::Unique]) {
+        let constraint = match self.consume_one_of(&[Keyword::Primary, Keyword::Unique]) {
             Keyword::Primary => {
                 self.expect_keyword(Keyword::Key)?;
                 Some(Constraint::PrimaryKey)
@@ -305,54 +312,72 @@ impl<'i> Parser<'i> {
         })
     }
 
-    fn consume_one_of_keywords(&mut self, keywords: &[Keyword]) -> Keyword {
-        for keyword in keywords {
-            if self.consume_optional_keyword(*keyword) {
-                return *keyword;
-            }
+    /// Takes a `subparser` as input and calls it after every instance of
+    /// [`Token::Comma`].
+    fn parse_comma_separated<T>(
+        &mut self,
+        mut subparser: impl FnMut(&mut Self) -> ParseResult<T>,
+        required_parenthesis: bool,
+    ) -> ParseResult<Vec<T>> {
+        let left_paren = self.consume_optional_token(Token::LeftParen);
+
+        if required_parenthesis && !left_paren {
+            return Err(self.error("opening parenthesis is required"));
         }
 
-        Keyword::None
+        let mut results = vec![subparser(self)?];
+        while self.consume_optional_token(Token::Comma) {
+            results.push(subparser(self)?);
+        }
+
+        if left_paren {
+            self.expect_token(Token::RightParen)?;
+        }
+
+        Ok(results)
     }
 
+    /// Used to parse the expressions after `SELECT`, `WHERE`, `SET` or `VALUES`.
+    fn parse_comma_separated_expressions(&mut self) -> ParseResult<Vec<Expression>> {
+        self.parse_comma_separated(Self::parse_expression, false)
+    }
+
+    /// Used to parse `CREATE TABLE` column definitions.
     fn parse_schema(&mut self) -> ParseResult<Vec<Column>> {
-        self.expect_token(Token::LeftParen)?;
-        let mut columns = vec![self.parse_column()?];
-        while self.consume_optional_token(Token::Comma) {
-            columns.push(self.parse_column()?);
-        }
-        self.expect_token(Token::RightParen)?;
-
-        Ok(columns)
+        self.parse_comma_separated(Self::parse_column, true)
     }
 
+    /// Expects a list of identifiers, not complete expressions.
     fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
-        self.expect_token(Token::LeftParen)?;
-        let mut identifiers = vec![self.parse_identifier()?];
-        while self.consume_optional_token(Token::Comma) {
-            identifiers.push(self.parse_identifier()?);
-        }
-
-        self.expect_token(Token::RightParen)?;
-
-        Ok(identifiers)
+        self.parse_comma_separated(Self::parse_identifier, true)
     }
 
+    /// Parses the next identifier in the stream or fails if it's not an
+    /// identifier.
     fn parse_identifier(&mut self) -> ParseResult<String> {
-        self.next_after_whitespaces().and_then(|token| match token {
+        self.next_token().and_then(|token| match token {
             Token::Identifier(ident) => Ok(ident),
             _ => Err(self.error(format!("expected identifier. Got {token} instead"))),
         })
     }
 
+    /// Parses the entire `WHERE` clause if the next token is [`Keyword::Where`].
     fn parse_optional_where(&mut self) -> ParseResult<Option<Expression>> {
         if self.consume_optional_keyword(Keyword::Where) {
-            Ok(Some(self.parse_expression(0)?))
+            Ok(Some(self.parse_expression()?))
         } else {
             Ok(None)
         }
     }
 
+    /// These statements all have a `FROM` clause and an optional `WHERE`
+    /// clause:
+    ///
+    /// ```sql
+    /// SELECT * FROM table WHERE condition;
+    /// UPDATE table SET column = "value" WHERE condition;
+    /// DELETE FROM table WHERE condition;
+    /// ```
     fn parse_from_and_optional_where(&mut self) -> ParseResult<(String, Option<Expression>)> {
         let from = self.parse_identifier()?;
         let r#where = self.parse_optional_where()?;
@@ -360,65 +385,45 @@ impl<'i> Parser<'i> {
         Ok((from, r#where))
     }
 
-    /// Expects `one` keyword or the `other` and returns whichever matches.
-    fn expect_one_of(&mut self, keywords: &[Keyword]) -> ParseResult<Keyword> {
-        match self.consume_one_of_keywords(keywords) {
-            Keyword::None => {
-                let token = self.next_after_whitespaces()?;
-                Err(self.error(format!("expected one of {keywords:?}. Got {token} instead")))
-            }
-            keyword => Ok(keyword),
-        }
-    }
-
-    /// Skips all instances of [`Token::Whitespace`] in the stream.
-    fn skip_white_spaces(&mut self) {
-        while let Some(Ok(Token::Whitespace(_))) = self.peek_token() {
-            self.next_token();
-        }
-    }
-
-    /// Skips all instances of [`Token::Whitespace`] and returns the next
-    /// [`Token`].
-    fn next_after_whitespaces(&mut self) -> ParseResult<Token> {
-        self.skip_white_spaces();
-
-        let t = self.next_token();
-
-        match t {
-            None => Err(self.error("unexpected EOF")),
-            Some(result) => Ok(result?),
-        }
-    }
-
-    /// Ensures that there is at least one instance of [`Token::Whitespace`]
-    /// followed by the given `expected` keyword. If so, every token before the
-    /// keyword and the keyword itself are consumed.
+    /// Same as [`Self::expect_token`] but takes [`Keyword`] variants instead.
     fn expect_keyword(&mut self, expected: Keyword) -> ParseResult<Keyword> {
-        self.next_after_whitespaces().and_then(|token| match token {
-            Token::Keyword(keyword) if keyword == expected => Ok(expected),
-
-            _ => Err(self.error(format!(
-                "unexpected token {token}, expected keyword {expected} instead"
-            ))),
-        })
+        self.expect_token(Token::Keyword(expected))
+            .map(|_| expected)
     }
 
     /// SQL statements must end with `;`, or [`Token::SemiColon`] in this
     /// context.
     fn expect_semicolon(&mut self) -> ParseResult<Token> {
-        self.expect_token(Token::SemiColon)
-            .map_err(|_| self.error(format!("missing {} statement terminator", Token::SemiColon)))
+        self.expect_token(Token::SemiColon).map_err(|_| {
+            self.error(format!(
+                "missing '{}' statement terminator",
+                Token::SemiColon
+            ))
+        })
     }
 
-    fn expect_token(&mut self, expect: Token) -> ParseResult<Token> {
-        self.next_after_whitespaces().and_then(|token| {
-            if token == expect {
+    /// Automatically fails if the `expected` token is not the next one in the
+    /// stream (after whitespaces). If it is, it will be returned back.
+    fn expect_token(&mut self, expected: Token) -> ParseResult<Token> {
+        self.next_token().and_then(|token| {
+            if token == expected {
                 Ok(token)
             } else {
-                Err(self.error(format!("expected token {expect}. Got {token} instead")))
+                Err(self.error(format!("expected token {expected}. Got {token} instead")))
             }
         })
+    }
+
+    /// Automatically fails if the next token does not match one of the given
+    /// `keywords`. If it does, then the keyword that matched is returned back.
+    fn expect_one_of(&mut self, keywords: &[Keyword]) -> ParseResult<Keyword> {
+        match self.consume_one_of(keywords) {
+            Keyword::None => {
+                let token = self.next_token()?;
+                Err(self.error(format!("expected one of {keywords:?}. Got {token} instead")))
+            }
+            keyword => Ok(keyword),
+        }
     }
 
     /// Consumes all the tokens before and including the given `optional`
@@ -427,16 +432,31 @@ impl<'i> Parser<'i> {
         self.consume_optional_token(Token::Keyword(optional))
     }
 
+    /// If the next token in the stream matches the given `optional` token, then
+    /// this function consumes the token and returns `true`. Otherwise the token
+    /// will not be consumed and the tokenizer will still be pointing at it.
     fn consume_optional_token(&mut self, optional: Token) -> bool {
-        match self.peek_after_whitespaces() {
+        match self.peek_token() {
             Some(Ok(token)) if token == &optional => {
-                self.next_token();
+                let _ = self.next_token();
                 true
             }
             _ => false,
         }
     }
 
+    /// Consumes the next token in the stream only if it matches one of the
+    /// given `keywords`. If so, the matched [`Keyword`] variant is returned.
+    /// Otherwise returns [`Keyword::None`].
+    fn consume_one_of(&mut self, keywords: &[Keyword]) -> Keyword {
+        *keywords
+            .into_iter()
+            .find(|keyword| self.consume_optional_keyword(**keyword))
+            .unwrap_or(&Keyword::None)
+    }
+
+    /// Builds an instance of [`ParserError`] giving it the current
+    /// [`Self::location`].
     fn error(&self, message: impl Into<String>) -> ParserError {
         ParserError {
             message: message.into(),
@@ -444,24 +464,45 @@ impl<'i> Parser<'i> {
         }
     }
 
-    fn peek_token(&mut self) -> Option<Result<&Token, &TokenizerError>> {
-        self.tokenizer
-            .peek()
-            .map(|result| result.as_ref().map(TokenWithLocation::token))
+    /// Skips all instances of [`Token::Whitespace`] in the stream.
+    fn skip_white_spaces(&mut self) {
+        while let Some(Ok(TokenWithLocation {
+            token: Token::Whitespace(_),
+            ..
+        })) = self.tokenizer.peek()
+        {
+            let _ = self.tokenizer.next();
+        }
     }
 
-    fn peek_after_whitespaces(&mut self) -> Option<Result<&Token, &TokenizerError>> {
+    /// Skips all instances of [`Token::Whitespace`] and returns the next
+    /// relevant [`Token`]. This function doesn't return [`Option`] because
+    /// it's used in all cases to expect some token. If we dont' expect any
+    /// more tokens (for example, after we've found [`Token::SemiColon`]) then
+    /// we just won't call this function at al.
+    fn next_token(&mut self) -> ParseResult<Token> {
         self.skip_white_spaces();
-        self.peek_token()
-    }
 
-    fn next_token(&mut self) -> Option<Result<Token, TokenizerError>> {
-        self.tokenizer.next().map(|result| {
+        let token = self.tokenizer.next().map(|result| {
             result.map(|TokenWithLocation { token, location }| {
                 self.location = location;
                 token
             })
-        })
+        });
+
+        match token {
+            None => Err(self.error("unexpected EOF")),
+            Some(result) => Ok(result?),
+        }
+    }
+
+    /// Returns a reference to the next relevant [`Token`] after whitespaces
+    /// without consuming it.
+    fn peek_token(&mut self) -> Option<Result<&Token, &TokenizerError>> {
+        self.skip_white_spaces();
+        self.tokenizer
+            .peek()
+            .map(|result| result.as_ref().map(TokenWithLocation::token))
     }
 }
 
@@ -789,7 +830,7 @@ mod tests {
         let expr = "price * discount / 100 < 10 + 20 * 30";
 
         assert_eq!(
-            Parser::new(expr).parse_expression(0),
+            Parser::new(expr).parse_expression(),
             Ok(Expression::BinaryOperation {
                 left: Box::new(Expression::BinaryOperation {
                     left: Box::new(Expression::BinaryOperation {
@@ -819,7 +860,7 @@ mod tests {
         let expr = "price * discount >= 10 - (20 + 50) / (2 * (4 + (1 - 1)))";
 
         assert_eq!(
-            Parser::new(expr).parse_expression(0),
+            Parser::new(expr).parse_expression(),
             Ok(Expression::BinaryOperation {
                 left: Box::new(Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("price".into())),
@@ -861,7 +902,7 @@ mod tests {
         let expr = "100 <= price AND price <= 200 OR price > 1000";
 
         assert_eq!(
-            Parser::new(expr).parse_expression(0),
+            Parser::new(expr).parse_expression(),
             Ok(Expression::BinaryOperation {
                 left: Box::new(Expression::BinaryOperation {
                     left: Box::new(Expression::BinaryOperation {
