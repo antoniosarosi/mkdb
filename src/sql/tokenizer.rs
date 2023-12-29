@@ -1,7 +1,6 @@
-use core::iter::Peekable;
 use std::{
     fmt::{self, Display},
-    iter,
+    iter::Peekable,
     str::Chars,
 };
 
@@ -29,10 +28,13 @@ pub(super) struct TokenWithLocation {
 }
 
 impl TokenWithLocation {
+    /// Discards the location. Used mostly for mapping:
+    /// `.map(TokenWithLocation::token_only)`.
     pub fn token_only(self) -> Token {
         self.token
     }
 
+    /// Reference to [`Token`].
     pub fn token(&self) -> &Token {
         &self.token
     }
@@ -74,6 +76,13 @@ impl<'i> Stream<'i> {
         self.chars.peek()
     }
 
+    /// Consumes one character in the stream and returns a reference to the next
+    /// one without consuming it.
+    fn peek_next(&mut self) -> Option<&char> {
+        self.next();
+        self.peek()
+    }
+
     /// Safe version of [`std::iter::TakeWhile`] that does not discard elements
     /// when `predicate` returns `false`.
     fn take_while<P: FnMut(&char) -> bool>(&mut self, predicate: P) -> TakeWhile<'_, 'i, P> {
@@ -83,7 +92,8 @@ impl<'i> Stream<'i> {
         }
     }
 
-    /// Current location in the stream.
+    /// Current location in the stream. [`Location`] is [`Copy`], no need for
+    /// references.
     fn location(&self) -> Location {
         self.location
     }
@@ -107,7 +117,8 @@ impl<'s, 'c, P: FnMut(&char) -> bool> Iterator for TakeWhile<'s, 'c, P> {
     }
 }
 
-/// Syntax error.
+/// If the tokenizer finds an error it means to syntax is not correct. Some
+/// examples are unclosed strings, unclosed operators, etc.
 #[derive(Debug, PartialEq)]
 pub(super) struct TokenizerError {
     pub message: String,
@@ -133,15 +144,18 @@ impl TokenizerError {
     }
 }
 
-/// Main parsing structure. See [`Tokenizer::tokenize`].
+/// Main parsing structure. See [`Tokenizer::next_token`].
 pub(super) struct Tokenizer<'i> {
-    /// Token stream.
+    /// Character stream.
     stream: Stream<'i>,
 }
 
 type TokenResult = Result<Token, TokenizerError>;
 
 impl<'i> Tokenizer<'i> {
+    /// Creates a new tokenizer for the given `input`. The tokenizer won't parse
+    /// anything until [`Tokenizer::next_token`] through helper functions or
+    /// iterators. See [`Tokenizer::iter_mut`] and [`Tokenizer::tokenize`].
     pub fn new(input: &'i str) -> Self {
         Self {
             stream: Stream::new(input),
@@ -186,105 +200,115 @@ impl<'i> Tokenizer<'i> {
     /// Consumes and returns the next [`Token`] variant in [`Self::stream`].
     fn next_token(&mut self) -> TokenResult {
         // Done, no more chars.
-        let Some(chr) = self.stream.next() else {
+        let Some(chr) = self.stream.peek() else {
             return Ok(Token::Eof);
         };
 
         match chr {
-            ' ' => Ok(Token::Whitespace(Whitespace::Space)),
+            ' ' => self.consume(Token::Whitespace(Whitespace::Space)),
 
-            '\t' => Ok(Token::Whitespace(Whitespace::Tab)),
+            '\t' => self.consume(Token::Whitespace(Whitespace::Tab)),
 
-            '\n' => Ok(Token::Whitespace(Whitespace::Newline)),
+            '\n' => self.consume(Token::Whitespace(Whitespace::Newline)),
 
-            '\r' => match self.stream.peek() {
+            '\r' => match self.stream.peek_next() {
                 Some('\n') => self.consume(Token::Whitespace(Whitespace::Newline)),
                 _ => Ok(Token::Whitespace(Whitespace::Newline)),
             },
 
-            '<' => match self.stream.peek() {
+            '<' => match self.stream.peek_next() {
                 Some('=') => self.consume(Token::LtEq),
                 _ => Ok(Token::Lt),
             },
 
-            '>' => match self.stream.peek() {
+            '>' => match self.stream.peek_next() {
                 Some('=') => self.consume(Token::GtEq),
                 _ => Ok(Token::Gt),
             },
 
-            '*' => Ok(Token::Mul),
+            '*' => self.consume(Token::Mul),
 
-            '/' => Ok(Token::Div),
+            '/' => self.consume(Token::Div),
 
-            '+' => Ok(Token::Plus),
+            '+' => self.consume(Token::Plus),
 
-            '-' => Ok(Token::Minus),
+            '-' => self.consume(Token::Minus),
 
-            '=' => Ok(Token::Eq),
+            '=' => self.consume(Token::Eq),
 
-            '!' => match self.stream.peek().copied() {
+            '!' => match self.stream.peek_next() {
                 Some('=') => self.consume(Token::Neq),
 
-                Some(unexpected) => Err(self.error(format!(
-                    "unexpected token '{unexpected}' while parsing '!=' operator"
-                ))),
+                Some(unexpected) => {
+                    let message =
+                        format!("unexpected token '{unexpected}' while parsing '!=' operator");
+                    self.error(message)
+                }
 
-                None => Err(self.error(format!("'!=' operator not closed"))),
+                None => self.error(format!("'!=' operator not closed")),
             },
 
-            '(' => Ok(Token::LeftParen),
+            '(' => self.consume(Token::LeftParen),
 
-            ')' => Ok(Token::RightParen),
+            ')' => self.consume(Token::RightParen),
 
-            ',' => Ok(Token::Comma),
+            ',' => self.consume(Token::Comma),
 
-            ';' => Ok(Token::SemiColon),
+            ';' => self.consume(Token::SemiColon),
 
             '"' => self.tokenize_string(),
 
-            '0'..='9' => self.tokenize_number(chr),
+            '0'..='9' => self.tokenize_number(),
 
-            _ => self.tokenize_keyword_or_identifier(chr),
+            _ if Token::is_part_of_ident_or_keyword(&chr) => self.tokenize_keyword_or_identifier(),
+
+            _ => {
+                let message = format!("unexpected or unsupported token '{chr}'");
+                self.error(message)
+            }
         }
     }
 
-    /// Consumes one character in the stream and returns a [`Result`] containing
-    /// the given [`Token`] variant. This is used for parsing operators like
-    /// `<=` where we have to peek the second character and consume it
-    /// afterwards if it matches what we expect.
+    /// Consumes one character in the stream and returns an [`Ok(Token)`] result
+    /// containing the given [`Token`] variant.
     fn consume(&mut self, token: Token) -> TokenResult {
         self.stream.next();
         Ok(token)
     }
 
+    /// Builds an instance of [`Err(TokenizerError)`] giving it the current
+    /// location of the stream.
+    fn error(&self, message: impl Into<String>) -> TokenResult {
+        Err(TokenizerError::new(message.into(), self.stream.location()))
+    }
+
     /// Parses a double quoted string like `"this one"` into [`Token::String`].
     fn tokenize_string(&mut self) -> TokenResult {
+        let Some('"') = self.stream.next() else {
+            return self.error("expected double quoted string opening");
+        };
+
         let string = self.stream.take_while(|chr| *chr != '"').collect();
 
         match self.stream.next() {
             Some('"') => Ok(Token::String(string)),
-            _ => Err(self.error("double quoted string not closed")),
+            _ => self.error("double quoted string not closed"),
         }
     }
 
     /// Tokenizes numbers like `1234`. Floats and negatives not supported.
-    fn tokenize_number(&mut self, first_digit: char) -> TokenResult {
+    fn tokenize_number(&mut self) -> TokenResult {
         Ok(Token::Number(
-            iter::once(first_digit)
-                .chain(self.stream.take_while(char::is_ascii_digit))
-                .collect(),
+            self.stream.take_while(char::is_ascii_digit).collect(),
         ))
     }
 
     /// Attempts to parse an instance of [`Token::Keyword`] or
     /// [`Token::Identifier`].
-    fn tokenize_keyword_or_identifier(&mut self, first_char: char) -> TokenResult {
-        if !Token::is_part_of_ident_or_keyword(&first_char) {
-            return Err(self.error("unexpected keyword or identifier part"));
-        }
-
-        let value: String = iter::once(first_char)
-            .chain(self.stream.take_while(Token::is_part_of_ident_or_keyword))
+    fn tokenize_keyword_or_identifier(&mut self) -> TokenResult {
+        let value: String = self
+            .stream
+            .take_while(Token::is_part_of_ident_or_keyword)
             .collect();
 
         let keyword = match value.to_uppercase().as_str() {
@@ -315,12 +339,6 @@ impl<'i> Tokenizer<'i> {
             Keyword::None => Token::Identifier(value),
             _ => Token::Keyword(keyword),
         })
-    }
-
-    /// Builds an instance of [`Err(TokenizerError)`] giving it the current
-    /// location.
-    fn error(&self, message: impl Into<String>) -> TokenizerError {
-        TokenizerError::new(message.into(), self.stream.location())
     }
 }
 
@@ -587,13 +605,49 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_error() {
+    fn tokenize_incorrect_neq_operator() {
         let sql = "SELECT * FROM table WHERE column ! other";
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
                 message: "unexpected token ' ' while parsing '!=' operator".into(),
                 location: Location { line: 1, col: 35 }
+            })
+        );
+    }
+
+    #[test]
+    fn tokenize_unclosed_neq_operator() {
+        let sql = "SELECT * FROM table WHERE column !";
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Err(TokenizerError {
+                message: "'!=' operator not closed".into(),
+                location: Location { line: 1, col: 35 }
+            })
+        );
+    }
+
+    #[test]
+    fn tokenize_double_quoted_string_not_closed() {
+        let sql = "SELECT * FROM table WHERE string = \"not closed";
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Err(TokenizerError {
+                message: "double quoted string not closed".into(),
+                location: Location { line: 1, col: 47 }
+            })
+        );
+    }
+
+    #[test]
+    fn tokenize_unsupported_token() {
+        let sql = "SELECT * FROM ^ WHERE unsupported = 1;";
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Err(TokenizerError {
+                message: "unexpected or unsupported token '^'".into(),
+                location: Location { line: 1, col: 15 }
             })
         );
     }
