@@ -4,7 +4,7 @@ use super::{
     statement::{
         BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression, Statement, Value,
     },
-    token::{Keyword, Token},
+    token::{Keyword, KeywordList, Token},
     tokenizer::{self, Location, TokenWithLocation, Tokenizer, TokenizerError},
 };
 
@@ -34,7 +34,7 @@ impl From<TokenizerError> for ParserError {
 
 pub(crate) type ParseResult<T> = Result<T, ParserError>;
 
-/// TODP (Top-Down Operator Precedence) recursive descent parser. See this
+/// TDOP (Top-Down Operator Precedence) recursive descent parser. See this
 /// [tutorial] for an introduction to the algorithms used here and see also the
 /// [sqlparser] Github repo for a more complete and robust SQL parser written in
 /// Rust. This one is simply a toy parser implemented for the sake of it.
@@ -73,9 +73,11 @@ impl<'i> Parser<'i> {
     /// Parses a single SQL statement in the input string. If the statement
     /// terminator is not found then it returns [`Err`].
     fn parse_statement(&mut self) -> ParseResult<Statement> {
-        let Token::Keyword(keyword) = self.next_token()? else {
+        let token = self.next_token()?;
+
+        let Token::Keyword(keyword) = token else {
             return Err(self.error(format!(
-                "unexpected initial token. Statements must start with one of the supported keywords."
+                "unexpected initial token '{token}'. Statements must start with one of the supported keywords"
             )));
         };
 
@@ -156,9 +158,7 @@ impl<'i> Parser<'i> {
                 }))
             }
 
-            Keyword::None => Err(self.error("expected SQL statement")),
-
-            _ => Err(self.error(format!("unexpected initial statement keyword: {keyword}"))),
+            _ => Err(self.error(format!("unexpected initial keyword '{keyword}'"))),
         };
 
         if statement.is_ok() {
@@ -168,7 +168,7 @@ impl<'i> Parser<'i> {
         statement
     }
 
-    /// TODP recursive descent consists of 3 functions that call each other
+    /// TDOP recursive descent consists of 3 functions that call each other
     /// recursively:
     ///
     /// - [`Self::parse_expr`]
@@ -184,7 +184,7 @@ impl<'i> Parser<'i> {
         self.parse_expr(0)
     }
 
-    /// Main TODP loop.
+    /// Main TDOP loop.
     fn parse_expr(&mut self, precedence: u8) -> ParseResult<Expression> {
         let mut expr = self.parse_prefix()?;
         let mut next_precedence = self.get_next_precedence();
@@ -220,9 +220,7 @@ impl<'i> Parser<'i> {
     /// Parses an infix expression in the form of
     /// (left expr | operator | right expr).
     fn parse_infix(&mut self, left: Expression, precedence: u8) -> ParseResult<Expression> {
-        let token = self.next_token()?;
-
-        let operator = match token {
+        let operator = match self.next_token()? {
             Token::Plus => BinaryOperator::Plus,
             Token::Minus => BinaryOperator::Minus,
             Token::Div => BinaryOperator::Div,
@@ -236,8 +234,8 @@ impl<'i> Parser<'i> {
             Token::Keyword(Keyword::And) => BinaryOperator::And,
             Token::Keyword(Keyword::Or) => BinaryOperator::Or,
 
-            _ => Err(self.error(format!(
-                "expected an operator: [+, -, *, /, =, !=, <, >, <=, >=, AND, OR]. Got {token} instead"
+            unexpected => Err(self.error(format!(
+                "expected an operator: [+, -, *, /, =, !=, <, >, <=, >=, AND, OR]. Got '{unexpected}' instead"
             )))?,
         };
 
@@ -268,8 +266,9 @@ impl<'i> Parser<'i> {
     fn parse_column(&mut self) -> ParseResult<Column> {
         let name = self.parse_identifier()?;
 
-        let Token::Keyword(keyword) = self.next_token()? else {
-            return Err(self.error("expected data type"));
+        let token = self.next_token()?;
+        let Token::Keyword(keyword) = token else {
+            return Err(self.error(format!("expected data type. Got '{token}' instead")));
         };
 
         let data_type = match keyword {
@@ -281,15 +280,17 @@ impl<'i> Parser<'i> {
                 let length = match self.next_token()? {
                     Token::Number(num) => num
                         .parse()
-                        .map_err(|_| self.error("incorrect varchar length"))?,
-                    _ => Err(self.error("expected varchar length"))?,
+                        .map_err(|_| self.error("incorrect VARCHAR length definition"))?,
+                    unexpected => Err(self.error(format!(
+                        "expected VARCHAR length definition. Got '{unexpected}' instead"
+                    )))?,
                 };
 
                 self.expect_token(Token::RightParen)?;
                 DataType::Varchar(length)
             }
 
-            unexpected => Err(self.error(format!("unexpected keyword {unexpected}")))?,
+            _ => Err(self.error(format!("unexpected or unsupported keyword {keyword}")))?,
         };
 
         let constraint = match self.consume_one_of(&[Keyword::Primary, Keyword::Unique]) {
@@ -357,7 +358,7 @@ impl<'i> Parser<'i> {
     fn parse_identifier(&mut self) -> ParseResult<String> {
         self.next_token().and_then(|token| match token {
             Token::Identifier(ident) => Ok(ident),
-            _ => Err(self.error(format!("expected identifier. Got {token} instead"))),
+            _ => Err(self.error(format!("expected identifier. Got '{token}' instead"))),
         })
     }
 
@@ -409,7 +410,9 @@ impl<'i> Parser<'i> {
             if token == expected {
                 Ok(token)
             } else {
-                Err(self.error(format!("expected token {expected}. Got {token} instead")))
+                Err(self.error(format!(
+                    "expected token '{expected}'. Got '{token}' instead"
+                )))
             }
         })
     }
@@ -420,7 +423,10 @@ impl<'i> Parser<'i> {
         match self.consume_one_of(keywords) {
             Keyword::None => {
                 let token = self.next_token()?;
-                Err(self.error(format!("expected one of {keywords:?}. Got {token} instead")))
+                Err(self.error(format!(
+                    "expected one of {}. Got '{token}' instead",
+                    KeywordList(keywords)
+                )))
             }
             keyword => Ok(keyword),
         }
@@ -467,10 +473,11 @@ impl<'i> Parser<'i> {
     /// Skips all instances of [`Token::Whitespace`] in the stream.
     fn skip_white_spaces(&mut self) {
         while let Some(Ok(TokenWithLocation {
-            token: Token::Whitespace(_),
-            ..
+            variant: Token::Whitespace(_),
+            location,
         })) = self.tokenizer.peek()
         {
+            self.location = *location;
             let _ = self.tokenizer.next();
         }
     }
@@ -484,9 +491,9 @@ impl<'i> Parser<'i> {
         self.skip_white_spaces();
 
         let token = self.tokenizer.next().map(|result| {
-            result.map(|TokenWithLocation { token, location }| {
-                self.location = location;
-                token
+            result.map(|token| {
+                self.location = token.location;
+                token.variant
             })
         });
 
@@ -923,6 +930,151 @@ mod tests {
                     operator: BinaryOperator::Gt,
                     right: Box::new(Expression::Value(Value::Number("1000".into()))),
                 })
+            })
+        )
+    }
+
+    #[test]
+    fn parse_unterminated_statement() {
+        let sql = "SELECT * FROM users ";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "missing ';' statement terminator".into(),
+                location: Location { line: 1, col: 20 }
+            })
+        )
+    }
+
+    #[test]
+    fn parse_unexpected_initial_token() {
+        let sql = "/ SELECT * FROM users;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "unexpected initial token '/'. Statements must start with one of the supported keywords".into(),
+                location: Location { line: 1, col: 1 }
+            })
+        )
+    }
+
+    #[test]
+    fn parse_unexpected_initial_keyword() {
+        let sql = "VARCHAR * FROM users;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "unexpected initial keyword 'VARCHAR'".into(),
+                location: Location { line: 1, col: 1 }
+            })
+        )
+    }
+
+    #[test]
+    fn parse_unexpected_expression_token() {
+        let sql = "SELECT ) FROM table;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: String::from(
+                    "expected an identifier, raw value or opening parenthesis. Got ')' instead"
+                ),
+                location: Location { line: 1, col: 8 }
+            })
+        )
+    }
+
+    #[test]
+    fn expect_keyword() {
+        let sql = "SELECT * VALUES users";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "expected token 'FROM'. Got 'VALUES' instead".into(),
+                location: Location { line: 1, col: 10 }
+            })
+        )
+    }
+
+    #[test]
+    fn expect_one_of_keywords() {
+        let sql = "DROP VALUES test";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "expected one of ['DATABASE', 'TABLE']. Got 'VALUES' instead".into(),
+                location: Location { line: 1, col: 6 }
+            })
+        )
+    }
+
+    #[test]
+    fn expect_data_type() {
+        let sql = "CREATE TABLE test (id INCORRECT);";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "expected data type. Got 'INCORRECT' instead".into(),
+                location: Location { line: 1, col: 23 }
+            })
+        )
+    }
+
+    #[test]
+    fn expect_identifier() {
+        let sql = "INSERT INTO 1 VALUES (2);";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "expected identifier. Got '1' instead".into(),
+                location: Location { line: 1, col: 13 }
+            })
+        )
+    }
+
+    #[test]
+    fn expect_varchar_length() {
+        let sql = "CREATE TABLE test (name VARCHAR(test));";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "expected VARCHAR length definition. Got 'test' instead".into(),
+                location: Location { line: 1, col: 33 }
+            })
+        )
+    }
+
+    #[test]
+    fn required_parenthesis() {
+        let sql = "INSERT INTO test column VALUES 2;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "opening parenthesis is required".into(),
+                location: Location { line: 1, col: 17 }
+            })
+        )
+    }
+
+    #[test]
+    fn unexpected_eof() {
+        let sql = "SELECT ";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                message: "unexpected EOF".into(),
+                location: Location { line: 1, col: 7 }
             })
         )
     }

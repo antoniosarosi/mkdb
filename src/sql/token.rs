@@ -124,6 +124,22 @@ impl Display for Keyword {
     }
 }
 
+pub(super) struct KeywordList<'k>(pub &'k [Keyword]);
+
+impl<'k> Display for KeywordList<'k> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        if self.0.len() >= 1 {
+            write!(f, "'{}'", self.0[0])?;
+            for keyword in self.0[1..].iter() {
+                f.write_str(", ")?;
+                write!(f, "'{keyword}'")?;
+            }
+        }
+        f.write_str("]")
+    }
+}
+
 impl Display for Whitespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

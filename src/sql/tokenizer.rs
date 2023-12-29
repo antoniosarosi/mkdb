@@ -9,9 +9,9 @@ use super::token::{Keyword, Token, Whitespace};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Location {
     /// Line number.
-    line: usize,
+    pub line: usize,
     /// Column number.
-    col: usize,
+    pub col: usize,
 }
 
 impl Default for Location {
@@ -23,7 +23,7 @@ impl Default for Location {
 /// Stores both the [`Token`] and its starting location in the input string.
 #[derive(Debug, PartialEq)]
 pub(super) struct TokenWithLocation {
-    pub token: Token,
+    pub variant: Token,
     pub location: Location,
 }
 
@@ -31,12 +31,12 @@ impl TokenWithLocation {
     /// Discards the location. Used mostly for mapping:
     /// `.map(TokenWithLocation::token_only)`.
     pub fn token_only(self) -> Token {
-        self.token
+        self.variant
     }
 
     /// Reference to [`Token`].
     pub fn token(&self) -> &Token {
-        &self.token
+        &self.variant
     }
 }
 
@@ -185,8 +185,12 @@ impl<'i> Tokenizer<'i> {
     ) -> Option<Result<TokenWithLocation, TokenizerError>> {
         let location = self.stream.location();
 
-        self.optional_next_token()
-            .map(|result| result.map(|token| TokenWithLocation { token, location }))
+        self.optional_next_token().map(|result| {
+            result.map(|token| TokenWithLocation {
+                variant: token,
+                location,
+            })
+        })
     }
 
     /// Discards [`Token::Eof`] as [`Option::None`]. Useful for iterators.
