@@ -69,10 +69,16 @@ impl Token {
     }
 }
 
+impl From<&Keyword> for Token {
+    fn from(keyword: &Keyword) -> Self {
+        Token::Keyword(*keyword)
+    }
+}
+
 impl Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Eof => f.write_str("Eof"),
+            Self::Eof => f.write_str("EOF"),
             Self::Whitespace(whitespace) => write!(f, "{whitespace}"),
             Self::Keyword(keyword) => write!(f, "{keyword}"),
             Self::Identifier(identifier) => f.write_str(&identifier),
@@ -121,22 +127,6 @@ impl Display for Keyword {
             Self::Varchar => f.write_str("VARCHAR"),
             Self::None => f.write_str("_"),
         }
-    }
-}
-
-pub(super) struct KeywordList<'k>(pub &'k [Keyword]);
-
-impl<'k> Display for KeywordList<'k> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[")?;
-        if self.0.len() >= 1 {
-            write!(f, "'{}'", self.0[0])?;
-            for keyword in self.0[1..].iter() {
-                f.write_str(", ")?;
-                write!(f, "'{keyword}'")?;
-            }
-        }
-        f.write_str("]")
     }
 }
 

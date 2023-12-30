@@ -1,8 +1,4 @@
-use std::{
-    fmt::{self, Display},
-    iter::Peekable,
-    str::Chars,
-};
+use std::{iter::Peekable, str::Chars};
 
 use super::token::{Keyword, Token, Whitespace};
 
@@ -117,30 +113,52 @@ impl<'s, 'c, P: FnMut(&char) -> bool> Iterator for TakeWhile<'s, 'c, P> {
     }
 }
 
+/// Some of the possible syntax errors that the [`Tokenizer`] can find.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ErrorKind {
+    UnexpectedOrUnsupportedToken(char),
+
+    UnexpectedWhileParsingOperator { unexpected: char, operator: Token },
+
+    OperatorNotClosed(Token),
+
+    StringNotClosed,
+
+    Other(String),
+}
+
+impl From<ErrorKind> for String {
+    fn from(kind: ErrorKind) -> String {
+        match kind {
+            ErrorKind::UnexpectedOrUnsupportedToken(token) => {
+                format!("unexpected or unsupported token '{token}'")
+            }
+
+            ErrorKind::UnexpectedWhileParsingOperator {
+                unexpected,
+                operator,
+            } => format!("unexpected token '{unexpected}' while parsing '{operator}' operator"),
+
+            ErrorKind::StringNotClosed => "double quoted string not closed".into(),
+
+            ErrorKind::OperatorNotClosed(operator) => format!("'{operator}' operator not closed"),
+
+            ErrorKind::Other(message) => message,
+        }
+    }
+}
+
 /// If the tokenizer finds an error it means to syntax is not correct. Some
 /// examples are unclosed strings, unclosed operators, etc.
 #[derive(Debug, PartialEq)]
 pub(super) struct TokenizerError {
-    pub message: String,
+    pub kind: ErrorKind,
     pub location: Location,
 }
 
-impl Display for TokenizerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} at line {} column {}",
-            self.message, self.location.line, self.location.col
-        )
-    }
-}
-
 impl TokenizerError {
-    fn new(message: String, location: Location) -> Self {
-        Self {
-            message: String::from(message),
-            location,
-        }
+    fn new(kind: ErrorKind, location: Location) -> Self {
+        Self { kind, location }
     }
 }
 
@@ -244,12 +262,14 @@ impl<'i> Tokenizer<'i> {
                 Some('=') => self.consume(Token::Neq),
 
                 Some(unexpected) => {
-                    let message =
-                        format!("unexpected token '{unexpected}' while parsing '!=' operator");
-                    self.error(message)
+                    let error_kind = ErrorKind::UnexpectedWhileParsingOperator {
+                        unexpected: *unexpected,
+                        operator: Token::Neq,
+                    };
+                    self.error(error_kind)
                 }
 
-                None => self.error(format!("'!=' operator not closed")),
+                None => self.error(ErrorKind::OperatorNotClosed(Token::Neq)),
             },
 
             '(' => self.consume(Token::LeftParen),
@@ -267,8 +287,8 @@ impl<'i> Tokenizer<'i> {
             _ if Token::is_part_of_ident_or_keyword(&chr) => self.tokenize_keyword_or_identifier(),
 
             _ => {
-                let message = format!("unexpected or unsupported token '{chr}'");
-                self.error(message)
+                let error_kind = ErrorKind::UnexpectedOrUnsupportedToken(*chr);
+                self.error(error_kind)
             }
         }
     }
@@ -282,21 +302,19 @@ impl<'i> Tokenizer<'i> {
 
     /// Builds an instance of [`Err(TokenizerError)`] giving it the current
     /// location of the stream.
-    fn error(&self, message: impl Into<String>) -> TokenResult {
-        Err(TokenizerError::new(message.into(), self.stream.location()))
+    fn error(&self, kind: ErrorKind) -> TokenResult {
+        Err(TokenizerError::new(kind, self.stream.location()))
     }
 
     /// Parses a double quoted string like `"this one"` into [`Token::String`].
     fn tokenize_string(&mut self) -> TokenResult {
-        let Some('"') = self.stream.next() else {
-            return self.error("expected double quoted string opening");
-        };
+        self.stream.next(); // Consume opening quote.
 
         let string = self.stream.take_while(|chr| *chr != '"').collect();
 
         match self.stream.next() {
             Some('"') => Ok(Token::String(string)),
-            _ => self.error("double quoted string not closed"),
+            _ => self.error(ErrorKind::StringNotClosed),
         }
     }
 
@@ -392,7 +410,7 @@ impl<'i> IntoIterator for Tokenizer<'i> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Keyword, Token, Tokenizer, Whitespace};
+    use super::{ErrorKind, Keyword, Token, Tokenizer, Whitespace};
     use crate::sql::tokenizer::{Location, TokenizerError};
 
     #[test]
@@ -614,7 +632,10 @@ mod tests {
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
-                message: "unexpected token ' ' while parsing '!=' operator".into(),
+                kind: ErrorKind::UnexpectedWhileParsingOperator {
+                    unexpected: ' ',
+                    operator: Token::Neq
+                },
                 location: Location { line: 1, col: 35 }
             })
         );
@@ -626,7 +647,7 @@ mod tests {
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
-                message: "'!=' operator not closed".into(),
+                kind: ErrorKind::OperatorNotClosed(Token::Neq),
                 location: Location { line: 1, col: 35 }
             })
         );
@@ -638,7 +659,7 @@ mod tests {
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
-                message: "double quoted string not closed".into(),
+                kind: ErrorKind::StringNotClosed,
                 location: Location { line: 1, col: 47 }
             })
         );
@@ -650,7 +671,7 @@ mod tests {
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
-                message: "unexpected or unsupported token '^'".into(),
+                kind: ErrorKind::UnexpectedOrUnsupportedToken('^'),
                 location: Location { line: 1, col: 15 }
             })
         );

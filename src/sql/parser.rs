@@ -4,30 +4,101 @@ use super::{
     statement::{
         BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression, Statement, Value,
     },
-    token::{Keyword, KeywordList, Token},
+    token::{Keyword, Token},
     tokenizer::{self, Location, TokenWithLocation, Tokenizer, TokenizerError},
 };
 
+/// Parser error kind.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ParserError {
-    message: String,
-    location: Location,
+enum ErrorKind {
+    TokenizerError(tokenizer::ErrorKind),
+
+    Expected { expected: Token, found: Token },
+
+    ExpectedOneOf { expected: Vec<Token>, found: Token },
+
+    UnexpectedOrUnsupported(Token),
+
+    UnexpectedEof,
+
+    Other(String),
 }
 
-impl ParserError {
-    fn new(message: impl Into<String>, location: Location) -> Self {
-        Self {
-            message: message.into(),
-            location,
+impl ErrorKind {
+    /// We need a display value for [`Token`] variants that hold inner data. We
+    /// could also use something like [strum], but it's unnecessary for now.
+    ///
+    /// [strum]: https://docs.rs/strum/latest/strum/derive.EnumDiscriminants.html
+    fn expected_token_string(token: &Token) -> String {
+        match token {
+            Token::Identifier(_) => "identifier".into(),
+            Token::Number(_) => "number".into(),
+            Token::String(_) => "string".into(),
+            _ => format!("{token}"),
         }
     }
 }
 
+impl From<ErrorKind> for String {
+    fn from(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::TokenizerError(err) => err.into(),
+
+            ErrorKind::Expected { expected, found } => format!(
+                "expected {}, found '{found}' instead",
+                ErrorKind::expected_token_string(&expected)
+            ),
+
+            ErrorKind::ExpectedOneOf { expected, found } => {
+                let mut one_of = String::new(); // Token1, Token2 or Token3
+
+                one_of.push_str(&ErrorKind::expected_token_string(&expected[0]));
+
+                for token in &expected[1..expected.len() - 1] {
+                    one_of.push_str(", ");
+                    one_of.push_str(&ErrorKind::expected_token_string(token));
+                }
+
+                if expected.len() > 1 {
+                    one_of.push_str("or ");
+                    one_of.push_str(&ErrorKind::expected_token_string(
+                        &expected[expected.len() - 1],
+                    ));
+                }
+
+                format!("expected {one_of}. Found {found} instead")
+            }
+
+            ErrorKind::UnexpectedOrUnsupported(token) => {
+                format!("unexpected or unsupported token {token}")
+            }
+
+            ErrorKind::UnexpectedEof => format!("unexpected EOF"),
+
+            ErrorKind::Other(message) => message,
+        }
+    }
+}
+
+/// Holds the error kind and location of the token where the error was
+/// originated.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParserError {
+    kind: ErrorKind,
+    location: Location,
+}
+
+impl ParserError {
+    fn new(kind: ErrorKind, location: Location) -> Self {
+        Self { kind, location }
+    }
+}
+
 impl From<TokenizerError> for ParserError {
-    fn from(err: TokenizerError) -> Self {
+    fn from(TokenizerError { kind, location }: TokenizerError) -> Self {
         Self {
-            message: format!("syntax error: {}", err.message),
-            location: err.location,
+            kind: ErrorKind::TokenizerError(kind),
+            location,
         }
     }
 }
@@ -73,15 +144,7 @@ impl<'i> Parser<'i> {
     /// Parses a single SQL statement in the input string. If the statement
     /// terminator is not found then it returns [`Err`].
     fn parse_statement(&mut self) -> ParseResult<Statement> {
-        let token = self.next_token()?;
-
-        let Token::Keyword(keyword) = token else {
-            return Err(self.error(format!(
-                "unexpected initial token '{token}'. Statements must start with one of the supported keywords"
-            )));
-        };
-
-        let statement = match keyword {
+        let statement = match self.expect_one_of(&Self::supported_statements())? {
             Keyword::Select => {
                 let columns = self.parse_comma_separated_expressions()?;
                 self.expect_keyword(Keyword::From)?;
@@ -158,11 +221,11 @@ impl<'i> Parser<'i> {
                 }))
             }
 
-            _ => Err(self.error(format!("unexpected initial keyword '{keyword}'"))),
+            _ => unreachable!(),
         };
 
         if statement.is_ok() {
-            self.expect_semicolon()?;
+            self.expect_token(Token::SemiColon)?;
         }
 
         statement
@@ -211,9 +274,15 @@ impl<'i> Parser<'i> {
                 Ok(expr)
             }
 
-            unexpected => Err(self.error(format!(
-                "expected an identifier, raw value or opening parenthesis. Got '{unexpected}' instead",
-            ))),
+            unexpected => Err(self.error(ErrorKind::ExpectedOneOf {
+                expected: vec![
+                    Token::Identifier(Default::default()),
+                    Token::Number(Default::default()),
+                    Token::String(Default::default()),
+                    Token::LeftParen,
+                ],
+                found: unexpected,
+            })),
         }
     }
 
@@ -234,9 +303,10 @@ impl<'i> Parser<'i> {
             Token::Keyword(Keyword::And) => BinaryOperator::And,
             Token::Keyword(Keyword::Or) => BinaryOperator::Or,
 
-            unexpected => Err(self.error(format!(
-                "expected an operator: [+, -, *, /, =, !=, <, >, <=, >=, AND, OR]. Got '{unexpected}' instead"
-            )))?,
+            unexpected => Err(self.error(ErrorKind::ExpectedOneOf {
+                expected: Self::supported_operators(),
+                found: unexpected,
+            }))?,
         };
 
         Ok(Expression::BinaryOperation {
@@ -266,31 +336,29 @@ impl<'i> Parser<'i> {
     fn parse_column(&mut self) -> ParseResult<Column> {
         let name = self.parse_identifier()?;
 
-        let token = self.next_token()?;
-        let Token::Keyword(keyword) = token else {
-            return Err(self.error(format!("expected data type. Got '{token}' instead")));
-        };
-
-        let data_type = match keyword {
+        let data_type = match self.expect_one_of(&Self::supported_data_types())? {
             Keyword::Int => DataType::Int,
 
             Keyword::Varchar => {
                 self.expect_token(Token::LeftParen)?;
 
                 let length = match self.next_token()? {
-                    Token::Number(num) => num
-                        .parse()
-                        .map_err(|_| self.error("incorrect VARCHAR length definition"))?,
-                    unexpected => Err(self.error(format!(
-                        "expected VARCHAR length definition. Got '{unexpected}' instead"
-                    )))?,
+                    Token::Number(num) => num.parse().map_err(|_| {
+                        self.error(ErrorKind::Other(
+                            "incorrect VARCHAR length definition".into(),
+                        ))
+                    })?,
+                    unexpected => Err(self.error(ErrorKind::Expected {
+                        expected: Token::Number(Default::default()),
+                        found: unexpected,
+                    }))?,
                 };
 
                 self.expect_token(Token::RightParen)?;
                 DataType::Varchar(length)
             }
 
-            _ => Err(self.error(format!("unexpected or unsupported keyword {keyword}")))?,
+            _ => unreachable!(),
         };
 
         let constraint = match self.consume_one_of(&[Keyword::Primary, Keyword::Unique]) {
@@ -323,7 +391,11 @@ impl<'i> Parser<'i> {
         let left_paren = self.consume_optional_token(Token::LeftParen);
 
         if required_parenthesis && !left_paren {
-            return Err(self.error("opening parenthesis is required"));
+            let found = self.next_token()?;
+            return Err(self.error(ErrorKind::Expected {
+                expected: Token::LeftParen,
+                found,
+            }));
         }
 
         let mut results = vec![subparser(self)?];
@@ -358,7 +430,11 @@ impl<'i> Parser<'i> {
     fn parse_identifier(&mut self) -> ParseResult<String> {
         self.next_token().and_then(|token| match token {
             Token::Identifier(ident) => Ok(ident),
-            _ => Err(self.error(format!("expected identifier. Got '{token}' instead"))),
+
+            _ => Err(self.error(ErrorKind::Expected {
+                expected: Token::Identifier(Default::default()),
+                found: token,
+            })),
         })
     }
 
@@ -392,17 +468,6 @@ impl<'i> Parser<'i> {
             .map(|_| expected)
     }
 
-    /// SQL statements must end with `;`, or [`Token::SemiColon`] in this
-    /// context.
-    fn expect_semicolon(&mut self) -> ParseResult<Token> {
-        self.expect_token(Token::SemiColon).map_err(|_| {
-            self.error(format!(
-                "missing '{}' statement terminator",
-                Token::SemiColon
-            ))
-        })
-    }
-
     /// Automatically fails if the `expected` token is not the next one in the
     /// stream (after whitespaces). If it is, it will be returned back.
     fn expect_token(&mut self, expected: Token) -> ParseResult<Token> {
@@ -410,23 +475,27 @@ impl<'i> Parser<'i> {
             if token == expected {
                 Ok(token)
             } else {
-                Err(self.error(format!(
-                    "expected token '{expected}'. Got '{token}' instead"
-                )))
+                Err(self.error(ErrorKind::Expected {
+                    expected,
+                    found: token,
+                }))
             }
         })
     }
 
     /// Automatically fails if the next token does not match one of the given
     /// `keywords`. If it does, then the keyword that matched is returned back.
-    fn expect_one_of(&mut self, keywords: &[Keyword]) -> ParseResult<Keyword> {
+    fn expect_one_of<'k, K>(&mut self, keywords: &'k K) -> ParseResult<Keyword>
+    where
+        &'k K: IntoIterator<Item = &'k Keyword>,
+    {
         match self.consume_one_of(keywords) {
             Keyword::None => {
                 let token = self.next_token()?;
-                Err(self.error(format!(
-                    "expected one of {}. Got '{token}' instead",
-                    KeywordList(keywords)
-                )))
+                Err(self.error(ErrorKind::ExpectedOneOf {
+                    expected: Self::tokens_from_keywords(keywords),
+                    found: token,
+                }))
             }
             keyword => Ok(keyword),
         }
@@ -454,7 +523,10 @@ impl<'i> Parser<'i> {
     /// Consumes the next token in the stream only if it matches one of the
     /// given `keywords`. If so, the matched [`Keyword`] variant is returned.
     /// Otherwise returns [`Keyword::None`].
-    fn consume_one_of(&mut self, keywords: &[Keyword]) -> Keyword {
+    fn consume_one_of<'k, K>(&mut self, keywords: &'k K) -> Keyword
+    where
+        &'k K: IntoIterator<Item = &'k Keyword>,
+    {
         *keywords
             .into_iter()
             .find(|keyword| self.consume_optional_keyword(**keyword))
@@ -463,9 +535,9 @@ impl<'i> Parser<'i> {
 
     /// Builds an instance of [`ParserError`] giving it the current
     /// [`Self::location`].
-    fn error(&self, message: impl Into<String>) -> ParserError {
+    fn error(&self, kind: ErrorKind) -> ParserError {
         ParserError {
-            message: message.into(),
+            kind,
             location: self.location,
         }
     }
@@ -498,7 +570,7 @@ impl<'i> Parser<'i> {
         });
 
         match token {
-            None => Err(self.error("unexpected EOF")),
+            None => Err(self.error(ErrorKind::UnexpectedEof)),
             Some(result) => Ok(result?),
         }
     }
@@ -510,6 +582,49 @@ impl<'i> Parser<'i> {
         self.tokenizer
             .peek()
             .map(|result| result.as_ref().map(TokenWithLocation::token))
+    }
+
+    /// Maps [`Keyword`] variants to [`Token`] variants.
+    fn tokens_from_keywords<'k, K>(keywords: &'k K) -> Vec<Token>
+    where
+        &'k K: IntoIterator<Item = &'k Keyword>,
+    {
+        keywords.into_iter().map(From::from).collect()
+    }
+}
+
+// Supported statements and keywords.
+impl<'i> Parser<'i> {
+    fn supported_statements() -> Vec<Keyword> {
+        vec![
+            Keyword::Select,
+            Keyword::Create,
+            Keyword::Update,
+            Keyword::Insert,
+            Keyword::Delete,
+            Keyword::Drop,
+        ]
+    }
+
+    fn supported_data_types() -> Vec<Keyword> {
+        vec![Keyword::Int, Keyword::Varchar]
+    }
+
+    fn supported_operators() -> Vec<Token> {
+        vec![
+            Token::Plus,
+            Token::Minus,
+            Token::Div,
+            Token::Mul,
+            Token::Eq,
+            Token::Neq,
+            Token::Gt,
+            Token::GtEq,
+            Token::Lt,
+            Token::LtEq,
+            Token::Keyword(Keyword::And),
+            Token::Keyword(Keyword::Or),
+        ]
     }
 }
 
@@ -941,7 +1056,7 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "missing ';' statement terminator".into(),
+                kind: ErrorKind::UnexpectedEof,
                 location: Location { line: 1, col: 20 }
             })
         )
@@ -954,7 +1069,10 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "unexpected initial token '/'. Statements must start with one of the supported keywords".into(),
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: Parser::tokens_from_keywords(&Parser::supported_statements()),
+                    found: Token::Div,
+                },
                 location: Location { line: 1, col: 1 }
             })
         )
@@ -967,9 +1085,12 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "unexpected initial keyword 'VARCHAR'".into(),
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: Parser::tokens_from_keywords(&Parser::supported_statements()),
+                    found: Token::Keyword(Keyword::Varchar),
+                },
                 location: Location { line: 1, col: 1 }
-            })
+            }),
         )
     }
 
@@ -980,9 +1101,15 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: String::from(
-                    "expected an identifier, raw value or opening parenthesis. Got ')' instead"
-                ),
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: vec![
+                        Token::Identifier(Default::default()),
+                        Token::Number(Default::default()),
+                        Token::String(Default::default()),
+                        Token::LeftParen,
+                    ],
+                    found: Token::RightParen,
+                },
                 location: Location { line: 1, col: 8 }
             })
         )
@@ -995,7 +1122,10 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "expected token 'FROM'. Got 'VALUES' instead".into(),
+                kind: ErrorKind::Expected {
+                    expected: Token::Keyword(Keyword::From),
+                    found: Token::Keyword(Keyword::Values)
+                },
                 location: Location { line: 1, col: 10 }
             })
         )
@@ -1008,7 +1138,13 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "expected one of ['DATABASE', 'TABLE']. Got 'VALUES' instead".into(),
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: vec![
+                        Token::Keyword(Keyword::Database),
+                        Token::Keyword(Keyword::Table),
+                    ],
+                    found: Token::Keyword(Keyword::Values)
+                },
                 location: Location { line: 1, col: 6 }
             })
         )
@@ -1021,7 +1157,10 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "expected data type. Got 'INCORRECT' instead".into(),
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: Parser::tokens_from_keywords(&Parser::supported_data_types()),
+                    found: Token::Identifier("INCORRECT".into())
+                },
                 location: Location { line: 1, col: 23 }
             })
         )
@@ -1034,7 +1173,10 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "expected identifier. Got '1' instead".into(),
+                kind: ErrorKind::Expected {
+                    expected: Token::Identifier(Default::default()),
+                    found: Token::Number("1".into())
+                },
                 location: Location { line: 1, col: 13 }
             })
         )
@@ -1047,7 +1189,10 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "expected VARCHAR length definition. Got 'test' instead".into(),
+                kind: ErrorKind::Expected {
+                    expected: Token::Number(Default::default()),
+                    found: Token::Identifier("test".into())
+                },
                 location: Location { line: 1, col: 33 }
             })
         )
@@ -1060,8 +1205,11 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "opening parenthesis is required".into(),
-                location: Location { line: 1, col: 17 }
+                kind: ErrorKind::Expected {
+                    expected: Token::LeftParen,
+                    found: Token::Identifier("column".into())
+                },
+                location: Location { line: 1, col: 18 }
             })
         )
     }
@@ -1073,7 +1221,7 @@ mod tests {
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                message: "unexpected EOF".into(),
+                kind: ErrorKind::UnexpectedEof,
                 location: Location { line: 1, col: 7 }
             })
         )
