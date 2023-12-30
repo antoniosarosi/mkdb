@@ -151,18 +151,18 @@ impl<'i> Parser<'i> {
 
                 let (from, r#where) = self.parse_from_and_optional_where()?;
 
-                Ok(Statement::Select {
+                Statement::Select {
                     columns,
                     from,
                     r#where,
-                })
+                }
             }
 
             Keyword::Create => {
                 let keyword = self.expect_one_of(&[Keyword::Database, Keyword::Table])?;
                 let identifier = self.parse_identifier()?;
 
-                Ok(Statement::Create(match keyword {
+                Statement::Create(match keyword {
                     Keyword::Database => Create::Database(identifier),
 
                     Keyword::Table => Create::Table {
@@ -171,7 +171,7 @@ impl<'i> Parser<'i> {
                     },
 
                     _ => unreachable!(),
-                }))
+                })
             }
 
             Keyword::Update => {
@@ -181,11 +181,11 @@ impl<'i> Parser<'i> {
                 let columns = self.parse_comma_separated_expressions()?;
                 let r#where = self.parse_optional_where()?;
 
-                Ok(Statement::Update {
+                Statement::Update {
                     table,
                     columns,
                     r#where,
-                })
+                }
             }
 
             Keyword::Insert => {
@@ -196,39 +196,36 @@ impl<'i> Parser<'i> {
                 self.expect_keyword(Keyword::Values)?;
                 let values = self.parse_comma_separated_expressions()?;
 
-                Ok(Statement::Insert {
+                Statement::Insert {
                     into,
                     columns,
                     values,
-                })
+                }
             }
 
             Keyword::Delete => {
                 self.expect_keyword(Keyword::From)?;
                 let (from, r#where) = self.parse_from_and_optional_where()?;
 
-                Ok(Statement::Delete { from, r#where })
+                Statement::Delete { from, r#where }
             }
 
             Keyword::Drop => {
                 let keyword = self.expect_one_of(&[Keyword::Database, Keyword::Table])?;
                 let identifier = self.parse_identifier()?;
 
-                Ok(Statement::Drop(match keyword {
+                Statement::Drop(match keyword {
                     Keyword::Database => Drop::Database(identifier),
                     Keyword::Table => Drop::Table(identifier),
                     _ => unreachable!(),
-                }))
+                })
             }
 
             _ => unreachable!(),
         };
 
-        if statement.is_ok() {
-            self.expect_token(Token::SemiColon)?;
-        }
-
-        statement
+        self.expect_token(Token::SemiColon)?;
+        Ok(statement)
     }
 
     /// TDOP recursive descent consists of 3 functions that call each other
