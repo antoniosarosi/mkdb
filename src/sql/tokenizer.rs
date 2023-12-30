@@ -166,6 +166,8 @@ impl TokenizerError {
 pub(super) struct Tokenizer<'i> {
     /// Character stream.
     stream: Stream<'i>,
+    /// True once we've returned [`Token::Eof`].
+    reached_eof: bool,
 }
 
 type TokenResult = Result<Token, TokenizerError>;
@@ -177,6 +179,7 @@ impl<'i> Tokenizer<'i> {
     pub fn new(input: &'i str) -> Self {
         Self {
             stream: Stream::new(input),
+            reached_eof: false,
         }
     }
 
@@ -196,33 +199,34 @@ impl<'i> Tokenizer<'i> {
             .collect()
     }
 
-    /// Same as [`Self::optional_next_token`] but stores the starting location
-    /// of the token as well.
+    /// Returns [`None`] once [`Token::Eof`] has been returned. Useful for
+    /// iterators.
     fn optional_next_token_with_location(
         &mut self,
     ) -> Option<Result<TokenWithLocation, TokenizerError>> {
-        let location = self.stream.location();
-
-        self.optional_next_token().map(|result| {
-            result.map(|token| TokenWithLocation {
-                variant: token,
-                location,
-            })
-        })
+        if !self.reached_eof {
+            Some(self.next_token_with_location())
+        } else {
+            None
+        }
     }
 
-    /// Discards [`Token::Eof`] as [`Option::None`]. Useful for iterators.
-    fn optional_next_token(&mut self) -> Option<TokenResult> {
-        match self.next_token() {
-            Ok(Token::Eof) => None,
-            result => Some(result),
-        }
+    /// Same as [`Self::next_token`] but returns the starting location
+    /// of the token as well.
+    fn next_token_with_location(&mut self) -> Result<TokenWithLocation, TokenizerError> {
+        let location = self.stream.location();
+
+        self.next_token().map(|token| TokenWithLocation {
+            variant: token,
+            location,
+        })
     }
 
     /// Consumes and returns the next [`Token`] variant in [`Self::stream`].
     fn next_token(&mut self) -> TokenResult {
         // Done, no more chars.
         let Some(chr) = self.stream.peek() else {
+            self.reached_eof = true;
             return Ok(Token::Eof);
         };
 
@@ -431,6 +435,7 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Identifier("users".into()),
                 Token::SemiColon,
+                Token::Eof,
             ])
         );
     }
@@ -464,6 +469,7 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("100".into()),
                 Token::SemiColon,
+                Token::Eof,
             ])
         );
     }
@@ -509,7 +515,8 @@ mod tests {
                 Token::Eq,
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("1".into()),
-                Token::SemiColon
+                Token::SemiColon,
+                Token::Eof,
             ])
         );
     }
@@ -545,6 +552,7 @@ mod tests {
                 Token::RightParen,
                 Token::RightParen,
                 Token::SemiColon,
+                Token::Eof,
             ])
         );
     }
@@ -583,6 +591,7 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("100".into()),
                 Token::SemiColon,
+                Token::Eof,
             ])
         );
     }
@@ -622,6 +631,7 @@ mod tests {
                 Token::Number("20".into()),
                 Token::RightParen,
                 Token::SemiColon,
+                Token::Eof,
             ])
         );
     }

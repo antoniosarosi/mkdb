@@ -1051,13 +1051,53 @@ mod tests {
 
     #[test]
     fn parse_unterminated_statement() {
-        let sql = "SELECT * FROM users ";
+        let sql = "SELECT * FROM users";
 
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
-                kind: ErrorKind::UnexpectedEof,
+                kind: ErrorKind::Expected {
+                    expected: Token::SemiColon,
+                    found: Token::Eof
+                },
                 location: Location { line: 1, col: 20 }
+            })
+        )
+    }
+
+    #[test]
+    fn parse_partial_select() {
+        let sql = "SELECT";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                kind: ErrorKind::ExpectedOneOf {
+                    expected: vec![
+                        Token::Identifier(Default::default()),
+                        Token::Number(Default::default()),
+                        Token::String(Default::default()),
+                        Token::LeftParen
+                    ],
+                    found: Token::Eof
+                },
+                location: Location { line: 1, col: 7 }
+            })
+        )
+    }
+
+    #[test]
+    fn parse_partial_insert() {
+        let sql = "INSERT";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Err(ParserError {
+                kind: ErrorKind::Expected {
+                    expected: Token::Keyword(Keyword::Into),
+                    found: Token::Eof
+                },
+                location: Location { line: 1, col: 7 }
             })
         )
     }
@@ -1210,19 +1250,6 @@ mod tests {
                     found: Token::Identifier("column".into())
                 },
                 location: Location { line: 1, col: 18 }
-            })
-        )
-    }
-
-    #[test]
-    fn unexpected_eof() {
-        let sql = "SELECT ";
-
-        assert_eq!(
-            Parser::new(sql).parse_statement(),
-            Err(ParserError {
-                kind: ErrorKind::UnexpectedEof,
-                location: Location { line: 1, col: 7 }
             })
         )
     }
