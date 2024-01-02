@@ -1,3 +1,5 @@
+//! Simple SQL parser and AST for our toy database.
+
 mod parser;
 mod statement;
 mod token;

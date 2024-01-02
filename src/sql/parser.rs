@@ -378,6 +378,19 @@ impl<'i> Parser<'i> {
         })
     }
 
+    /// Parses the next identifier in the stream or fails if it's not an
+    /// identifier.
+    fn parse_identifier(&mut self) -> ParseResult<String> {
+        self.next_token().and_then(|token| match token {
+            Token::Identifier(ident) => Ok(ident),
+
+            _ => Err(self.error(ErrorKind::Expected {
+                expected: Token::Identifier(Default::default()),
+                found: token,
+            })),
+        })
+    }
+
     /// Takes a `subparser` as input and calls it after every instance of
     /// [`Token::Comma`].
     fn parse_comma_separated<T>(
@@ -385,9 +398,9 @@ impl<'i> Parser<'i> {
         mut subparser: impl FnMut(&mut Self) -> ParseResult<T>,
         required_parenthesis: bool,
     ) -> ParseResult<Vec<T>> {
-        let left_paren = self.consume_optional_token(Token::LeftParen);
+        let found_left_paren = self.consume_optional_token(Token::LeftParen);
 
-        if required_parenthesis && !left_paren {
+        if required_parenthesis && !found_left_paren {
             let found = self.next_token()?;
             return Err(self.error(ErrorKind::Expected {
                 expected: Token::LeftParen,
@@ -400,7 +413,7 @@ impl<'i> Parser<'i> {
             results.push(subparser(self)?);
         }
 
-        if left_paren {
+        if found_left_paren {
             self.expect_token(Token::RightParen)?;
         }
 
@@ -420,19 +433,6 @@ impl<'i> Parser<'i> {
     /// Expects a list of identifiers, not complete expressions.
     fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
         self.parse_comma_separated(Self::parse_identifier, true)
-    }
-
-    /// Parses the next identifier in the stream or fails if it's not an
-    /// identifier.
-    fn parse_identifier(&mut self) -> ParseResult<String> {
-        self.next_token().and_then(|token| match token {
-            Token::Identifier(ident) => Ok(ident),
-
-            _ => Err(self.error(ErrorKind::Expected {
-                expected: Token::Identifier(Default::default()),
-                found: token,
-            })),
-        })
     }
 
     /// Parses the entire `WHERE` clause if the next token is [`Keyword::Where`].
@@ -541,41 +541,48 @@ impl<'i> Parser<'i> {
 
     /// Skips all instances of [`Token::Whitespace`] in the stream.
     fn skip_white_spaces(&mut self) {
-        while let Some(Ok(TokenWithLocation {
-            variant: Token::Whitespace(_),
-            location,
-        })) = self.tokenizer.peek()
-        {
-            self.location = *location;
-            let _ = self.tokenizer.next();
+        while let Some(Ok(Token::Whitespace(_))) = self.peek_token_in_stream() {
+            let _ = self.next_token_in_stream();
         }
     }
 
     /// Skips all instances of [`Token::Whitespace`] and returns the next
     /// relevant [`Token`]. This function doesn't return [`Option`] because
     /// it's used in all cases to expect some token. If we dont' expect any
-    /// more tokens (for example, after we've found [`Token::SemiColon`]) then
-    /// we just won't call this function at al.
+    /// more tokens (for example, after we've found [`Token::SemiColon`] or
+    /// [`Token::Eof`]) then we just won't call this function at all.
     fn next_token(&mut self) -> ParseResult<Token> {
         self.skip_white_spaces();
-
-        let token = self.tokenizer.next().map(|result| {
-            result.map(|token| {
-                self.location = token.location;
-                token.variant
-            })
-        });
-
-        match token {
-            None => Err(self.error(ErrorKind::UnexpectedEof)),
-            Some(result) => Ok(result?),
-        }
+        self.next_token_in_stream()
     }
 
     /// Returns a reference to the next relevant [`Token`] after whitespaces
     /// without consuming it.
     fn peek_token(&mut self) -> Option<Result<&Token, &TokenizerError>> {
         self.skip_white_spaces();
+        self.peek_token_in_stream()
+    }
+
+    /// Consumes and returns the next [`Token`] in the stream updating
+    /// [`Self::location`] in the process, removing the need to use
+    /// [`TokenWithLocation`] instances. This method should not be called after
+    /// [`Token::Eof`] has been returned once since it will error with
+    /// [`ErrorKind::UnexpectedEof`].
+    fn next_token_in_stream(&mut self) -> ParseResult<Token> {
+        match self.tokenizer.peek() {
+            None => Err(self.error(ErrorKind::UnexpectedEof)),
+
+            _ => {
+                let token = self.tokenizer.next().unwrap()?;
+                self.location = token.location;
+                Ok(token.variant)
+            }
+        }
+    }
+
+    /// Same as [`Self::next_token_in_stream`] but does not consume the next
+    /// token.
+    fn peek_token_in_stream(&mut self) -> Option<Result<&Token, &TokenizerError>> {
         self.tokenizer
             .peek()
             .map(|result| result.as_ref().map(TokenWithLocation::token))
@@ -592,6 +599,7 @@ impl<'i> Parser<'i> {
 
 // Supported statements and keywords.
 impl<'i> Parser<'i> {
+    /// Initial SQL statements that we support. For now, CRUD stuff only.
     fn supported_statements() -> Vec<Keyword> {
         vec![
             Keyword::Select,
@@ -603,10 +611,12 @@ impl<'i> Parser<'i> {
         ]
     }
 
+    /// Data type that can be used for column definitions.
     fn supported_data_types() -> Vec<Keyword> {
         vec![Keyword::Int, Keyword::Varchar]
     }
 
+    /// Supported binary operators.
     fn supported_operators() -> Vec<Token> {
         vec![
             Token::Plus,
