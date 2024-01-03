@@ -643,27 +643,23 @@ impl<H> Drop for Page<H> {
 impl<H: Debug> Debug for Page<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Page")
-            .field("header", unsafe { self.header.as_ref() })
+            .field("header", self.header())
+            .field("meta", self.meta())
             .field("number", &self.number)
             .field("size", &self.size)
-            .field("slots", unsafe { &self.slot_array_non_null().as_ref() })
+            .field("slots", &self.slot_array())
             .field_with("blocks", |f| {
                 let mut list = f.debug_list();
-                unsafe {
-                    self.slot_array_non_null()
-                        .as_ref()
-                        .iter()
-                        .for_each(|offset| {
-                            let block = self.block_at_offset(*offset as _).as_ref();
-                            list.entry_with(|f| {
-                                f.debug_struct("Block")
-                                    .field("start", &offset)
-                                    .field("end", &(*offset + block.total_size()))
-                                    .field("size", &block.size)
-                                    .finish()
-                            });
-                        })
-                }
+                self.slot_array().iter().for_each(|offset| {
+                    let block = unsafe { self.block_at_offset(*offset as _).as_ref() };
+                    list.entry_with(|f| {
+                        f.debug_struct("Block")
+                            .field("start", &offset)
+                            .field("end", &(*offset + block.total_size()))
+                            .field("size", &block.size)
+                            .finish()
+                    });
+                });
 
                 list.finish()
             })

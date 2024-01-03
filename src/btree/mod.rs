@@ -1753,7 +1753,7 @@ mod tests {
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
-    ///
+    /// 
     ///                           DELETE 15
     ///                               |
     ///                               V
@@ -2091,7 +2091,7 @@ mod tests {
     /// check if everything still works. This is what we're going to build:
     ///
     /// ```text
-    ///
+    /// 
     ///                                                INSERT 36
     ///                                                    |
     ///                                                    v
@@ -2156,7 +2156,7 @@ mod tests {
     /// Delete on `order = 6`.
     ///
     /// ```text
-    ///
+    /// 
     ///                                                      DELETE (34,35,36)
     ///                                                              |
     ///                                                              V
