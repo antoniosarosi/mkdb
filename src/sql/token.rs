@@ -81,7 +81,7 @@ impl Display for Token {
             Self::Eof => f.write_str("EOF"),
             Self::Whitespace(whitespace) => write!(f, "{whitespace}"),
             Self::Keyword(keyword) => write!(f, "{keyword}"),
-            Self::Identifier(identifier) => f.write_str(&identifier),
+            Self::Identifier(identifier) => f.write_str(identifier),
             Self::String(string) => write!(f, "\"{string}\""),
             Self::Number(number) => write!(f, "{number}"),
             Self::Eq => f.write_str("="),

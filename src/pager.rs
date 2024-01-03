@@ -128,7 +128,7 @@ impl<F: Seek + Read> Pager<F> {
             if page_size >= block_size {
                 (page_size, page_size * page_number, 0)
             } else {
-                let offset = page_number * page_size & !(block_size - 1);
+                let offset = (page_number * page_size) & !(block_size - 1);
                 (block_size, offset, page_number * page_size - offset)
             }
         };
@@ -138,7 +138,7 @@ impl<F: Seek + Read> Pager<F> {
 
         // Read page into memory.
         let mut buf = vec![0; capacity];
-        self.io.read(&mut buf[..])?;
+        let _ = self.io.read(&mut buf[..])?;
 
         // If page_size < block_size remove the other pages from the buffer.
         // TODO: Cache or do something with the pages that were not read here.

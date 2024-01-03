@@ -338,7 +338,7 @@ impl<H> Page<H> {
                     block.as_ref().total_size() as usize,
                 );
             }
-            self.slot_array_mut()[i] = destination_offset as u16;
+            self.slot_array_mut()[i] = destination_offset;
         }
 
         self.header_mut().last_used_block = destination_offset;
@@ -393,7 +393,7 @@ impl<H> Page<H> {
         // enough space to initialize the new one.
         unsafe {
             let mut block = self.block_at_offset(offset);
-            block.as_mut().size = Self::aligned_size_of(data) as u16;
+            block.as_mut().size = Self::aligned_size_of(data);
             BlockHeader::content_of(block).as_mut()[..data.len()].copy_from_slice(data);
         }
 
@@ -539,7 +539,7 @@ impl<H> Page<H> {
     fn header(&self) -> &PageHeader<H> {
         // SAFETY: `self.header` points to the beginning of the page, where
         // the [`PageHeader`] struct is located.
-        unsafe { &self.header.as_ref() }
+        unsafe { self.header.as_ref() }
     }
 
     /// Mutable reference to the page header.

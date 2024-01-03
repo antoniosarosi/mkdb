@@ -288,7 +288,7 @@ impl<'i> Tokenizer<'i> {
 
             '0'..='9' => self.tokenize_number(),
 
-            _ if Token::is_part_of_ident_or_keyword(&chr) => self.tokenize_keyword_or_identifier(),
+            _ if Token::is_part_of_ident_or_keyword(chr) => self.tokenize_keyword_or_identifier(),
 
             _ => {
                 let error_kind = ErrorKind::UnexpectedOrUnsupportedToken(*chr);

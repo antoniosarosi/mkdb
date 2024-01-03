@@ -73,7 +73,7 @@ impl From<ErrorKind> for String {
                 format!("unexpected or unsupported token {token}")
             }
 
-            ErrorKind::UnexpectedEof => format!("unexpected EOF"),
+            ErrorKind::UnexpectedEof => "unexpected EOF".into(),
 
             ErrorKind::Other(message) => message,
         }

@@ -354,7 +354,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         self.balance(leaf_node, parents)?;
         self.cache.flush_write_queue_to_disk()?;
 
-        return Ok(Some(entry.value));
+        Ok(Some(entry.value))
     }
 
     /// # BTree search algorithm
@@ -468,7 +468,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         let node = self.node_mut(search.page)?;
         let entry = mem::replace(&mut node.entries[search.index], substitute);
 
-        return Ok(Some((entry, leaf_node)));
+        Ok(Some((entry, leaf_node)))
     }
 
     /// Traverses the tree all the way down to the leaf nodes, following the
@@ -536,7 +536,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         // is allowed to underflow past that point, but if it reaches 0 keys it
         // has completely underflowed and tree height must be decreased.
         let is_underflow =
-            (node.entries.len() < max_keys * 2 / 3 && !node.is_root()) || node.entries.len() == 0;
+            (node.entries.len() < max_keys * 2 / 3 && !node.is_root()) || node.entries.is_empty();
 
         // Done, this node didn't overflow or underflow.
         if !is_overflow && !is_underflow {
@@ -565,7 +565,7 @@ impl<F: Seek + Read + Write> BTree<F> {
             // leave the root empty.
             let mut old_root = Node::new_at(self.allocate_page());
             let root = self.node_mut(page)?;
-            old_root.extend_by_draining(root);
+            old_root.append(root);
 
             // Now make the new node a child of the empty root.
             root.children.push(old_root.page);
@@ -702,7 +702,7 @@ impl<F: Seek + Read + Write> BTree<F> {
             num_siblings_per_side *= 2;
         };
 
-        let left_siblings = index.checked_sub(num_siblings_per_side).unwrap_or(0)..index;
+        let left_siblings = index.saturating_sub(num_siblings_per_side)..index;
 
         let right_siblings =
             (index + 1)..min(index + num_siblings_per_side + 1, parent.children.len());
@@ -727,15 +727,15 @@ impl<F: Seek + Read + Write> BTree<F> {
     fn redistribute_entries_and_children(
         &mut self,
         parent_page: PageNumber,
-        siblings: &mut Vec<(u32, usize)>,
+        siblings: &mut [(u32, usize)],
     ) -> io::Result<()> {
         let mut entries_to_balance = Vec::new();
         let mut children_to_balance = Vec::new();
 
         for node in siblings.iter_mut() {
             let node = self.cache.get_mut(node.0)?;
-            entries_to_balance.extend(node.entries.drain(..));
-            children_to_balance.extend(node.children.drain(..));
+            entries_to_balance.append(&mut node.entries);
+            children_to_balance.append(&mut node.children);
         }
 
         let num_siblings = siblings.len();
@@ -901,47 +901,14 @@ impl<F: Seek + Read + Write> BTree<F> {
 
         let mut string = String::from('[');
 
-        string.push_str(&self.to_json(&nodes[0])?);
+        string.push_str(&nodes[0].json());
 
         for node in &nodes[1..] {
             string.push(',');
-            string.push_str(&self.to_json(&node)?);
+            string.push_str(&node.json());
         }
 
         string.push(']');
-
-        Ok(string)
-    }
-
-    fn to_json(&mut self, node: &Node) -> io::Result<String> {
-        let mut string = format!("{{\"page\":{},\"entries\":[", node.page);
-
-        if node.entries.len() >= 1 {
-            #[allow(unused_variables)]
-            let Entry { key, value } = node.entries[0];
-            // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
-            string.push_str(&format!("{}", key));
-
-            #[allow(unused_variables)]
-            for Entry { key, value } in &node.entries[1..] {
-                string.push(',');
-                // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
-                string.push_str(&format!("{}", key));
-            }
-        }
-
-        string.push_str("],\"children\":[");
-
-        if node.children.len() >= 1 {
-            string.push_str(&format!("{}", node.children[0]));
-
-            for child in &node.children[1..] {
-                string.push_str(&format!(",{child}"));
-            }
-        }
-
-        string.push(']');
-        string.push('}');
 
         Ok(string)
     }

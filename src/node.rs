@@ -106,11 +106,11 @@ impl Node {
         node
     }
 
-    /// Consumes all the entries and children in `other` and appends them to
-    /// `self`.
-    pub fn extend_by_draining(&mut self, other: &mut Node) {
-        self.entries.extend(other.entries.drain(..));
-        self.children.extend(other.children.drain(..));
+    /// Moves all the entries and children in `other` into `self`, leaving
+    /// other empty.
+    pub fn append(&mut self, other: &mut Node) {
+        self.entries.append(&mut other.entries);
+        self.children.append(&mut other.children);
     }
 
     pub fn kind(&self) -> NodeKind {
@@ -132,6 +132,39 @@ impl Node {
     /// also be a leaf node if it has no children.
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
+    }
+
+    pub fn json(&self) -> String {
+        let mut string = format!("{{\"page\":{},\"entries\":[", self.page);
+
+        if !self.entries.is_empty() {
+            #[allow(unused_variables)]
+            let Entry { key, value } = self.entries[0];
+            // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+            string.push_str(&format!("{}", key));
+
+            #[allow(unused_variables)]
+            for Entry { key, value } in &self.entries[1..] {
+                string.push(',');
+                // string.push_str(&format!("{{\"key\":{key},\"value\":{value}}}"));
+                string.push_str(&format!("{}", key));
+            }
+        }
+
+        string.push_str("],\"children\":[");
+
+        if !self.children.is_empty() {
+            string.push_str(&format!("{}", self.children[0]));
+
+            for child in &self.children[1..] {
+                string.push_str(&format!(",{child}"));
+            }
+        }
+
+        string.push(']');
+        string.push('}');
+
+        string
     }
 }
 
