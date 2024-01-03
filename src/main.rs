@@ -4,11 +4,8 @@
 #![feature(pointer_is_aligned)]
 
 mod btree;
-mod cache;
-mod node;
 mod os;
-mod page;
-mod pager;
+mod paging;
 mod sql;
 
 use std::io;

@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, mem};
 
-use crate::{
+use crate::paging::{
     cache::MemPage,
     pager::{Page, PageNumber},
 };

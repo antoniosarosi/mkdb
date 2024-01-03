@@ -1,5 +1,7 @@
 //! Disk BTree data structure. See [`BTree`] for details.
 
+pub(crate) mod node;
+
 use std::{
     cmp::min,
     fs::File,
@@ -9,11 +11,14 @@ use std::{
     path::Path,
 };
 
+use node::{Entry, Node};
+
 use crate::{
-    cache::Cache,
-    node::{Entry, Node},
     os::{Disk, HardwareBlockSize},
-    pager::{PageNumber, Pager},
+    paging::{
+        cache::Cache,
+        pager::{PageNumber, Pager},
+    },
 };
 
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
@@ -870,7 +875,7 @@ impl<F: Seek + Read + Write> BTree<F> {
         // TODO: Free list.
         self.cache
             .pager
-            .write_page(crate::pager::Page {
+            .write_page(crate::paging::pager::Page {
                 number: page,
                 content: Vec::from("FREE PAGE".as_bytes()),
             })
@@ -941,7 +946,7 @@ mod tests {
     use std::{io, mem};
 
     use super::{BTree, BALANCE_SIBLINGS_PER_SIDE};
-    use crate::{cache::Cache, pager::Pager};
+    use crate::paging::{cache::Cache, pager::Pager};
 
     /// Allows us to build an entire tree manually and then compare it to an
     /// actual [`BTree`] structure. See tests below for examples.
@@ -1748,7 +1753,7 @@ mod tests {
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
-    /// 
+    ///
     ///                           DELETE 15
     ///                               |
     ///                               V
@@ -2086,7 +2091,7 @@ mod tests {
     /// check if everything still works. This is what we're going to build:
     ///
     /// ```text
-    /// 
+    ///
     ///                                                INSERT 36
     ///                                                    |
     ///                                                    v
@@ -2151,7 +2156,7 @@ mod tests {
     /// Delete on `order = 6`.
     ///
     /// ```text
-    /// 
+    ///
     ///                                                      DELETE (34,35,36)
     ///                                                              |
     ///                                                              V

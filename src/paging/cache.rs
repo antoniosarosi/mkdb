@@ -13,7 +13,7 @@ const MAX_CACHE_SIZE: usize = 1024;
 /// Minimum allowed cache size.
 const MIN_CACHE_SIZE: usize = 3;
 
-use crate::pager::{Page, PageNumber, Pager};
+use super::pager::{Page, PageNumber, Pager};
 
 /// The buffer pool is made of a list of frames. Each frame holds a parsed page,
 /// a reference bit a dirty bit.
@@ -432,11 +432,11 @@ where
 mod tests {
     use std::io;
 
-    use super::Cache;
-    use crate::{
-        node::{Entry, Node},
-        pager::{PageNumber, Pager},
+    use super::{
+        super::pager::{PageNumber, Pager},
+        Cache,
     };
+    use crate::btree::node::{Entry, Node};
 
     impl Node {
         fn with_entries(mut self, entries: Vec<Entry>) -> Self {
