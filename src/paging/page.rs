@@ -1,27 +1,51 @@
-//! Generic slotted page implementation. At this layer we don't care whether
-//! pages are used for BTree nodes or tuple storage, we only deal with binary
-//! data. This allows us to implement either index organized storage like
-//! SQLite or tuple oriented storage like Postgres on top of the [`Page`]
-//! struct.
+//! Slotted page implementation tuned for index organized storage. Initially
+//! this was going to be a generic slotted page implementation that would serve
+//! as a building block for both index organized storage (like SQLite) and tuple
+//! oriented storage (like Postgres), but the idea has been dropped in favor of
+//! simplicity.
+//!
+//! The main difference is that when using index organized storage we never
+//! point to slot indexes from outside the page, so there's no need to attempt
+//! to maintain their current position for as long as possible. This [commit]
+//! contains the last version that used to do so. Another benefit of the current
+//! aproach is that BTree nodes and disk pages are the same thing, because
+//! everything is stored in a BTree, so we need less generics, less types and
+//! less code. Take a look at the [btree.c] file from SQLite 2.X.X for the
+//! inspiration.
 //!
 //! Check these lectures for some background on slotted pages and data storage:
 //!
 //! - [F2023 #03 - Database Storage Part 1 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=DJ5u5HrbcMk)
 //! - [F2023 #04 - Database Storage Part 2 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=Ra50bFHkeM8)
+//!
+//! [commit]: https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs
+//! [btree.c]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c
 
-use std::{alloc::Layout, collections::BinaryHeap, fmt::Debug, mem, ptr::NonNull};
+use std::{
+    alloc::{self, Layout},
+    cmp::Ordering,
+    collections::BinaryHeap,
+    fmt::Debug,
+    mem,
+    ptr::NonNull,
+};
 
-/// Generic slotted page header. Located at the beginning of each page and does
+use super::pager::PageNumber;
+
+pub const BLOCK_HEADER_SIZE: u16 = mem::size_of::<BlockHeader>() as _;
+pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
+
+/// BTree slotted page header. Located at the beginning of each page and does
 /// not contain variable length data:
 ///
 /// ```text
-///                                 HEADER                                       CONTENT
-/// +------------------------------------------------------------------+-----------------------+
-/// | +------------+-------------+------------+---------------+------+ |                       |
-/// | | free_space | total_slots | null_slots | last_used_blk | meta | |                       |
-/// | +------------+-------------+------------+---------------+------+ |                       |
-/// +------------------------------------------------------------------+-----------------------+
-///                                         PAGE
+///                           HEADER                             CONTENT
+/// +-----------------------------------------------------+--------------------+
+/// | +------------+-------------+---------------+------+ |                    |
+/// | | free_space | total_slots | last_used_blk | meta | |                    |
+/// | +------------+-------------+---------------+------+ |                    |
+/// +-----------------------------------------------------+--------------------+
+///                                    PAGE
 /// ```
 ///
 /// The alignment and size of this struct doesn't matter. Actual data is
@@ -29,18 +53,15 @@ use std::{alloc::Layout, collections::BinaryHeap, fmt::Debug, mem, ptr::NonNull}
 /// bytes. See [`Page`] for more details.
 #[derive(Debug)]
 #[repr(C)]
-struct PageHeader<H> {
+pub(crate) struct PageHeader {
     /// Amount of free bytes in this page.
     free_space: u16,
     /// Length of the slot array.
     total_slots: u16,
-    /// Number of Slots that aren't pointing to anything.
-    null_slots: u16,
     /// Offset of the last used block.
     last_used_block: u16,
-    /// Additional page metadata defined by the user. This must not allocate
-    /// anything, it should be a self contained struct.
-    meta: H,
+    /// Last child of this page.
+    pub right_child: PageNumber,
 }
 
 /// Located at the beginning of each used block. For now we only need to store
@@ -64,6 +85,10 @@ struct PageHeader<H> {
 struct BlockHeader {
     /// Size of this block excluding the header (data only).
     size: u16,
+    ///
+    pub left_child: PageNumber,
+    /// First overflow page. This is 0 if the block did not overflow.
+    pub overflow: PageNumber,
 }
 
 impl BlockHeader {
@@ -78,34 +103,9 @@ impl BlockHeader {
 
     /// Total size of the block including the header.
     fn total_size(&self) -> u16 {
-        self.size + mem::size_of::<Self>() as u16
+        self.size + BLOCK_HEADER_SIZE
     }
 }
-
-/// Decides what to do with the slot when it's removed. See [`Page`] for more
-/// details.
-enum RemoveSlotStrategy {
-    /// Sets the slot value to 0. All of the others slots do not change. Useful
-    /// for delaying BTree index updates as much as possible when using tuple
-    /// oriented storage.
-    SetNull,
-    /// Compacts the slot array as if we removed from a [`Vec`]. In the worst
-    /// case all the remaining slots change their position and all pointers to
-    /// them must be updated.
-    Compact,
-}
-
-/// The result of an insert operation in the page.
-struct Insert {
-    /// The newly created slot index.
-    new_slot: u16,
-    /// Changes made to previous slots to accommodate data.
-    /// Format is `(previous_location, new_location)`.
-    changes: Vec<(u16, u16)>,
-}
-
-/// For convenience.
-type InsertResult = Result<Insert, ()>;
 
 /// Slotted page. The page maintains a "slot array" located after the header
 /// that grows towards the right. On the opposite side is where used blocks are
@@ -127,7 +127,9 @@ type InsertResult = Result<Insert, ()>;
 ///                     +---------------------+
 /// ```
 ///
-/// This is useful for 2 reasons:
+/// This is useful for 2 reasons, described below.
+///
+/// # Cheap Sorting or Reordering
 ///
 /// First, we can rearrange blocks without changing their physical location. We
 /// only need to change the offsets in the slot array. For example, if we wanted
@@ -151,11 +153,15 @@ type InsertResult = Result<Insert, ()>;
 /// Now the third block becomes the first one in the list, second block stays
 /// the same and the first block becomes the last. Changing offsets in the slot
 /// array is much cheaper than moving the blocks around the page. This is needed
-/// for BTree pages to sort entries.
+/// for BTree pages to sort entries, and this is the only feature implemented
+/// here.
 ///
-/// The second reason this is useful is because we can maintain the same slot
+/// # Slot Positions After Delete Operations
+///
+/// The second reason this is useful is because we could maintain the same slot
 /// number for the rest of the blocks when one of them is deleted. For example,
-/// if we deleted block 2, we don't have to compact the slot array like this:
+/// if we deleted block 2 in the figure above, we don't have to compact the slot
+/// array like this:
 ///
 /// ```text
 ///   HEADER SLOT ARRAY      FREE SPACE                USED BLOCKS
@@ -170,7 +176,7 @@ type InsertResult = Result<Insert, ()>;
 /// ```
 ///
 /// If we did this, then the slot ID of block 1 would change from 2 to 1. But
-/// instead we can just set the slot to NULL or zero:
+/// instead we could simply set the slot to NULL or zero:
 ///
 /// ```text
 ///   HEADER   SLOT ARRAY        FREE SPACE             USED BLOCKS
@@ -186,7 +192,10 @@ type InsertResult = Result<Insert, ()>;
 ///
 /// The remaining slot IDs do not change. This is useful for deleting tuples
 /// and delaying index updates as much as possible if using tuple oriented
-/// storage (we are not doing so currently).
+/// storage, which we are not doing, so you'll never see NULL slots.
+/// Check this [commit](https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs)
+/// for the initial implementation which used to manage both null and non-null
+/// slot indexes.
 ///
 /// # Alignment
 ///
@@ -197,91 +206,217 @@ type InsertResult = Result<Insert, ()>;
 /// have some schema like `[Int, Varchar(255), Bool]`, we can't worry about
 /// individual column alignment here because we're only storing binary data, we
 /// know nothing about what's inside.
-struct Page<H> {
+pub(crate) struct Page {
     /// Page number on disk.
-    number: u32,
+    pub number: PageNumber,
     /// We need to know where the page ends.
     size: u16,
-    /// Page header.
-    header: NonNull<PageHeader<H>>,
+    /// Data that comes from memory and doesn't fit in this page.
+    overflow: Vec<(BlockHeader, Vec<u8>, u16)>,
+    /// Page header and pointer to the main memory buffer of this page.
+    header: NonNull<PageHeader>,
 }
 
-impl<H> Page<H> {
-    pub fn new(number: u32, buf: NonNull<[u8]>) -> Self {
-        let size = buf.len() as u16;
-        let mut header = buf.cast::<PageHeader<H>>();
+impl Page {
+    /// Allocates a new empty [`Page`] of the given `size`.
+    pub fn new(number: PageNumber, size: u16) -> Self {
+        let header = unsafe {
+            let header = NonNull::new_unchecked(alloc::alloc_zeroed(Self::layout(size))).cast();
 
-        if !buf.is_aligned_to(mem::align_of::<BlockHeader>()) {
-            panic!(
-                "In-memory pages must me aligned to {}",
-                mem::align_of::<BlockHeader>()
-            );
-        }
+            header.write(PageHeader {
+                total_slots: 0,
+                last_used_block: size,
+                free_space: Self::usable_space(size),
+                right_child: 0,
+            });
 
-        // SAFETY: `buf` must be a valid pointer.
-        unsafe {
-            let header = header.as_mut();
-            header.total_slots = 0;
-            header.null_slots = 0;
-            header.last_used_block = size;
-            header.free_space = Self::usable_space(size as usize) as u16;
-        }
+            header
+        };
 
         Self {
             number,
             size,
+            overflow: Vec::new(),
             header,
         }
     }
 
-    /// Removes all null slots from the slot array. For example:
-    ///
-    /// ```text
-    ///   HEADER         SLOT ARRAY          FREE SPACE           USED BLOCKS
-    ///  +------+----+----+----+----+----+--------------+---------+---------+---------+
-    ///  |      | O1 |NULL| O2 |NULL| O3 |  ->       <- | BLOCK 3 | BLOCK 2 | BLOCK 1 |
-    ///  +------+----+----+----+----+----+--------------+---------+---------+---------+
-    /// ```
-    ///
-    /// would turn into:
-    ///
-    /// ```text
-    ///   HEADER   SLOT ARRAY        FREE SPACE             USED BLOCKS
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    ///  |      | O1 | O2 | O3 | ->            <- | BLOCK 3 | BLOCK 2 | BLOCK 1 |
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    /// ```
-    ///
-    /// The changes made to each slot are returned in a list of two-tuples with
-    /// the format `(previous_index, new_index)`.
-    pub fn compact_slots(&mut self) -> Vec<(u16, u16)> {
-        let slots = self.slot_array_mut();
+    /// Returns `true` if this page can fit `data` somehow. We don't know if we
+    /// need to remove fragmentation yet, but we know the data will fit.
+    pub fn can_fit(&self, data: &[u8]) -> bool {
+        // The total size includes the 2 byte slot pointer.
+        let total_size = Self::total_block_size_for(data) + SLOT_SIZE;
 
-        // Find first null slot.
-        let Some(mut dest) = slots.iter().position(|offset| *offset == 0) else {
-            return vec![];
-        };
+        self.header().free_space >= total_size
+    }
 
-        let mut changes = Vec::new();
+    /// Attempts to insert the given `data` in this page with all the available
+    /// methods that we have. If possible, data will be inserted without moving
+    /// blocks arount, otherwise optimizations have to be made.
+    pub fn try_insert(&mut self, data: &[u8]) -> Result<(), ()> {
+        self.try_insert_at(self.header().total_slots, data)
+    }
 
-        // We'll use two pointers, dest and source. We copy from source to dest.
-        let mut source = dest + 1;
-
-        while source < slots.len() {
-            if slots[source] != 0 {
-                slots[dest] = slots[source];
-                changes.push((source as u16, dest as u16));
-                dest += 1;
-            }
-            source += 1;
+    /// Same as [`Self::try_insert`] but receives the slot index that should
+    /// point to the data once inserted in the page.
+    pub fn try_insert_at(&mut self, index: u16, data: &[u8]) -> Result<(), ()> {
+        // TODO: Optimize
+        if !self.can_fit(data) {
+            return Err(());
         }
 
-        // NOTE: Null slots already count as free space, so this shouldn't run.
-        // self.header_mut().free_space += ((slots.len() - dest) * mem::size_of::<u16>()) as u16;
-        self.header_mut().total_slots = dest as u16;
-        self.header_mut().null_slots = 0;
+        self.try_insert_without_optimizations(index, data)
+            .or_else(|_| self.try_insert_compacting_blocks(index, data))
+    }
 
-        changes
+    /// Attempts to replace the bytes stored in the block pointed by the given
+    /// slot `index` with the given `data` buffer.
+    pub fn try_replace(&mut self, index: u16, data: &[u8]) -> Result<(), ()> {
+        let mut block = self.block_at_slot_index(index);
+
+        let new_data_size = Self::aligned_size_of(data);
+        let current_data_size = unsafe { block.as_ref().size };
+        let total_block_size = unsafe { block.as_ref().total_size() };
+
+        if current_data_size <= new_data_size {
+            // Case 1: Given data fits in the same block that was already
+            // allocated. Copy the given bytes and update free space counter.
+            let free_bytes = current_data_size - new_data_size;
+            unsafe {
+                BlockHeader::content_of(block).as_mut()[..data.len()].copy_from_slice(data);
+                block.as_mut().size -= free_bytes;
+            }
+            self.header_mut().free_space += free_bytes;
+            Ok(())
+        } else if self.header().free_space + total_block_size >= Self::total_block_size_for(data) {
+            // Case 2: Given data fits in the page but we have to remove the
+            // current block.
+            // TODO: Optimize this, slot array is shifted left when we remove
+            // and then shifted right when we insert.
+            self.remove(index);
+            self.try_insert_at(index, data)?;
+            Ok(())
+        } else {
+            // No luck.
+            Err(())
+        }
+    }
+
+    /// Attempts to insert data without doing any work at all. This is the Best
+    /// case scenario, because data will fit in the "free space":
+    /// ```text
+    ///   HEADER SLOT ARRAY       FREE SPACE                   BLOCKS
+    ///  +------+----+----+-----------------------+---------+---------+---------+
+    ///  |      | O3 | 01 | ->                 <- | BLOCK 3 |   DEL   | BLOCK 1 |
+    ///  +------+----+----+-----------------------+---------+---------+---------+
+    ///                               ^
+    ///                               |
+    ///        Both the new block plus the slot index fit here
+    /// ```
+    pub fn try_insert_without_optimizations(&mut self, index: u16, data: &[u8]) -> Result<(), ()> {
+        let block_size = Self::total_block_size_for(data);
+
+        // Space in the the middle of the page, not counting fragmentation.
+        let available_space = self.header().last_used_block - self.end_of_slot_array_offset();
+
+        // There's no way we can fit the block without doing anything.
+        if available_space < (block_size + SLOT_SIZE) {
+            return Err(());
+        }
+
+        let offset = self.header().last_used_block - block_size;
+
+        // Add block. SAFETY: The offset has been correctly computed above. We
+        // are pointing to a location that doesn't contain any block but has
+        // enough space to initialize the new one.
+        unsafe {
+            let mut block = self.block_at_offset(offset);
+            block.as_mut().size = Self::aligned_size_of(data);
+            block.as_mut().left_child = 0;
+            block.as_mut().overflow = 0;
+            BlockHeader::content_of(block).as_mut()[..data.len()].copy_from_slice(data);
+        }
+
+        // Update header.
+        self.header_mut().last_used_block = offset;
+        self.header_mut().free_space -= block_size + SLOT_SIZE;
+
+        // If the index is not the last one, shift slots to the right.
+        if index < self.header().total_slots {
+            let end = self.header().total_slots as usize - 1;
+            self.slot_array_mut()
+                .copy_within(index as usize..end, index as usize + 1);
+        }
+
+        // Add new slot.
+        self.header_mut().total_slots += 1;
+
+        self.slot_array_mut()[index as usize] = offset;
+
+        Ok(())
+    }
+
+    /// Attempts to insert data compacting the blocks. Given this state:
+    ///
+    /// ```text
+    ///   HEADER SLOT ARRAY     FREE SPACE                BLOCKS
+    ///  +------+----+----+------------------+---------+---------+---------+
+    ///  |      | O3 | O1 | ->            <- | BLOCK 3 |   DEL   | BLOCK 1 |
+    ///  +------+----+----+------------------+---------+---------+---------+
+    /// ```
+    ///
+    /// we can try to make enough room for the new block by sliding BLOCK 3 to
+    /// the end:
+    ///
+    /// ```text
+    ///   HEADER SLOT ARRAY         FREE SPACE              USED BLOCKS
+    ///  +------+----+----+----------------------------+---------+---------+
+    ///  |      | O3 | O1 | ->                      <- | BLOCK 3 | BLOCK 1 |
+    ///  +------+----+----+----------------------------+---------+---------+
+    /// ```
+    ///
+    /// This function is used in a chain, first we call
+    /// [`Self::try_insert_without_optimizations`] and then we call this one.
+    /// See [`Self::try_insert`] for details.
+    pub fn try_insert_compacting_blocks(&mut self, index: u16, data: &[u8]) -> Result<(), ()> {
+        self.compact_blocks();
+        self.try_insert_without_optimizations(index, data)
+    }
+
+    /// Removes the given slot from this page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `index` is out of bounds. Check the slot array length
+    /// first before calling this.
+    pub fn remove(&mut self, index: u16) {
+        // TODO: Clean all overflow related hacks
+        if let Some(p) = self.overflow.iter().position(|o| o.2 == index) {
+            self.overflow.remove(p);
+            return;
+        } else {
+            self.overflow.iter_mut().for_each(|o| o.2 -= 1);
+        }
+
+        let total_slots = self.header().total_slots;
+
+        if index >= total_slots {
+            panic!("Out of bounds: index {index} out of range for length {total_slots}");
+        }
+
+        // Remove the index as if we removed from a Vec.
+        self.slot_array_mut()
+            .copy_within(index as usize + 1..total_slots as usize, index as usize);
+
+        // Add new free space SAFETY: See [`Self::block_at_slot_index`].
+        self.header_mut().free_space +=
+            unsafe { self.block_at_slot_index(index).as_ref().total_size() };
+
+        // Decrease length.
+        self.header_mut().total_slots -= 1;
+
+        // Removed one slot, gained 2 extra bytes.
+        self.header_mut().free_space += SLOT_SIZE;
     }
 
     /// Slides blocks towards the right to eliminate fragmentation. For example:
@@ -302,9 +437,6 @@ impl<H> Page<H> {
     ///  +------+----+----+----+--------------------------------+---------+---------+---------+
     /// ```
     ///
-    /// Note that the slot array is not touched. Call [`Self::compact_slots`] if
-    /// you need to optimize the slots themselves.
-    ///
     /// # Algorithm
     ///
     /// We can eliminate fragmentation in-place by simply moving the blocks
@@ -317,7 +449,6 @@ impl<H> Page<H> {
         let mut offsets = BinaryHeap::from_iter(
             self.slot_array()
                 .iter()
-                .filter(|offset| **offset != 0)
                 .enumerate()
                 .map(|(i, offset)| (*offset, i)),
         );
@@ -345,187 +476,33 @@ impl<H> Page<H> {
         self.header_mut().free_space = destination_offset - self.end_of_slot_array_offset();
     }
 
-    /// Returns `true` if this page can fit `data` somehow. We don't know how,
-    /// but it sure will fit.
-    pub fn can_fit(&self, data: &[u8]) -> bool {
-        let mut total_size = Self::total_block_size_for(data);
-        if self.header().null_slots == 0 {
-            total_size += mem::size_of::<u16>() as u16;
-        }
-
-        self.header().free_space >= total_size
-    }
-
-    /// Attempts to insert data without doing any work at all. This is the Best
-    /// case scenario, because data will fit in the "free space":
-    /// ```text
-    ///   HEADER   SLOT ARRAY        FREE SPACE             USED BLOCKS
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    ///  |      | O3 |NULL| O1 | ->            <- | BLOCK 3 |   DEL   | BLOCK 1 |
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    ///                                  ^
-    ///                                  |
-    ///           Both the new block plus the slot index fit here
-    /// ```
-    ///
-    /// If for some reason the new block fits in the free space but the slot
-    /// pointer doesn't, we'll try to reuse a null slot. Null slot search is
-    /// O(n), but it's still much faster than rearranging blocks to eliminate
-    /// fragmentation.
-    pub fn try_insert_without_optimizations(&mut self, data: &[u8]) -> InsertResult {
-        let block_size = Self::total_block_size_for(data);
-        let slot_size = mem::size_of::<u16>() as u16;
-
-        // Space in the the middle of the page, not counting fragmentation.
-        let available_space = self.header().last_used_block - self.end_of_slot_array_offset();
-
-        let can_fit_both_slot_and_block = available_space > block_size + slot_size;
-
-        // There's no way we can fit the block without doing anything.
-        if !can_fit_both_slot_and_block && (available_space < block_size) {
-            return Err(());
-        }
-
-        let offset = self.header().last_used_block - block_size;
-
-        // Add block. SAFETY: The offset has been correctly computed above. We
-        // are pointing to a location that doesn't contain any block but has
-        // enough space to initialize the new one.
-        unsafe {
-            let mut block = self.block_at_offset(offset);
-            block.as_mut().size = Self::aligned_size_of(data);
-            BlockHeader::content_of(block).as_mut()[..data.len()].copy_from_slice(data);
-        }
-
-        // Update header.
-        self.header_mut().last_used_block = offset;
-        self.header_mut().free_space -= block_size + slot_size;
-
-        // Find available slot or add a new one.
-        let index = if can_fit_both_slot_and_block {
-            let index = self.header().total_slots;
-            self.header_mut().total_slots += 1;
-            index
-        } else {
-            self.header_mut().null_slots -= 1;
-            self.slot_array()
-                .iter()
-                .position(|value| *value == 0)
-                .unwrap() as u16
-        };
-
-        self.slot_array_mut()[index as usize] = offset;
-
-        Ok(Insert {
-            new_slot: index,
-            changes: vec![],
-        })
-    }
-
-    /// Attempts to insert data compacting only the blocks and not the slots.
-    /// Given this state:
-    ///
-    /// ```text
-    ///   HEADER   SLOT ARRAY        FREE SPACE             USED BLOCKS
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    ///  |      | O3 |NULL| O1 | ->            <- | BLOCK 3 |   DEL   | BLOCK 1 |
-    ///  +------+----+----+----+------------------+---------+---------+---------+
-    /// ```
-    ///
-    /// we can try to make enough room for the new block by sliding BLOCK 3 to
-    /// the end:
-    ///
-    /// ```text
-    ///   HEADER   SLOT ARRAY        FREE SPACE             USED BLOCKS
-    ///  +------+----+----+----+----------------------------+---------+---------+
-    ///  |      | O3 |NULL| O1 | ->                      <- | BLOCK 3 | BLOCK 1 |
-    ///  +------+----+----+----+----------------------------+---------+---------+
-    /// ```
-    ///
-    /// This function is used in a chain, first we call
-    /// [`Self::try_insert_without_optimizations`] and then we call this one.
-    /// See [`Self::try_insert`] for details.
-    pub fn try_insert_compacting_blocks(&mut self, data: &[u8]) -> InsertResult {
-        self.compact_blocks();
-        self.try_insert_without_optimizations(data)
-    }
-
-    /// Worst case scenario, we'll have to compact the slots and report the
-    /// changes to the user. Last step in the insert chain, see
-    /// [`Self::try_insert`] for details.
-    pub fn try_insert_compacting_slots(&mut self, data: &[u8]) -> InsertResult {
-        let changes = self.compact_slots();
-        self.try_insert_without_optimizations(data)
-            .map(|Insert { new_slot, .. }| Insert { new_slot, changes })
-    }
-
-    /// Attempts to insert the given `data` in this page with all the available
-    /// methods that we have. If possible, data will be inserted without moving
-    /// blocks and slots, otherwise optimizations have to be made. In case slots
-    /// are moved, they are returned in [`Insert::changes`] and pointers to them
-    /// in indexes or other places can be updated.
-    pub fn try_insert(&mut self, data: &[u8]) -> InsertResult {
-        // There's no way we can fit the given data in this page.
-        if !self.can_fit(data) {
-            return Err(());
-        }
-
-        self.try_insert_without_optimizations(data)
-            .or_else(|_| self.try_insert_compacting_blocks(data))
-            .or_else(|_| self.try_insert_compacting_slots(data))
-    }
-
-    /// Removes the given slot from this page. Caller can choose whether the
-    /// rest of slots maintain their position or not.
-    pub fn remove(&mut self, index: u16, strategy: RemoveSlotStrategy) -> Vec<(u16, u16)> {
-        let total_slots = self.header().total_slots;
-
-        if total_slots == 0 {
-            return vec![];
-        }
-
-        if index >= total_slots {
-            panic!("Out of bounds: index {index} out of range for length {total_slots}");
-        }
-
-        // Set the slots to null first. We'll check later if we need to compact.
-        self.slot_array_mut()[index as usize] = 0;
-        self.header_mut().null_slots += 1;
-        // SAFETY: See [`Self::block_at_slot_index`].
-        self.header_mut().free_space +=
-            unsafe { self.block_at_slot_index(index).as_ref().total_size() };
-        // Removed one slot, gained 2 bytes.
-        self.header_mut().free_space += mem::size_of::<u16>() as u16;
-
-        match strategy {
-            RemoveSlotStrategy::Compact => self.compact_slots(),
-
-            // No changes.
-            _ => vec![],
-        }
-    }
-
-    /// Read-only reference to header metadata.
-    pub fn meta(&self) -> &H {
-        &self.header().meta
-    }
-
-    /// Mutable reference to header metadata.
-    pub fn meta_mut(&mut self) -> &mut H {
-        &mut self.header_mut().meta
-    }
-
     /// Read only reference to the content of the given slot `index`.
     pub fn slot(&self, index: u16) -> &[u8] {
+        match self.overflow.iter().position(|o| o.2 == index) {
+            None => unsafe { self.slot_non_null(index).as_ref() },
+            Some(p) => &self.overflow[p].1,
+        }
+
         // SAFETY: Accessing blocks through slot indexes should always be safe,
         // that's the point of this struct.
-        unsafe { self.slot_non_null(index).as_ref() }
     }
 
     /// Mutable reference to the content of the given slot `index`.
     pub fn slot_mut(&mut self, index: u16) -> &mut [u8] {
         // SAFETY: See [`Self::slot`].
         unsafe { self.slot_non_null(index).as_mut() }
+    }
+
+    pub fn buffer(&self) -> &[u8] {
+        unsafe { self.buffer_non_null().as_ref() }
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        unsafe { self.buffer_non_null().as_mut() }
+    }
+
+    fn buffer_non_null(&self) -> NonNull<[u8]> {
+        NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size as usize)
     }
 
     /// Returns a pointer to the content of the block referenced in the given
@@ -536,14 +513,14 @@ impl<H> Page<H> {
     }
 
     /// Read-only reference to the entire page header.
-    fn header(&self) -> &PageHeader<H> {
+    pub fn header(&self) -> &PageHeader {
         // SAFETY: `self.header` points to the beginning of the page, where
         // the [`PageHeader`] struct is located.
         unsafe { self.header.as_ref() }
     }
 
     /// Mutable reference to the page header.
-    fn header_mut(&mut self) -> &mut PageHeader<H> {
+    pub fn header_mut(&mut self) -> &mut PageHeader {
         // SAFETY: Same as [`Self::header`].
         unsafe { self.header.as_mut() }
     }
@@ -588,11 +565,6 @@ impl<H> Page<H> {
         unsafe { self.block_at_offset(offset) }
     }
 
-    /// Available space in the page without counting the header.
-    fn usable_space(page_size: usize) -> usize {
-        page_size - mem::size_of::<PageHeader<H>>()
-    }
-
     /// Beginning of the free space.
     ///
     ///
@@ -605,18 +577,15 @@ impl<H> Page<H> {
     ///                        |
     ///                        +------ The returned value points here.
     /// ```
-    ///
-    /// Note that null slots don't mean anything in this context. They are
-    /// treated as normal used slots.
     fn end_of_slot_array_offset(&self) -> u16 {
         let total_slots = self.header().total_slots as usize;
-        let offset = mem::size_of::<PageHeader<H>>() + total_slots * mem::size_of::<u16>();
+        let offset = mem::size_of::<PageHeader>() + total_slots * mem::size_of::<u16>();
 
         offset as _
     }
 
     /// If data is not aligned to 64 bits then add padding.
-    fn aligned_size_of(data: &[u8]) -> u16 {
+    pub fn aligned_size_of(data: &[u8]) -> u16 {
         Layout::from_size_align(data.len(), mem::align_of::<BlockHeader>())
             .unwrap()
             .pad_to_align()
@@ -625,26 +594,201 @@ impl<H> Page<H> {
 
     /// Total size needed to store a valid block of at least `data.len()` size.
     fn total_block_size_for(data: &[u8]) -> u16 {
-        mem::size_of::<BlockHeader>() as u16 + Self::aligned_size_of(data)
+        BLOCK_HEADER_SIZE + Self::aligned_size_of(data)
     }
-}
 
-impl<H> Drop for Page<H> {
-    fn drop(&mut self) {
+    pub fn total_size_needed_to_store(data: &[u8]) -> u16 {
+        SLOT_SIZE + Self::total_block_size_for(data)
+    }
+
+    /// Available space in the page without counting the header.
+    pub fn usable_space(page_size: u16) -> u16 {
+        page_size - mem::size_of::<PageHeader>() as u16
+    }
+
+    fn layout(page_size: u16) -> Layout {
+        // SAFETY:
+        // - `size` is u16, it cannot overflow isize.
+        // - `align_of::<BlockHeader>()` is a non-zero power of two.
         unsafe {
-            std::alloc::dealloc(
-                self.header.as_ptr().cast(),
-                Layout::from_size_align(self.size as usize, 8).unwrap(),
-            )
+            Layout::from_size_align_unchecked(page_size as usize, mem::align_of::<BlockHeader>())
         }
     }
 }
 
-impl<H: Debug> Debug for Page<H> {
+// TODO: Node functions. Extract this to its own type or something.
+impl Page {
+    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<usize, usize> {
+        self.slot_array().binary_search_by(|offset| unsafe {
+            let block = self.block_at_offset(*offset);
+            f(BlockHeader::content_of(block).as_ref())
+        })
+    }
+
+    pub fn remove_and_return(&mut self, index: usize) -> Box<[u8]> {
+        let index = index as u16;
+
+        let owned = Vec::from(self.entry(index as usize)).into_boxed_slice();
+
+        self.remove(index);
+
+        owned
+    }
+
+    pub fn drain_data(&mut self) -> impl Iterator<Item = Box<[u8]>> + '_ {
+        std::iter::from_fn(|| {
+            if self.entries_len() == 0 {
+                None
+            } else {
+                Some(self.remove_and_return(0))
+            }
+        })
+    }
+
+    pub fn entry(&self, index: usize) -> &[u8] {
+        // TODO: Do something about overflow entries
+        match self.overflow.iter().position(|o| o.2 == index as u16) {
+            None => &self.slot(index as u16),
+
+            Some(p) => self.overflow[p].1.as_ref(),
+        }
+    }
+
+    pub fn replace_entry_at(&mut self, index: usize, entry: &[u8]) {
+        if let Err(_) = self.try_replace(index as u16, entry) {
+            let blk = BlockHeader {
+                size: Self::aligned_size_of(entry),
+                left_child: 0,
+                overflow: 0,
+            };
+            let mut data = Vec::from(entry);
+            while data.len() < Self::aligned_size_of(entry) as usize {
+                data.push(0);
+            }
+            self.overflow.push((blk, data, index as u16));
+        }
+    }
+
+    pub fn replace_and_ret(&mut self, index: usize, entry: &[u8]) -> Box<[u8]> {
+        let r = Vec::from(self.entry(index)).into_boxed_slice();
+        self.replace_entry_at(index, entry);
+        r
+    }
+
+    pub fn insert_entry_at(&mut self, index: usize, entry: &[u8]) {
+        if let Err(_) = self.try_insert_at(index as u16, entry) {
+            let blk = BlockHeader {
+                size: Self::aligned_size_of(entry),
+                left_child: 0,
+                overflow: 0,
+            };
+            let mut data = Vec::from(entry);
+            while data.len() < Self::aligned_size_of(entry) as usize {
+                data.push(0);
+            }
+            self.overflow.push((blk, data, index as u16));
+        }
+    }
+
+    pub fn push_entry(&mut self, entry: &[u8]) {
+        self.insert_entry_at(self.entries_len(), entry)
+    }
+
+    pub fn set_right_child(&mut self, child: PageNumber) {
+        self.header_mut().right_child = child;
+    }
+
+    pub fn child(&self, index: usize) -> PageNumber {
+        // TODO: Do something about overflow entries
+        match self.overflow.iter().position(|o| o.2 == index as _) {
+            None => {
+                if self.header().total_slots == 0
+                    || index as u16 == self.header().total_slots + self.overflow.len() as u16
+                {
+                    self.header().right_child
+                } else {
+                    unsafe { self.block_at_slot_index(index as _).as_ref().left_child }
+                }
+            }
+
+            Some(p) => self.overflow[p].0.left_child,
+        }
+    }
+
+    pub fn set_child(&mut self, index: usize, value: PageNumber) {
+        match self.overflow.iter().position(|o| o.2 == index as _) {
+            None => {
+                if self.header().total_slots == 0 || index as u16 == self.header().total_slots {
+                    self.header_mut().right_child = value;
+                } else {
+                    unsafe { self.block_at_slot_index(index as _).as_mut().left_child = value }
+                }
+            }
+
+            Some(p) => self.overflow[p].0.left_child = value,
+        }
+    }
+
+    pub fn children_len(&self) -> usize {
+        if self.header().right_child == 0 {
+            0
+        } else {
+            1 + self.header().total_slots as usize + self.overflow.len()
+        }
+    }
+
+    pub fn entries_len(&self) -> usize {
+        self.header().total_slots as usize + self.overflow.len()
+    }
+
+    pub fn children_iter(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        (0..self.children_len()).map(|i| self.child(i))
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.children_len() == 0
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.number == 0
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        let mut i = 0;
+        while i < other.entries_len() {
+            self.push_entry(other.slot(i as _));
+            self.set_child(i, other.child(i));
+            i += 1;
+        }
+        self.header_mut().right_child = other.header().right_child;
+
+        while other.entries_len() > 0 {
+            other.remove(0);
+        }
+
+        other.header_mut().right_child = 0;
+    }
+
+    pub fn is_overflow(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    pub fn is_underflow(&self) -> bool {
+        self.entries_len() == 0
+            || !self.is_root() && self.header().free_space > Self::usable_space(self.size) / 2
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        unsafe { alloc::dealloc(self.header.as_ptr().cast(), Self::layout(self.size)) }
+    }
+}
+
+impl Debug for Page {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Page")
             .field("header", self.header())
-            .field("meta", self.meta())
             .field("number", &self.number)
             .field("size", &self.size)
             .field("slots", &self.slot_array())
@@ -667,17 +811,26 @@ impl<H: Debug> Debug for Page<H> {
     }
 }
 
+impl PartialEq for Page {
+    fn eq(&self, other: &Self) -> bool {
+        self.number == other.number && self.size == other.size && self.buffer().eq(other.buffer())
+    }
+}
+
+impl Clone for Page {
+    fn clone(&self) -> Self {
+        let mut page = Page::new(self.number, self.size);
+        page.buffer_mut().copy_from_slice(self.buffer());
+        page
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_page(size: usize) -> Page<()> {
-        let buf = unsafe {
-            NonNull::new_unchecked(std::alloc::alloc(
-                Layout::from_size_align(size, 8).unwrap().pad_to_align(),
-            ))
-        };
-        Page::new(0, NonNull::slice_from_raw_parts(buf, size))
+    fn make_page(size: u16) -> Page {
+        Page::new(0, size)
     }
 
     fn make_variable_size_blocks(sizes: &[usize]) -> Vec<Vec<u8>> {
@@ -692,30 +845,26 @@ mod tests {
         make_variable_size_blocks(&vec![size; amount])
     }
 
-    impl<H> Page<H> {
-        fn insert_all(&mut self, blocks: &Vec<Vec<u8>>) -> Vec<u16> {
-            let mut slots = Vec::new();
+    impl Page {
+        fn insert_all(&mut self, blocks: &Vec<Vec<u8>>) {
             for block in blocks {
-                slots.push(self.try_insert(block).unwrap().new_slot);
+                self.try_insert(block).unwrap()
             }
-            slots
         }
     }
 
     /// # Arguments
     ///
-    /// * `blocks` - List of blocks that have been inserted in the page.
-    /// Necessary for checking data corruption.
-    ///
-    /// * `slots` - Slot index of each given block, in order.
-    ///
     /// * `page` - [`Page`] instance.
-    fn compare_consecutive_offsets<H>(blocks: &Vec<Vec<u8>>, slots: &Vec<u16>, page: &Page<H>) {
+    ///
+    /// * `blocks` - List of blocks that have been inserted in the page
+    /// (in order). Necessary for checking data corruption.
+    fn compare_consecutive_offsets(page: &Page, blocks: &Vec<Vec<u8>>) {
         let mut expected_offset = page.size;
-        for (i, slot_index) in slots.iter().enumerate() {
-            expected_offset -= Page::<H>::total_block_size_for(&blocks[i]);
+        for (i, block) in blocks.iter().enumerate() {
+            expected_offset -= Page::total_block_size_for(block);
             assert_eq!(page.slot_array()[i], expected_offset);
-            assert_eq!(&page.slot(*slot_index)[..blocks[i].len()], &blocks[i]);
+            assert_eq!(&page.slot(i as u16)[..block.len()], block);
         }
     }
 
@@ -723,48 +872,33 @@ mod tests {
     fn add_fixed_size_blocks() {
         let mut page = make_page(512);
         let blocks = make_fixed_size_blocks(32, 3);
-        let slots = page.insert_all(&blocks);
+        page.insert_all(&blocks);
 
-        assert_eq!(slots, vec![0, 1, 2]);
-        compare_consecutive_offsets(&blocks, &slots, &page);
+        assert_eq!(page.header().total_slots, blocks.len() as u16);
+        compare_consecutive_offsets(&page, &blocks);
     }
 
     #[test]
     fn add_variable_size_blocks() {
         let mut page = make_page(512);
         let blocks = make_variable_size_blocks(&[64, 32, 128]);
-        let slots = page.insert_all(&blocks);
+        page.insert_all(&blocks);
 
-        assert_eq!(slots, vec![0, 1, 2]);
-        compare_consecutive_offsets(&blocks, &slots, &page);
+        assert_eq!(page.header().total_slots, blocks.len() as u16);
+        compare_consecutive_offsets(&page, &blocks);
     }
 
     #[test]
-    fn delete_slot_by_compacting() {
+    fn delete_slot() {
         let mut page = make_page(512);
         let blocks = make_fixed_size_blocks(32, 3);
         page.insert_all(&blocks);
 
         let expected_offsets = [page.slot_array()[0], page.slot_array()[2]];
 
-        page.remove(1, RemoveSlotStrategy::Compact);
+        page.remove(1);
 
         assert_eq!(page.header().total_slots, 2);
-        assert_eq!(page.slot_array(), expected_offsets);
-    }
-
-    #[test]
-    fn delete_slot_by_set_null() {
-        let mut page = make_page(512);
-        let blocks = make_fixed_size_blocks(32, 3);
-        page.insert_all(&blocks);
-
-        let expected_offsets = [page.slot_array()[0], 0, page.slot_array()[2]];
-
-        page.remove(1, RemoveSlotStrategy::SetNull);
-
-        assert_eq!(page.header().total_slots, 3);
-        assert_eq!(page.slot_array()[1], 0);
         assert_eq!(page.slot_array(), expected_offsets);
     }
 
@@ -775,47 +909,29 @@ mod tests {
         page.insert_all(&blocks);
 
         for i in [1, 2] {
-            page.remove(i as u16, RemoveSlotStrategy::Compact);
+            page.remove(i as u16);
             blocks.remove(i);
         }
 
         page.compact_blocks();
 
         assert_eq!(page.header().total_slots, 3);
-        compare_consecutive_offsets(&blocks, &vec![0, 1, 2], &page);
-    }
-
-    #[test]
-    fn compact_slots() {
-        let mut page = make_page(512);
-        let blocks = make_variable_size_blocks(&[64, 32, 128, 16, 24, 8]);
-        page.insert_all(&blocks);
-
-        let offsets = page.slot_array();
-        let expected = [offsets[0], offsets[2], offsets[5]];
-
-        page.remove(1, RemoveSlotStrategy::SetNull);
-        page.remove(3, RemoveSlotStrategy::SetNull);
-        page.remove(4, RemoveSlotStrategy::SetNull);
-        page.compact_slots();
-
-        assert_eq!(page.header().total_slots as usize, expected.len());
-        assert_eq!(page.slot_array(), expected);
+        compare_consecutive_offsets(&page, &blocks);
     }
 
     #[test]
     fn unaligned_blocks() {
         let mut page = make_page(512);
         let blocks = make_variable_size_blocks(&[7, 19, 20]);
-        let slots = page.insert_all(&blocks);
+        page.insert_all(&blocks);
 
-        compare_consecutive_offsets(&blocks, &slots, &page);
+        compare_consecutive_offsets(&page, &blocks);
 
         // Check padding
         for i in 0..blocks.len() {
             assert_eq!(
                 page.slot(i as u16).len(),
-                Page::<()>::aligned_size_of(&blocks[i]) as usize
+                Page::aligned_size_of(&blocks[i]) as usize
             );
         }
     }
@@ -826,14 +942,14 @@ mod tests {
         let mut blocks = make_variable_size_blocks(&[64, 32, 128]);
         page.insert_all(&blocks);
 
-        page.remove(1, RemoveSlotStrategy::Compact);
+        page.remove(1);
         blocks.remove(1);
 
         let available_space = page.header().last_used_block - page.end_of_slot_array_offset();
 
-        blocks.push(vec![(blocks.len() + 1) as u8; available_space as usize]);
+        blocks.push(vec![4; available_space as usize]);
         page.try_insert(&blocks[2]).unwrap();
 
-        compare_consecutive_offsets(&blocks, &vec![0, 1, 2], &page);
+        compare_consecutive_offsets(&page, &blocks);
     }
 }
