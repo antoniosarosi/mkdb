@@ -81,8 +81,9 @@ pub(crate) struct PageHeader {
 /// # Alignment
 ///
 /// Blocks are 64 bit aligned. See [`Page`] for more details.
+#[derive(Debug)]
 #[repr(C, align(8))]
-struct BlockHeader {
+pub struct BlockHeader {
     /// Size of this block excluding the header (data only).
     size: u16,
     ///
@@ -105,6 +106,45 @@ impl BlockHeader {
     fn total_size(&self) -> u16 {
         self.size + BLOCK_HEADER_SIZE
     }
+}
+
+#[derive(Debug)]
+pub struct Block {
+    pub header: BlockHeader,
+    pub content: Box<[u8]>,
+}
+
+impl Block {
+    pub fn new(data: &[u8]) -> Self {
+        let mut v = Vec::from(data);
+        let s = Page::aligned_size_of(data);
+        while v.len() < s as _ {
+            v.push(0);
+        }
+
+        Self {
+            header: BlockHeader {
+                size: s,
+                left_child: 0,
+                overflow: 0,
+            },
+            content: v.into_boxed_slice(),
+        }
+    }
+
+    pub fn size(&self) -> u16 {
+        self.header.size as _
+    }
+
+    pub fn total_storage_size(&self) -> u16 {
+        SLOT_SIZE + BLOCK_HEADER_SIZE + self.size()
+    }
+}
+
+#[derive(Debug)]
+struct OverflowBlock {
+    block: Block,
+    index: u16,
 }
 
 /// Slotted page. The page maintains a "slot array" located after the header
@@ -212,7 +252,7 @@ pub(crate) struct Page {
     /// We need to know where the page ends.
     size: u16,
     /// Data that comes from memory and doesn't fit in this page.
-    overflow: Vec<(BlockHeader, Vec<u8>, u16)>,
+    overflow: Vec<OverflowBlock>,
     /// Page header and pointer to the main memory buffer of this page.
     header: NonNull<PageHeader>,
 }
@@ -248,6 +288,14 @@ impl Page {
         let total_size = Self::total_block_size_for(data) + SLOT_SIZE;
 
         self.header().free_space >= total_size
+    }
+
+    pub fn try_insert_block(&mut self, block: Block) -> Result<(), ()> {
+        self.try_insert(&block.content).and_then(|_| {
+            let index = self.header().total_slots - 1;
+            unsafe { self.block_at_slot_index(index).write(block.header) };
+            Ok(())
+        })
     }
 
     /// Attempts to insert the given `data` in this page with all the available
@@ -391,11 +439,11 @@ impl Page {
     /// first before calling this.
     pub fn remove(&mut self, index: u16) {
         // TODO: Clean all overflow related hacks
-        if let Some(p) = self.overflow.iter().position(|o| o.2 == index) {
+        if let Some(p) = self.overflow.iter().position(|o| o.index == index) {
             self.overflow.remove(p);
             return;
         } else {
-            self.overflow.iter_mut().for_each(|o| o.2 -= 1);
+            self.overflow.iter_mut().for_each(|o| o.index -= 1);
         }
 
         let total_slots = self.header().total_slots;
@@ -478,9 +526,9 @@ impl Page {
 
     /// Read only reference to the content of the given slot `index`.
     pub fn slot(&self, index: u16) -> &[u8] {
-        match self.overflow.iter().position(|o| o.2 == index) {
+        match self.overflow.iter().position(|o| o.index == index) {
             None => unsafe { self.slot_non_null(index).as_ref() },
-            Some(p) => &self.overflow[p].1,
+            Some(p) => &self.overflow[p].block.content,
         }
 
         // SAFETY: Accessing blocks through slot indexes should always be safe,
@@ -625,17 +673,30 @@ impl Page {
         })
     }
 
-    pub fn remove_and_return(&mut self, index: usize) -> Box<[u8]> {
+    pub fn remove_and_return(&mut self, index: usize) -> Block {
         let index = index as u16;
 
-        let owned = Vec::from(self.entry(index as usize)).into_boxed_slice();
+        if let Some(p) = self.overflow.iter().position(|o| o.index == index) {
+            return self.overflow.remove(p).block;
+        }
+
+        let hdr = self.block_at_slot_index(index);
+
+        let block = Block {
+            header: BlockHeader {
+                size: unsafe { hdr.as_ref().size },
+                left_child: unsafe { hdr.as_ref().left_child },
+                overflow: unsafe { hdr.as_ref().overflow },
+            },
+            content: Vec::from(self.entry(index as usize)).into_boxed_slice(),
+        };
 
         self.remove(index);
 
-        owned
+        block
     }
 
-    pub fn drain_data(&mut self) -> impl Iterator<Item = Box<[u8]>> + '_ {
+    pub fn drain_blocks(&mut self) -> impl Iterator<Item = Block> + '_ {
         std::iter::from_fn(|| {
             if self.entries_len() == 0 {
                 None
@@ -647,25 +708,30 @@ impl Page {
 
     pub fn entry(&self, index: usize) -> &[u8] {
         // TODO: Do something about overflow entries
-        match self.overflow.iter().position(|o| o.2 == index as u16) {
+        match self.overflow.iter().position(|o| o.index == index as u16) {
             None => &self.slot(index as u16),
 
-            Some(p) => self.overflow[p].1.as_ref(),
+            Some(p) => &self.overflow[p].block.content,
         }
     }
 
     pub fn replace_entry_at(&mut self, index: usize, entry: &[u8]) {
         if let Err(_) = self.try_replace(index as u16, entry) {
-            let blk = BlockHeader {
-                size: Self::aligned_size_of(entry),
-                left_child: 0,
-                overflow: 0,
-            };
             let mut data = Vec::from(entry);
             while data.len() < Self::aligned_size_of(entry) as usize {
                 data.push(0);
             }
-            self.overflow.push((blk, data, index as u16));
+            self.overflow.push(OverflowBlock {
+                block: Block {
+                    header: BlockHeader {
+                        size: Self::aligned_size_of(entry),
+                        left_child: 0,
+                        overflow: 0,
+                    },
+                    content: data.into_boxed_slice(),
+                },
+                index: index as u16,
+            });
         }
     }
 
@@ -675,23 +741,23 @@ impl Page {
         r
     }
 
-    pub fn insert_entry_at(&mut self, index: usize, entry: &[u8]) {
-        if let Err(_) = self.try_insert_at(index as u16, entry) {
-            let blk = BlockHeader {
-                size: Self::aligned_size_of(entry),
-                left_child: 0,
-                overflow: 0,
-            };
-            let mut data = Vec::from(entry);
-            while data.len() < Self::aligned_size_of(entry) as usize {
-                data.push(0);
-            }
-            self.overflow.push((blk, data, index as u16));
+    pub fn insert_entry_at(&mut self, index: usize, block: Block) {
+        if let Err(_) = self.try_insert_at(index as u16, &block.content) {
+            self.overflow.push(OverflowBlock {
+                block,
+                index: index as u16,
+            });
+        } else {
+            unsafe { self.block_at_slot_index(index as _).write(block.header) }
         }
     }
 
     pub fn push_entry(&mut self, entry: &[u8]) {
-        self.insert_entry_at(self.entries_len(), entry)
+        self.insert_entry_at(self.entries_len(), Block::new(entry))
+    }
+
+    pub fn push_block(&mut self, block: Block) {
+        self.insert_entry_at(self.entries_len(), block)
     }
 
     pub fn set_right_child(&mut self, child: PageNumber) {
@@ -700,7 +766,7 @@ impl Page {
 
     pub fn child(&self, index: usize) -> PageNumber {
         // TODO: Do something about overflow entries
-        match self.overflow.iter().position(|o| o.2 == index as _) {
+        match self.overflow.iter().position(|o| o.index == index as _) {
             None => {
                 if self.header().total_slots == 0
                     || index as u16 == self.header().total_slots + self.overflow.len() as u16
@@ -711,12 +777,12 @@ impl Page {
                 }
             }
 
-            Some(p) => self.overflow[p].0.left_child,
+            Some(p) => self.overflow[p].block.header.left_child,
         }
     }
 
     pub fn set_child(&mut self, index: usize, value: PageNumber) {
-        match self.overflow.iter().position(|o| o.2 == index as _) {
+        match self.overflow.iter().position(|o| o.index == index as _) {
             None => {
                 if self.header().total_slots == 0 || index as u16 == self.header().total_slots {
                     self.header_mut().right_child = value;
@@ -725,7 +791,7 @@ impl Page {
                 }
             }
 
-            Some(p) => self.overflow[p].0.left_child = value,
+            Some(p) => self.overflow[p].block.header.left_child = value,
         }
     }
 
@@ -756,8 +822,21 @@ impl Page {
     pub fn append(&mut self, other: &mut Self) {
         let mut i = 0;
         while i < other.entries_len() {
-            self.push_entry(other.slot(i as _));
-            self.set_child(i, other.child(i));
+            let hdr = match other.overflow.iter().position(|o| o.index == i as _) {
+                Some(p) => &other.overflow[p].block.header,
+                None => unsafe { other.block_at_slot_index(i as _).as_ref() },
+            };
+
+            let block = Block {
+                header: BlockHeader {
+                    size: hdr.size,
+                    left_child: hdr.left_child,
+                    overflow: hdr.overflow,
+                },
+                content: Vec::from(other.entry(i)).into_boxed_slice(),
+            };
+
+            self.push_block(block);
             i += 1;
         }
         self.header_mut().right_child = other.header().right_child;
@@ -792,15 +871,16 @@ impl Debug for Page {
             .field("number", &self.number)
             .field("size", &self.size)
             .field("slots", &self.slot_array())
+            .field("overflow", &self.overflow)
             .field_with("blocks", |f| {
                 let mut list = f.debug_list();
                 self.slot_array().iter().for_each(|offset| {
                     let block = unsafe { self.block_at_offset(*offset as _).as_ref() };
                     list.entry_with(|f| {
                         f.debug_struct("Block")
+                            .field("header", &block)
                             .field("start", &offset)
                             .field("end", &(*offset + block.total_size()))
-                            .field("size", &block.size)
                             .finish()
                     });
                 });

@@ -13,7 +13,7 @@ use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
         cache::Cache,
-        page::Page,
+        page::{Block, Page, SLOT_SIZE},
         pager::{PageNumber, Pager},
     },
 };
@@ -121,7 +121,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             // Key found, swap value.
             Ok(index) => node.replace_entry_at(index, entry),
             // Key not found, insert new entry.
-            Err(index) => node.insert_entry_at(index, entry),
+            Err(index) => node.insert_entry_at(index, Block::new(entry)),
         };
 
         self.balance(search.page, parents)?;
@@ -153,7 +153,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
                 .cache
                 .get_mut(search.page)?
                 .remove_and_return(search.index.unwrap());
-            return Ok(Some((entry, search.page)));
+            return Ok(Some((entry.content, search.page)));
         }
 
         // Root or internal nodes require additional work. We need to find a
@@ -176,7 +176,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let substitute = self.cache.get_mut(leaf_node)?.remove_and_return(key_idx);
 
         let node = self.cache.get_mut(search.page)?;
-        let entry = node.replace_and_ret(search.index.unwrap(), &substitute);
+        let entry = node.replace_and_ret(search.index.unwrap(), &substitute.content);
 
         Ok(Some((entry, leaf_node)))
     }
@@ -279,7 +279,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             let root = self.cache.get_mut(page)?;
             old_root.append(root);
 
-            root.set_right_child(old_root.number);
+            root.header_mut().right_child = old_root.number;
 
             parents.push(page);
             page = old_root.number;
@@ -290,21 +290,20 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let parent_page = parents.remove(parents.len() - 1);
         let mut siblings = self.load_siblings(page, parent_page)?;
 
-        let mut entries = Vec::new();
-        let mut children = Vec::new();
+        let mut blocks = Vec::new();
 
         let mut divider_idx = siblings[0].1;
 
         // Make copies of data in order.
         for (i, s) in siblings.iter().enumerate() {
-            children.extend(self.cache.get_mut(s.0)?.children_iter());
-            entries.extend(self.cache.get_mut(s.0)?.drain_data());
+            blocks.extend(self.cache.get_mut(s.0)?.drain_blocks());
             if i < siblings.len() - 1 && self.cache.get(parent_page)?.entries_len() > 0 {
-                entries.push(
-                    self.cache
-                        .get_mut(parent_page)?
-                        .remove_and_return(divider_idx),
-                );
+                let mut divider = self
+                    .cache
+                    .get_mut(parent_page)?
+                    .remove_and_return(divider_idx);
+                divider.header.left_child = self.cache.get(s.0)?.header().right_child;
+                blocks.push(divider);
             }
         }
 
@@ -315,12 +314,11 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let mut subtotal = 0;
 
         // Precompute left biased distribution
-        for entry in &entries {
-            if subtotal + Page::total_size_needed_to_store(&entry) <= usable_space {
+        for block in &blocks {
+            if subtotal + block.total_storage_size() <= usable_space {
                 *number_of_cells_per_page.last_mut().unwrap() += 1;
-                *total_size_of_each_page.last_mut().unwrap() +=
-                    Page::total_size_needed_to_store(&entry);
-                subtotal += Page::total_size_needed_to_store(&entry);
+                *total_size_of_each_page.last_mut().unwrap() += block.total_storage_size();
+                subtotal += block.total_storage_size();
             } else {
                 number_of_cells_per_page.push(0);
                 total_size_of_each_page.push(0);
@@ -330,20 +328,18 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Account for underflow towards the right
         if number_of_cells_per_page.len() > 1 {
-            let mut i = entries.len() - number_of_cells_per_page.last().unwrap() - 1;
+            let mut i = blocks.len() - number_of_cells_per_page.last().unwrap() - 1;
 
             for k in (1..=(total_size_of_each_page.len() - 1)).rev() {
                 while total_size_of_each_page[k] < usable_space / 2
-                    && total_size_of_each_page[0]
-                        - Page::total_size_needed_to_store(&entries[i - 1])
+                    && total_size_of_each_page[0] - &blocks[i - 1].total_storage_size()
                         >= usable_space / 2
                 {
                     number_of_cells_per_page[k] += 1;
-                    total_size_of_each_page[k] += Page::total_size_needed_to_store(&entries[i]);
+                    total_size_of_each_page[k] += &blocks[i].total_storage_size();
 
                     number_of_cells_per_page[k - 1] -= 1;
-                    total_size_of_each_page[k - 1] -=
-                        Page::total_size_needed_to_store(&entries[i - 1]);
+                    total_size_of_each_page[k - 1] -= &blocks[i - 1].total_storage_size();
                     i -= 1;
                 }
             }
@@ -351,11 +347,14 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let new_page = Page::new(self.allocate_page() as _, self.cache.pager.page_size as _);
+            let mut new_page =
+                Page::new(self.allocate_page() as _, self.cache.pager.page_size as _);
+            new_page.header_mut().right_child = self
+                .cache
+                .get(siblings[siblings.len() - 1].0)?
+                .header()
+                .right_child;
             let pidx = siblings[siblings.len() - 1].1 + 1;
-            if self.cache.get(parent_page)?.header().right_child == siblings[siblings.len() - 1].0 {
-                self.cache.get_mut(parent_page)?.header_mut().right_child = new_page.number;
-            }
             siblings.push((new_page.number, pidx));
             self.cache.load_from_mem(new_page)?;
         }
@@ -363,38 +362,39 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         // Free unused pages.
         while number_of_cells_per_page.len() < siblings.len() {
             let unused_page = siblings.pop().unwrap().0;
+            let right_child = self.cache.get(unused_page)?.header().right_child;
+            self.cache
+                .get_mut(siblings[siblings.len() - 1].0)?
+                .header_mut()
+                .right_child = right_child;
             self.free_page(unused_page);
-            if self.cache.get(parent_page)?.header().right_child == unused_page {
-                self.cache.get_mut(parent_page)?.header_mut().right_child =
-                    siblings.last().unwrap().0;
-            }
         }
 
         // Begin distribution
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
             let page = self.cache.get_mut(siblings[i].0)?;
-            let mut e_idx = 0;
             for _ in 0..*n {
-                page.try_insert(&entries.remove(0)).expect("Should fit");
-                if children.len() > 0 {
-                    page.set_child(e_idx, children.remove(0));
-                }
-                e_idx += 1;
-            }
-
-            if children.len() > 0 {
-                page.set_right_child(children.remove(0));
+                page.try_insert_block(blocks.remove(0)).expect("Should fit");
             }
 
             if i < siblings.len() - 1 {
+                let mut divider = blocks.remove(0);
+                page.header_mut().right_child = divider.header.left_child;
+                divider.header.left_child = siblings[i].0;
                 self.cache
                     .get_mut(parent_page)?
-                    .insert_entry_at(divider_idx, &entries.remove(0));
-                self.cache
-                    .get_mut(parent_page)?
-                    .set_child(divider_idx, siblings[i].0);
+                    .insert_entry_at(divider_idx, divider);
                 divider_idx += 1;
             }
+        }
+
+        if divider_idx == self.cache.get(parent_page)?.entries_len() {
+            self.cache.get_mut(parent_page)?.header_mut().right_child =
+                siblings[siblings.len() - 1].0;
+        } else {
+            self.cache
+                .get_mut(parent_page)?
+                .set_child(divider_idx, siblings[siblings.len() - 1].0);
         }
 
         self.balance(parent_page, parents)?;
@@ -564,7 +564,7 @@ mod tests {
             keys: K,
         ) -> io::Result<()> {
             for key in keys {
-                // println!("{:?}", self.into_test_nodes(0)?);
+                println!("{:?}", self.into_test_nodes(0)?);
                 self.insert(&key.to_le_bytes())?;
             }
 
@@ -577,9 +577,7 @@ mod tests {
         ) -> io::Result<Vec<Option<Box<[u8]>>>> {
             let mut results = Vec::new();
             for k in keys {
-                println!("{:?}", self.into_test_nodes(0));
                 results.push(self.remove(&k.to_le_bytes())?);
-                println!("{:?}\n", self.into_test_nodes(0));
             }
             Ok(results)
         }
