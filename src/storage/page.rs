@@ -6,7 +6,7 @@ use std::{
     ptr::NonNull,
 };
 
-use super::pager::PageNumber;
+use crate::paging::pager::PageNumber;
 
 pub const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
 pub const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;

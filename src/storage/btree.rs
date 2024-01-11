@@ -8,11 +8,11 @@ use std::{
     path::Path,
 };
 
+use super::page::{Cell, Page};
 use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
         cache::Cache,
-        page::{Cell, Page},
         pager::{PageNumber, Pager},
     },
 };
@@ -586,10 +586,9 @@ mod tests {
     use std::{io, mem};
 
     use super::{BTree, BytesCmp, BALANCE_SIBLINGS_PER_SIDE};
-    use crate::paging::{
-        cache::Cache,
-        page::{Page, CELL_HEADER_SIZE, SLOT_SIZE},
-        pager::Pager,
+    use crate::{
+        paging::{cache::Cache, pager::Pager},
+        storage::page::{Page, CELL_HEADER_SIZE, SLOT_SIZE},
     };
 
     /// Allows us to build an entire tree manually and then compare it to an

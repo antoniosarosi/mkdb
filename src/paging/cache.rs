@@ -13,10 +13,8 @@ const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
 /// Minimum allowed cache size.
 const MIN_CACHE_SIZE: usize = 3;
 
-use super::{
-    page::Page,
-    pager::{PageNumber, Pager},
-};
+use super::pager::{PageNumber, Pager};
+use crate::storage::page::Page;
 
 /// The buffer pool is made of a list of frames. Each frame holds a parsed page,
 /// a reference bit a dirty bit.
@@ -439,7 +437,7 @@ mod tests {
         super::pager::{PageNumber, Pager},
         Cache,
     };
-    use crate::paging::page::{Cell, Page};
+    use crate::storage::page::{Cell, Page};
 
     type MemBuf = io::Cursor<Vec<u8>>;
 
