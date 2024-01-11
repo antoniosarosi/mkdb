@@ -2,6 +2,7 @@
 #![feature(ptr_metadata)]
 #![feature(debug_closure_helpers)]
 #![feature(pointer_is_aligned)]
+#![feature(allocator_api)]
 
 mod btree;
 mod os;

@@ -357,7 +357,8 @@ impl<I: Seek + Read + Write> Cache<I> {
 
     /// Loads a page into the buffer pool. Doesn't matter where the page comes
     /// from, it could have been created in memory or read from disk.
-    fn load_page(&mut self, page: Page) -> io::Result<FrameId> {
+    fn load_page(&mut self, mut page: Page) -> io::Result<FrameId> {
+        page.init();
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
             let frame_id = self.buffer.len();
@@ -438,7 +439,7 @@ mod tests {
         super::pager::{PageNumber, Pager},
         Cache,
     };
-    use crate::paging::page::Page;
+    use crate::paging::page::{Cell, Page};
 
     type MemBuf = io::Cursor<Vec<u8>>;
 
@@ -494,7 +495,7 @@ mod tests {
             let pages: Vec<Page> = (0..self.number_of_pages as PageNumber)
                 .map(|i| {
                     let mut page = Page::new(i, PAGE_SIZE as _);
-                    page.try_insert(&vec![i as u8; PAGE_SIZE / 2]).unwrap();
+                    page.push(Cell::new(&vec![i as u8; PAGE_SIZE / 2]));
                     page
                 })
                 .collect();
@@ -690,7 +691,10 @@ mod tests {
 
         for i in [0, 1] {
             let page = cache.get_mut(i)?;
-            page.slot_mut(0).iter_mut().for_each(|byte| *byte += 10);
+            page.cell_mut(0)
+                .content
+                .iter_mut()
+                .for_each(|byte| *byte += 10);
             expected.push(page.clone());
         }
 
@@ -719,7 +723,10 @@ mod tests {
 
         // Reference and modify page 0
         let page = cache.get_mut(0)?;
-        page.slot_mut(0).iter_mut().for_each(|byte| *byte += 1);
+        page.cell_mut(0)
+            .content
+            .iter_mut()
+            .for_each(|byte| *byte += 1);
         let expected = page.clone();
 
         // Reference pages 1 and 2
