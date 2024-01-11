@@ -5,7 +5,6 @@ use std::{
     fs::File,
     io,
     io::{Read, Seek, Write},
-    mem,
     path::Path,
 };
 
@@ -13,7 +12,7 @@ use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
         cache::Cache,
-        page::{Cell, Page, SLOT_SIZE},
+        page::{Cell, Page},
         pager::{PageNumber, Pager},
     },
 };
@@ -22,7 +21,7 @@ pub(crate) trait BytesCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering;
 }
 
-struct MemCmp;
+pub struct MemCmp;
 
 impl BytesCmp for MemCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -84,6 +83,58 @@ impl<F, C: BytesCmp> BTree<F, C> {
             balance_siblings_per_side,
             len: 1,
         }
+    }
+}
+
+impl<C: BytesCmp> BTree<File, C> {
+    /// Creates a new [`BTree`] at the given `path` in the file system.
+    pub fn new_at_path_with_comparator<P: AsRef<Path>>(
+        path: P,
+        page_size: usize,
+        comparator: C,
+    ) -> io::Result<Self> {
+        let file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        let metadata = file.metadata()?;
+
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
+        }
+
+        let block_size = Disk::from(&path).block_size()?;
+
+        // TODO: Add magic number & header to file.
+        let mut cache = Cache::new(Pager::new(file, page_size, block_size));
+        let balance_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
+
+        // TODO: Init root while we don't have a header.
+        let mut current_root = Page::new(0, page_size as _);
+        cache.pager.read(0, current_root.buffer_mut())?;
+        if current_root.header().free_space() == 0 {
+            let new_root = Page::new(0, page_size as _);
+            cache.pager.write(new_root.number, new_root.buffer())?;
+        }
+
+        // TODO: Take free pages into account.
+        let len = std::cmp::max(metadata.len() as usize / page_size, 1);
+
+        Ok(Self {
+            cache,
+            len,
+            comparator,
+            balance_siblings_per_side,
+        })
+    }
+}
+
+impl BTree<File> {
+    /// Creates a new [`BTree`] at the given `path` in the file system.
+    pub fn new_at_path<P: AsRef<Path>>(path: P, page_size: usize) -> io::Result<Self> {
+        Self::new_at_path_with_comparator(path, page_size, MemCmp)
     }
 }
 
@@ -465,6 +516,68 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         self.len += 1;
 
         page as u32
+    }
+
+    // Testing/Debugging only.
+    fn read_into_mem(&mut self, root: PageNumber, buf: &mut Vec<Page>) -> io::Result<()> {
+        for page in self.cache.get(root)?.iter_children().collect::<Vec<_>>() {
+            self.read_into_mem(page, buf)?;
+        }
+
+        let mut node = self.cache.get(root)?.clone();
+        node.init();
+        buf.push(node);
+
+        Ok(())
+    }
+
+    pub fn json(&mut self) -> io::Result<String> {
+        let mut nodes = Vec::new();
+        self.read_into_mem(0, &mut nodes)?;
+
+        nodes.sort_by(|n1, n2| n1.number.cmp(&n2.number));
+
+        let mut string = String::from('[');
+
+        string.push_str(&self.to_json(&nodes[0])?);
+
+        for node in &nodes[1..] {
+            string.push(',');
+            string.push_str(&self.to_json(&node)?);
+        }
+
+        string.push(']');
+
+        Ok(string)
+    }
+
+    fn to_json(&mut self, page: &Page) -> io::Result<String> {
+        let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
+
+        if page.len() >= 1 {
+            let key = page.cell(0).content;
+            string.push_str(&format!("{:?}", key));
+
+            for i in 1..page.len() {
+                string.push(',');
+                string.push_str(&format!("{:?}", page.cell(i).content));
+            }
+        }
+
+        string.push_str("],\"children\":[");
+
+        if page.header().right_child != 0 {
+            string.push_str(&format!("{}", page.child(0)));
+
+            for child in page.iter_children().skip(1) {
+                string.push_str(&format!(",{child}"));
+            }
+        }
+
+        string.push(']');
+        string.push('}');
+
+        Ok(string)
     }
 }
 

@@ -3,7 +3,6 @@ use std::{
     cmp::Ordering,
     collections::BinaryHeap,
     mem,
-    ops::Index,
     ptr::NonNull,
 };
 
@@ -29,6 +28,12 @@ pub(crate) struct PageHeader {
     last_used_offset: Offset,
     /// Last child of this page.
     pub right_child: PageNumber,
+}
+
+impl PageHeader {
+    pub fn free_space(&self) -> u16 {
+        self.free_space
+    }
 }
 
 #[derive(Debug)]
