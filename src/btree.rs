@@ -59,9 +59,25 @@ struct Search {
     index: Result<u16, u16>,
 }
 
+impl<F> BTree<F> {
+    #[allow(dead_code)]
+    pub fn new(cache: Cache<F>, balance_siblings_per_side: usize) -> Self {
+        Self {
+            cache,
+            comparator: MemCmp,
+            balance_siblings_per_side,
+            len: 1,
+        }
+    }
+}
+
 impl<F, C: BytesCmp> BTree<F, C> {
     #[allow(dead_code)]
-    pub fn new(cache: Cache<F>, comparator: C, balance_siblings_per_side: usize) -> Self {
+    pub fn new_with_comparator(
+        cache: Cache<F>,
+        balance_siblings_per_side: usize,
+        comparator: C,
+    ) -> Self {
         Self {
             cache,
             comparator,
@@ -463,17 +479,6 @@ mod tests {
         pager::Pager,
     };
 
-    struct U32BytesCmp;
-
-    impl BytesCmp for U32BytesCmp {
-        fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-            let a = u32::from_le_bytes(a[..4].try_into().unwrap());
-            let b = u32::from_le_bytes(b[..4].try_into().unwrap());
-
-            a.cmp(&b)
-        }
-    }
-
     /// Allows us to build an entire tree manually and then compare it to an
     /// actual [`BTree`] structure. See tests below for examples.
     #[derive(Debug, PartialEq)]
@@ -527,7 +532,7 @@ mod tests {
             self
         }
 
-        fn try_build(self) -> io::Result<BTree<MemBuf, U32BytesCmp>> {
+        fn try_build(self) -> io::Result<BTree<MemBuf>> {
             BTree::try_from(self)
         }
     }
@@ -536,7 +541,7 @@ mod tests {
     /// up tests as it avoids disk IO and system calls.
     type MemBuf = io::Cursor<Vec<u8>>;
 
-    impl BTree<MemBuf, U32BytesCmp> {
+    impl BTree<MemBuf> {
         fn into_test_nodes(&mut self, root: u32) -> io::Result<Node> {
             let mut node = Page::new(root, self.cache.pager.page_size as _);
             self.cache.pager.read(root, node.buffer_mut())?;
@@ -544,7 +549,7 @@ mod tests {
 
             let mut test_node = Node {
                 keys: (0..node.len())
-                    .map(|i| u32::from_le_bytes(node.cell(i).content[..4].try_into().unwrap()))
+                    .map(|i| u32::from_be_bytes(node.cell(i).content[..4].try_into().unwrap()))
                     .collect(),
                 children: vec![],
             };
@@ -566,7 +571,7 @@ mod tests {
         ) -> io::Result<()> {
             for key in keys {
                 println!("{:?}", self.into_test_nodes(0)?);
-                self.insert(&key.to_le_bytes())?;
+                self.insert(&key.to_be_bytes())?;
             }
 
             Ok(())
@@ -578,7 +583,7 @@ mod tests {
         ) -> io::Result<Vec<Option<Box<[u8]>>>> {
             let mut results = Vec::new();
             for k in keys {
-                results.push(self.remove(&k.to_le_bytes())?);
+                results.push(self.remove(&k.to_be_bytes())?);
             }
             Ok(results)
         }
@@ -599,7 +604,7 @@ mod tests {
         size
     }
 
-    impl TryFrom<Config> for BTree<MemBuf, U32BytesCmp> {
+    impl TryFrom<Config> for BTree<MemBuf> {
         type Error = io::Error;
 
         fn try_from(config: Config) -> Result<Self, Self::Error> {
@@ -608,7 +613,6 @@ mod tests {
 
             let mut btree = BTree::new(
                 Cache::new(Pager::new(buf, page_size, page_size)),
-                U32BytesCmp,
                 config.balance_siblings_per_side,
             );
 
@@ -622,10 +626,10 @@ mod tests {
         }
     }
 
-    impl TryFrom<BTree<MemBuf, U32BytesCmp>> for Node {
+    impl TryFrom<BTree<MemBuf>> for Node {
         type Error = io::Error;
 
-        fn try_from(mut btree: BTree<MemBuf, U32BytesCmp>) -> Result<Self, Self::Error> {
+        fn try_from(mut btree: BTree<MemBuf>) -> Result<Self, Self::Error> {
             btree.into_test_nodes(0)
         }
     }
@@ -1090,7 +1094,7 @@ mod tests {
     fn delete_from_leaf_node() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
-        btree.remove(&13_u32.to_le_bytes())?;
+        btree.remove(&13_u32.to_be_bytes())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1146,7 +1150,7 @@ mod tests {
     fn delete_from_internal_node() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
-        btree.remove(&8_u32.to_le_bytes())?;
+        btree.remove(&8_u32.to_be_bytes())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1209,7 +1213,7 @@ mod tests {
     fn delete_from_root() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
-        btree.remove(&11_u32.to_le_bytes())?;
+        btree.remove(&11_u32.to_be_bytes())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1274,7 +1278,7 @@ mod tests {
     fn delete_using_successor_instead_of_predecessor() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=26).try_build()?;
 
-        btree.remove(&11_u32.to_le_bytes())?;
+        btree.remove(&11_u32.to_be_bytes())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1449,7 +1453,7 @@ mod tests {
     fn merge_root() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=4).try_build()?;
 
-        btree.remove(&4_u32.to_le_bytes())?;
+        btree.remove(&4_u32.to_be_bytes())?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
 
@@ -1585,7 +1589,7 @@ mod tests {
 
         btree
             .try_remove_all(1..=3)
-            .and_then(|_| btree.remove(&35_u32.to_le_bytes()))?;
+            .and_then(|_| btree.remove(&35_u32.to_be_bytes()))?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1773,8 +1777,8 @@ mod tests {
             .keys(1..=15)
             .try_build()?;
 
-        btree.remove(&3_u32.to_le_bytes())?;
-        btree.insert(&16_u32.to_le_bytes())?;
+        btree.remove(&3_u32.to_be_bytes())?;
+        btree.insert(&16_u32.to_be_bytes())?;
 
         assert_eq!(
             Node::try_from(btree)?,
