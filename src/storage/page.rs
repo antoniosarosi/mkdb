@@ -37,7 +37,7 @@ use crate::paging::pager::PageNumber;
 /// represent using 2 bytes.
 pub const MAX_PAGE_SIZE: u16 = u16::MAX;
 
-/// Size of the [`DiskPage`] header. See [`PageHeader`] for details.
+/// Size of the [`Page`] header. See [`PageHeader`] for details.
 pub const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
 
 /// Size of [`CellHeader`].
@@ -46,7 +46,7 @@ pub const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 /// Size of an individual slot (offset pointer).
 pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
-/// See [`DiskPage`] for alignment details.
+/// See [`Page`] for alignment details.
 const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
 
 /// Type alias to make it clear when we're dealing with cell offsets. A 2 byte
@@ -112,7 +112,7 @@ impl PageHeader {
 ///
 /// # Alignment
 ///
-/// cells are 64 bit aligned. See [`DiskPage`] for more details.
+/// cells are 64 bit aligned. See [`Page`] for more details.
 #[derive(Debug, PartialEq, Clone)]
 #[repr(C, align(8))]
 pub struct CellHeader {
@@ -201,13 +201,18 @@ impl Cell {
         self.header.storage_size()
     }
 
-    /// See [`DiskPage`] for details.
+    /// See [`Page`] for details.
     pub fn aligned_size_of(data: &[u8]) -> u16 {
         Layout::from_size_align(data.len(), CELL_ALIGNMENT)
             .unwrap()
             .pad_to_align()
             .size() as _
     }
+}
+
+struct OverflowCell {
+    cell: Cell,
+    index: SlotId,
 }
 
 /// Fixed size slotted page. This is what we store on disk. The page maintains a
@@ -313,15 +318,23 @@ impl Cell {
 ///
 /// # Overflow
 ///
-/// [`DiskPage`] is not allowed to overflow. That's why we need [`MemPage`].
-pub(crate) struct DiskPage {
+/// To deal with overflow we maintain a list of cells that didn't fit in the
+/// slotted page and we store the index where they should have been inserted
+/// in the slotted array. Not all methods take overflow into account, most of
+/// them don't care because once the page overflows the BTree balancing
+/// algorithm will move all the cells out of the page and reorganize them across
+/// siblings. The only method that needs to work correctly is [`Page::drain`] as
+/// that's the one used to move the cells out.
+pub(crate) struct Page {
     /// Page number on disk.
     pub number: PageNumber,
     /// Fixed size in-memory buffer that contains the data read from disk.
     buffer: NonNull<[u8]>,
+    /// Overflow list.
+    overflow: VecDeque<OverflowCell>,
 }
 
-impl DiskPage {
+impl Page {
     pub fn new(number: PageNumber, size: u16) -> Self {
         let buffer = alloc::Global
             .allocate_zeroed(Self::layout(size))
@@ -336,21 +349,19 @@ impl DiskPage {
             });
         }
 
-        Self { number, buffer }
+        Self {
+            number,
+            buffer,
+            overflow: VecDeque::new(),
+        }
     }
 
     pub fn size(&self) -> u16 {
         self.buffer.len() as _
     }
 
-    pub fn clear(&mut self) {
-        self.header_mut().num_slots = 0;
-        self.header_mut().last_used_offset = self.size();
-        self.header_mut().free_space = Self::usable_space(self.size());
-    }
-
     pub fn len(&self) -> u16 {
-        self.header().num_slots
+        self.header().num_slots + self.overflow.len() as u16
     }
 
     pub fn buffer(&self) -> &[u8] {
@@ -441,6 +452,25 @@ impl DiskPage {
         }
     }
 
+    pub fn is_underflow(&self) -> bool {
+        self.len() == 0
+            || !self.is_root() && self.header().free_space > Self::usable_space(self.size()) / 2
+    }
+
+    pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        let len = if self.is_leaf() { 0 } else { self.len() + 1 };
+
+        (0..len).map(|i| self.child(i))
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        for cell in other.drain(..) {
+            self.push(cell);
+        }
+
+        self.header_mut().right_child = other.header().right_child;
+    }
+
     pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
         self.slot_array()
             .binary_search_by(|offset| unsafe {
@@ -449,6 +479,46 @@ impl DiskPage {
             })
             .map(|index| index as _)
             .map_err(|index| index as _)
+    }
+
+    pub fn is_overflow(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.header().right_child == 0
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.number == 0
+    }
+
+    pub fn push(&mut self, cell: Cell) {
+        self.insert(self.len(), cell);
+    }
+
+    pub fn insert(&mut self, index: SlotId, cell: Cell) {
+        if self.is_overflow() {
+            return self.overflow.push_back(OverflowCell { cell, index });
+        }
+
+        if let Err(cell) = self.try_insert(index, cell) {
+            self.overflow.push_back(OverflowCell { cell, index });
+        }
+    }
+
+    pub fn replace(&mut self, index: SlotId, new_cell: Cell) -> Cell {
+        match self.try_replace(index, new_cell) {
+            Ok(old_cell) => old_cell,
+
+            Err(new_cell) => {
+                self.overflow.push_back(OverflowCell {
+                    cell: new_cell,
+                    index,
+                });
+                self.remove(index)
+            }
+        }
     }
 
     /// Attempts to insert the given `cell` in this page. There are two possible
@@ -726,32 +796,48 @@ impl DiskPage {
             Bound::Included(i) => i + 1,
         };
 
-        let mut i = start;
+        let mut drain_index = start;
+        let mut slot_index = start;
+
+        self.overflow
+            .make_contiguous()
+            .sort_by_key(|overflow| overflow.index);
 
         iter::from_fn(move || {
             // Copy cells until we reach the end.
-            if i < end {
-                let cell = self.owned_cell(i as _);
-                i += 1;
-                return Some(cell);
+            if drain_index < end {
+                let cell = if self
+                    .overflow
+                    .front()
+                    .is_some_and(|overflow| overflow.index as usize == drain_index)
+                {
+                    self.overflow.pop_front().unwrap().cell
+                } else {
+                    let cell = self.owned_cell(slot_index as _);
+                    slot_index += 1;
+                    cell
+                };
+
+                drain_index += 1;
+
+                Some(cell)
+            } else {
+                // Now compute gained space and shift slots towards the left.
+                self.header_mut().free_space += (start..slot_index)
+                    .map(|slot| self.cell(slot as _).storage_size())
+                    .sum::<u16>();
+
+                self.slot_array_mut().copy_within(start..slot_index, 0);
+
+                self.header_mut().num_slots -= (slot_index - start) as u16;
+
+                None
             }
-
-            // Now compute gained space and shift slots towards the left.
-            self.header_mut().free_space += self.slot_array()[end..]
-                .iter()
-                .map(|slot| self.cell(*slot).storage_size())
-                .sum::<u16>();
-
-            self.slot_array_mut().copy_within(end.., 0);
-
-            self.header_mut().num_slots -= (end - start) as u16;
-
-            None
         })
     }
 }
 
-impl Drop for DiskPage {
+impl Drop for Page {
     fn drop(&mut self) {
         unsafe {
             alloc::Global.deallocate(self.buffer.cast(), Self::layout(self.buffer.len() as _))
@@ -759,7 +845,7 @@ impl Drop for DiskPage {
     }
 }
 
-impl PartialEq for DiskPage {
+impl PartialEq for Page {
     fn eq(&self, other: &Self) -> bool {
         self.number == other.number
             && self.buffer.len() == other.buffer.len()
@@ -767,17 +853,17 @@ impl PartialEq for DiskPage {
     }
 }
 
-impl Clone for DiskPage {
+impl Clone for Page {
     fn clone(&self) -> Self {
-        let mut page = DiskPage::new(self.number, self.buffer.len() as _);
+        let mut page = Page::new(self.number, self.buffer.len() as _);
         page.buffer_mut().copy_from_slice(self.buffer());
         page
     }
 }
 
-impl Debug for DiskPage {
+impl Debug for Page {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DiskPage")
+        f.debug_struct("Page")
             .field("header", self.header())
             .field("number", &self.number)
             .field("size", &self.size())
@@ -800,322 +886,5 @@ impl Debug for DiskPage {
                 list.finish()
             })
             .finish()
-    }
-}
-
-/// Pointer to either a cell in memory or in a [`DiskPage`] instance.
-#[derive(Debug, PartialEq, Clone)]
-enum CellLocation {
-    /// The cell is located in [`DiskPage`] and we have its slot index.
-    Disk(SlotId),
-
-    /// The cell is located in memory and we own it.
-    Mem(Cell),
-}
-
-/// In-memory page. The difference between [`DiskPage`] and [`MemPage`] is that
-/// [`MemPage`] is allowed to overflow, so it can store as many [`Cell`]s as
-/// there is memory. The reason we need to be able to overflow is because the
-/// BTree balancing algorithm will attempt to insert as many divider keys as
-/// needed into parent pages when reordering cells around siblings, so we need a
-/// way to maintain cells that don't fit in [`DiskPage`].
-///
-/// Since [`MemPage`] can overflow, there are no fallible APIs, we don't have to
-/// `try_` anything, we just do it.
-///
-/// # Overflow
-///
-/// The [`MemPage`] maintains an overflow array that is lazily initialized only
-/// when it's needed. The overflow array points to cells either on [`DiskPage`]
-/// or in-memory using [`CellLocation`]:
-///
-/// ```text
-///                     +---------------+
-///                     | BOXED CONTENT |
-///                     +---------------+
-///                             ^
-///                             |
-///  +---------+---------+-----------+---------+
-///  | Disk(0) | Disk(1) | Mem(Cell) | Disk(2) | MemPage
-///  +---------+---------+-----------+---------+
-///       |         |                     |
-///       +---+     |    +----------------+
-///           |     |    |
-///           V     V    V                       DiskPage
-///  +------+----+----+----+------------------+--------+--------+--------+
-///  |      | O1 | O2 | O3 | ->            <- | CELL 3 | CELL 2 | CELL 1 |
-///  +------+----+----+----+------------------+--------+--------+--------+
-///           |    |    |                     ^        ^        ^
-///           |    |    |                     |        |        |
-///           +----|----|---------------------|--------|--------+
-///                |    |                     |        |
-///                +----|---------------------|--------+
-///                     |                     |
-///                     +---------------------+
-/// ```
-///
-/// Once the overflow array is initialized and the first [`CellLocation::Mem`]
-/// instance is inserted, all subsequent insert operations will use
-/// [`CellLocation::Mem`] even if the cell fits in the slotted [`DiskPage`].
-///
-/// Similarly, remove operations will leave the slotted page untouched and only
-/// remove from the overflow array. We do this for simplicity reasons and
-/// because it's not worth it trying to save data in the slotted page once
-/// a single [`Cell`] has already overflowed into memory, since the BTree will
-/// have to reorganize all the cells anyway.
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct MemPage {
-    /// We wrap the disk page and we will attempt to fit as many cells as
-    /// possible here before overflowing into memory.
-    disk: DiskPage,
-
-    /// Once we overflow, the [`DiskPage`] is no longer used for inserts/deletes
-    /// and everything is done in memory. It is used only for reading through
-    /// [`CellLocation::Disk`].
-    overflow: Vec<CellLocation>,
-}
-
-impl MemPage {
-    pub fn new(number: PageNumber, size: u16) -> Self {
-        Self {
-            disk: DiskPage::new(number, size),
-            overflow: Vec::new(),
-        }
-    }
-
-    pub fn number(&self) -> PageNumber {
-        self.disk.number
-    }
-
-    pub fn buffer(&self) -> &[u8] {
-        self.disk.buffer()
-    }
-
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
-        self.disk.buffer_mut()
-    }
-
-    pub fn len(&self) -> u16 {
-        if self.is_overflow() {
-            self.overflow.len() as _
-        } else {
-            self.disk.len()
-        }
-    }
-
-    pub fn header(&self) -> &PageHeader {
-        self.disk.header()
-    }
-
-    pub fn header_mut(&mut self) -> &mut PageHeader {
-        self.disk.header_mut()
-    }
-
-    pub fn is_root(&self) -> bool {
-        self.number() == 0
-    }
-
-    pub fn is_leaf(&self) -> bool {
-        self.header().right_child == 0
-    }
-
-    pub fn is_underflow(&self) -> bool {
-        self.disk.len() == 0
-            || !self.is_root()
-                && self.header().free_space > DiskPage::usable_space(self.disk.size()) / 2
-    }
-
-    pub fn child(&self, index: u16) -> PageNumber {
-        if self.is_overflow() {
-            match &self.overflow[index as usize] {
-                CellLocation::Disk(slot) => self.disk.child(*slot),
-                CellLocation::Mem(cell) => cell.header.left_child,
-            }
-        } else {
-            self.disk.child(index)
-        }
-    }
-
-    pub fn append(&mut self, other: &mut Self) {
-        for cell in other.drain(..) {
-            self.push(cell);
-        }
-
-        other.disk.clear();
-
-        self.header_mut().right_child = other.header().right_child;
-    }
-
-    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
-        if self.is_overflow() {
-            self.overflow
-                .binary_search_by(|location| {
-                    f(match location {
-                        CellLocation::Mem(cell) => &cell.content,
-                        CellLocation::Disk(slot) => self.disk.cell(*slot).content,
-                    })
-                })
-                .map(|i| i as u16)
-                .map_err(|i| i as u16)
-        } else {
-            self.disk.binary_search_by(f)
-        }
-    }
-
-    pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
-        let len = if self.is_leaf() { 0 } else { self.len() + 1 };
-
-        (0..len).map(|i| self.child(i))
-    }
-
-    /// Whether this page has overflown once. Note that in theory it is possible
-    /// for this [`MemPage`] to actually fit in a [`DiskPage`] if we remove
-    /// cells from it once it has overflown, but this function will still
-    /// return `true` because the underlying [`DiskPage`] is not kept in sync
-    /// with what we have in memory and we may also still point to some
-    /// [`CellLocation::Mem`] instances, so the page is not safe to write to
-    /// disk.
-    ///
-    /// The "overflow" state should be seen more like some kind of "dirty" state
-    /// that requires cleanup instead of simply "this page has more cells than
-    /// we can fit". It's not worth it trying to keep everything in sync because
-    /// once a page overflows the BTree balancing algorithm will take all the
-    /// cells out and reorganize them among siblings. The only thing we need to
-    /// make sure works correctly is CRUDing the cells.
-    pub fn is_overflow(&self) -> bool {
-        !self.overflow.is_empty()
-    }
-
-    /// Goes into "overflow" state. See [`Self::is_overflow`].
-    fn init_overflow(&mut self, index: u16, cell: Cell, skip_disk_index: bool) {
-        // Already initialized. This function is not called more than once
-        // anyway, but paranoia ¯\_(ツ)_/¯
-        if self.is_overflow() {
-            return;
-        }
-
-        let disk_left_cells = 0..index;
-
-        let disk_right_cells = if skip_disk_index {
-            index + 1..self.disk.len()
-        } else {
-            index..self.disk.len()
-        };
-
-        self.overflow.extend(
-            disk_left_cells
-                .map(CellLocation::Disk)
-                .chain(iter::once(CellLocation::Mem(cell)))
-                .chain(disk_right_cells.map(CellLocation::Disk)),
-        );
-    }
-
-    pub fn push(&mut self, cell: Cell) {
-        self.insert(self.len(), cell)
-    }
-
-    pub fn insert(&mut self, index: u16, cell: Cell) {
-        // Don't bother trying to insert in the slotted page once we
-        // overflowed, there's no point since the BTree will take all the cells
-        // out of this page and reorganize them.
-        if self.is_overflow() {
-            return self.overflow.insert(index as _, CellLocation::Mem(cell));
-        }
-
-        // If we didn't overflow yet, keep filling the slotted page until we
-        // overflow. Once that happens this code doesn't run anymore.
-        if let Err(cell) = self.disk.try_insert(index, cell) {
-            self.init_overflow(index, cell, false);
-        }
-    }
-
-    pub fn replace(&mut self, index: u16, new_cell: Cell) -> Cell {
-        if self.is_overflow() {
-            let location = mem::replace(
-                &mut self.overflow[index as usize],
-                CellLocation::Mem(new_cell),
-            );
-
-            match location {
-                CellLocation::Mem(old_cell) => old_cell,
-                CellLocation::Disk(slot) => self.disk.owned_cell(slot),
-            }
-        } else {
-            match self.disk.try_replace(index, new_cell) {
-                Ok(old_cell) => old_cell,
-
-                Err(new_cell) => {
-                    self.init_overflow(index, new_cell, true);
-
-                    self.disk.owned_cell(index)
-                }
-            }
-        }
-    }
-
-    pub fn remove(&mut self, index: u16) -> Cell {
-        if !self.is_overflow() {
-            return self.disk.remove(index);
-        }
-
-        let cell = match self.overflow.remove(index as usize) {
-            CellLocation::Mem(cell) => cell,
-            CellLocation::Disk(slot) => self.disk.owned_cell(slot),
-        };
-
-        // This is the only condition that can "unoverflow" the page. Since
-        // everything is gone, syncing the overflow array with the slotted page
-        // doesn't matter anymore.
-        if self.overflow.is_empty() {
-            self.disk.clear();
-        }
-
-        cell
-    }
-
-    pub fn cell(&self, index: u16) -> CellRef {
-        if !self.is_overflow() {
-            return self.disk.cell(index);
-        }
-
-        match &self.overflow[index as usize] {
-            CellLocation::Disk(slot) => self.disk.cell(*slot),
-            CellLocation::Mem(cell) => CellRef {
-                header: &cell.header,
-                content: &cell.content,
-            },
-        }
-    }
-
-    pub fn cell_mut(&mut self, index: u16) -> CellRefMut {
-        if !self.is_overflow() {
-            return self.disk.cell_mut(index);
-        }
-
-        match &mut self.overflow[index as usize] {
-            CellLocation::Disk(slot) => self.disk.cell_mut(*slot),
-            CellLocation::Mem(cell) => CellRefMut {
-                header: &mut cell.header,
-                content: &mut cell.content,
-            },
-        }
-    }
-
-    pub fn drain(&mut self, range: impl RangeBounds<usize>) -> Box<dyn Iterator<Item = Cell> + '_> {
-        if self.is_overflow() {
-            let cells =
-                VecDeque::from_iter(self.overflow.drain(range).map(|location| match location {
-                    CellLocation::Disk(slot) => self.disk.owned_cell(slot),
-                    CellLocation::Mem(cell) => cell,
-                }));
-
-            if self.overflow.is_empty() {
-                self.disk.clear();
-            }
-
-            Box::new(cells.into_iter())
-        } else {
-            Box::new(self.disk.drain(range))
-        }
     }
 }
