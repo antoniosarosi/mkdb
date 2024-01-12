@@ -1,22 +1,78 @@
+//! Slotted page implementation tuned for index organized storage. Initially
+//! this was going to be a generic slotted page implementation that would serve
+//! as a building block for both index organized storage (like SQLite) and tuple
+//! oriented storage (like Postgres), but the idea has been dropped in favor of
+//! simplicity.
+//!
+//! The main difference is that when using index organized storage we never
+//! point to slot indexes from outside the page, so there's no need to attempt
+//! to maintain their current position for as long as possible. This [commit]
+//! contains the last version that used to do so. Another benefit of the current
+//! aproach is that BTree nodes and disk pages are the same thing, because
+//! everything is stored in a BTree, so we need less generics, less types and
+//! less code. Take a look at the [btree.c] file from SQLite 2.X.X for the
+//! inspiration.
+//!
+//! Check these lectures for some background on slotted pages and data storage:
+//!
+//! - [F2023 #03 - Database Storage Part 1 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=DJ5u5HrbcMk)
+//! - [F2023 #04 - Database Storage Part 2 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=Ra50bFHkeM8)
+//!
+//! [commit]: https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs
+//! [btree.c]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c
+
 use std::{
     alloc::{self, Allocator, Layout},
     cmp::Ordering,
-    collections::BinaryHeap,
-    mem,
+    collections::{BinaryHeap, VecDeque},
+    fmt::Debug,
+    iter, mem,
+    ops::{Bound, RangeBounds},
     ptr::NonNull,
 };
 
 use crate::paging::pager::PageNumber;
 
+/// Maximum page size is 64 KiB, which is the maximum number that we can
+/// represent using 2 bytes.
+pub const MAX_PAGE_SIZE: u16 = u16::MAX;
+
+/// Size of the [`DiskPage`] header. See [`PageHeader`] for details.
 pub const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
+
+/// Size of [`CellHeader`].
 pub const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
+
+/// Size of an individual slot (offset pointer).
 pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
+/// See [`DiskPage`] for alignment details.
 const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
 
+/// Type alias to make it clear when we're dealing with cell offsets. A 2 byte
+/// offset can point to the end of [`MAX_PAGE_SIZE`].
 type Offset = u16;
+
+/// The slot array can be indexed using 2 bytes, since it will never be bigger
+/// than [`MAX_PAGE_SIZE`].
 type SlotId = u16;
 
+/// Slotted page header. It is located at the beginning of each page and it does
+/// not contain variable length data:
+///
+/// ```text
+///                           HEADER                                          CONTENT
+/// +-------------------------------------------------------------+----------------------------+
+/// | +------------+-----------+------------------+-------------+ |                            |
+/// | | free_space | num_slots | last_used_offset | right_child | |                            |
+/// | +------------+-----------+------------------+-------------+ |                            |
+/// +-------------------------------------------------------------+----------------------------+
+///                                          PAGE
+/// ```
+///
+/// The alignment and size of this struct doesn't matter. Actual data is
+/// appended towards to end of the page, and the page should be aligned to 8
+/// bytes. See [`Page`] for more details.
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct PageHeader {
@@ -31,16 +87,38 @@ pub(crate) struct PageHeader {
 }
 
 impl PageHeader {
+    /// Total free space that can be used to store [`Cell`] instances.
     pub fn free_space(&self) -> u16 {
         self.free_space
     }
 }
 
-#[derive(Debug)]
+/// Located at the beginning of each cell. The header stores the size of the
+/// cell without including its own size and it also stores a pointer to the
+/// BTree page the contains entries "less than" this one.
+///
+/// ```text
+///           HEADER                               CONTENT
+/// +-----------------------+-----------------------------------------------+
+/// | +------+------------+ |                                               |
+/// | | size | left_child | |                                               |
+/// | +------+------------+ |                                               |
+/// +-----------------------+-----------------------------------------------+
+///                         ^                                               ^
+///                         |                                               |
+///                         +-----------------------------------------------+
+///                                            size bytes
+/// ```
+///
+/// # Alignment
+///
+/// cells are 64 bit aligned. See [`DiskPage`] for more details.
+#[derive(Debug, PartialEq, Clone)]
 #[repr(C, align(8))]
 pub struct CellHeader {
+    /// Size of the cell content.
     size: u16,
-    ///
+    /// ID of the BTree page that contains values less than this cell.
     pub left_child: PageNumber,
 }
 
@@ -49,31 +127,57 @@ impl CellHeader {
         CELL_HEADER_SIZE + self.size
     }
 
+    pub fn storage_size(&self) -> u16 {
+        self.total_size() + SLOT_SIZE
+    }
+
     fn content_of(cell: NonNull<Self>) -> NonNull<[u8]> {
         unsafe { NonNull::slice_from_raw_parts(cell.add(1).cast(), cell.as_ref().size as _) }
     }
 }
 
-#[derive(Debug)]
+/// Owned version of a cell. The [`crate::storage::BTree`] structure reorders
+/// cells around different sibling pages when an overflow or underflow occurs,
+/// so instead of hiding the low level details we provide some API that can be
+/// used by upper levels.
+#[derive(Debug, PartialEq, Clone)]
 pub struct Cell {
     pub header: CellHeader,
     pub content: Box<[u8]>,
 }
 
+/// Read-only reference to a cell. The cell could be located either in a page
+/// that comes from disk or in memory if the page overflowed. See [`MemPage`]
+/// for more details.
 pub struct CellRef<'a> {
     pub header: &'a CellHeader,
     pub content: &'a [u8],
 }
 
+impl<'a> CellRef<'a> {
+    pub fn size(&self) -> u16 {
+        self.header.size
+    }
+
+    pub fn total_size(&self) -> u16 {
+        self.header.total_size()
+    }
+
+    pub fn storage_size(&self) -> u16 {
+        self.header.storage_size()
+    }
+}
+
+/// Same as [`CellRef`] but mutable.
 pub struct CellRefMut<'a> {
     pub header: &'a mut CellHeader,
     pub content: &'a mut [u8],
 }
 
 impl Cell {
-    pub fn new(mut data: &[u8]) -> Self {
+    pub fn new(data: &[u8]) -> Self {
         let mut data = Vec::from(data);
-        let size = Page::aligned_size_of(&data);
+        let size = Self::aligned_size_of(&data);
         data.resize(size as _, 0);
 
         Self {
@@ -85,37 +189,140 @@ impl Cell {
         }
     }
 
-    pub fn total_size(&self) -> u16 {
-        self.header.total_size()
-    }
-
     pub fn size(&self) -> u16 {
         self.header.size
     }
 
+    pub fn total_size(&self) -> u16 {
+        self.header.total_size()
+    }
+
     pub fn storage_size(&self) -> u16 {
-        self.total_size() + SLOT_SIZE
+        self.header.storage_size()
+    }
+
+    /// See [`DiskPage`] for details.
+    pub fn aligned_size_of(data: &[u8]) -> u16 {
+        Layout::from_size_align(data.len(), CELL_ALIGNMENT)
+            .unwrap()
+            .pad_to_align()
+            .size() as _
     }
 }
 
-#[derive(Debug)]
-enum CellLocation {
-    Disk(u16),
-    Mem(Cell),
-}
-
-#[derive(Debug)]
-pub(crate) struct Page {
+/// Fixed size slotted page. This is what we store on disk. The page maintains a
+/// "slot array" located after the header that grows towards the right. On the
+/// opposite side is where used cells are located, leaving free space in the
+/// middle of the page. Each item in the slot array points to one of the used
+/// cells through its offset, calculated from the start of the page (before the
+/// header).
+///
+/// ```text
+///   HEADER   SLOT ARRAY       FREE SPACE             USED CELLS
+///  +------+----+----+----+------------------+--------+--------+--------+
+///  |      | O1 | O2 | O3 | ->            <- | CELL 3 | CELL 2 | CELL 1 |
+///  +------+----+----+----+------------------+--------+--------+--------+
+///           |    |    |                     ^        ^        ^
+///           |    |    |                     |        |        |
+///           +----|----|---------------------|--------|--------+
+///                |    |                     |        |
+///                +----|---------------------|--------+
+///                     |                     |
+///                     +---------------------+
+/// ```
+///
+/// This is useful for 2 reasons, described below.
+///
+/// # Cheap Sorting or Reordering
+///
+/// First, we can rearrange cells without changing their physical location. We
+/// only need to change the offsets in the slot array. For example, if we wanted
+/// to reverse the order of the cells in the figure above, this is all we need
+/// to do:
+///
+/// ```text
+///   HEADER   SLOT ARRAY       FREE SPACE             USED CELLS
+///  +------+----+----+----+------------------+--------+--------+--------+
+///  |      | O3 | O2 | O1 | ->            <- | CELL 3 | CELL 2 | CELL 1 |
+///  +------+----+----+----+------------------+--------+--------+--------+
+///           |    |    |                     ^        ^        ^
+///           |    |    |                     |        |        |
+///           +----|----|---------------------+        |        |
+///                |    |                              |        |
+///                +----|-------------------------------        |
+///                     |                                       |
+///                     +---------------------------------------+
+/// ```
+///
+/// Now the third cell becomes the first one in the list, second cell stays
+/// the same and the first cell becomes the last. Changing offsets in the slot
+/// array is much cheaper than moving the cells around the page. This is needed
+/// for BTree pages to sort entries, and this is the only feature implemented
+/// here.
+///
+/// # Maintaining Slot Positions After Delete Operations
+///
+/// The second reason this is useful is because we could maintain the same slot
+/// number for the rest of the cells when one of them is deleted. For example,
+/// if we deleted CELL 2 in the figure above, we wouldn't have to compact the
+/// slot array like this:
+///
+/// ```text
+///   HEADER SLOT ARRAY       FREE SPACE              USED CELLS
+///  +------+----+----+----------------------+--------+--------+--------+
+///  |      | O3 | O1 | ->                <- | CELL 3 |   DEL  | CELL 1 |
+///  +------+----+----+----------------------+--------+--------+--------+
+///           |    |                         ^                 ^
+///           |    |                         |                 |
+///           +----|-------------------------+                 |
+///                |                                           |
+///                +-------------------------------------------+
+/// ```
+///
+/// If we did this, then the slot ID of CELL 1 would change from 2 to 1. But
+/// instead we could simply set the slot to NULL or zero:
+///
+/// ```text
+///   HEADER SLOT ARRAY       FREE SPACE              USED CELLS
+///  +------+----+----+----+------------------+--------+--------+--------+
+///  |      | O3 |NULL| O1 | ->            <- | CELL 3 |   DEL  | CELL 1 |
+///  +------+----+----+----+------------------+--------+--------+--------+
+///           |         |                     ^                 ^
+///           |         |                     |                 |
+///           +---------|---------------------+                 |
+///                     |                                       |
+///                     +---------------------------------------+
+/// ```
+///
+/// The remaining slot IDs do not change. This is useful for deleting tuples
+/// and delaying index updates as much as possible if using tuple oriented
+/// storage, which we are not doing, so you'll never see NULL slots.
+/// Check this [commit](https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs)
+/// for the initial implementation which used to manage both null and non-null
+/// slot indexes.
+///
+/// # Alignment
+///
+/// In-memory pages should be 64 bit aligned. This will allow the [`CellHeader`]
+/// instances to be 64 bit aligned as well, which in turn will make the first
+/// content byte of each cell 64 bit aligned. Further alignment within the
+/// content should be controlled on upper layers. For example, if we have some
+/// schema like `[Int, Varchar(255), Bool]`, we can't worry about individual
+/// column alignment here because we're only storing binary data, we know
+/// nothing about what's inside.
+///
+/// # Overflow
+///
+/// [`DiskPage`] is not allowed to overflow. That's why we need [`MemPage`].
+pub(crate) struct DiskPage {
+    /// Page number on disk.
     pub number: PageNumber,
+    /// Fixed size in-memory buffer that contains the data read from disk.
     buffer: NonNull<[u8]>,
-    cells: Vec<CellLocation>,
-    mem_cells: usize,
 }
 
-impl Page {
-    /// Allocates a new empty [`Page`] of the given `size`.
+impl DiskPage {
     pub fn new(number: PageNumber, size: u16) -> Self {
-        // TODO: Handle alloc error.
         let buffer = alloc::Global
             .allocate_zeroed(Self::layout(size))
             .expect("could not allocate page");
@@ -129,320 +336,21 @@ impl Page {
             });
         }
 
-        Self {
-            number,
-            buffer,
-            mem_cells: 0,
-            cells: Vec::new(),
-        }
-    }
-
-    pub fn init(&mut self) {
-        if self.cells.is_empty() {
-            for slot in 0..self.header().num_slots {
-                self.cells.push(CellLocation::Disk(slot));
-            }
-        }
-    }
-
-    pub fn cell(&self, index: u16) -> CellRef {
-        match &self.cells[index as usize] {
-            CellLocation::Mem(cell) => CellRef {
-                header: &cell.header,
-                content: &cell.content,
-            },
-
-            CellLocation::Disk(slot) => unsafe {
-                let offset = self.slots()[*slot as usize];
-
-                let header = self.cell_at_offset(offset);
-                CellRef {
-                    header: header.as_ref(),
-                    content: CellHeader::content_of(header).as_ref(),
-                }
-            },
-        }
-    }
-
-    pub fn cell_mut(&mut self, index: u16) -> CellRefMut {
-        match self.cells[index as usize] {
-            CellLocation::Mem(ref mut cell) => CellRefMut {
-                header: &mut cell.header,
-                content: &mut cell.content,
-            },
-
-            CellLocation::Disk(slot) => unsafe {
-                let offset = self
-                    .buffer
-                    .byte_add((PAGE_HEADER_SIZE + SLOT_SIZE * slot) as usize)
-                    .cast::<u16>()
-                    .read();
-
-                let mut header = self.buffer.byte_add(offset as usize).cast::<CellHeader>();
-
-                CellRefMut {
-                    header: header.as_mut(),
-                    content: CellHeader::content_of(header).as_mut(),
-                }
-            },
-        }
+        Self { number, buffer }
     }
 
     pub fn size(&self) -> u16 {
         self.buffer.len() as _
     }
 
-    pub fn is_overflow(&self) -> bool {
-        self.mem_cells > 0
+    pub fn clear(&mut self) {
+        self.header_mut().num_slots = 0;
+        self.header_mut().last_used_offset = self.size();
+        self.header_mut().free_space = Self::usable_space(self.size());
     }
 
     pub fn len(&self) -> u16 {
-        self.cells.len() as _
-    }
-
-    pub fn push(&mut self, cell: Cell) {
-        self.insert(self.len(), cell)
-    }
-
-    pub fn append(&mut self, other: &mut Self) {
-        for cell in other.drain() {
-            self.push(cell);
-        }
-
-        self.header_mut().right_child = other.header().right_child;
-    }
-
-    pub fn drain(&mut self) -> impl Iterator<Item = Cell> + '_ {
-        self.init();
-        // TODO: Optimize this, there's no need to remove anything until the
-        // end.
-        std::iter::from_fn(|| {
-            if self.cells.is_empty() {
-                return None;
-            } else {
-                Some(self.remove(0))
-            }
-        })
-    }
-
-    pub fn insert(&mut self, index: u16, cell: Cell) {
-        match self.try_insert(index, cell) {
-            Ok(slot) => self.cells.insert(index as _, CellLocation::Disk(slot)),
-
-            Err(cell) => {
-                self.cells.insert(index as _, CellLocation::Mem(cell));
-                self.mem_cells += 1;
-            }
-        }
-    }
-
-    pub fn remove(&mut self, index: u16) -> Cell {
-        let location = self.cells.remove(index as _);
-
-        // Cell is not written in the page, not much to do here.
-        if let CellLocation::Mem(cell) = location {
-            self.mem_cells -= 1;
-            return cell;
-        }
-
-        // Grab the slot id and delete the cell from the page.
-        let slot = match location {
-            CellLocation::Disk(slot) => slot,
-            _ => unreachable!(),
-        };
-
-        let len = self.header().num_slots;
-
-        if slot >= len {
-            panic!("index {slot} out of range for length {len}");
-        }
-
-        let cell = {
-            unsafe {
-                let offset = self.slots()[slot as usize];
-
-                let header = self.cell_at_offset(offset);
-                Cell {
-                    header: header.read(),
-                    content: Vec::from(CellHeader::content_of(header).as_ref()).into(),
-                }
-            }
-        };
-
-        // Remove the index as if we removed from a Vec.
-        self.slots_mut()
-            .copy_within(slot as usize + 1..len as usize, slot as usize);
-
-        self.cells[index as _..].iter_mut().for_each(|location| {
-            if let CellLocation::Disk(slot) = location {
-                *slot -= 1
-            }
-        });
-
-        // Add new free space SAFETY: See [`Self::block_at_slot_index`].
-        self.header_mut().free_space += cell.total_size();
-
-        // Decrease length.
-        self.header_mut().num_slots -= 1;
-
-        // Removed one slot, gained 2 extra bytes.
-        self.header_mut().free_space += SLOT_SIZE;
-
-        cell
-    }
-
-    pub fn is_leaf(&self) -> bool {
-        self.header().right_child == 0
-    }
-
-    pub fn replace(&mut self, index: u16, cell: Cell) -> Cell {
-        match self.try_replace(index, cell) {
-            Ok(old) => old,
-
-            Err(cell) => {
-                let old = self.remove(index);
-                self.insert(index, cell);
-                old
-            }
-        }
-    }
-
-    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<u16, u16> {
-        self.slots()
-            .binary_search_by(|offset| unsafe {
-                let cell = self.cell_at_offset(*offset);
-                f(CellHeader::content_of(cell).as_ref())
-            })
-            .map(|index| index as _)
-            .map_err(|index| index as _)
-    }
-
-    pub fn child(&self, index: u16) -> PageNumber {
-        if index == self.len() {
-            self.header().right_child
-        } else {
-            self.cell(index).header.left_child
-        }
-    }
-
-    fn try_insert(&mut self, index: u16, cell: Cell) -> Result<u16, Cell> {
-        let total_size = SLOT_SIZE + cell.total_size();
-
-        // There's no way we can fit the block in the page without overflowing.
-        if self.header().free_space < total_size {
-            return Err(cell);
-        }
-
-        let available_space = {
-            let end = self.header().last_used_offset;
-            let start = PAGE_HEADER_SIZE + self.header().num_slots * SLOT_SIZE;
-
-            end - start
-        };
-
-        // We can fit the new cell but we have to defragment the page first.
-        if available_space < total_size {
-            self.defragment();
-        }
-
-        let offset = self.header().last_used_offset - cell.total_size();
-
-        // Write new cell.
-        unsafe {
-            let header = self.cell_at_offset(offset);
-            header.write(cell.header);
-
-            CellHeader::content_of(header)
-                .as_mut()
-                .copy_from_slice(&cell.content);
-        }
-
-        // Update header.
-        self.header_mut().last_used_offset = offset;
-        self.header_mut().free_space -= total_size;
-
-        // If the index is not the last one, shift slots to the right.
-        if index < self.header().num_slots {
-            let end = self.header().num_slots as usize - 1;
-            self.slots_mut()
-                .copy_within(index as usize..end, index as usize + 1);
-
-            self.cells[index as _..].iter_mut().for_each(|location| {
-                if let CellLocation::Disk(slot) = location {
-                    *slot += 1
-                }
-            });
-        }
-
-        // Add new slot.
-        self.header_mut().num_slots += 1;
-
-        self.slots_mut()[index as usize] = offset;
-
-        Ok(index)
-    }
-
-    fn try_replace(&mut self, index: u16, new_cell: Cell) -> Result<Cell, Cell> {
-        let current_cell = self.cell(index);
-
-        if current_cell.header.size <= new_cell.header.size {
-            let free_bytes = current_cell.header.size - new_cell.header.size;
-
-            let old = Cell {
-                header: CellHeader {
-                    size: current_cell.header.size,
-                    left_child: current_cell.header.left_child,
-                },
-                content: Vec::from(current_cell.content.as_ref()).into_boxed_slice(),
-            };
-
-            let current_cell = self.cell_mut(index);
-
-            current_cell.content[..new_cell.content.len()].copy_from_slice(&new_cell.content);
-            current_cell.header.size = new_cell.header.size;
-
-            self.header_mut().free_space += free_bytes;
-            Ok(old)
-        } else if self.header().free_space + current_cell.header.total_size()
-            >= new_cell.total_size()
-        {
-            let old = self.remove(index);
-
-            self.try_insert(index, new_cell)
-                .expect("we made room for the new cell");
-
-            Ok(old)
-        } else {
-            Err(new_cell)
-        }
-    }
-
-    fn defragment(&mut self) {
-        let mut offsets = BinaryHeap::from_iter(
-            self.slots()
-                .iter()
-                .enumerate()
-                .map(|(i, offset)| (*offset, i)),
-        );
-
-        let mut destination_offset = self.size();
-
-        while let Some((offset, i)) = offsets.pop() {
-            let cell = unsafe { self.cell_at_offset(offset) };
-            unsafe {
-                let cell_size = cell.as_ref().total_size();
-                destination_offset -= cell_size;
-                cell.cast::<u8>().copy_to(
-                    self.buffer
-                        .byte_add(destination_offset as usize)
-                        .cast::<u8>(),
-                    cell_size as usize,
-                );
-            }
-            self.slots_mut()[i] = destination_offset;
-        }
-
-        self.header_mut().last_used_offset = destination_offset;
+        self.header().num_slots
     }
 
     pub fn buffer(&self) -> &[u8] {
@@ -462,7 +370,7 @@ impl Page {
         unsafe { self.buffer.cast().as_mut() }
     }
 
-    fn slots_non_null(&self) -> NonNull<[u16]> {
+    fn slot_array_non_null(&self) -> NonNull<[u16]> {
         unsafe {
             NonNull::slice_from_raw_parts(
                 self.buffer.byte_add(PAGE_HEADER_SIZE as _).cast(),
@@ -471,51 +379,379 @@ impl Page {
         }
     }
 
-    fn slots(&self) -> &[u16] {
-        unsafe { self.slots_non_null().as_ref() }
+    fn slot_array(&self) -> &[u16] {
+        unsafe { self.slot_array_non_null().as_ref() }
     }
 
-    fn slots_mut(&mut self) -> &mut [u16] {
-        unsafe { self.slots_non_null().as_mut() }
+    fn slot_array_mut(&mut self) -> &mut [u16] {
+        unsafe { self.slot_array_non_null().as_mut() }
     }
 
-    unsafe fn cell_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
+    unsafe fn cell_header_at_offset(&self, offset: Offset) -> NonNull<CellHeader> {
         self.buffer.byte_add(offset as _).cast()
     }
 
-    /// If data is not aligned to 64 bits then add padding.
-    pub fn aligned_size_of(data: &[u8]) -> u16 {
-        Layout::from_size_align(data.len(), CELL_ALIGNMENT)
-            .unwrap()
-            .pad_to_align()
-            .size() as _
+    fn cell_header_at_slot_index(&self, index: SlotId) -> NonNull<CellHeader> {
+        unsafe { self.cell_header_at_offset(self.slot_array()[index as usize]) }
     }
 
     pub fn usable_space(page_size: u16) -> u16 {
         page_size - PAGE_HEADER_SIZE
     }
 
-    fn layout(page_size: u16) -> Layout {
+    pub fn layout(page_size: u16) -> Layout {
         unsafe { Layout::from_size_align_unchecked(page_size as usize, CELL_ALIGNMENT) }
     }
 
-    pub fn is_underflow(&self) -> bool {
-        self.len() == 0
-            || !self.is_root() && self.header().free_space > Self::usable_space(self.size()) / 2
+    pub fn cell(&self, index: SlotId) -> CellRef {
+        let header = self.cell_header_at_slot_index(index);
+        unsafe {
+            CellRef {
+                header: header.as_ref(),
+                content: CellHeader::content_of(header).as_ref(),
+            }
+        }
     }
 
-    pub fn is_root(&self) -> bool {
-        self.number == 0
+    pub fn cell_mut(&mut self, index: SlotId) -> CellRefMut {
+        let mut header = self.cell_header_at_slot_index(index);
+        unsafe {
+            CellRefMut {
+                header: header.as_mut(),
+                content: CellHeader::content_of(header).as_mut(),
+            }
+        }
     }
 
-    pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
-        let len = if self.is_leaf() { 0 } else { self.len() + 1 };
+    pub fn owned_cell(&mut self, index: SlotId) -> Cell {
+        let header = self.cell_header_at_slot_index(index);
+        unsafe {
+            Cell {
+                header: header.read(),
+                content: Vec::from(CellHeader::content_of(header).as_ref()).into(),
+            }
+        }
+    }
 
-        (0..len).map(|i| self.child(i))
+    pub fn child(&self, index: SlotId) -> PageNumber {
+        if index == self.len() {
+            self.header().right_child
+        } else {
+            self.cell(index).header.left_child
+        }
+    }
+
+    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
+        self.slot_array()
+            .binary_search_by(|offset| unsafe {
+                let cell = self.cell_header_at_offset(*offset);
+                f(CellHeader::content_of(cell).as_ref())
+            })
+            .map(|index| index as _)
+            .map_err(|index| index as _)
+    }
+
+    /// Attempts to insert the given `cell` in this page. There are two possible
+    /// cases:
+    ///
+    /// - Case 1: the cell fits in the "free space" between the slot array and
+    /// the closest cell. This is the best case scenario since we can just write
+    /// the new cell without doing anything else.
+    ///
+    /// ```text
+    ///   HEADER SLOT ARRAY       FREE SPACE              USED CELLS
+    ///  +------+----+----+----------------------+--------+--------+--------+
+    ///  |      | O3 | O1 | ->                <- | CELL 3 |   DEL  | CELL 1 |
+    ///  +------+----+----+----------------------+--------+--------+--------+
+    ///                               ^
+    ///                               |
+    ///           Both the new cell plus the slot fit here
+    /// ```
+    ///
+    /// - Case 2: the cell fits in this page but we have to defragment first.
+    /// This is the worst case scenario, but at least it does some garbage
+    /// collection. See [`Self::defragment`] for details.
+    ///
+    /// ```text
+    ///   HEADER SLOT ARRAY       FREE SPACE              USED CELLS
+    ///  +------+----+----+----------------------+--------+--------+--------+
+    ///  |      | O3 | O1 | ->                <- | CELL 3 |   DEL  | CELL 1 |
+    ///  +------+----+----+----------------------+--------+--------+--------+
+    ///                               ^                        ^
+    ///                               |                        |
+    ///                               +------------+-----------+
+    ///                                            |
+    ///                            We can fit the cell plus the slot
+    ///                            if we join all the free space into
+    ///                            one contiguous block
+    /// ```
+    ///
+    /// There is no free list, we don't search for deleted blocks that can fit
+    /// the new cell.
+    pub fn try_insert(&mut self, index: SlotId, cell: Cell) -> Result<SlotId, Cell> {
+        let total_size = cell.storage_size();
+
+        // There's no way we can fit the cell in this page.
+        if self.header().free_space < total_size {
+            return Err(cell);
+        }
+
+        // Space between the end of the slot array and the closest cell.
+        let available_space = {
+            let end = self.header().last_used_offset;
+            let start = PAGE_HEADER_SIZE + self.header().num_slots * SLOT_SIZE;
+
+            end - start
+        };
+
+        // We can fit the new cell but we have to defragment the page first.
+        if available_space < total_size {
+            self.defragment();
+        }
+
+        let offset = self.header().last_used_offset - cell.total_size();
+
+        // Write new cell.
+        // SAFETY: `last_used_offset` keeps track of where the last cell was
+        // written. By substracting the total size of the new cell to
+        // `last_used_offset` we get a valid pointer within the page where we
+        // write the new cell.
+        unsafe {
+            let header = self.cell_header_at_offset(offset);
+            header.write(cell.header);
+
+            CellHeader::content_of(header)
+                .as_mut()
+                .copy_from_slice(&cell.content);
+        }
+
+        // Update header.
+        self.header_mut().last_used_offset = offset;
+        self.header_mut().free_space -= total_size;
+
+        // If the index is not the last one, shift slots to the right.
+        if index < self.header().num_slots {
+            let end = self.header().num_slots as usize - 1;
+            self.slot_array_mut()
+                .copy_within(index as usize..end, index as usize + 1);
+        }
+
+        // Add new slot.
+        self.header_mut().num_slots += 1;
+
+        // Set offset.
+        self.slot_array_mut()[index as usize] = offset;
+
+        Ok(index)
+    }
+
+    /// Tries to replace the cell pointed by the given slot `index` with the
+    /// `new_cell`. Similar to [`Self::try_insert`] there are 2 main cases:
+    ///
+    /// - Case 1: The new cell fits in the same place as the old cell:
+    ///
+    /// ```text
+    ///                               The size of the new cell is less or
+    ///                                  equal to that of the old cell
+    ///
+    ///                                         +----------+
+    ///                                         | NEW CELL |
+    ///                                         +----------+
+    ///                                               |
+    ///                                               v
+    ///  +------+----+----+------------------+----------------+--------+--------+
+    ///  |      | O3 | O1 | ->            <- |     CELL 3     |   DEL  | CELL 1 |
+    ///  +------+----+----+------------------+----------------+--------+--------+
+    /// ```
+    ///
+    /// - Case 2: The new cell does not fit in the same place, but it does fit
+    /// in the page if we remove the old cell.
+    ///     - Case A: The new cell fits in the "free space".
+    ///     - Case B: We have to defragment the page to fit the new cell.
+    ///
+    /// ```text
+    ///                                                    The size of the new cell is greater
+    ///                                                         than that of the old cell
+    ///
+    ///                                                          +--------------------+
+    ///                                                          |      NEW CELL      |
+    ///                Case A: new cell fits here                +--------------------+
+    ///                             |                                       |
+    ///                             v                                       v
+    ///  +------+----+----+------------------+----------------+--------+--------+
+    ///  |      | O3 | O1 | ->            <- |      CELL 3    |   DEL  | CELL 1 |
+    ///  +------+----+----+------------------+----------------+--------+--------+
+    ///                             ^                              ^        ^
+    ///                             |                              |        |
+    ///                             +------------------------------+--------+
+    ///                                                  |
+    ///                                   Case B: new cell fits in the page
+    ///                                   using all the available free space
+    ///                                   including the deleted cell
+    /// ```
+    pub fn try_replace(&mut self, index: SlotId, new_cell: Cell) -> Result<Cell, Cell> {
+        let old_cell = self.cell(index);
+
+        // There's no way we can fit the new cell in this page, even if we
+        // remove the one that has to be replaced.
+        if self.header().free_space + old_cell.header.total_size() < new_cell.total_size() {
+            return Err(new_cell);
+        }
+
+        // Case 1: The new cell is smaller than the old cell. This is the best
+        // case scenario because we can simply overwrite the contents without
+        // doing much else.
+        if old_cell.header.size <= new_cell.header.size {
+            // If new_cell is smaller we gain some extra bytes.
+            let free_bytes = old_cell.header.size - new_cell.header.size;
+
+            // Copy the old cell to return it.
+            let owned_cell = self.owned_cell(index);
+
+            // Overwrite the contents of the old cell.
+            let old_cell = self.cell_mut(index);
+            old_cell.content[..new_cell.content.len()].copy_from_slice(&new_cell.content);
+            *old_cell.header = new_cell.header;
+
+            self.header_mut().free_space += free_bytes;
+
+            return Ok(owned_cell);
+        }
+
+        // Case 2: The new cell fits in this page but we have to remove the old
+        // one and potentially defragment the page. Worst case scenario.
+        let old = self.remove(index);
+
+        self.try_insert(index, new_cell)
+            .expect("we made room for the new cell, it should fit in the page");
+
+        Ok(old)
+    }
+
+    /// Removes the cell pointed by the given slot `index`. Unlike
+    /// [`Self::try_insert`] and [`Self::try_replace`], this function cannot
+    /// fail. However, it does panic if the given `index` is out of bounds.
+    pub fn remove(&mut self, index: SlotId) -> Cell {
+        let len = self.header().num_slots;
+
+        assert!(index < len, "index {index} out of range for length {len}");
+
+        let cell = self.owned_cell(index);
+
+        // Remove the index as if we removed from a Vec.
+        self.slot_array_mut()
+            .copy_within(index as usize + 1..len as usize, index as usize);
+
+        // Add new free space.
+        self.header_mut().free_space += cell.total_size();
+
+        // Decrease length.
+        self.header_mut().num_slots -= 1;
+
+        // Removed one slot, gained 2 extra bytes.
+        self.header_mut().free_space += SLOT_SIZE;
+
+        cell
+    }
+
+    /// Slides cells towards the right to eliminate fragmentation. For example:
+    ///
+    /// ```text
+    ///   HEADER   SLOT ARRAY    FREE SPACE                      CELLS
+    ///  +------+----+----+----+------------+--------+---------+--------+---------+--------+
+    ///  |      | O1 | O2 | O3 | ->      <- | CELL 3 |   DEL   | CELL 2 |   DEL   | CELL 1 |
+    ///  +------+----+----+----+------------+--------+---------+--------+---------+--------+
+    /// ```
+    ///
+    /// turns into:
+    ///
+    /// ```text
+    ///   HEADER   SLOT ARRAY              FREE SPACE                       CELLS
+    ///  +------+----+----+----+--------------------------------+--------+--------+--------+
+    ///  |      | O1 | O2 | O3 | ->                          <- | CELL 3 | CELL 2 | CELL 1 |
+    ///  +------+----+----+----+--------------------------------+--------+--------+--------+
+    /// ```
+    ///
+    /// Note that we the total amount of "free space" does not change. Instead,
+    /// all the free space is now contiguous, but we do not gain any bytes from
+    /// this.
+    ///
+    /// # Algorithm
+    ///
+    /// We can eliminate fragmentation in-place (without copying the page) by
+    /// simply moving the cells that have the largest offset first. In the
+    /// figures above, we would move CELL 1, then CELL 2 and finally CELL 3.
+    /// This makes sure that we don't write one cell on top of another or we
+    /// corrupt the data otherwise.
+    fn defragment(&mut self) {
+        let mut offsets = BinaryHeap::from_iter(
+            self.slot_array()
+                .iter()
+                .enumerate()
+                .map(|(i, offset)| (*offset, i)),
+        );
+
+        let mut destination_offset = self.size();
+
+        while let Some((offset, i)) = offsets.pop() {
+            unsafe {
+                let cell = self.cell_header_at_offset(offset);
+                let size = cell.as_ref().total_size();
+
+                destination_offset -= size;
+
+                cell.cast::<u8>().copy_to(
+                    self.buffer
+                        .byte_add(destination_offset as usize)
+                        .cast::<u8>(),
+                    size as usize,
+                );
+            }
+            self.slot_array_mut()[i] = destination_offset;
+        }
+
+        self.header_mut().last_used_offset = destination_offset;
+    }
+
+    pub fn drain(&mut self, range: impl RangeBounds<usize>) -> impl Iterator<Item = Cell> + '_ {
+        let start = match range.start_bound() {
+            Bound::Unbounded => 0,
+            Bound::Excluded(i) => i + 1,
+            Bound::Included(i) => *i,
+        };
+
+        let end = match range.end_bound() {
+            Bound::Unbounded => self.len() as usize,
+            Bound::Excluded(i) => *i,
+            Bound::Included(i) => i + 1,
+        };
+
+        let mut i = start;
+
+        iter::from_fn(move || {
+            // Copy cells until we reach the end.
+            if i < end {
+                let cell = self.owned_cell(i as _);
+                i += 1;
+                return Some(cell);
+            }
+
+            // Now compute gained space and shift slots towards the left.
+            self.header_mut().free_space += self.slot_array()[end..]
+                .iter()
+                .map(|slot| self.cell(*slot).storage_size())
+                .sum::<u16>();
+
+            self.slot_array_mut().copy_within(end.., 0);
+
+            self.header_mut().num_slots -= (end - start) as u16;
+
+            None
+        })
     }
 }
 
-impl Drop for Page {
+impl Drop for DiskPage {
     fn drop(&mut self) {
         unsafe {
             alloc::Global.deallocate(self.buffer.cast(), Self::layout(self.buffer.len() as _))
@@ -523,7 +759,7 @@ impl Drop for Page {
     }
 }
 
-impl PartialEq for Page {
+impl PartialEq for DiskPage {
     fn eq(&self, other: &Self) -> bool {
         self.number == other.number
             && self.buffer.len() == other.buffer.len()
@@ -531,10 +767,355 @@ impl PartialEq for Page {
     }
 }
 
-impl Clone for Page {
+impl Clone for DiskPage {
     fn clone(&self) -> Self {
-        let mut page = Page::new(self.number, self.buffer.len() as _);
+        let mut page = DiskPage::new(self.number, self.buffer.len() as _);
         page.buffer_mut().copy_from_slice(self.buffer());
         page
+    }
+}
+
+impl Debug for DiskPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskPage")
+            .field("header", self.header())
+            .field("number", &self.number)
+            .field("size", &self.size())
+            .field("slots", &self.slot_array())
+            .field_with("cells", |f| {
+                let mut list = f.debug_list();
+                (0..self.len()).for_each(|slot| {
+                    let cell = self.cell(slot);
+                    let offset = self.slot_array()[slot as usize];
+                    list.entry_with(|f| {
+                        f.debug_struct("Cell")
+                            .field("header", &cell.header)
+                            .field("start", &offset)
+                            .field("end", &(offset + cell.total_size()))
+                            .field("size", &cell.size())
+                            .finish()
+                    });
+                });
+
+                list.finish()
+            })
+            .finish()
+    }
+}
+
+/// Pointer to either a cell in memory or in a [`DiskPage`] instance.
+#[derive(Debug, PartialEq, Clone)]
+enum CellLocation {
+    /// The cell is located in [`DiskPage`] and we have its slot index.
+    Disk(SlotId),
+
+    /// The cell is located in memory and we own it.
+    Mem(Cell),
+}
+
+/// In-memory page. The difference between [`DiskPage`] and [`MemPage`] is that
+/// [`MemPage`] is allowed to overflow, so it can store as many [`Cell`]s as
+/// there is memory. The reason we need to be able to overflow is because the
+/// BTree balancing algorithm will attempt to insert as many divider keys as
+/// needed into parent pages when reordering cells around siblings, so we need a
+/// way to maintain cells that don't fit in [`DiskPage`].
+///
+/// Since [`MemPage`] can overflow, there are no fallible APIs, we don't have to
+/// `try_` anything, we just do it.
+///
+/// # Overflow
+///
+/// The [`MemPage`] maintains an overflow array that is lazily initialized only
+/// when it's needed. The overflow array points to cells either on [`DiskPage`]
+/// or in-memory using [`CellLocation`]:
+///
+/// ```text
+///                     +---------------+
+///                     | BOXED CONTENT |
+///                     +---------------+
+///                             ^
+///                             |
+///  +---------+---------+-----------+---------+
+///  | Disk(0) | Disk(1) | Mem(Cell) | Disk(2) | MemPage
+///  +---------+---------+-----------+---------+
+///       |         |                     |
+///       +---+     |    +----------------+
+///           |     |    |
+///           V     V    V                       DiskPage
+///  +------+----+----+----+------------------+--------+--------+--------+
+///  |      | O1 | O2 | O3 | ->            <- | CELL 3 | CELL 2 | CELL 1 |
+///  +------+----+----+----+------------------+--------+--------+--------+
+///           |    |    |                     ^        ^        ^
+///           |    |    |                     |        |        |
+///           +----|----|---------------------|--------|--------+
+///                |    |                     |        |
+///                +----|---------------------|--------+
+///                     |                     |
+///                     +---------------------+
+/// ```
+///
+/// Once the overflow array is initialized and the first [`CellLocation::Mem`]
+/// instance is inserted, all subsequent insert operations will use
+/// [`CellLocation::Mem`] even if the cell fits in the slotted [`DiskPage`].
+///
+/// Similarly, remove operations will leave the slotted page untouched and only
+/// remove from the overflow array. We do this for simplicity reasons and
+/// because it's not worth it trying to save data in the slotted page once
+/// a single [`Cell`] has already overflowed into memory, since the BTree will
+/// have to reorganize all the cells anyway.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct MemPage {
+    /// We wrap the disk page and we will attempt to fit as many cells as
+    /// possible here before overflowing into memory.
+    disk: DiskPage,
+
+    /// Once we overflow, the [`DiskPage`] is no longer used for inserts/deletes
+    /// and everything is done in memory. It is used only for reading through
+    /// [`CellLocation::Disk`].
+    overflow: Vec<CellLocation>,
+}
+
+impl MemPage {
+    pub fn new(number: PageNumber, size: u16) -> Self {
+        Self {
+            disk: DiskPage::new(number, size),
+            overflow: Vec::new(),
+        }
+    }
+
+    pub fn number(&self) -> PageNumber {
+        self.disk.number
+    }
+
+    pub fn buffer(&self) -> &[u8] {
+        self.disk.buffer()
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        self.disk.buffer_mut()
+    }
+
+    pub fn len(&self) -> u16 {
+        if self.is_overflow() {
+            self.overflow.len() as _
+        } else {
+            self.disk.len()
+        }
+    }
+
+    pub fn header(&self) -> &PageHeader {
+        self.disk.header()
+    }
+
+    pub fn header_mut(&mut self) -> &mut PageHeader {
+        self.disk.header_mut()
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.number() == 0
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.header().right_child == 0
+    }
+
+    pub fn is_underflow(&self) -> bool {
+        self.disk.len() == 0
+            || !self.is_root()
+                && self.header().free_space > DiskPage::usable_space(self.disk.size()) / 2
+    }
+
+    pub fn child(&self, index: u16) -> PageNumber {
+        if self.is_overflow() {
+            match &self.overflow[index as usize] {
+                CellLocation::Disk(slot) => self.disk.child(*slot),
+                CellLocation::Mem(cell) => cell.header.left_child,
+            }
+        } else {
+            self.disk.child(index)
+        }
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        for cell in other.drain(..) {
+            self.push(cell);
+        }
+
+        other.disk.clear();
+
+        self.header_mut().right_child = other.header().right_child;
+    }
+
+    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
+        if self.is_overflow() {
+            self.overflow
+                .binary_search_by(|location| {
+                    f(match location {
+                        CellLocation::Mem(cell) => &cell.content,
+                        CellLocation::Disk(slot) => self.disk.cell(*slot).content,
+                    })
+                })
+                .map(|i| i as u16)
+                .map_err(|i| i as u16)
+        } else {
+            self.disk.binary_search_by(f)
+        }
+    }
+
+    pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        let len = if self.is_leaf() { 0 } else { self.len() + 1 };
+
+        (0..len).map(|i| self.child(i))
+    }
+
+    /// Whether this page has overflown once. Note that in theory it is possible
+    /// for this [`MemPage`] to actually fit in a [`DiskPage`] if we remove
+    /// cells from it once it has overflown, but this function will still
+    /// return `true` because the underlying [`DiskPage`] is not kept in sync
+    /// with what we have in memory and we may also still point to some
+    /// [`CellLocation::Mem`] instances, so the page is not safe to write to
+    /// disk.
+    ///
+    /// The "overflow" state should be seen more like some kind of "dirty" state
+    /// that requires cleanup instead of simply "this page has more cells than
+    /// we can fit". It's not worth it trying to keep everything in sync because
+    /// once a page overflows the BTree balancing algorithm will take all the
+    /// cells out and reorganize them among siblings. The only thing we need to
+    /// make sure works correctly is CRUDing the cells.
+    pub fn is_overflow(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    /// Goes into "overflow" state. See [`Self::is_overflow`].
+    fn init_overflow(&mut self, index: u16, cell: Cell, skip_disk_index: bool) {
+        // Already initialized. This function is not called more than once
+        // anyway, but paranoia ¯\_(ツ)_/¯
+        if self.is_overflow() {
+            return;
+        }
+
+        let disk_left_cells = 0..index;
+
+        let disk_right_cells = if skip_disk_index {
+            index + 1..self.disk.len()
+        } else {
+            index..self.disk.len()
+        };
+
+        self.overflow.extend(
+            disk_left_cells
+                .map(CellLocation::Disk)
+                .chain(iter::once(CellLocation::Mem(cell)))
+                .chain(disk_right_cells.map(CellLocation::Disk)),
+        );
+    }
+
+    pub fn push(&mut self, cell: Cell) {
+        self.insert(self.len(), cell)
+    }
+
+    pub fn insert(&mut self, index: u16, cell: Cell) {
+        // Don't bother trying to insert in the slotted page once we
+        // overflowed, there's no point since the BTree will take all the cells
+        // out of this page and reorganize them.
+        if self.is_overflow() {
+            return self.overflow.insert(index as _, CellLocation::Mem(cell));
+        }
+
+        // If we didn't overflow yet, keep filling the slotted page until we
+        // overflow. Once that happens this code doesn't run anymore.
+        if let Err(cell) = self.disk.try_insert(index, cell) {
+            self.init_overflow(index, cell, false);
+        }
+    }
+
+    pub fn replace(&mut self, index: u16, new_cell: Cell) -> Cell {
+        if self.is_overflow() {
+            let location = mem::replace(
+                &mut self.overflow[index as usize],
+                CellLocation::Mem(new_cell),
+            );
+
+            match location {
+                CellLocation::Mem(old_cell) => old_cell,
+                CellLocation::Disk(slot) => self.disk.owned_cell(slot),
+            }
+        } else {
+            match self.disk.try_replace(index, new_cell) {
+                Ok(old_cell) => old_cell,
+
+                Err(new_cell) => {
+                    self.init_overflow(index, new_cell, true);
+
+                    self.disk.owned_cell(index)
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, index: u16) -> Cell {
+        if !self.is_overflow() {
+            return self.disk.remove(index);
+        }
+
+        let cell = match self.overflow.remove(index as usize) {
+            CellLocation::Mem(cell) => cell,
+            CellLocation::Disk(slot) => self.disk.owned_cell(slot),
+        };
+
+        // This is the only condition that can "unoverflow" the page. Since
+        // everything is gone, syncing the overflow array with the slotted page
+        // doesn't matter anymore.
+        if self.overflow.is_empty() {
+            self.disk.clear();
+        }
+
+        cell
+    }
+
+    pub fn cell(&self, index: u16) -> CellRef {
+        if !self.is_overflow() {
+            return self.disk.cell(index);
+        }
+
+        match &self.overflow[index as usize] {
+            CellLocation::Disk(slot) => self.disk.cell(*slot),
+            CellLocation::Mem(cell) => CellRef {
+                header: &cell.header,
+                content: &cell.content,
+            },
+        }
+    }
+
+    pub fn cell_mut(&mut self, index: u16) -> CellRefMut {
+        if !self.is_overflow() {
+            return self.disk.cell_mut(index);
+        }
+
+        match &mut self.overflow[index as usize] {
+            CellLocation::Disk(slot) => self.disk.cell_mut(*slot),
+            CellLocation::Mem(cell) => CellRefMut {
+                header: &mut cell.header,
+                content: &mut cell.content,
+            },
+        }
+    }
+
+    pub fn drain(&mut self, range: impl RangeBounds<usize>) -> Box<dyn Iterator<Item = Cell> + '_> {
+        if self.is_overflow() {
+            let cells =
+                VecDeque::from_iter(self.overflow.drain(range).map(|location| match location {
+                    CellLocation::Disk(slot) => self.disk.owned_cell(slot),
+                    CellLocation::Mem(cell) => cell,
+                }));
+
+            if self.overflow.is_empty() {
+                self.disk.clear();
+            }
+
+            Box::new(cells.into_iter())
+        } else {
+            Box::new(self.disk.drain(range))
+        }
     }
 }

@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-use super::page::{Cell, Page};
+use super::page::{Cell, DiskPage, MemPage};
 use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
@@ -112,11 +112,11 @@ impl<C: BytesCmp> BTree<File, C> {
         let balance_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
 
         // TODO: Init root while we don't have a header.
-        let mut current_root = Page::new(0, page_size as _);
+        let mut current_root = MemPage::new(0, page_size as _);
         cache.pager.read(0, current_root.buffer_mut())?;
         if current_root.header().free_space() == 0 {
-            let new_root = Page::new(0, page_size as _);
-            cache.pager.write(new_root.number, new_root.buffer())?;
+            let new_root = MemPage::new(0, page_size as _);
+            cache.pager.write(new_root.number(), new_root.buffer())?;
         }
 
         // TODO: Take free pages into account.
@@ -346,15 +346,16 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Root overflow
         if node.is_root() && node.is_overflow() {
-            let mut old_root = Page::new(self.allocate_page(), self.cache.pager.page_size as u16);
+            let mut old_root =
+                MemPage::new(self.allocate_page(), self.cache.pager.page_size as u16);
 
             let root = self.cache.get_mut(page)?;
             old_root.append(root);
 
-            root.header_mut().right_child = old_root.number;
+            root.header_mut().right_child = old_root.number();
 
             parents.push(page);
-            page = old_root.number;
+            page = old_root.number();
 
             self.cache.load_from_mem(old_root)?;
         }
@@ -368,7 +369,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Make copies of data in order.
         for (i, s) in siblings.iter().enumerate() {
-            cells.extend(self.cache.get_mut(s.0)?.drain());
+            cells.extend(self.cache.get_mut(s.0)?.drain(..));
             if i < siblings.len() - 1 && self.cache.get(parent_page)?.len() > 0 {
                 let mut divider = self.cache.get_mut(parent_page)?.remove(divider_idx as u16);
                 divider.header.left_child = self.cache.get(s.0)?.header().right_child;
@@ -379,7 +380,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let mut number_of_cells_per_page = vec![0];
         let mut total_size_of_each_page = vec![0];
 
-        let usable_space = Page::usable_space(self.cache.pager.page_size as _);
+        let usable_space = DiskPage::usable_space(self.cache.pager.page_size as _);
         let mut subtotal = 0;
 
         // Precompute left biased distribution
@@ -416,14 +417,14 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
             let mut new_page =
-                Page::new(self.allocate_page() as _, self.cache.pager.page_size as _);
+                MemPage::new(self.allocate_page() as _, self.cache.pager.page_size as _);
             new_page.header_mut().right_child = self
                 .cache
                 .get(siblings[siblings.len() - 1].0)?
                 .header()
                 .right_child;
             let pidx = siblings[siblings.len() - 1].1 + 1;
-            siblings.push((new_page.number, pidx));
+            siblings.push((new_page.number(), pidx));
             self.cache.load_from_mem(new_page)?;
         }
 
@@ -519,13 +520,12 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     }
 
     // Testing/Debugging only.
-    fn read_into_mem(&mut self, root: PageNumber, buf: &mut Vec<Page>) -> io::Result<()> {
+    fn read_into_mem(&mut self, root: PageNumber, buf: &mut Vec<MemPage>) -> io::Result<()> {
         for page in self.cache.get(root)?.iter_children().collect::<Vec<_>>() {
             self.read_into_mem(page, buf)?;
         }
 
         let mut node = self.cache.get(root)?.clone();
-        node.init();
         buf.push(node);
 
         Ok(())
@@ -535,7 +535,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let mut nodes = Vec::new();
         self.read_into_mem(0, &mut nodes)?;
 
-        nodes.sort_by(|n1, n2| n1.number.cmp(&n2.number));
+        nodes.sort_by(|n1, n2| n1.number().cmp(&n2.number()));
 
         let mut string = String::from('[');
 
@@ -551,8 +551,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         Ok(string)
     }
 
-    fn to_json(&mut self, page: &Page) -> io::Result<String> {
-        let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
+    fn to_json(&mut self, page: &MemPage) -> io::Result<String> {
+        let mut string = format!("{{\"page\":{},\"entries\":[", page.number());
 
         if page.len() >= 1 {
             let key = page.cell(0).content;
@@ -588,7 +588,7 @@ mod tests {
     use super::{BTree, BytesCmp, BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
         paging::{cache::Cache, pager::Pager},
-        storage::page::{Page, CELL_HEADER_SIZE, SLOT_SIZE},
+        storage::page::{Cell, DiskPage, MemPage, CELL_HEADER_SIZE, SLOT_SIZE},
     };
 
     /// Allows us to build an entire tree manually and then compare it to an
@@ -655,9 +655,8 @@ mod tests {
 
     impl BTree<MemBuf> {
         fn into_test_nodes(&mut self, root: u32) -> io::Result<Node> {
-            let mut node = Page::new(root, self.cache.pager.page_size as _);
+            let mut node = MemPage::new(root, self.cache.pager.page_size as _);
             self.cache.pager.read(root, node.buffer_mut())?;
-            node.init();
 
             let mut test_node = Node {
                 keys: (0..node.len())
@@ -704,9 +703,9 @@ mod tests {
     fn optimal_page_size_for(n_children: usize) -> usize {
         let mut size = 16;
         // TODO: Divide or something
-        while (Page::usable_space(size as u16) as usize)
+        while (DiskPage::usable_space(size as u16) as usize)
             < (CELL_HEADER_SIZE as usize
-                + Page::aligned_size_of(&[0, 0, 0, 0]) as usize
+                + Cell::aligned_size_of(&[0, 0, 0, 0]) as usize
                 + SLOT_SIZE as usize)
                 * (n_children - 1)
         {
@@ -728,9 +727,9 @@ mod tests {
                 config.balance_siblings_per_side,
             );
 
-            let root = Page::new(0, page_size as _);
+            let root = MemPage::new(0, page_size as _);
             // Init root.
-            btree.cache.pager.write(root.number, root.buffer())?;
+            btree.cache.pager.write(root.number(), root.buffer())?;
 
             btree.extend_from_keys_only(config.keys)?;
 
