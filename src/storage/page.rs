@@ -47,7 +47,7 @@ pub const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
 /// See [`Page`] for alignment details.
-const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
+pub const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
 
 /// Type alias to make it clear when we're dealing with cell offsets. A 2 byte
 /// offset can point to the end of [`MAX_PAGE_SIZE`].

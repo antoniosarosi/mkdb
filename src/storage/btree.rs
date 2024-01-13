@@ -145,11 +145,23 @@ enum LeafKeyType {
     Min,
 }
 
+struct Sibling {
+    page: PageNumber,
+    index: u16,
+}
+
+impl Sibling {
+    fn new(page: PageNumber, index: u16) -> Self {
+        Self { page, index }
+    }
+}
+
 impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
     /// details.
-    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<&[u8]>> {
-        let search = self.search(0, key, &mut Vec::new())?;
+    pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<&[u8]>> {
+        let search = self.search(0, entry, &mut Vec::new())?;
+
         match search.index {
             Err(_) => Ok(None),
             Ok(index) => Ok(Some(self.cache.get(search.page)?.cell(index).content)),
@@ -199,9 +211,9 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         self.cache.flush_write_queue_to_disk()
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> io::Result<Option<Box<[u8]>>> {
+    pub fn remove(&mut self, entry: &[u8]) -> io::Result<Option<Box<[u8]>>> {
         let mut parents = Vec::new();
-        let Some((entry, leaf_node)) = self.remove_entry(key, &mut parents)? else {
+        let Some((entry, leaf_node)) = self.remove_entry(entry, &mut parents)? else {
             return Ok(None);
         };
 
@@ -219,10 +231,10 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// See [`Self::remove`] for more details.
     fn remove_entry(
         &mut self,
-        key: &[u8],
+        entry: &[u8],
         parents: &mut Vec<u32>,
     ) -> io::Result<Option<(Box<[u8]>, u32)>> {
-        let search = self.search(0, key, parents)?;
+        let search = self.search(0, entry, parents)?;
         let node = self.cache.get(search.page)?;
 
         // Can't remove entry, key not found.
@@ -230,13 +242,12 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             return Ok(None);
         }
 
+        let index = search.index.unwrap();
+
         // Leaf node is the simplest case, remove key and pop off the stack.
         if node.is_leaf() {
-            let entry = self
-                .cache
-                .get_mut(search.page)?
-                .remove(search.index.unwrap());
-            return Ok(Some((entry.content, search.page)));
+            let cell = self.cache.get_mut(search.page)?.remove(index);
+            return Ok(Some((cell.content, search.page)));
         }
 
         // Root or internal nodes require additional work. We need to find a
@@ -244,8 +255,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         // pick either the predecessor (max key in the left subtree) or the
         // successor (min key in the right subtree) of the key we want to
         // delete.
-        let left_child = node.child(search.index.unwrap());
-        let right_child = node.child(search.index.unwrap() + 1);
+        let left_child = node.child(index);
+        let right_child = node.child(index + 1);
 
         parents.push(search.page);
         let (leaf_node, key_idx) =
@@ -259,8 +270,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         let node = self.cache.get_mut(search.page)?;
 
-        substitute.header.left_child = node.child(search.index.unwrap());
-        let entry = node.replace(search.index.unwrap(), substitute);
+        substitute.header.left_child = node.child(index);
+        let entry = node.replace(index, substitute);
 
         Ok(Some((entry.content, leaf_node)))
     }
@@ -327,7 +338,47 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         // self.len -= 1; // TODO: Next free page is grabed from here
     }
 
-    fn balance(&mut self, mut page: PageNumber, mut parents: Vec<u32>) -> io::Result<()> {
+    /// B*-Tree balancing algorithm inspired by (or rather stolen from) SQLite
+    /// 2.X.X. Take a look at the original source code here:
+    ///
+    /// https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L2171
+    ///
+    /// This is how it works:
+    ///
+    /// 1. Check for root overflow or underflow. The root is only considered
+    /// underflow when it contains 0 cells and has one child:
+    ///
+    /// ```text
+    ///                      +--------+
+    ///                      |        | Empty root
+    ///                      +--------+
+    ///                           |
+    ///                           v
+    ///                      +--------+ Direct root child
+    ///                  +---| 4,8,11 |----+
+    ///                 /    +--------+     \
+    ///                /          |          \
+    ///            +-------+  +-------+  +----------+
+    ///            | 1,2,3 |  | 5,6,7 |  | 12,13,14 | Other pages below
+    ///            +-------+  +-------+  +----------+
+    /// ```
+    ///
+    /// In that case, move the child into the root decreasing tree height by
+    /// one, free the child page and return:
+    ///
+    /// ```text
+    ///                       New root
+    ///                      +--------+
+    ///                  +---| 4,8,11 |----+
+    ///                 /    +--------+     \
+    ///                /          |          \
+    ///            +-------+  +-------+  +----------+
+    ///            | 1,2,3 |  | 5,6,7 |  | 12,13,14 | Other pages below
+    ///            +-------+  +-------+  +----------+
+    /// ```
+    ///
+    /// TODO
+    fn balance(&mut self, mut page: PageNumber, mut parents: Vec<PageNumber>) -> io::Result<()> {
         let node = self.cache.get(page)?;
 
         if !node.is_overflow() && !node.is_underflow() {
@@ -363,84 +414,83 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let mut siblings = self.load_siblings(page, parent_page)?;
 
         let mut cells = Vec::new();
-
-        let mut divider_idx = siblings[0].1 as u16;
+        let mut divider_idx = siblings[0].index;
 
         // Make copies of data in order.
-        for (i, s) in siblings.iter().enumerate() {
-            cells.extend(self.cache.get_mut(s.0)?.drain(..));
-            if i < siblings.len() - 1 && self.cache.get(parent_page)?.len() > 0 {
-                let mut divider = self.cache.get_mut(parent_page)?.remove(divider_idx as u16);
-                divider.header.left_child = self.cache.get(s.0)?.header().right_child;
+        for (i, sibling) in siblings.iter().enumerate() {
+            cells.extend(self.cache.get_mut(sibling.page)?.drain(..));
+            if i < siblings.len() - 1 {
+                let mut divider = self.cache.get_mut(parent_page)?.remove(divider_idx);
+                divider.header.left_child = self.cache.get(sibling.page)?.header().right_child;
                 cells.push(divider);
             }
         }
 
-        let mut number_of_cells_per_page = vec![0];
-        let mut total_size_of_each_page = vec![0];
-
         let usable_space = Page::usable_space(self.cache.pager.page_size as _);
-        let mut subtotal = 0;
+
+        let mut total_size_in_each_page = vec![0];
+        let mut number_of_cells_per_page = vec![0];
 
         // Precompute left biased distribution
         for cell in &cells {
-            if subtotal + cell.storage_size() <= usable_space {
-                *number_of_cells_per_page.last_mut().unwrap() += 1;
-                *total_size_of_each_page.last_mut().unwrap() += cell.storage_size();
-                subtotal += cell.storage_size();
+            let i = number_of_cells_per_page.len() - 1;
+            if total_size_in_each_page[i] + cell.storage_size() <= usable_space {
+                number_of_cells_per_page[i] += 1;
+                total_size_in_each_page[i] += cell.storage_size();
             } else {
                 number_of_cells_per_page.push(0);
-                total_size_of_each_page.push(0);
-                subtotal = 0;
+                total_size_in_each_page.push(0);
             }
         }
 
         // Account for underflow towards the right
-        if number_of_cells_per_page.len() > 1 {
+        if number_of_cells_per_page.len() >= 2 {
             let mut i = cells.len() - number_of_cells_per_page.last().unwrap() - 1;
 
-            for k in (1..=(total_size_of_each_page.len() - 1)).rev() {
-                while total_size_of_each_page[k] < usable_space / 2
-                    && total_size_of_each_page[0] - &cells[i - 1].storage_size() >= usable_space / 2
-                {
-                    number_of_cells_per_page[k] += 1;
-                    total_size_of_each_page[k] += &cells[i].storage_size();
+            for j in (1..=(total_size_in_each_page.len() - 1)).rev() {
+                while total_size_in_each_page[j] < usable_space / 2 {
+                    number_of_cells_per_page[j] += 1;
+                    total_size_in_each_page[j] += &cells[i].storage_size();
 
-                    number_of_cells_per_page[k - 1] -= 1;
-                    total_size_of_each_page[k - 1] -= &cells[i - 1].storage_size();
+                    number_of_cells_per_page[j - 1] -= 1;
+                    total_size_in_each_page[j - 1] -= &cells[i - 1].storage_size();
                     i -= 1;
                 }
             }
+
+            // Second page has more data than the first one, make a little
+            // adjustment to keep it left biased.
+            if total_size_in_each_page[0] < usable_space / 2 {
+                number_of_cells_per_page[0] += 1;
+                number_of_cells_per_page[1] -= 1;
+            }
         }
+
+        let old_right_child = self
+            .cache
+            .get(siblings[siblings.len() - 1].page)?
+            .header()
+            .right_child;
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let mut new_page =
-                Page::new(self.allocate_page() as _, self.cache.pager.page_size as _);
-            new_page.header_mut().right_child = self
-                .cache
-                .get(siblings[siblings.len() - 1].0)?
-                .header()
-                .right_child;
-            let pidx = siblings[siblings.len() - 1].1 + 1;
-            siblings.push((new_page.number, pidx));
+            let new_page = Page::new(self.allocate_page() as _, self.cache.pager.page_size as _);
+            siblings.push(Sibling::new(
+                new_page.number,
+                siblings[siblings.len() - 1].index + 1,
+            ));
             self.cache.load_from_mem(new_page)?;
         }
 
         // Free unused pages.
         while number_of_cells_per_page.len() < siblings.len() {
-            let unused_page = siblings.pop().unwrap().0;
-            let right_child = self.cache.get(unused_page)?.header().right_child;
-            self.cache
-                .get_mut(siblings[siblings.len() - 1].0)?
-                .header_mut()
-                .right_child = right_child;
+            let unused_page = siblings.pop().unwrap().page;
             self.free_page(unused_page);
         }
 
         // Begin distribution
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
-            let page = self.cache.get_mut(siblings[i].0)?;
+            let page = self.cache.get_mut(siblings[i].page)?;
             for _ in 0..*n {
                 page.push(cells.remove(0));
             }
@@ -448,7 +498,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             if i < siblings.len() - 1 {
                 let mut divider = cells.remove(0);
                 page.header_mut().right_child = divider.header.left_child;
-                divider.header.left_child = siblings[i].0;
+                divider.header.left_child = siblings[i].page;
                 self.cache
                     .get_mut(parent_page)?
                     .insert(divider_idx as _, divider);
@@ -456,15 +506,21 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             }
         }
 
+        // Fix children pointers.
+        self.cache
+            .get_mut(siblings[siblings.len() - 1].page)?
+            .header_mut()
+            .right_child = old_right_child;
+
         if divider_idx == self.cache.get(parent_page)?.len() {
             self.cache.get_mut(parent_page)?.header_mut().right_child =
-                siblings[siblings.len() - 1].0;
+                siblings[siblings.len() - 1].page;
         } else {
             self.cache
                 .get_mut(parent_page)?
                 .cell_mut(divider_idx)
                 .header
-                .left_child = siblings[siblings.len() - 1].0;
+                .left_child = siblings[siblings.len() - 1].page;
         }
 
         self.balance(parent_page, parents)?;
@@ -476,37 +532,28 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         &mut self,
         page: PageNumber,
         parent_page: PageNumber,
-    ) -> io::Result<Vec<(PageNumber, u16)>> {
-        let mut num_siblings_per_side = self.balance_siblings_per_side;
+    ) -> io::Result<Vec<Sibling>> {
+        let mut num_siblings_per_side = self.balance_siblings_per_side as u16;
 
         let parent = self.cache.get(parent_page)?;
 
         // TODO: Store this somewhere somehow.
-        let index = parent.iter_children().position(|p| p == page).unwrap();
+        let index = parent.iter_children().position(|p| p == page).unwrap() as u16;
 
-        if index == 0 || index == parent.len() as usize {
+        if index == 0 || index == parent.len() {
             num_siblings_per_side *= 2;
         };
 
         let left_siblings = index.saturating_sub(num_siblings_per_side)..index;
+        let right_siblings = (index + 1)..min(index + num_siblings_per_side + 1, parent.len() + 1);
 
-        let right_siblings =
-            (index + 1)..min(index + num_siblings_per_side + 1, parent.len() as usize + 1);
+        let read_sibling = |index| Sibling::new(parent.child(index), index);
 
-        let mut siblings =
-            Vec::with_capacity(left_siblings.size_hint().0 + 1 + right_siblings.size_hint().0);
-
-        for i in left_siblings {
-            siblings.push((parent.child(i as _), i as u16));
-        }
-
-        siblings.push((page, index as u16));
-
-        for i in right_siblings {
-            siblings.push((parent.child(i as _), i as u16));
-        }
-
-        Ok(siblings)
+        Ok(left_siblings
+            .map(read_sibling)
+            .chain(std::iter::once(Sibling::new(page, index)))
+            .chain(right_siblings.map(read_sibling))
+            .collect())
     }
 
     /// Returns a free page.
@@ -524,7 +571,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             self.read_into_mem(page, buf)?;
         }
 
-        let mut node = self.cache.get(root)?.clone();
+        let node = self.cache.get(root)?.clone();
         buf.push(node);
 
         Ok(())
@@ -582,12 +629,28 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
 #[cfg(test)]
 mod tests {
+    //! BTree testing module. Most of the tests use fixed size 32 bit keys
+    //! to easily test whether the BTree balancing algorithm does the correct
+    //! thing in each situation. To easily compare the state of the [`BTree`]
+    //! structure with something human readable we use [`Node`] instances, which
+    //! allow us to define a tree as if we used some JSON-like syntax. There's
+    //! also a [`Builder`] struct that can be used to insert many 32 bit keys at
+    //! once into the tree and also tune parameters such as
+    //! [`BTree::balance_siblings_per_side`]. See the tests for more details and
+    //! examples. Remember that `order` means the maximum number of children in
+    //! a BTree that stores fixed size keys.
+
     use std::{io, mem};
 
-    use super::{BTree, BytesCmp, BALANCE_SIBLINGS_PER_SIDE};
+    use super::{BTree, BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
-        paging::{cache::Cache, pager::Pager},
-        storage::page::{Cell, Page, CELL_HEADER_SIZE, SLOT_SIZE},
+        paging::{
+            cache::Cache,
+            pager::{PageNumber, Pager},
+        },
+        storage::page::{
+            Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE,
+        },
     };
 
     /// Allows us to build an entire tree manually and then compare it to an
@@ -601,7 +664,7 @@ mod tests {
     impl Node {
         /// Leaf nodes have no children. This method saves us some unecessary
         /// typing and makes the tree structure more readable.
-        fn leaf<K: IntoIterator<Item = u32>>(keys: K) -> Self {
+        fn leaf(keys: impl IntoIterator<Item = u32>) -> Self {
             Self {
                 keys: keys.into_iter().collect(),
                 children: Vec::new(),
@@ -609,17 +672,16 @@ mod tests {
         }
     }
 
-    /// Config/Builder for [`BTree<MemBuf>`]. Can be used with
-    /// [`TryFrom::try_from`] or [`BTree::builder`].
-    struct Config {
+    /// Builder for [`BTree<MemBuf>`].
+    struct Builder {
         keys: Vec<u32>,
         order: usize,
         balance_siblings_per_side: usize,
     }
 
-    impl Default for Config {
+    impl Default for Builder {
         fn default() -> Self {
-            Config {
+            Builder {
                 keys: vec![],
                 order: 4,
                 balance_siblings_per_side: BALANCE_SIBLINGS_PER_SIDE,
@@ -627,8 +689,8 @@ mod tests {
         }
     }
 
-    impl Config {
-        fn keys<K: IntoIterator<Item = u32>>(mut self, keys: K) -> Self {
+    impl Builder {
+        fn keys(mut self, keys: impl IntoIterator<Item = u32>) -> Self {
             self.keys = keys.into_iter().collect();
             self
         }
@@ -644,7 +706,21 @@ mod tests {
         }
 
         fn try_build(self) -> io::Result<BTree<MemBuf>> {
-            BTree::try_from(self)
+            let page_size = optimal_page_size_for(self.order);
+            let buf = io::Cursor::new(Vec::new());
+
+            let mut btree = BTree::new(
+                Cache::new(Pager::new(buf, page_size, page_size)),
+                self.balance_siblings_per_side,
+            );
+
+            let root = Page::new(0, page_size as _);
+            // Init root.
+            btree.cache.pager.write(root.number, root.buffer())?;
+
+            btree.extend_from_keys(self.keys)?;
+
+            Ok(btree)
         }
     }
 
@@ -653,43 +729,47 @@ mod tests {
     type MemBuf = io::Cursor<Vec<u8>>;
 
     impl BTree<MemBuf> {
-        fn into_test_nodes(&mut self, root: u32) -> io::Result<Node> {
-            let mut node = Page::new(root, self.cache.pager.page_size as _);
-            self.cache.pager.read(root, node.buffer_mut())?;
+        fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
+            let mut page = Page::new(root, self.cache.pager.page_size as _);
+            self.cache.pager.read(root, page.buffer_mut())?;
 
-            let mut test_node = Node {
-                keys: (0..node.len())
-                    .map(|i| u32::from_be_bytes(node.cell(i).content[..4].try_into().unwrap()))
+            let mut node = Node {
+                keys: (0..page.len())
+                    .map(|i| u32::from_be_bytes(page.cell(i).content[..4].try_into().unwrap()))
                     .collect(),
                 children: vec![],
             };
 
-            for page in node.iter_children() {
-                test_node.children.push(self.into_test_nodes(page)?);
+            for page in page.iter_children() {
+                node.children.push(self.into_test_nodes(page)?);
             }
 
-            Ok(test_node)
+            Ok(node)
         }
 
-        fn builder() -> Config {
-            Config::default()
+        fn builder() -> Builder {
+            Builder::default()
         }
 
-        fn extend_from_keys_only<K: IntoIterator<Item = u32>>(
-            &mut self,
-            keys: K,
-        ) -> io::Result<()> {
+        fn insert_key(&mut self, key: u32) -> io::Result<()> {
+            self.insert(&key.to_be_bytes())
+        }
+
+        fn remove_key(&mut self, key: u32) -> io::Result<Option<Box<[u8]>>> {
+            self.remove(&key.to_be_bytes())
+        }
+
+        fn extend_from_keys(&mut self, keys: impl IntoIterator<Item = u32>) -> io::Result<()> {
             for key in keys {
-                println!("{:?}", self.into_test_nodes(0)?);
                 self.insert(&key.to_be_bytes())?;
             }
 
             Ok(())
         }
 
-        fn try_remove_all<K: IntoIterator<Item = u32>>(
+        fn try_remove_all_keys(
             &mut self,
-            keys: K,
+            keys: impl IntoIterator<Item = u32>,
         ) -> io::Result<Vec<Option<Box<[u8]>>>> {
             let mut results = Vec::new();
             for k in keys {
@@ -699,41 +779,14 @@ mod tests {
         }
     }
 
-    fn optimal_page_size_for(n_children: usize) -> usize {
-        let mut size = 16;
-        // TODO: Divide or something
-        while (Page::usable_space(size as u16) as usize)
-            < (CELL_HEADER_SIZE as usize
-                + Cell::aligned_size_of(&[0, 0, 0, 0]) as usize
-                + SLOT_SIZE as usize)
-                * (n_children - 1)
-        {
-            size += 8;
-        }
+    fn optimal_page_size_for(order: usize) -> usize {
+        let key_size = Cell::new(&[0; mem::size_of::<u32>()]).storage_size();
+        let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
 
-        size
-    }
-
-    impl TryFrom<Config> for BTree<MemBuf> {
-        type Error = io::Error;
-
-        fn try_from(config: Config) -> Result<Self, Self::Error> {
-            let page_size = optimal_page_size_for(config.order);
-            let buf = io::Cursor::new(Vec::new());
-
-            let mut btree = BTree::new(
-                Cache::new(Pager::new(buf, page_size, page_size)),
-                config.balance_siblings_per_side,
-            );
-
-            let root = Page::new(0, page_size as _);
-            // Init root.
-            btree.cache.pager.write(root.number, root.buffer())?;
-
-            btree.extend_from_keys_only(config.keys)?;
-
-            Ok(btree)
-        }
+        std::alloc::Layout::from_size_align(total_space_needed as usize, CELL_ALIGNMENT)
+            .unwrap()
+            .pad_to_align()
+            .size() as _
     }
 
     impl TryFrom<BTree<MemBuf>> for Node {
@@ -1204,7 +1257,7 @@ mod tests {
     fn delete_from_leaf_node() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
-        btree.remove(&13_u32.to_be_bytes())?;
+        btree.remove_key(13)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1260,7 +1313,7 @@ mod tests {
     fn delete_from_internal_node() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
-        btree.remove(&8_u32.to_be_bytes())?;
+        btree.remove_key(8)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1323,7 +1376,7 @@ mod tests {
     fn delete_from_root() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=16).try_build()?;
 
-        btree.remove(&11_u32.to_be_bytes())?;
+        btree.remove_key(11)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1388,7 +1441,7 @@ mod tests {
     fn delete_using_successor_instead_of_predecessor() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=26).try_build()?;
 
-        btree.remove(&11_u32.to_be_bytes())?;
+        btree.remove_key(11)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1419,7 +1472,7 @@ mod tests {
         Ok(())
     }
 
-    /// When a leaf node falls under 66% capacity it should not be merged with
+    /// When a leaf node falls under 50% capacity it should not be merged with
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
@@ -1428,9 +1481,9 @@ mod tests {
     ///                               |
     ///                               V
     ///                           +--------+
-    ///                   +-------| 4,8,12 |--------+
+    ///                  +--------| 4,8,12 |--------+
     ///                 /         +--------+         \
-    ///               /            /      \           \
+    ///                /           /      \           \
     ///           +-------+  +-------+  +---------+  +----------+
     ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
     ///           +-------+  +-------+  +---------+  +----------+
@@ -1439,9 +1492,9 @@ mod tests {
     ///                               |
     ///                               V
     ///                           +--------+
-    ///                   +-------| 4,8,12 |--------+
+    ///                  +--------| 4,8,12 |--------+
     ///                 /         +--------+         \
-    ///               /            /      \           \
+    ///                /           /      \           \
     ///           +-------+  +-------+  +---------+  +----------+
     ///           | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14    |
     ///           +-------+  +-------+  +---------+  +----------+
@@ -1450,9 +1503,9 @@ mod tests {
     ///                               |
     ///                               V
     ///                           +--------+
-    ///                   +-------| 4,8,11 |--------+
+    ///                  +--------| 4,8,11 |--------+
     ///                 /         +--------+         \
-    ///               /            /      \           \
+    ///                /           /      \           \
     ///           +-------+  +-------+  +---------+  +----------+
     ///           | 1,2,3 |  | 5,6,7 |  | 9,10    |  | 12,13    |
     ///           +-------+  +-------+  +---------+  +----------+
@@ -1461,7 +1514,7 @@ mod tests {
     fn delay_leaf_node_merge() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
-        btree.try_remove_all((14..=15).rev())?;
+        btree.try_remove_all_keys((14..=15).rev())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1520,7 +1573,7 @@ mod tests {
     fn merge_leaf_node() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=15).try_build()?;
 
-        btree.try_remove_all((12..=15).rev())?;
+        btree.try_remove_all_keys((12..=15).rev())?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1563,9 +1616,60 @@ mod tests {
     fn merge_root() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=4).try_build()?;
 
-        btree.remove(&4_u32.to_be_bytes())?;
+        btree.remove_key(4)?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
+
+        Ok(())
+    }
+
+    /// Same as [`merge_root`] but the root children have their own children.
+    ///
+    /// ```text
+    ///                          DELETE 15,16
+    ///                               |
+    ///                               V
+    ///                           +--------+
+    ///                   +-------|   11   |-------+
+    ///                  /        +--------+        \
+    ///                 /                            \
+    ///            +-------+                     +--------+
+    ///       +----|  4,8  |----+                |   14   |
+    ///      /     +-------+     \               +--------+
+    ///     /          |          \               /      \
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    ///
+    ///                             RESULT
+    ///                                |
+    ///                                V
+    ///                           +--------+
+    ///                   +-------| 4,8,11 |--------+
+    ///                 /         +--------+         \
+    ///               /            /      \           \
+    ///           +-------+  +-------+  +------+  +----------+
+    ///           | 1,2,3 |  | 5,6,7 |  | 9,10 |  | 12,13,14 |
+    ///           +-------+  +-------+  +------+  +----------+
+    /// ```
+    #[test]
+    fn decrease_tree_height() -> io::Result<()> {
+        let mut btree = BTree::builder().keys(1..=16).try_build()?;
+
+        btree.try_remove_all_keys(15..=16)?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![4, 8, 11],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10]),
+                    Node::leaf([12, 13, 14]),
+                ]
+            }
+        );
 
         Ok(())
     }
@@ -1607,7 +1711,7 @@ mod tests {
     fn delay_internal_node_merge() -> io::Result<()> {
         let mut btree = BTree::builder().keys(1..=35).try_build()?;
 
-        btree.try_remove_all(1..=3)?;
+        btree.try_remove_all_keys(1..=3)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1698,8 +1802,8 @@ mod tests {
         let mut btree = BTree::builder().keys(1..=35).try_build()?;
 
         btree
-            .try_remove_all(1..=3)
-            .and_then(|_| btree.remove(&35_u32.to_be_bytes()))?;
+            .try_remove_all_keys(1..=3)
+            .and_then(|_| btree.remove_key(35))?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1833,7 +1937,7 @@ mod tests {
     fn greater_order_deletion() -> io::Result<()> {
         let mut btree = BTree::builder().order(6).keys(1..=36).try_build()?;
 
-        btree.try_remove_all(34..=36)?;
+        btree.try_remove_all_keys(34..=36)?;
 
         assert_eq!(
             Node::try_from(btree)?,
@@ -1887,8 +1991,8 @@ mod tests {
             .keys(1..=15)
             .try_build()?;
 
-        btree.remove(&3_u32.to_be_bytes())?;
-        btree.insert(&16_u32.to_be_bytes())?;
+        btree.remove_key(3)?;
+        btree.insert_key(16)?;
 
         assert_eq!(
             Node::try_from(btree)?,
