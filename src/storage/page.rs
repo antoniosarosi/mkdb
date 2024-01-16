@@ -1,8 +1,9 @@
-//! Slotted page implementation tuned for index organized storage. Initially
-//! this was going to be a generic slotted page implementation that would serve
-//! as a building block for both index organized storage (like SQLite) and tuple
-//! oriented storage (like Postgres), but the idea has been dropped in favor of
-//! simplicity.
+//! Slotted page implementation tuned for index organized storage.
+//!
+//! Initially this was going to be a generic slotted page implementation that
+//! would serve as a building block for both index organized storage (like
+//! SQLite) and tuple oriented storage (like Postgres), but the idea has been
+//! dropped in favor of simplicity.
 //!
 //! The main difference is that when using index organized storage we never
 //! point to slot indexes from outside the page, so there's no need to attempt
@@ -37,6 +38,12 @@ use crate::paging::pager::PageNumber;
 /// represent using 2 bytes.
 pub const MAX_PAGE_SIZE: u16 = u16::MAX;
 
+/// Minimum acceptable page size. This should not be used for anything as it
+/// can only store about 8 bytes of payload per page.
+pub const MIN_PAGE_SIZE: u16 =
+    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1)
+        & !(CELL_ALIGNMENT as u16 - 1);
+
 /// Size of the [`Page`] header. See [`PageHeader`] for details.
 pub const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
 
@@ -55,10 +62,12 @@ type Offset = u16;
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
-type SlotId = u16;
+pub(crate) type SlotId = u16;
 
-/// Slotted page header. It is located at the beginning of each page and it does
-/// not contain variable length data:
+/// Slotted page header.
+///
+/// It is located at the beginning of each page and it does not contain variable
+/// length data:
 ///
 /// ```text
 ///                           HEADER                                          CONTENT
@@ -93,9 +102,11 @@ impl PageHeader {
     }
 }
 
-/// Located at the beginning of each cell. The header stores the size of the
-/// cell without including its own size and it also stores a pointer to the
-/// BTree page the contains entries "less than" this one.
+/// Cell header located at the beginning of each cell.
+///
+/// The header stores the size of the cell without including its own size and it
+/// also stores a pointer to the BTree page the contains entries "less than"
+/// this one.
 ///
 /// ```text
 ///           HEADER                               CONTENT
@@ -123,49 +134,46 @@ pub struct CellHeader {
 }
 
 impl CellHeader {
+    /// Total size of the cell including the header.
     fn total_size(&self) -> u16 {
         CELL_HEADER_SIZE + self.size
     }
 
+    /// Total size of the cell including the header and the slot array pointer
+    /// needed to store the offset.
     pub fn storage_size(&self) -> u16 {
         self.total_size() + SLOT_SIZE
     }
 
-    fn content_of(cell: NonNull<Self>) -> NonNull<[u8]> {
-        unsafe { NonNull::slice_from_raw_parts(cell.add(1).cast(), cell.as_ref().size as _) }
+    /// Returns a pointer to the content of the given cell header.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee that the given pointer is valid and points to a
+    /// cell within the page.
+    unsafe fn content_of(header: NonNull<Self>) -> NonNull<[u8]> {
+        NonNull::slice_from_raw_parts(header.add(1).cast(), header.as_ref().size as _)
     }
 }
 
-/// Owned version of a cell. The [`crate::storage::BTree`] structure reorders
-/// cells around different sibling pages when an overflow or underflow occurs,
-/// so instead of hiding the low level details we provide some API that can be
-/// used by upper levels.
+/// Owned version of a cell.
+///
+/// The [`crate::storage::BTree`] structure reorders cells around different
+/// sibling pages when an overflow or underflow occurs, so instead of hiding the
+/// low level details we provide some API that can be used by upper levels.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Cell {
     pub header: CellHeader,
     pub content: Box<[u8]>,
 }
 
-/// Read-only reference to a cell. The cell could be located either in a page
-/// that comes from disk or in memory if the page overflowed. See [`MemPage`]
-/// for more details.
+/// Read-only reference to a cell.
+///
+/// The cell could be located either in a page that comes from disk or in memory
+/// if the page overflowed.
 pub struct CellRef<'a> {
     pub header: &'a CellHeader,
     pub content: &'a [u8],
-}
-
-impl<'a> CellRef<'a> {
-    pub fn size(&self) -> u16 {
-        self.header.size
-    }
-
-    pub fn total_size(&self) -> u16 {
-        self.header.total_size()
-    }
-
-    pub fn storage_size(&self) -> u16 {
-        self.header.storage_size()
-    }
 }
 
 /// Same as [`CellRef`] but mutable.
@@ -175,6 +183,7 @@ pub struct CellRefMut<'a> {
 }
 
 impl Cell {
+    /// Creates a new cell allocated in memory.
     pub fn new(data: &[u8]) -> Self {
         let mut data = Vec::from(data);
         let size = Self::aligned_size_of(&data);
@@ -189,14 +198,12 @@ impl Cell {
         }
     }
 
-    pub fn size(&self) -> u16 {
-        self.header.size
-    }
-
+    /// Shorthand for [`CellHeader::total_size`].
     pub fn total_size(&self) -> u16 {
         self.header.total_size()
     }
 
+    /// Shorthand for [`CellHeader::storage_size`].
     pub fn storage_size(&self) -> u16 {
         self.header.storage_size()
     }
@@ -210,17 +217,23 @@ impl Cell {
     }
 }
 
+/// Cell that didn't fit in the slotted page. This is stored in-memory and
+/// cannot be written to disk.
+#[derive(Debug, Clone)]
 struct OverflowCell {
+    /// Owned cell.
     cell: Cell,
+    /// Index in the slot array where the cell should be located.
     index: SlotId,
 }
 
-/// Fixed size slotted page. This is what we store on disk. The page maintains a
-/// "slot array" located after the header that grows towards the right. On the
-/// opposite side is where used cells are located, leaving free space in the
-/// middle of the page. Each item in the slot array points to one of the used
-/// cells through its offset, calculated from the start of the page (before the
-/// header).
+/// Fixed size slotted page.
+///
+/// This is what we store on disk. The page maintains a "slot array" located
+/// after the header that grows towards the right. On the opposite side is where
+/// used cells are located, leaving free space in the middle of the page. Each
+/// item in the slot array points to one of the used cells through its offset,
+/// calculated from the start of the page (before the header).
 ///
 /// ```text
 ///   HEADER   SLOT ARRAY       FREE SPACE             USED CELLS
@@ -335,11 +348,15 @@ pub(crate) struct Page {
 }
 
 impl Page {
+    /// Allocates a new page in memory.
     pub fn new(number: PageNumber, size: u16) -> Self {
         let buffer = alloc::Global
             .allocate_zeroed(Self::layout(size))
             .expect("could not allocate page");
 
+        // SAFETY: If allocation didn't fail then the layout is guaranteed to
+        // fit the page header plus some payload. We can cast and write the
+        // header safely.
         unsafe {
             buffer.cast().write(PageHeader {
                 num_slots: 0,
@@ -356,32 +373,63 @@ impl Page {
         }
     }
 
+    /// Amount of space that can be used in a page to store [`Cell`] instances.
+    pub fn usable_space(page_size: u16) -> u16 {
+        page_size - PAGE_HEADER_SIZE
+    }
+
+    /// Memory layout of the page.
+    pub fn layout(page_size: u16) -> Layout {
+        assert!(
+            MIN_PAGE_SIZE <= page_size && page_size <= MAX_PAGE_SIZE,
+            "page size out of acceptable bounds"
+        );
+
+        // SAFETY:
+        // - `CELL_ALIGNMENT` is a non-zero power of two.
+        // - `page_size` is u16 so it cannot overflow isize.
+        unsafe { Layout::from_size_align_unchecked(page_size as usize, CELL_ALIGNMENT) }
+    }
+
+    /// Size in bytes of the page.
     pub fn size(&self) -> u16 {
         self.buffer.len() as _
     }
 
+    /// Number of cells in the page.
     pub fn len(&self) -> u16 {
         self.header().num_slots + self.overflow.len() as u16
     }
 
+    /// In-memory page buffer.
     pub fn buffer(&self) -> &[u8] {
+        // SAFETY: We allocated the pointer so we know it's valid.
         unsafe { self.buffer.as_ref() }
     }
 
+    /// Same as [`Self::buffer`] but readable.
     pub fn buffer_mut(&mut self) -> &mut [u8] {
+        // SAFETY: Same as [`Self::buffer`].
         unsafe { self.buffer.as_mut() }
     }
 
+    /// Reference to the page header.
     pub fn header(&self) -> &PageHeader {
+        // SAFETY: The pointer is valid and we store the header at the beginning
+        // of the page, so we can safely cast.
         unsafe { self.buffer.cast().as_ref() }
     }
 
     /// Mutable reference to the page header.
     pub fn header_mut(&mut self) -> &mut PageHeader {
+        // SAFETY: Same as [`Self::header`].
         unsafe { self.buffer.cast().as_mut() }
     }
 
+    /// Pointer to the slot array.
     fn slot_array_non_null(&self) -> NonNull<[u16]> {
+        // SAFETY: The slotted array is located right after the header and
+        // `num_slots` records the exact size of the slotted array.
         unsafe {
             NonNull::slice_from_raw_parts(
                 self.buffer.byte_add(PAGE_HEADER_SIZE as _).cast(),
@@ -390,30 +438,37 @@ impl Page {
         }
     }
 
+    // Slotted array as a slice.
     fn slot_array(&self) -> &[u16] {
+        // SAFETY: See [`Self::slot_array_non_null`].
         unsafe { self.slot_array_non_null().as_ref() }
     }
 
+    // Slotted array as a mutable slice.
     fn slot_array_mut(&mut self) -> &mut [u16] {
+        // SAFETY: See [`Self::slot_array_non_null`].
         unsafe { self.slot_array_non_null().as_mut() }
     }
 
+    /// Returns a pointer to the [`CellHeader`] located at the given `offset`.
+    ///
+    /// # Safety
+    ///
+    /// This is the only function marked as `unsafe` because we can't guarantee
+    /// the offset is valid within the function, so the caller is responsible
+    /// for that.
     unsafe fn cell_header_at_offset(&self, offset: Offset) -> NonNull<CellHeader> {
         self.buffer.byte_add(offset as _).cast()
     }
 
+    /// Returns a pointer to the [`CellHeader`] pointer by the given slot.
     fn cell_header_at_slot_index(&self, index: SlotId) -> NonNull<CellHeader> {
+        // SAFETY: The slot array always stores valid offsets within the page
+        // that point to actual cells.
         unsafe { self.cell_header_at_offset(self.slot_array()[index as usize]) }
     }
 
-    pub fn usable_space(page_size: u16) -> u16 {
-        page_size - PAGE_HEADER_SIZE
-    }
-
-    pub fn layout(page_size: u16) -> Layout {
-        unsafe { Layout::from_size_align_unchecked(page_size as usize, CELL_ALIGNMENT) }
-    }
-
+    /// Read-only reference to a cell.
     pub fn cell(&self, index: SlotId) -> CellRef {
         let header = self.cell_header_at_slot_index(index);
         unsafe {
@@ -424,6 +479,7 @@ impl Page {
         }
     }
 
+    /// Mutable reference to a cell.
     pub fn cell_mut(&mut self, index: SlotId) -> CellRefMut {
         let mut header = self.cell_header_at_slot_index(index);
         unsafe {
@@ -434,6 +490,7 @@ impl Page {
         }
     }
 
+    /// Returns an owned cell by cloning it.
     pub fn owned_cell(&mut self, index: SlotId) -> Cell {
         let header = self.cell_header_at_slot_index(index);
         unsafe {
@@ -444,6 +501,7 @@ impl Page {
         }
     }
 
+    /// Returns the child at the given `index`.
     pub fn child(&self, index: SlotId) -> PageNumber {
         if index == self.len() {
             self.header().right_child
@@ -452,17 +510,26 @@ impl Page {
         }
     }
 
-    pub fn is_underflow(&self) -> bool {
-        self.len() == 0
-            || !self.is_root() && self.header().free_space > Self::usable_space(self.size()) / 2
-    }
-
+    /// Iterates over all the children pointers in this page.
     pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
         let len = if self.is_leaf() { 0 } else { self.len() + 1 };
 
         (0..len).map(|i| self.child(i))
     }
 
+    /// Returns `true` if this page is underflow.
+    pub fn is_underflow(&self) -> bool {
+        self.len() == 0
+            || !self.is_root() && self.header().free_space > Self::usable_space(self.size()) / 2
+    }
+
+    /// Returns `true` if this page is overflow.
+    pub fn is_overflow(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    /// Just like [`Vec::append`], this function removes all the cells in
+    /// `other` and adds them to `self`.
     pub fn append(&mut self, other: &mut Self) {
         for cell in other.drain(..) {
             self.push(cell);
@@ -471,6 +538,7 @@ impl Page {
         self.header_mut().right_child = other.header().right_child;
     }
 
+    /// Works like [`slice::binary_search_by`].
     pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
         self.slot_array()
             .binary_search_by(|offset| unsafe {
@@ -481,22 +549,23 @@ impl Page {
             .map_err(|index| index as _)
     }
 
-    pub fn is_overflow(&self) -> bool {
-        !self.overflow.is_empty()
-    }
-
+    /// Returns `true` if this page has no children.
     pub fn is_leaf(&self) -> bool {
         self.header().right_child == 0
     }
 
+    /// Returns `true` if this page is the root page.
     pub fn is_root(&self) -> bool {
+        // TODO: Probably not necessary since we store parents in a list.
         self.number == 0
     }
 
+    /// Adds `cell` to this page, possibly overflowing the page.
     pub fn push(&mut self, cell: Cell) {
         self.insert(self.len(), cell);
     }
 
+    /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Cell) {
         if self.is_overflow() {
             return self.overflow.push_back(OverflowCell { cell, index });
@@ -507,7 +576,15 @@ impl Page {
         }
     }
 
+    /// Attempts to replace the cell at `index` with `new_cell`. It causes the
+    /// page to overflow if it's not possible. After that, this function should
+    /// not be called anymore.
     pub fn replace(&mut self, index: SlotId, new_cell: Cell) -> Cell {
+        debug_assert!(
+            !self.is_overflow(),
+            "overflow cells are not replaced so replace() should not run on overflow pages"
+        );
+
         match self.try_replace(index, new_cell) {
             Ok(old_cell) => old_cell,
 
@@ -558,7 +635,7 @@ impl Page {
     ///
     /// There is no free list, we don't search for deleted blocks that can fit
     /// the new cell.
-    pub fn try_insert(&mut self, index: SlotId, cell: Cell) -> Result<SlotId, Cell> {
+    fn try_insert(&mut self, index: SlotId, cell: Cell) -> Result<SlotId, Cell> {
         let total_size = cell.storage_size();
 
         // There's no way we can fit the cell in this page.
@@ -659,7 +736,7 @@ impl Page {
     ///                                   using all the available free space
     ///                                   including the deleted cell
     /// ```
-    pub fn try_replace(&mut self, index: SlotId, new_cell: Cell) -> Result<Cell, Cell> {
+    fn try_replace(&mut self, index: SlotId, new_cell: Cell) -> Result<Cell, Cell> {
         let old_cell = self.cell(index);
 
         // There's no way we can fit the new cell in this page, even if we
@@ -700,8 +777,14 @@ impl Page {
 
     /// Removes the cell pointed by the given slot `index`. Unlike
     /// [`Self::try_insert`] and [`Self::try_replace`], this function cannot
-    /// fail. However, it does panic if the given `index` is out of bounds.
+    /// fail. However, it does panic if the given `index` is out of bounds or
+    /// the page is overflow.
     pub fn remove(&mut self, index: SlotId) -> Cell {
+        debug_assert!(
+            !self.is_overflow(),
+            "remove() does not handle overflow indexes"
+        );
+
         let len = self.header().num_slots;
 
         assert!(index < len, "index {index} out of range for length {len}");
@@ -783,6 +866,9 @@ impl Page {
         self.header_mut().last_used_offset = destination_offset;
     }
 
+    /// Works just like [`Vec::drain`]. Removes the specified cells from this
+    /// page and returns an owned version of them. This function does account
+    /// for [`Self::is_overflow`], so it's safe to call on overflow pages.
     pub fn drain(&mut self, range: impl RangeBounds<usize>) -> impl Iterator<Item = Cell> + '_ {
         let start = match range.start_bound() {
             Bound::Unbounded => 0,
@@ -824,7 +910,7 @@ impl Page {
             } else {
                 // Now compute gained space and shift slots towards the left.
                 self.header_mut().free_space += (start..slot_index)
-                    .map(|slot| self.cell(slot as _).storage_size())
+                    .map(|slot| self.cell(slot as _).header.storage_size())
                     .sum::<u16>();
 
                 self.slot_array_mut().copy_within(start..slot_index, 0);
@@ -857,6 +943,7 @@ impl Clone for Page {
     fn clone(&self) -> Self {
         let mut page = Page::new(self.number, self.buffer.len() as _);
         page.buffer_mut().copy_from_slice(self.buffer());
+        page.overflow = self.overflow.clone();
         page
     }
 }
@@ -877,8 +964,8 @@ impl Debug for Page {
                         f.debug_struct("Cell")
                             .field("header", &cell.header)
                             .field("start", &offset)
-                            .field("end", &(offset + cell.total_size()))
-                            .field("size", &cell.size())
+                            .field("end", &(offset + cell.header.total_size()))
+                            .field("size", &cell.header.size)
                             .finish()
                     });
                 });

@@ -1,3 +1,5 @@
+//! Disk storage data structures.
+
 mod btree;
 pub(crate) mod page;
 
