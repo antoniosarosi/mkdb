@@ -256,7 +256,7 @@ impl Eq for OverflowCell {}
 
 impl PartialOrd for OverflowCell {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.index.partial_cmp(&other.index)
+        Some(self.cmp(other))
     }
 }
 
@@ -799,7 +799,7 @@ impl Page {
         // Case 1: The new cell is smaller than the old cell. This is the best
         // case scenario because we can simply overwrite the contents without
         // doing much else.
-        if old_cell.header.size <= new_cell.header.size {
+        if new_cell.header.size <= old_cell.header.size {
             // If new_cell is smaller we gain some extra bytes.
             let free_bytes = old_cell.header.size - new_cell.header.size;
 
@@ -960,7 +960,7 @@ impl Page {
                     .map(|slot| self.cell(slot as _).header.storage_size())
                     .sum::<u16>();
 
-                self.slot_array_mut().copy_within(start..slot_index, 0);
+                self.slot_array_mut().copy_within(slot_index.., start);
 
                 self.header_mut().num_slots -= (slot_index - start) as u16;
 
@@ -1095,6 +1095,14 @@ mod tests {
         }
     }
 
+    /// Same as [`compare_consecutive_offsets`] but only checks the cell values,
+    /// not the offsets.
+    fn compare_cells(page: &Page, cells: &Vec<Cell>) {
+        for (i, cell) in cells.iter().enumerate() {
+            assert_eq!(page.cell(i as _), cell);
+        }
+    }
+
     #[test]
     fn push_fixed_size_cells() {
         let (page, cells) = Page::builder()
@@ -1119,7 +1127,7 @@ mod tests {
 
     #[test]
     fn delete_slot() {
-        let (mut page, _) = Page::builder()
+        let (mut page, mut cells) = Page::builder()
             .size(512)
             .cells(fixed_size_cells(32, 3))
             .build();
@@ -1127,9 +1135,11 @@ mod tests {
         let expected_offsets = [page.slot_array()[0], page.slot_array()[2]];
 
         page.remove(1);
+        cells.remove(1);
 
         assert_eq!(page.header().num_slots, 2);
         assert_eq!(page.slot_array(), expected_offsets);
+        compare_cells(&page, &cells);
     }
 
     #[test]
@@ -1185,5 +1195,86 @@ mod tests {
         page.push(cells[2].clone());
 
         compare_consecutive_offsets(&page, &cells);
+    }
+
+    #[test]
+    fn replace_cell_in_place() {
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[64, 32, 128]))
+            .build();
+
+        let new_cell = Cell::new(&vec![4; 32]);
+        cells[1] = new_cell.clone();
+
+        page.replace(1, new_cell);
+
+        compare_consecutive_offsets(&page, &cells);
+    }
+
+    #[test]
+    fn replace_cell_removing_previous() {
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[64, 128]))
+            .build();
+
+        let new_cell = Cell::new(&vec![4; 128]);
+
+        let expected_offset =
+            page.size() - cells.iter().map(Cell::total_size).sum::<u16>() - new_cell.total_size();
+
+        cells[0] = new_cell.clone();
+
+        page.replace(0, new_cell);
+
+        assert_eq!(page.header().num_slots, 2);
+        assert_eq!(page.slot_array()[0], expected_offset);
+        compare_cells(&page, &cells);
+    }
+
+    #[test]
+    fn drain() {
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(fixed_size_cells(32, 4))
+            .build();
+
+        let expected_offsets = [page.slot_array()[0], page.slot_array()[3]];
+
+        assert_eq!(
+            page.drain(1..=2).collect::<Vec<_>>(),
+            cells.drain(1..=2).collect::<Vec<_>>()
+        );
+
+        assert_eq!(page.header().num_slots, 2);
+        assert_eq!(page.slot_array(), expected_offsets);
+        compare_cells(&page, &cells);
+    }
+
+    #[test]
+    fn insert_with_overflow() {
+        let cell_size = 32;
+        let page_size = 512;
+
+        let num_cells_in_page =
+            Page::usable_space(page_size) / Cell::new(&vec![0; cell_size]).storage_size();
+
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(fixed_size_cells(cell_size, num_cells_in_page as usize))
+            .build();
+
+        let mut cell_data = num_cells_in_page + 1;
+        for i in [1, 3] {
+            let new_cell = Cell::new(&vec![cell_data as u8; cell_size]);
+            cells.insert(i, new_cell.clone());
+            page.insert(i as _, new_cell);
+            cell_data += 1;
+        }
+
+        assert_eq!(page.overflow.len(), 2);
+        assert_eq!(page.len(), num_cells_in_page + 2);
+        assert_eq!(page.drain(..).collect::<Vec<_>>(), cells);
     }
 }

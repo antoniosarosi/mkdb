@@ -1674,7 +1674,9 @@ mod tests {
             cache::Cache,
             pager::{PageNumber, Pager},
         },
-        storage::page::{Cell, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
+        storage::page::{
+            Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE,
+        },
     };
 
     /// Allows us to build an entire tree manually and then compare it to an
@@ -1696,7 +1698,7 @@ mod tests {
         }
     }
 
-    /// Builder for [`BTree<MemBuf>`].
+    /// Builder for [`BTree<MemBuf>`] with fixed size keys.
     struct Builder {
         keys: Vec<u32>,
         order: usize,
@@ -3027,6 +3029,67 @@ mod tests {
                     Node::leaf([6, 7, 8]),
                     Node::leaf([10, 11, 12]),
                     Node::leaf([14, 15, 16]),
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn variable_length_data() -> io::Result<()> {
+        let page_size = 256; // Page::usable_space() is 244 bytes.
+
+        // 48 is the maximum payload size for pages of 256 bytes. This is how
+        // it's calculated:
+        // let max_payload_size = (Page::usable_space(page_size) / 4 - CELL_HEADER_SIZE - SLOT_SIZE)
+        //     & !(CELL_ALIGNMENT as u16 - 1);
+
+        // Size of the payloads. Add 10 bytes to each one of them to make the
+        // calcultions mentally (header size + slot size). We need to fill up
+        // 244 bytes per page.
+        let payload_sizes = vec![
+            // 7 entries, 238 bytes total. This fills the root page.
+            vec![48, 16, 8, 24, 48, 16, 8],
+            // 10 entries, 244 bytes total. Inserting the first one will split
+            // the root moving the 7 entries above into the left child, leaving
+            // the first entry below in the root and moving the other 9 into
+            // the right child.
+            vec![8, 8, 8, 8, 8, 8, 8, 24, 16, 48],
+            // We can squeeze one more key into the right child before the root
+            // needs 3 children.
+            vec![8],
+        ];
+
+        let mut btree = BTree::new(
+            Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size)),
+            1,
+        );
+
+        for (i, size) in payload_sizes.iter().flatten().enumerate() {
+            let mut entry = vec![0; *size];
+            let key = i as u32 + 1;
+            entry[..4].copy_from_slice(&key.to_be_bytes());
+            btree.insert(&entry)?;
+        }
+
+        // Considering the size of each cell, this is how the BTree should
+        // end up looking:
+        //
+        //                 +---+
+        //         +-------| 8 |--------+
+        //        /        +---+         \
+        // +---------------+  +------------------------------+
+        // | 1,2,3,4,5,6,7 |  | 9,10,11,12,13,14,15,16,17,18 |
+        // +---------------+  +------------------------------+
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![8],
+                children: vec![
+                    Node::leaf([1, 2, 3, 4, 5, 6, 7]),
+                    Node::leaf([9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
                 ]
             }
         );
