@@ -171,6 +171,7 @@ pub struct Cell {
 ///
 /// The cell could be located either in a page that comes from disk or in memory
 /// if the page overflowed.
+#[derive(Debug, PartialEq)]
 pub struct CellRef<'a> {
     pub header: &'a CellHeader,
     pub content: &'a [u8],
@@ -180,6 +181,21 @@ pub struct CellRef<'a> {
 pub struct CellRefMut<'a> {
     pub header: &'a mut CellHeader,
     pub content: &'a mut [u8],
+}
+
+impl<'a> From<&'a Cell> for CellRef<'a> {
+    fn from(cell: &'a Cell) -> Self {
+        Self {
+            header: &cell.header,
+            content: &cell.content,
+        }
+    }
+}
+
+impl PartialEq<&Cell> for CellRef<'_> {
+    fn eq(&self, other: &&Cell) -> bool {
+        self.header.eq(&other.header) && self.content.eq(other.content.as_ref())
+    }
 }
 
 impl Cell {
@@ -973,5 +989,170 @@ impl Debug for Page {
                 list.finish()
             })
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variable_size_cells(sizes: &[usize]) -> Vec<Cell> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| Cell::new(&vec![i as u8 + 1; *size]))
+            .collect()
+    }
+
+    fn fixed_size_cells(size: usize, amount: usize) -> Vec<Cell> {
+        variable_size_cells(&vec![size; amount])
+    }
+
+    struct Builder {
+        size: u16,
+        cells: Vec<Cell>,
+    }
+
+    impl Builder {
+        fn new() -> Self {
+            Self {
+                size: MIN_PAGE_SIZE,
+                cells: Vec::new(),
+            }
+        }
+
+        fn size(mut self, size: u16) -> Self {
+            self.size = size;
+            self
+        }
+
+        fn cells(mut self, cells: Vec<Cell>) -> Self {
+            self.cells = cells;
+            self
+        }
+
+        fn build(self) -> (Page, Vec<Cell>) {
+            let mut page = Page::new(0, self.size);
+            page.push_all(self.cells.clone());
+
+            (page, self.cells)
+        }
+    }
+
+    impl Page {
+        fn push_all(&mut self, cells: Vec<Cell>) {
+            cells.into_iter().for_each(|cell| self.push(cell));
+        }
+
+        fn builder() -> Builder {
+            Builder::new()
+        }
+    }
+
+    /// # Arguments
+    ///
+    /// * `page` - [`Page`] instance.
+    ///
+    /// * `cells` - List of cells that have been inserted in the page
+    /// (in order). Necessary for checking data corruption.
+    fn compare_consecutive_offsets(page: &Page, cells: &Vec<Cell>) {
+        let mut expected_offset = page.size();
+        for (i, cell) in cells.iter().enumerate() {
+            expected_offset -= cell.total_size();
+            assert_eq!(page.slot_array()[i], expected_offset);
+            assert_eq!(page.cell(i as u16), cell);
+        }
+    }
+
+    #[test]
+    fn push_fixed_size_cells() {
+        let (page, cells) = Page::builder()
+            .size(512)
+            .cells(fixed_size_cells(32, 3))
+            .build();
+
+        assert_eq!(page.header().num_slots, cells.len() as u16);
+        compare_consecutive_offsets(&page, &cells);
+    }
+
+    #[test]
+    fn push_variable_size_cells() {
+        let (page, cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[64, 32, 128]))
+            .build();
+
+        assert_eq!(page.header().num_slots, cells.len() as u16);
+        compare_consecutive_offsets(&page, &cells);
+    }
+
+    #[test]
+    fn delete_slot() {
+        let (mut page, _) = Page::builder()
+            .size(512)
+            .cells(fixed_size_cells(32, 3))
+            .build();
+
+        let expected_offsets = [page.slot_array()[0], page.slot_array()[2]];
+
+        page.remove(1);
+
+        assert_eq!(page.header().num_slots, 2);
+        assert_eq!(page.slot_array(), expected_offsets);
+    }
+
+    #[test]
+    fn defragment() {
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[24, 64, 32, 128, 8]))
+            .build();
+
+        for i in [1, 2] {
+            page.remove(i as u16);
+            cells.remove(i);
+        }
+
+        page.defragment();
+
+        assert_eq!(page.header().num_slots, 3);
+        compare_consecutive_offsets(&page, &cells);
+    }
+
+    #[test]
+    fn unaligned_content() {
+        let (page, cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[7, 19, 20]))
+            .build();
+
+        compare_consecutive_offsets(&page, &cells);
+
+        // Check padding
+        for i in 0..cells.len() {
+            assert_eq!(
+                page.cell(i as u16).content.len(),
+                Cell::aligned_size_of(&cells[i].content) as usize
+            );
+        }
+    }
+
+    #[test]
+    fn insert_defragmenting() {
+        let (mut page, mut cells) = Page::builder()
+            .size(512)
+            .cells(variable_size_cells(&[64, 32, 128]))
+            .build();
+
+        page.remove(1);
+        cells.remove(1);
+
+        let end_of_slot_array = PAGE_HEADER_SIZE + SLOT_SIZE * page.header().num_slots;
+        let available_space = page.header().last_used_offset - end_of_slot_array;
+
+        cells.push(Cell::new(&vec![4; available_space as usize]));
+        page.push(cells[2].clone());
+
+        compare_consecutive_offsets(&page, &cells);
     }
 }
