@@ -2,6 +2,7 @@
 
 use std::{
     cmp::{min, Ordering},
+    collections::VecDeque,
     fs::File,
     io,
     io::{Read, Seek, Write},
@@ -1398,7 +1399,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let parent_page = parents.remove(parents.len() - 1);
         let mut siblings = self.load_siblings(page, parent_page)?;
 
-        let mut cells = Vec::new();
+        let mut cells = VecDeque::new();
         let divider_idx = siblings[0].index;
 
         // Make copies of cells in order.
@@ -1407,7 +1408,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             if i < siblings.len() - 1 {
                 let mut divider = self.cache.get_mut(parent_page)?.remove(divider_idx);
                 divider.header.left_child = self.cache.get(sibling.page)?.header().right_child;
-                cells.push(divider);
+                cells.push_back(divider);
             }
         }
 
@@ -1474,11 +1475,11 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
             let page = self.cache.get_mut(siblings[i].page)?;
             for _ in 0..*n {
-                page.push(cells.remove(0));
+                page.push(cells.pop_front().unwrap());
             }
 
             if i < siblings.len() - 1 {
-                let mut divider = cells.remove(0);
+                let mut divider = cells.pop_front().unwrap();
                 page.header_mut().right_child = divider.header.left_child;
                 divider.header.left_child = siblings[i].page;
                 self.cache

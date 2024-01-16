@@ -25,7 +25,7 @@
 use std::{
     alloc::{self, Allocator, Layout},
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::BinaryHeap,
     fmt::Debug,
     iter, mem,
     ops::{Bound, RangeBounds},
@@ -246,6 +246,27 @@ struct OverflowCell {
     index: SlotId,
 }
 
+impl PartialEq for OverflowCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.index.eq(&other.index)
+    }
+}
+
+impl Eq for OverflowCell {}
+
+impl PartialOrd for OverflowCell {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.index.partial_cmp(&other.index)
+    }
+}
+
+impl Ord for OverflowCell {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is max-heap by default, make it min-heap.
+        self.index.cmp(&other.index).reverse()
+    }
+}
+
 /// Fixed size slotted page.
 ///
 /// This is what we store on disk. The page maintains a "slot array" located
@@ -363,7 +384,7 @@ pub(crate) struct Page {
     /// Fixed size in-memory buffer that contains the data read from disk.
     buffer: NonNull<[u8]>,
     /// Overflow list.
-    overflow: VecDeque<OverflowCell>,
+    overflow: BinaryHeap<OverflowCell>,
 }
 
 impl Page {
@@ -389,7 +410,7 @@ impl Page {
         Self {
             number,
             buffer,
-            overflow: VecDeque::new(),
+            overflow: BinaryHeap::new(),
         }
     }
 
@@ -598,11 +619,11 @@ impl Page {
     /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Cell) {
         if self.is_overflow() {
-            return self.overflow.push_back(OverflowCell { cell, index });
+            return self.overflow.push(OverflowCell { cell, index });
         }
 
         if let Err(cell) = self.try_insert(index, cell) {
-            self.overflow.push_back(OverflowCell { cell, index });
+            self.overflow.push(OverflowCell { cell, index });
         }
     }
 
@@ -619,7 +640,7 @@ impl Page {
             Ok(old_cell) => old_cell,
 
             Err(new_cell) => {
-                self.overflow.push_back(OverflowCell {
+                self.overflow.push(OverflowCell {
                     cell: new_cell,
                     index,
                 });
@@ -915,19 +936,15 @@ impl Page {
         let mut drain_index = start;
         let mut slot_index = start;
 
-        self.overflow
-            .make_contiguous()
-            .sort_by_key(|overflow| overflow.index);
-
         iter::from_fn(move || {
             // Copy cells until we reach the end.
             if drain_index < end {
                 let cell = if self
                     .overflow
-                    .front()
+                    .peek()
                     .is_some_and(|overflow| overflow.index as usize == drain_index)
                 {
-                    self.overflow.pop_front().unwrap().cell
+                    self.overflow.pop().unwrap().cell
                 } else {
                     let cell = self.owned_cell(slot_index as _);
                     slot_index += 1;
