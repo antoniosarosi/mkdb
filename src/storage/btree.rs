@@ -5,6 +5,7 @@ use std::{
     fs::File,
     io,
     io::{Read, Seek, Write},
+    os::unix::fs::MetadataExt,
     path::Path,
 };
 
@@ -269,9 +270,7 @@ impl<C: BytesCmp> BTree<File, C> {
         let balance_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
 
         // TODO: Init root while we don't have a header.
-        let mut current_root = Page::new(0, page_size as _);
-        cache.pager.read(0, current_root.buffer_mut())?;
-        if current_root.header().free_space() == 0 {
+        if metadata.size() == 0 {
             let new_root = Page::new(0, page_size as _);
             cache.pager.write(new_root.number, new_root.buffer())?;
         }
@@ -467,8 +466,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             // Key found, swap value.
             Ok(index) => {
                 let mut cell = Cell::new(entry);
-                cell.header.left_child = node.child(index);
-                node.replace(index, Cell::new(entry));
+                cell.header.left_child = node.cell(index).header.left_child;
+                node.replace(index, cell);
             }
             // Key not found, insert new entry.
             Err(index) => node.insert(index, Cell::new(entry)),

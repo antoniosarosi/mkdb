@@ -56,10 +56,6 @@ pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 /// See [`Page`] for alignment details.
 pub const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
 
-/// Type alias to make it clear when we're dealing with cell offsets. A 2 byte
-/// offset can point to the end of [`MAX_PAGE_SIZE`].
-type Offset = u16;
-
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
 pub(crate) type SlotId = u16;
@@ -87,19 +83,23 @@ pub(crate) type SlotId = u16;
 pub(crate) struct PageHeader {
     /// Amount of free bytes in this page.
     free_space: u16,
+
     /// Length of the slot array.
     num_slots: u16,
+
     /// Offset of the last cell.
-    last_used_offset: Offset,
+    last_used_offset: u16,
+
+    /// Add padding manually to avoid uninitialized bytes since the [`PartialEq`]
+    /// implementation for [`Page`] relies on comparing the memory buffers. Rust
+    /// does not make any guarantees about the values of padding bytes. See
+    /// here:
+    ///
+    /// https://github.com/rust-lang/unsafe-code-guidelines/issues/174
+    padding: u16,
+
     /// Last child of this page.
     pub right_child: PageNumber,
-}
-
-impl PageHeader {
-    /// Total free space that can be used to store [`Cell`] instances.
-    pub fn free_space(&self) -> u16 {
-        self.free_space
-    }
 }
 
 /// Cell header located at the beginning of each cell.
@@ -129,6 +129,8 @@ impl PageHeader {
 pub struct CellHeader {
     /// Size of the cell content.
     size: u16,
+    /// See [`PageHeader::padding`] for details.
+    padding: u16,
     /// ID of the BTree page that contains values less than this cell.
     pub left_child: PageNumber,
 }
@@ -209,6 +211,7 @@ impl Cell {
             header: CellHeader {
                 size,
                 left_child: 0,
+                padding: 0,
             },
             content: data.into_boxed_slice(),
         }
@@ -379,6 +382,7 @@ impl Page {
                 last_used_offset: size,
                 free_space: Self::usable_space(size),
                 right_child: 0,
+                padding: 0,
             });
         }
 
@@ -473,7 +477,7 @@ impl Page {
     /// This is the only function marked as `unsafe` because we can't guarantee
     /// the offset is valid within the function, so the caller is responsible
     /// for that.
-    unsafe fn cell_header_at_offset(&self, offset: Offset) -> NonNull<CellHeader> {
+    unsafe fn cell_header_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
         self.buffer.byte_add(offset as _).cast()
     }
 
@@ -487,6 +491,9 @@ impl Page {
     /// Read-only reference to a cell.
     pub fn cell(&self, index: SlotId) -> CellRef {
         let header = self.cell_header_at_slot_index(index);
+        // SAFETY: The slot array stores a correct offset to a cell. Once we
+        // have the pointer to the cell, we know the header and content are
+        // contiguous, so we can take the two references.
         unsafe {
             CellRef {
                 header: header.as_ref(),
@@ -498,10 +505,17 @@ impl Page {
     /// Mutable reference to a cell.
     pub fn cell_mut(&mut self, index: SlotId) -> CellRefMut {
         let mut header = self.cell_header_at_slot_index(index);
+        // SAFETY: This one is not as easy as getting a [`CellRef`] because we
+        // can't get a mutable reference to the header and _then_ a mutable
+        // reference to the content, since in order to know how long the content
+        // is we have to borrow the header as immutable to read the `size`
+        // property. Since we can't borrow as mutable and immutable at the same
+        // time we'll just flip the order. Grab the content first and then the
+        // header.
         unsafe {
             CellRefMut {
-                header: header.as_mut(),
                 content: CellHeader::content_of(header).as_mut(),
+                header: header.as_mut(),
             }
         }
     }

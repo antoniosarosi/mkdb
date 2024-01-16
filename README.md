@@ -43,7 +43,7 @@ cargo +nightly test
 ## Unsafe
 
 Most of the [unsafe](https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html)
-code is located in [`./src/paging/page.rs`](./src/paging/page.rs), which is the
+code is located in [`./src/storage/page.rs`](./src/paging/page.rs), which is the
 module that implements slotted pages. [`Miri`](https://github.com/rust-lang/miri)
 can be used to test possible undefined behaviour bugs. Install the component
 using `rustup`:
@@ -55,5 +55,13 @@ rustup +nightly component add miri
 Then use `cargo` to test the `page` module:
 
 ```bash
-cargo +nightly miri test paging::page::tests
+cargo +nightly miri test storage::page::tests
+```
+
+The [`./src/paging/cache.rs`](./src/paging/cache.rs) module is not unsafe by
+itself but it heavily relies on the slotted page module so it's worth testing
+with Miri as well:
+
+```bash
+cargo +nightly miri test paging::cache::tests
 ```
