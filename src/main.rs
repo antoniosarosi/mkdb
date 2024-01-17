@@ -12,7 +12,7 @@ use std::io;
 fn main() -> io::Result<()> {
     let mut btree = storage::BTree::new_at_path("btree.bin", 72)?;
     for i in 1_u32..=46 {
-        btree.insert(&i.to_be_bytes())?;
+        btree.insert(Vec::from(i.to_be_bytes()))?;
     }
 
     eprintln!(

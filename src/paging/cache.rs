@@ -492,7 +492,7 @@ mod tests {
             let pages: Vec<Page> = (0..self.number_of_pages as PageNumber)
                 .map(|i| {
                     let mut page = Page::new(i, PAGE_SIZE as _);
-                    page.push(Cell::new(&vec![
+                    page.push(Cell::new(vec![
                         i as u8;
                         Page::max_payload_size(PAGE_SIZE as u16)
                             as usize

@@ -191,6 +191,20 @@ pub struct CellRef<'a> {
     pub content: &'a [u8],
 }
 
+impl CellRef<'_> {
+    pub fn overflow_page(&self) -> PageNumber {
+        if !self.header.is_overflow {
+            return 0;
+        }
+
+        PageNumber::from_le_bytes(
+            self.content[self.content.len() - mem::size_of::<PageNumber>()..]
+                .try_into()
+                .expect("failed parsing overflow page number"),
+        )
+    }
+}
+
 /// Same as [`CellRef`] but mutable.
 pub struct CellRefMut<'a> {
     pub header: &'a mut CellHeader,
@@ -212,25 +226,12 @@ impl PartialEq<&Cell> for CellRef<'_> {
     }
 }
 
-impl CellRef<'_> {
-    pub fn overflow_page(&self) -> PageNumber {
-        assert!(self.header.is_overflow, "cell is not overflow");
-
-        PageNumber::from_le_bytes(
-            self.content[self.content.len() - mem::size_of::<PageNumber>() - 1..]
-                .try_into()
-                .expect("failed parsing overflow page number"),
-        )
-    }
-}
-
 impl Cell {
     /// Creates a new cell allocated in memory.
-    pub fn new(data: &[u8]) -> Self {
-        // TODO: Could probably receive Vec<u8> to avoid copies.
-        let mut data = Vec::from(data);
-        let size = Self::aligned_size_of(&data);
-        data.resize(size as _, 0);
+    pub fn new(mut payload: Vec<u8>) -> Self {
+        let size = Self::aligned_size_of(&payload);
+        // Add padding.
+        payload.resize(size as _, 0);
 
         Self {
             header: CellHeader {
@@ -239,16 +240,14 @@ impl Cell {
                 is_overflow: false,
                 padding: 0,
             },
-            content: data.into_boxed_slice(),
+            content: payload.into_boxed_slice(),
         }
     }
 
-    pub fn new_overflow(data: &[u8], overflow_page: PageNumber) -> Self {
-        let mut payload = Vec::from(data);
+    pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Self {
         payload.extend_from_slice(&overflow_page.to_le_bytes());
 
-        // TODO: Avoid unnecessary copies.
-        let mut cell = Self::new(&payload);
+        let mut cell = Self::new(payload);
         cell.header.is_overflow = true;
 
         cell
@@ -265,13 +264,7 @@ impl Cell {
     }
 
     pub fn overflow_page(&self) -> PageNumber {
-        assert!(self.header.is_overflow, "cell is not overflow");
-
-        PageNumber::from_le_bytes(
-            self.content[self.content.len() - mem::size_of::<PageNumber>()..]
-                .try_into()
-                .expect("failed parsing overflow page number"),
-        )
+        CellRef::from(self).overflow_page()
     }
 
     /// See [`Page`] for details.
@@ -480,7 +473,7 @@ impl Page {
         // When the page size is too small we can't fit 4 keys. This is mostly
         // for tests, since we use small page sizes for simplicity.
         if max_size == 0 {
-            return usable_space - CELL_HEADER_SIZE - SLOT_SIZE;
+            return usable_space - CELL_HEADER_SIZE - SLOT_SIZE & !(CELL_ALIGNMENT as u16 - 1);
         }
 
         max_size
@@ -1220,7 +1213,7 @@ mod tests {
         sizes
             .iter()
             .enumerate()
-            .map(|(i, size)| Cell::new(&vec![i as u8 + 1; *size]))
+            .map(|(i, size)| Cell::new(vec![i as u8 + 1; *size]))
             .collect()
     }
 
@@ -1380,7 +1373,7 @@ mod tests {
         page.remove(1);
         cells.remove(1);
 
-        let new_cell = Cell::new(&vec![4; 112]);
+        let new_cell = Cell::new(vec![4; 112]);
 
         cells.push(new_cell.clone());
         page.push(new_cell);
@@ -1395,7 +1388,7 @@ mod tests {
             .cells(variable_size_cells(&[64, 32, 112]))
             .build();
 
-        let new_cell = Cell::new(&vec![4; 32]);
+        let new_cell = Cell::new(vec![4; 32]);
         cells[1] = new_cell.clone();
 
         page.replace(1, new_cell);
@@ -1410,7 +1403,7 @@ mod tests {
             .cells(variable_size_cells(&[64, 96]))
             .build();
 
-        let new_cell = Cell::new(&vec![4; 96]);
+        let new_cell = Cell::new(vec![4; 96]);
 
         let expected_offset =
             page.size() - cells.iter().map(Cell::total_size).sum::<u16>() - new_cell.total_size();
@@ -1449,7 +1442,7 @@ mod tests {
         let page_size = 512;
 
         let num_cells_in_page =
-            Page::usable_space(page_size) / Cell::new(&vec![0; cell_size]).storage_size();
+            Page::usable_space(page_size) / Cell::new(vec![0; cell_size]).storage_size();
 
         let (mut page, mut cells) = Page::builder()
             .size(512)
@@ -1458,7 +1451,7 @@ mod tests {
 
         let mut cell_data = num_cells_in_page + 1;
         for i in [1, 3] {
-            let new_cell = Cell::new(&vec![cell_data as u8; cell_size]);
+            let new_cell = Cell::new(vec![cell_data as u8; cell_size]);
             cells.insert(i, new_cell.clone());
             page.insert(i as _, new_cell);
             cell_data += 1;

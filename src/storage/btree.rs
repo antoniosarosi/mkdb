@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-use super::page::{Cell, CellRef, OverflowPage, Page, SlotId};
+use super::page::{Cell, OverflowPage, Page, SlotId};
 use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
@@ -24,6 +24,7 @@ use crate::{
 /// determine the correct [`Ordering`].
 pub(crate) trait BytesCmp {
     /// Compares two byte arrays and returns the corresponding [`Ordering`].
+    ///
     /// At the [`BTree`] level we don't care how that is done. Upper levels can
     /// parse the binary to obtain an [`Ordering`] instance, they can store
     /// the entry in such a format that they can tell the [`Ordering`] by
@@ -79,7 +80,7 @@ enum LeafKeySearch {
 }
 
 #[derive(Debug, PartialEq)]
-enum Payload<'s> {
+pub(crate) enum Payload<'s> {
     /// Payload did not need reassembly, so we returned a reference to the
     /// slotted page buffer.
     PageRef(&'s [u8]),
@@ -324,10 +325,9 @@ impl<F> BTree<F> {
 impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
     /// details.
-    pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<Box<[u8]>>> {
+    pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<Payload>> {
         let search = self.search(0, entry, &mut Vec::new())?;
 
-        // TODO: Return ref if we don't need to reassamble the payload.
         match search.index {
             Err(_) => Ok(None),
             Ok(index) => Ok(Some(self.reassemble_payload(search.page, index)?)),
@@ -401,6 +401,9 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         self.search(next_node, entry, parents)
     }
 
+    /// Returns an [`Ok`] result containing the index where `entry` was found or
+    /// an [`Err`] result containing the index where `entry` should have been
+    /// found if present.
     fn binary_search(&mut self, page: PageNumber, entry: &[u8]) -> io::Result<Result<u16, u16>> {
         let mut size = self.cache.get(page)?.len();
 
@@ -413,8 +416,17 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
             let overflow_buf: Box<[u8]>;
 
+            // TODO: This condition is probably not enough to check if we
+            // actually need to reassemble or not. If the given entry has the
+            // same length as the cell content and they match, we probably have
+            // to reassemble and check again. One example could be long strings
+            // such as "abcdefg" vs "abcd". If we don't have the entire string
+            // we can't tell for sure if they're equal.
             let payload = if cell.header.is_overflow && entry.len() > cell.content.len() {
-                overflow_buf = self.reassemble_payload(page, mid)?;
+                match self.reassemble_payload(page, mid)? {
+                    Payload::Reassembled(buf) => overflow_buf = buf,
+                    _ => unreachable!(),
+                }
                 &overflow_buf
             } else {
                 cell.content
@@ -501,9 +513,9 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// [`Self::balance`], which does all the work needed to maintain the tree
     /// in a correct and balanced state. See [`Self::balance`] for details on
     /// rearranging keys and splitting nodes after inserts.
-    pub fn insert(&mut self, entry: &[u8]) -> io::Result<()> {
+    pub fn insert(&mut self, entry: Vec<u8>) -> io::Result<()> {
         let mut parents = Vec::new();
-        let search = self.search(0, entry, &mut parents)?;
+        let search = self.search(0, &entry, &mut parents)?;
 
         let mut new_cell = self.alloc_cell(entry)?;
         let node = self.cache.get_mut(search.page)?;
@@ -644,8 +656,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     fn remove_entry(
         &mut self,
         entry: &[u8],
-        parents: &mut Vec<u32>,
-    ) -> io::Result<Option<(Box<[u8]>, u32)>> {
+        parents: &mut Vec<PageNumber>,
+    ) -> io::Result<Option<(Box<[u8]>, PageNumber)>> {
         let search = self.search(0, entry, parents)?;
         let node = self.cache.get(search.page)?;
 
@@ -1611,7 +1623,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             .collect())
     }
 
-    fn alloc_cell(&mut self, payload: &[u8]) -> io::Result<Cell> {
+    fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Cell> {
         let max_payload_size = Page::max_payload_size(self.cache.pager.page_size as _) as usize;
 
         if payload.len() <= max_payload_size {
@@ -1652,7 +1664,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         }
 
         Ok(Cell::new_overflow(
-            &payload[..first_cell_payload_size],
+            Vec::from(&payload[..first_cell_payload_size]),
             overflow_pages[0].number,
         ))
     }
@@ -1675,14 +1687,15 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         Ok(())
     }
 
-    fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Box<[u8]>> {
-        let cell = self.cache.get(page)?.owned_cell(slot);
-
-        // TODO: Return ref if we don't have to reassamble the payload.
-        if !cell.header.is_overflow {
-            return Ok(cell.content);
+    fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Payload> {
+        // TODO: Check if we can circumvent Rust borrowing rules to make stuff
+        // like this cleaner.
+        if !self.cache.get(page)?.cell(slot).header.is_overflow {
+            let cell = self.cache.get(page)?.cell(slot);
+            return Ok(Payload::PageRef(cell.content));
         }
 
+        let cell = self.cache.get(page)?.cell(slot);
         let mut overflow_page = cell.overflow_page();
 
         let mut payload =
@@ -1697,7 +1710,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             overflow_page = page.header().next;
         }
 
-        Ok(payload.into())
+        Ok(Payload::Reassembled(payload.into()))
     }
 
     // fn iter_cell_overflow(
@@ -1832,8 +1845,9 @@ mod tests {
             cache::Cache,
             pager::{PageNumber, Pager},
         },
-        storage::page::{
-            Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE,
+        storage::{
+            btree::Payload,
+            page::{Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
         },
     };
 
@@ -1936,7 +1950,7 @@ mod tests {
         }
 
         fn insert_key(&mut self, key: u32) -> io::Result<()> {
-            self.insert(&key.to_be_bytes())
+            self.insert(Vec::from(key.to_be_bytes()))
         }
 
         fn remove_key(&mut self, key: u32) -> io::Result<Option<Box<[u8]>>> {
@@ -1945,7 +1959,7 @@ mod tests {
 
         fn extend_from_keys(&mut self, keys: impl IntoIterator<Item = u32>) -> io::Result<()> {
             for key in keys {
-                self.insert(&key.to_be_bytes())?;
+                self.insert(Vec::from(key.to_be_bytes()))?;
             }
 
             Ok(())
@@ -1964,7 +1978,7 @@ mod tests {
     }
 
     fn optimal_page_size_for(order: usize) -> usize {
-        let key_size = Cell::new(&[0; mem::size_of::<u32>()]).storage_size();
+        let key_size = Cell::new(vec![0; mem::size_of::<u32>()]).storage_size();
         let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
 
         std::alloc::Layout::from_size_align(total_space_needed as usize, CELL_ALIGNMENT)
@@ -3224,7 +3238,7 @@ mod tests {
             let mut entry = vec![0; *size];
             let key = i as u32 + 1;
             entry[..4].copy_from_slice(&key.to_be_bytes());
-            btree.insert(&entry)?;
+            btree.insert(entry)?;
         }
 
         // Considering the size of each cell, this is how the BTree should
@@ -3265,9 +3279,12 @@ mod tests {
             1,
         );
 
-        btree.insert(&large_key)?;
+        btree.insert(large_key.clone())?;
 
-        assert_eq!(btree.get(&large_key)?, Some(large_key.into_boxed_slice()));
+        assert_eq!(
+            btree.get(&large_key)?,
+            Some(Payload::Reassembled(large_key.into_boxed_slice()))
+        );
 
         Ok(())
     }
