@@ -123,14 +123,26 @@ pub(crate) struct PageHeader {
 ///
 /// # Alignment
 ///
-/// cells are 64 bit aligned. See [`Page`] for more details.
+/// Cells are 64 bit aligned. See [`Page`] for more details.
+///
+/// # Overflow
+///
+/// The maximum size of a cell is about one fourth of the page size (substract
+/// the cell header size and slot pointer size). This allows to store a minimum
+/// of 4 keys per page. If a cell needs to hold more data than we can fit in a
+/// single page, then we'll set [`CellHeader::is_overflow`] to `true` and make
+/// the last 4 bytes of the content point to an overflow page.
 #[derive(Debug, PartialEq, Clone)]
 #[repr(C, align(8))]
 pub struct CellHeader {
     /// Size of the cell content.
     size: u16,
+    /// True if this cell points to an overflow page. Since we need to add
+    /// padding to align the fields of this struct anyway, we're not wasting
+    /// space here.
+    pub is_overflow: bool,
     /// See [`PageHeader::padding`] for details.
-    padding: u16,
+    padding: u8,
     /// ID of the BTree page that contains values less than this cell.
     pub left_child: PageNumber,
 }
@@ -200,9 +212,22 @@ impl PartialEq<&Cell> for CellRef<'_> {
     }
 }
 
+impl CellRef<'_> {
+    pub fn overflow_page(&self) -> PageNumber {
+        assert!(self.header.is_overflow, "cell is not overflow");
+
+        PageNumber::from_le_bytes(
+            self.content[self.content.len() - mem::size_of::<PageNumber>() - 1..]
+                .try_into()
+                .expect("failed parsing overflow page number"),
+        )
+    }
+}
+
 impl Cell {
     /// Creates a new cell allocated in memory.
     pub fn new(data: &[u8]) -> Self {
+        // TODO: Could probably receive Vec<u8> to avoid copies.
         let mut data = Vec::from(data);
         let size = Self::aligned_size_of(&data);
         data.resize(size as _, 0);
@@ -211,10 +236,22 @@ impl Cell {
             header: CellHeader {
                 size,
                 left_child: 0,
+                is_overflow: false,
                 padding: 0,
             },
             content: data.into_boxed_slice(),
         }
+    }
+
+    pub fn new_overflow(data: &[u8], overflow_page: PageNumber) -> Self {
+        let mut payload = Vec::from(data);
+        payload.extend_from_slice(&overflow_page.to_le_bytes());
+
+        // TODO: Avoid unnecessary copies.
+        let mut cell = Self::new(&payload);
+        cell.header.is_overflow = true;
+
+        cell
     }
 
     /// Shorthand for [`CellHeader::total_size`].
@@ -225,6 +262,16 @@ impl Cell {
     /// Shorthand for [`CellHeader::storage_size`].
     pub fn storage_size(&self) -> u16 {
         self.header.storage_size()
+    }
+
+    pub fn overflow_page(&self) -> PageNumber {
+        assert!(self.header.is_overflow, "cell is not overflow");
+
+        PageNumber::from_le_bytes(
+            self.content[self.content.len() - mem::size_of::<PageNumber>()..]
+                .try_into()
+                .expect("failed parsing overflow page number"),
+        )
     }
 
     /// See [`Page`] for details.
@@ -242,7 +289,7 @@ impl Cell {
 struct OverflowCell {
     /// Owned cell.
     cell: Cell,
-    /// Index in the slot array where the cell should be located.
+    /// Index in the slot array where the cell should have been inserted.
     index: SlotId,
 }
 
@@ -419,6 +466,26 @@ impl Page {
         page_size - PAGE_HEADER_SIZE
     }
 
+    /// The maximum size that the payload of a single cell can take on the page.
+    ///
+    /// It's calculated by substracting the cell header size and the slot
+    /// pointer size from one fourth of the usable space and then aligning the
+    /// result downwards to [`CELL_ALIGNMENT`].
+    pub fn max_payload_size(page_size: u16) -> u16 {
+        let usable_space = Self::usable_space(page_size);
+
+        let max_size =
+            usable_space / 4 - CELL_HEADER_SIZE - SLOT_SIZE & !(CELL_ALIGNMENT as u16 - 1);
+
+        // When the page size is too small we can't fit 4 keys. This is mostly
+        // for tests, since we use small page sizes for simplicity.
+        if max_size == 0 {
+            return usable_space - CELL_HEADER_SIZE - SLOT_SIZE;
+        }
+
+        max_size
+    }
+
     /// Memory layout of the page.
     pub fn layout(page_size: u16) -> Layout {
         assert!(
@@ -542,7 +609,7 @@ impl Page {
     }
 
     /// Returns an owned cell by cloning it.
-    pub fn owned_cell(&mut self, index: SlotId) -> Cell {
+    pub fn owned_cell(&self, index: SlotId) -> Cell {
         let header = self.cell_header_at_slot_index(index);
         unsafe {
             Cell {
@@ -589,17 +656,6 @@ impl Page {
         self.header_mut().right_child = other.header().right_child;
     }
 
-    /// Works like [`slice::binary_search_by`].
-    pub fn binary_search_by(&self, mut f: impl FnMut(&[u8]) -> Ordering) -> Result<SlotId, SlotId> {
-        self.slot_array()
-            .binary_search_by(|offset| unsafe {
-                let cell = self.cell_header_at_offset(*offset);
-                f(CellHeader::content_of(cell).as_ref())
-            })
-            .map(|index| index as _)
-            .map_err(|index| index as _)
-    }
-
     /// Returns `true` if this page has no children.
     pub fn is_leaf(&self) -> bool {
         self.header().right_child == 0
@@ -618,6 +674,13 @@ impl Page {
 
     /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Cell) {
+        debug_assert!(
+            cell.content.len() <= Self::max_payload_size(self.size()) as usize,
+            "attempt to store payload of size {} when max payload size is {}",
+            cell.content.len(),
+            Self::max_payload_size(self.size())
+        );
+
         if self.is_overflow() {
             return self.overflow.push(OverflowCell { cell, index });
         }
@@ -1023,6 +1086,132 @@ impl Debug for Page {
     }
 }
 
+/// Header of an overflow page.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct OverflowPageHeder {
+    /// Next overflow page.
+    pub next: PageNumber,
+    /// Number of bytes stored in this page. Not to be confused with the page
+    /// size.
+    pub num_bytes: u16,
+}
+
+const OVERFLOW_PAGE_HEADER_SIZE: usize = mem::size_of::<OverflowPageHeder>();
+
+/// Cell overflow page.
+///
+/// Cells have a maximum size that depends on the page size. See
+/// [`Page::max_payload_size`] for details. If the page size is big enough we
+/// attempt to fit at least 4 cells in each page. However, when the payload
+/// size of a cell exceeds the maximum size, we need to allocate extra pages
+/// to store the contents of that cell. The cell then points to the first
+/// overflow page, and that page points to the next and so on.
+///
+/// ```text
+/// PAGE       SLOT          FREE
+/// HEADER     ARRAY         SPACE         CELLS
+/// +----------------------------------------------------------------+
+/// | PAGE   | +---+                      +--------+---------+-----+ |
+/// | HEADER | | 1 | ->                <- | HEADER | PAYLOAD | OVF | |
+/// |        | +---+                      +--------+---------+--|--+ |
+/// +------------|----------------------------------------------|----+
+///              |                        ^                     |
+///              |                        |                     |
+///              +------------------------+                     |
+///                                                             |
+///      +------------------------------------------------------+
+///      |
+///      V
+/// +--------------------+-------------------------------------------+
+/// | +----------------+ | +---------------------------------------+ |
+/// | | next | n_bytes | | |    OVERFLOW PAYLOAD (FULL PAGE)       | |
+/// | +--|---+---------+ | +---------------------------------------+ |
+/// +----|---------------+-------------------------------------------+
+///      |
+///      V
+/// +--------------------+-------------------------------------------+
+/// | +----------------+ | +------------------------+                |
+/// | | next | n_bytes | | | REMAINING OVF PAYLOAD  |                |
+/// | +------+---------+ | +------------------------+                |
+/// +--------------------+-------------------------------------------+
+/// OVERFLOW PAGE                  OVERFLOW PAGE CONTENT
+/// HEADER                    (stores as many bytes as needed)
+/// ```
+///
+/// When a [`CellHeader::is_overflow`] equals `true` then the last 4 bytes of
+/// the [`Cell`] payload point to the first overflow page.
+pub(crate) struct OverflowPage {
+    /// Page number.
+    pub number: PageNumber,
+
+    /// In-memory page buffer.
+    buffer: NonNull<[u8]>,
+}
+
+impl OverflowPage {
+    pub fn new(number: PageNumber, size: u16) -> Self {
+        let buffer = alloc::Global
+            .allocate_zeroed(Self::layout(size))
+            .expect("could not allocate page");
+
+        Self { number, buffer }
+    }
+
+    fn layout(size: u16) -> Layout {
+        Layout::from_size_align(size as usize, mem::align_of::<OverflowPageHeder>()).unwrap()
+    }
+
+    pub fn usable_space(page_size: u16) -> u16 {
+        page_size - OVERFLOW_PAGE_HEADER_SIZE as u16
+    }
+
+    pub fn header(&self) -> &OverflowPageHeder {
+        unsafe { self.buffer.cast().as_ref() }
+    }
+
+    pub fn header_mut(&mut self) -> &mut OverflowPageHeder {
+        unsafe { self.buffer.cast().as_mut() }
+    }
+
+    fn content_non_null(&self) -> NonNull<[u8]> {
+        unsafe {
+            NonNull::slice_from_raw_parts(
+                self.buffer.byte_add(OVERFLOW_PAGE_HEADER_SIZE).cast::<u8>(),
+                Self::usable_space(self.buffer.len() as u16) as usize,
+            )
+        }
+    }
+
+    pub fn content(&self) -> &[u8] {
+        unsafe { self.content_non_null().as_ref() }
+    }
+
+    pub fn content_mut(&mut self) -> &mut [u8] {
+        unsafe { self.content_non_null().as_mut() }
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.content()[..self.header().num_bytes as usize]
+    }
+
+    pub fn buffer(&self) -> &[u8] {
+        unsafe { self.buffer.as_ref() }
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        unsafe { self.buffer.as_mut() }
+    }
+}
+
+impl Drop for OverflowPage {
+    fn drop(&mut self) {
+        unsafe {
+            alloc::Global.deallocate(self.buffer.cast(), Self::layout(self.buffer.len() as u16))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1292,9 @@ mod tests {
         }
     }
 
+    // Some important notes to keep in mind before you read the code below:
+    // - For pages of size 512, Page::max_payload_size() equals 112.
+
     #[test]
     fn push_fixed_size_cells() {
         let (page, cells) = Page::builder()
@@ -1118,7 +1310,7 @@ mod tests {
     fn push_variable_size_cells() {
         let (page, cells) = Page::builder()
             .size(512)
-            .cells(variable_size_cells(&[64, 32, 128]))
+            .cells(variable_size_cells(&[64, 32, 80]))
             .build();
 
         assert_eq!(page.header().num_slots, cells.len() as u16);
@@ -1146,7 +1338,7 @@ mod tests {
     fn defragment() {
         let (mut page, mut cells) = Page::builder()
             .size(512)
-            .cells(variable_size_cells(&[24, 64, 32, 128, 8]))
+            .cells(variable_size_cells(&[24, 64, 32, 72, 8]))
             .build();
 
         for i in [1, 2] {
@@ -1182,17 +1374,16 @@ mod tests {
     fn insert_defragmenting() {
         let (mut page, mut cells) = Page::builder()
             .size(512)
-            .cells(variable_size_cells(&[64, 32, 128]))
+            .cells(variable_size_cells(&[64, 112, 112, 112]))
             .build();
 
         page.remove(1);
         cells.remove(1);
 
-        let end_of_slot_array = PAGE_HEADER_SIZE + SLOT_SIZE * page.header().num_slots;
-        let available_space = page.header().last_used_offset - end_of_slot_array;
+        let new_cell = Cell::new(&vec![4; 112]);
 
-        cells.push(Cell::new(&vec![4; available_space as usize]));
-        page.push(cells[2].clone());
+        cells.push(new_cell.clone());
+        page.push(new_cell);
 
         compare_consecutive_offsets(&page, &cells);
     }
@@ -1201,7 +1392,7 @@ mod tests {
     fn replace_cell_in_place() {
         let (mut page, mut cells) = Page::builder()
             .size(512)
-            .cells(variable_size_cells(&[64, 32, 128]))
+            .cells(variable_size_cells(&[64, 32, 112]))
             .build();
 
         let new_cell = Cell::new(&vec![4; 32]);
@@ -1216,10 +1407,10 @@ mod tests {
     fn replace_cell_removing_previous() {
         let (mut page, mut cells) = Page::builder()
             .size(512)
-            .cells(variable_size_cells(&[64, 128]))
+            .cells(variable_size_cells(&[64, 96]))
             .build();
 
-        let new_cell = Cell::new(&vec![4; 128]);
+        let new_cell = Cell::new(&vec![4; 96]);
 
         let expected_offset =
             page.size() - cells.iter().map(Cell::total_size).sum::<u16>() - new_cell.total_size();

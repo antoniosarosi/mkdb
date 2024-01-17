@@ -6,11 +6,12 @@ use std::{
     fs::File,
     io,
     io::{Read, Seek, Write},
+    mem,
     os::unix::fs::MetadataExt,
     path::Path,
 };
 
-use super::page::{Cell, Page, SlotId};
+use super::page::{Cell, CellRef, OverflowPage, Page, SlotId};
 use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
@@ -75,6 +76,16 @@ enum LeafKeySearch {
     Max,
     /// Minimum key in a leaf node.
     Min,
+}
+
+#[derive(Debug, PartialEq)]
+enum Payload<'s> {
+    /// Payload did not need reassembly, so we returned a reference to the
+    /// slotted page buffer.
+    PageRef(&'s [u8]),
+
+    /// Payload was too large and needed reassembly.
+    Reassembled(Box<[u8]>),
 }
 
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
@@ -313,12 +324,13 @@ impl<F> BTree<F> {
 impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
     /// details.
-    pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<&[u8]>> {
+    pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<Box<[u8]>>> {
         let search = self.search(0, entry, &mut Vec::new())?;
 
+        // TODO: Return ref if we don't need to reassamble the payload.
         match search.index {
             Err(_) => Ok(None),
-            Ok(index) => Ok(Some(self.cache.get(search.page)?.cell(index).content)),
+            Ok(index) => Ok(Some(self.reassemble_payload(search.page, index)?)),
         }
     }
 
@@ -372,10 +384,10 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         entry: &[u8],
         parents: &mut Vec<PageNumber>,
     ) -> io::Result<Search> {
-        let node = self.cache.get(page)?;
-
         // Search key in this node.
-        let index = node.binary_search_by(|buf| self.comparator.bytes_cmp(buf, entry));
+        let index = self.binary_search(page, entry)?;
+
+        let node = self.cache.get(page)?;
 
         // We found the key or we're already at the bottom, stop recursion.
         if index.is_ok() || node.is_leaf() {
@@ -387,6 +399,37 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         let next_node = node.child(index.unwrap_err());
 
         self.search(next_node, entry, parents)
+    }
+
+    fn binary_search(&mut self, page: PageNumber, entry: &[u8]) -> io::Result<Result<u16, u16>> {
+        let mut size = self.cache.get(page)?.len();
+
+        let mut left = 0;
+        let mut right = size;
+        while left < right {
+            let mid = left + size / 2;
+
+            let cell = self.cache.get(page)?.cell(mid);
+
+            let overflow_buf: Box<[u8]>;
+
+            let payload = if cell.header.is_overflow && entry.len() > cell.content.len() {
+                overflow_buf = self.reassemble_payload(page, mid)?;
+                &overflow_buf
+            } else {
+                cell.content
+            };
+
+            match self.comparator.bytes_cmp(payload, entry) {
+                Ordering::Equal => return Ok(Ok(mid)),
+                Ordering::Greater => right = mid,
+                Ordering::Less => left = mid + 1,
+            }
+
+            size = right - left;
+        }
+
+        Ok(Err(left))
     }
 
     /// Inserts a new entry into the tree or updates the value if the key
@@ -461,17 +504,19 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     pub fn insert(&mut self, entry: &[u8]) -> io::Result<()> {
         let mut parents = Vec::new();
         let search = self.search(0, entry, &mut parents)?;
+
+        let mut new_cell = self.alloc_cell(entry)?;
         let node = self.cache.get_mut(search.page)?;
 
         match search.index {
             // Key found, swap value.
             Ok(index) => {
-                let mut cell = Cell::new(entry);
-                cell.header.left_child = node.cell(index).header.left_child;
-                node.replace(index, cell);
+                new_cell.header.left_child = node.cell(index).header.left_child;
+                let old_cell = node.replace(index, new_cell);
+                self.free_cell(old_cell)?;
             }
             // Key not found, insert new entry.
-            Err(index) => node.insert(index, Cell::new(entry)),
+            Err(index) => node.insert(index, new_cell),
         };
 
         self.balance(search.page, parents)?;
@@ -1565,6 +1610,119 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             .chain(right_siblings.map(read_sibling))
             .collect())
     }
+
+    fn alloc_cell(&mut self, payload: &[u8]) -> io::Result<Cell> {
+        let max_payload_size = Page::max_payload_size(self.cache.pager.page_size as _) as usize;
+
+        if payload.len() <= max_payload_size {
+            return Ok(Cell::new(payload));
+        }
+
+        let first_cell_payload_size = max_payload_size - mem::size_of::<PageNumber>();
+
+        let mut stored_bytes = first_cell_payload_size;
+        let mut overflow_pages: Vec<OverflowPage> = Vec::new();
+
+        // TODO: Allocate pages in sequential order to avoid random IO.
+        while stored_bytes < payload.len() {
+            let mut overflow_page =
+                OverflowPage::new(self.allocate_page(), self.cache.pager.page_size as _);
+
+            let overflow_bytes = min(
+                OverflowPage::usable_space(self.cache.pager.page_size as _) as usize,
+                payload[stored_bytes..].len(),
+            );
+
+            overflow_page.content_mut()[..overflow_bytes]
+                .copy_from_slice(&payload[stored_bytes..stored_bytes + overflow_bytes]);
+
+            overflow_page.header_mut().num_bytes = overflow_bytes as _;
+
+            if let Some(previous) = overflow_pages.last_mut() {
+                previous.header_mut().next = overflow_page.number;
+            }
+
+            overflow_pages.push(overflow_page);
+            stored_bytes += overflow_bytes;
+        }
+
+        // TODO: Same as above this should write in sequential order.
+        for page in &overflow_pages {
+            self.cache.pager.write(page.number, page.buffer())?;
+        }
+
+        Ok(Cell::new_overflow(
+            &payload[..first_cell_payload_size],
+            overflow_pages[0].number,
+        ))
+    }
+
+    fn free_cell(&mut self, cell: Cell) -> io::Result<()> {
+        if !cell.header.is_overflow {
+            return Ok(());
+        }
+
+        let mut overflow_page = cell.overflow_page();
+        while overflow_page != 0 {
+            let mut unused_page = OverflowPage::new(overflow_page, self.cache.pager.page_size as _);
+            self.cache
+                .pager
+                .read(unused_page.number, unused_page.buffer_mut())?;
+            self.free_page(unused_page.number);
+            overflow_page = unused_page.header().next;
+        }
+
+        Ok(())
+    }
+
+    fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Box<[u8]>> {
+        let cell = self.cache.get(page)?.owned_cell(slot);
+
+        // TODO: Return ref if we don't have to reassamble the payload.
+        if !cell.header.is_overflow {
+            return Ok(cell.content);
+        }
+
+        let mut overflow_page = cell.overflow_page();
+
+        let mut payload =
+            Vec::from(&cell.content[..cell.content.len() - mem::size_of::<PageNumber>()]);
+
+        while overflow_page != 0 {
+            let mut page = OverflowPage::new(overflow_page, self.cache.pager.page_size as _);
+            self.cache.pager.read(page.number, page.buffer_mut())?;
+
+            payload.extend_from_slice(page.payload());
+
+            overflow_page = page.header().next;
+        }
+
+        Ok(payload.into())
+    }
+
+    // fn iter_cell_overflow(
+    //     &mut self,
+    //     mut overflow_page: PageNumber,
+    // ) -> impl Iterator<Item = io::Result<OverflowPage>> + '_ {
+    //     std::iter::from_fn(move || {
+    //         if overflow_page == 0 {
+    //             return None;
+    //         }
+
+    //         let mut page = OverflowPage::new(overflow_page, self.cache.pager.page_size as _);
+
+    //         match self.cache.pager.read(overflow_page, page.buffer_mut()) {
+    //             Ok(_) => {
+    //                 overflow_page = page.header().next;
+    //                 Some(Ok(page))
+    //             }
+    //             Err(e) => {
+    //                 overflow_page = 0;
+    //                 Some(Err(e))
+    //             }
+    //         }
+    //     })
+    // }
 
     /// Returns a free page.
     fn allocate_page(&mut self) -> u32 {
@@ -3038,12 +3196,8 @@ mod tests {
 
     #[test]
     fn variable_length_data() -> io::Result<()> {
-        let page_size = 256; // Page::usable_space() is 244 bytes.
-
-        // 48 is the maximum payload size for pages of 256 bytes. This is how
-        // it's calculated:
-        // let max_payload_size = (Page::usable_space(page_size) / 4 - CELL_HEADER_SIZE - SLOT_SIZE)
-        //     & !(CELL_ALIGNMENT as u16 - 1);
+        // Page::usable_space() is 244 bytes and Page::max_payload_size() is 48.
+        let page_size = 256;
 
         // Size of the payloads. Add 10 bytes to each one of them to make the
         // calcultions mentally (header size + slot size). We need to fill up
@@ -3093,6 +3247,27 @@ mod tests {
                 ]
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reassemble_overflow_cell() -> io::Result<()> {
+        let page_size = 256;
+        let mut large_key = Vec::with_capacity(1024);
+
+        for _ in 0..4 {
+            large_key.extend(&(0..=255).collect::<Vec<u8>>());
+        }
+
+        let mut btree = BTree::new(
+            Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size)),
+            1,
+        );
+
+        btree.insert(&large_key)?;
+
+        assert_eq!(btree.get(&large_key)?, Some(large_key.into_boxed_slice()));
 
         Ok(())
     }
