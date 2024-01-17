@@ -95,7 +95,7 @@ pub(crate) struct PageHeader {
     /// does not make any guarantees about the values of padding bytes. See
     /// here:
     ///
-    /// https://github.com/rust-lang/unsafe-code-guidelines/issues/174
+    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
     padding: u16,
 
     /// Last child of this page.
@@ -468,12 +468,12 @@ impl Page {
         let usable_space = Self::usable_space(page_size);
 
         let max_size =
-            usable_space / 4 - CELL_HEADER_SIZE - SLOT_SIZE & !(CELL_ALIGNMENT as u16 - 1);
+            (usable_space / 4 - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1);
 
         // When the page size is too small we can't fit 4 keys. This is mostly
         // for tests, since we use small page sizes for simplicity.
         if max_size == 0 {
-            return usable_space - CELL_HEADER_SIZE - SLOT_SIZE & !(CELL_ALIGNMENT as u16 - 1);
+            return (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1);
         }
 
         max_size
@@ -482,7 +482,7 @@ impl Page {
     /// Memory layout of the page.
     pub fn layout(page_size: u16) -> Layout {
         assert!(
-            MIN_PAGE_SIZE <= page_size && page_size <= MAX_PAGE_SIZE,
+            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size),
             "page size out of acceptable bounds"
         );
 

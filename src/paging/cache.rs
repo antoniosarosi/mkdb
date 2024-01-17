@@ -246,7 +246,7 @@ impl<Page> Frame<Page> {
 }
 
 impl<I> Cache<I> {
-    /// Creates a new default cache. Max size is set to [`MAX_CACHE_SIZE`].
+    /// Creates a new default cache. Max size is set to [`DEFAULT_MAX_CACHE_SIZE`].
     pub fn new(pager: Pager<I>) -> Self {
         Self {
             pager,

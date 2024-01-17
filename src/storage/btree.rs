@@ -186,11 +186,13 @@ pub(crate) enum Payload<'s> {
 /// instances using a slot array. Cells are the smallest unit of data that we
 /// work with, each cell stores a key (or key-value pair, we don't care) and a
 /// pointer to the node that contains keys less than the one stored in the
-/// cell. Overall, this is how the BTree really looks like:
+/// cell. When a [`Cell`] is too big it points to a linked list of
+/// [`OverflowPage`] instances. Overall, this is how the BTree really looks
+/// like:
 ///
 /// ```text
-///                                                              +---------------+
-///                                                              |               |
+///                                              BTREE           +---------------+
+///                                              PAGE            |               |
 ///                                           +-------------+----|---------------V----------+
 ///                                           | +----+----+ | +----+             +----+---+ |
 ///                                           | | RC | NS | | | O1 | ->  FS   <- | LC | D | |
@@ -202,15 +204,24 @@ pub(crate) enum Payload<'s> {
 ///                               |               +-----------------------------------------------+
 ///                               |                                                               |
 ///  PAGE HEADER    SLOT ARRAY    V                 CELLS                                         V
-/// +-------------+-----------------------------------------------+      +-------------+-------------------------------+
-/// | +----+----+ | +----+----+             +----+---+ +----+---+ |      | +----+----+ | +----+             +----+---+ |
-/// | | RC | NS | | | O1 | O2 | ->   FS  <- | LC | D | | LC | D | |      | | RC | NS | | | O1 | ->   FS  <- | LC | D | |
-/// | +----+----+ | +----+----+             +----+---+ +----+---+ |      | +----+----+ | +----+             +----+---+ |
-/// +-------------+---|----|--------------------------------------+      +-------------+---|---------------------------+
-///                   |    |                ^          ^                                   |                ^
-///                   |    |                |          |                                   |                |
-///                   |    +----------------+          |                                   +----------------+
-///                   +--------------------------------+
+/// +-------------+-----------------------------------------------+      +-------------+-------------------------------------+
+/// | +----+----+ | +----+----+             +----+---+ +----+---+ |      | +----+----+ | +----+             +----+---+-----+ |
+/// | | RC | NS | | | O1 | O2 | ->   FS  <- | LC | D | | LC | D | |      | | RC | NS | | | O1 | ->   FS  <- | LC | D | OVF | |
+/// | +----+----+ | +----+----+             +----+---+ +----+---+ |      | +----+----+ | +----+             +----+---+-----+ |
+/// +-------------+---|----|--------------------------------------+      +-------------+---|----------------------------|----+
+///                   |    |                ^          ^                                   |                ^           |
+///                   |    |                |          |                                   |                |           |
+///                   |    +----------------+          |                                   +----------------+           |
+///                   +--------------------------------+                                                                |
+///                                                                          +------------------------------------------+
+///                                                                          |
+///              OVERFLOW PAGE                                               V
+///            +------+-------------------------------------------+      +------+-------------------------------------------+
+///            | NEXT | OVERFLOW PAYLOAD                          |      | NEXT | OVERFLOW PAYLOAD                          |
+///            +------+-------------------------------------------+      +------+-------------------------------------------+
+///               ^                                                         |
+///               |                                                         |
+///               +---------------------------------------------------------+
 /// ```
 ///
 /// Here's what everything stands for:
@@ -221,6 +232,7 @@ pub(crate) enum Payload<'s> {
 /// - LC: Left Child
 /// - FS: Free Space
 /// -  D: Data
+/// - OVF: Overflow
 ///
 /// Right child is stored in the page header and is always the "last child" of
 /// a node. Or in other words, the child that has keys grater than any key in
@@ -701,8 +713,8 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     }
 
     /// Traverses the tree all the way down to the leaf nodes, following the
-    /// path specified by [`LeafKeyType`]. [`LeafKeyType::Max`] will always
-    /// choose the last child for recursion, while [`LeafKeyType::Min`] will
+    /// path specified by [`LeafKeySearch`]. [`LeafKeySearch::Max`] will always
+    /// choose the last child for recursion, while [`LeafKeySearch::Min`] will
     /// always choose the first child. This function is used to find successors
     /// or predecessors of keys in internal nodes.
     fn search_leaf_key(
@@ -751,7 +763,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// B*-Tree balancing algorithm inspired by (or rather stolen from) SQLite
     /// 2.X.X. Take a look at the original source code here:
     ///
-    /// https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L2171
+    /// <https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L2171>
     ///
     /// # Algorithm Steps
     ///
@@ -1781,11 +1793,11 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         let mut string = String::from('[');
 
-        string.push_str(&self.to_json(&nodes[0])?);
+        string.push_str(&self.node_json(&nodes[0])?);
 
         for node in &nodes[1..] {
             string.push(',');
-            string.push_str(&self.to_json(&node)?);
+            string.push_str(&self.node_json(node)?);
         }
 
         string.push(']');
@@ -1794,7 +1806,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     }
 
     // Testing/Debugging only.
-    fn to_json(&mut self, page: &Page) -> io::Result<String> {
+    fn node_json(&mut self, page: &Page) -> io::Result<String> {
         let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
 
         if page.len() >= 1 {
@@ -2674,7 +2686,6 @@ mod tests {
     /// one of its siblings if the siblings can lend keys without underflowing.
     ///
     /// ```text
-    /// 
     ///                           DELETE 15
     ///                               |
     ///                               V
@@ -3037,7 +3048,6 @@ mod tests {
     /// check if everything still works. This is what we're going to build:
     ///
     /// ```text
-    /// 
     ///                                                INSERT 36
     ///                                                    |
     ///                                                    v
@@ -3102,7 +3112,6 @@ mod tests {
     /// Delete on `order = 6`.
     ///
     /// ```text
-    /// 
     ///                                                      DELETE (34,35,36)
     ///                                                              |
     ///                                                              V

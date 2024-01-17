@@ -147,7 +147,7 @@ impl<F: Seek + Read> Pager<F> {
         // pages in one call. TODO: Find a way to cache all the pages, not just
         // one.
         let mut block = vec![0; capacity];
-        self.io.read(&mut block)?;
+        let _ = self.io.read(&mut block)?;
         buf.copy_from_slice(&block[inner_offset..inner_offset + self.page_size]);
 
         Ok(self.page_size)
