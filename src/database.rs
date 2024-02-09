@@ -32,7 +32,8 @@ pub(crate) struct RowIdComparator;
 impl BytesCmp for RowIdComparator {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         // TODO: Store Row ID in Big Endian format to avoid parsing.
-        u64::from_le_bytes(a.try_into().unwrap()).cmp(&u64::from_le_bytes(b.try_into().unwrap()))
+        u64::from_le_bytes(a[..8].try_into().unwrap())
+            .cmp(&u64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 }
 
@@ -58,24 +59,24 @@ pub(crate) struct Exec {
 }
 
 #[derive(Debug)]
-pub(crate) enum Error {
+pub(crate) enum DbError {
     Io(io::Error),
     Parser(ParserError),
 }
 
-impl From<io::Error> for Error {
+impl From<io::Error> for DbError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
     }
 }
 
-impl From<ParserError> for Error {
+impl From<ParserError> for DbError {
     fn from(e: ParserError) -> Self {
         Self::Parser(e)
     }
 }
 
-type QueryResult = Result<Exec, Error>;
+type QueryResult = Result<Exec, DbError>;
 
 impl Exec {
     fn get(&self, row: usize, column: &str) -> Option<Value> {
@@ -276,7 +277,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     }
 
                     let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table = '{into}';"
+                        "SELECT root, sql FROM {MKDB_META} where table_name = '{into}';"
                     ))?;
 
                     if query.is_empty() {
@@ -350,7 +351,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     }
 
                     let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table = '{from}';"
+                        "SELECT root, sql FROM {MKDB_META} where table_name = '{from}';"
                     ))?;
 
                     if query.is_empty() {
@@ -399,15 +400,12 @@ impl<I: Seek + Read + Write> Database<I> {
                     // TODO: Deserialize only needed values instead of all and the cloning...
                     let values = Self::deserialize_values(row?, &schema);
 
-                    let mut result = vec![Value::Bool(false); identifiers.len()];
+                    let mut result = Vec::new();
 
-                    for (i, c) in schema.iter().enumerate() {
+                    for ident in &identifiers {
                         // TODO: O(n^2)
-                        let p = identifiers
-                            .iter()
-                            .position(|ident| *ident == c.name)
-                            .unwrap();
-                        result[p] = values[i].clone();
+                        let p = schema.iter().position(|s| &s.name == ident).unwrap();
+                        result.push(values[p].clone());
                     }
 
                     results.push(result);
@@ -435,38 +433,40 @@ impl<I: Seek + Read + Write> Database<I> {
 mod tests {
     use std::io;
 
-    use super::Database;
+    use super::{Database, DbError};
     use crate::{
         database::{mkdb_meta_schema, Exec, Header, MAGIC, MKDB_META_ROOT},
         paging::{cache::Cache, pager::Pager},
-        sql::{Parser, Value},
+        sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
     };
 
     const PAGE_SIZE: usize = 4096;
 
-    #[test]
-    fn create_table() {
+    fn init_database() -> io::Result<Database<io::Cursor<Vec<u8>>>> {
         let mut pager = Pager::new(io::Cursor::new(Vec::<u8>::new()), PAGE_SIZE, PAGE_SIZE);
 
-        pager
-            .write_header(Header {
-                magic: MAGIC,
-                page_size: PAGE_SIZE as _,
-                total_pages: 2,
-                first_free_page: 0,
-            })
-            .unwrap();
+        pager.write_header(Header {
+            magic: MAGIC,
+            page_size: PAGE_SIZE as _,
+            total_pages: 2,
+            first_free_page: 0,
+        })?;
 
         let root = Page::new(MKDB_META_ROOT, PAGE_SIZE as _);
-        pager.write(MKDB_META_ROOT, root.buffer()).unwrap();
+        pager.write(MKDB_META_ROOT, root.buffer())?;
 
-        let mut db = Database::new(Cache::new(pager));
+        Ok(Database::new(Cache::new(pager)))
+    }
+
+    #[test]
+    fn create_table() -> Result<(), DbError> {
+        let mut db = init_database()?;
 
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
-        db.execute(sql.into()).unwrap();
+        db.execute(sql.into())?;
 
-        let query = db.execute("SELECT * FROM mkdb_meta;".into()).unwrap();
+        let query = db.execute("SELECT * FROM mkdb_meta;".into())?;
 
         assert_eq!(
             query,
@@ -481,7 +481,42 @@ mod tests {
                 ]]
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_data() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));".into())?;
+        db.execute("INSERT INTO users(id, name) VALUES (1, 'John Doe');".into())?;
+        db.execute("INSERT INTO users(id, name) VALUES (2, 'Jane Doe');".into())?;
+
+        let query = db.execute("SELECT * FROM users;".into())?;
+
+        assert_eq!(
+            query,
+            Exec {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    }
+                ],
+                results: vec![
+                    vec![Value::Number("1".into()), Value::String("John Doe".into())],
+                    vec![Value::Number("2".into()), Value::String("Jane Doe".into())],
+                ]
+            }
+        );
+
+        Ok(())
     }
 }
-
-// (type, name, root, table, sql)
