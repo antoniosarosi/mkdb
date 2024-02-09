@@ -284,7 +284,7 @@ impl<'i> Tokenizer<'i> {
 
             ';' => self.consume(Token::SemiColon),
 
-            '"' => self.tokenize_string(),
+            '"' | '\'' => self.tokenize_string(),
 
             '0'..='9' => self.tokenize_number(),
 
@@ -312,13 +312,14 @@ impl<'i> Tokenizer<'i> {
 
     /// Parses a double quoted string like `"this one"` into [`Token::String`].
     fn tokenize_string(&mut self) -> TokenResult {
-        self.stream.next(); // Consume opening quote.
+        let quote = self.stream.next().unwrap();
 
-        let string = self.stream.take_while(|chr| *chr != '"').collect();
+        let string = self.stream.take_while(|chr| *chr != quote).collect();
 
-        match self.stream.next() {
-            Some('"') => Ok(Token::String(string)),
-            _ => self.error(ErrorKind::StringNotClosed),
+        if self.stream.next().is_some_and(|chr| chr == quote) {
+            Ok(Token::String(string))
+        } else {
+            self.error(ErrorKind::StringNotClosed)
         }
     }
 
@@ -637,6 +638,15 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_single_quoted_string() {
+        let string = "single quoted \"string\"";
+        assert_eq!(
+            Tokenizer::new(&format!("'{string}'")).tokenize(),
+            Ok(vec![Token::String(string.into()), Token::Eof])
+        );
+    }
+
+    #[test]
     fn tokenize_incorrect_neq_operator() {
         let sql = "SELECT * FROM table WHERE column ! other";
         assert_eq!(
@@ -666,6 +676,18 @@ mod tests {
     #[test]
     fn tokenize_double_quoted_string_not_closed() {
         let sql = "SELECT * FROM table WHERE string = \"not closed";
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Err(TokenizerError {
+                kind: ErrorKind::StringNotClosed,
+                location: Location { line: 1, col: 47 }
+            })
+        );
+    }
+
+    #[test]
+    fn tokenize_single_quoted_string_not_closed() {
+        let sql = "SELECT * FROM table WHERE string = 'not closed";
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {

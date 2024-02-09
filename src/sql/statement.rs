@@ -1,3 +1,5 @@
+use std::fmt::{self, Display};
+
 /// SQL statement.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Statement {
@@ -74,7 +76,7 @@ pub(crate) enum DataType {
     Varchar(usize),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Value {
     Number(String),
     String(String),
@@ -99,4 +101,151 @@ pub(crate) enum Create {
 pub(crate) enum Drop {
     Table(String),
     Database(String),
+}
+
+fn join<T: ToString>(values: &Vec<T>, separator: &str) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+impl Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataType::Int => f.write_str("INT"),
+            DataType::Bool => f.write_str("BOOL"),
+            DataType::Varchar(max) => write!(f, "VARCHAR({max})"),
+        }
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Number(number) => write!(f, "{number}"),
+            Value::String(string) => write!(f, "\"{string}\""),
+            Value::Bool(bool) => f.write_str(if *bool { "TRUE" } else { "FALSE" }),
+        }
+    }
+}
+
+impl Display for Column {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.data_type);
+
+        if let Some(constraint) = &self.constraint {
+            f.write_str(" ");
+            f.write_str(match constraint {
+                Constraint::PrimaryKey => "PRIMARY KEY",
+                Constraint::Unique => "UNIQUE",
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for BinaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BinaryOperator::Eq => "=",
+            BinaryOperator::Neq => "!=",
+            BinaryOperator::Lt => "<",
+            BinaryOperator::LtEq => "<=",
+            BinaryOperator::Gt => ">",
+            BinaryOperator::GtEq => ">=",
+            BinaryOperator::Plus => "+",
+            BinaryOperator::Minus => "-",
+            BinaryOperator::Mul => "*",
+            BinaryOperator::Div => "/",
+            BinaryOperator::And => "AND",
+            BinaryOperator::Or => "OR",
+        })
+    }
+}
+
+impl Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expression::Identifier(ident) => f.write_str(ident),
+            Expression::Value(value) => write!(f, "{value}"),
+            Expression::Wildcard => f.write_str("*"),
+            Expression::BinaryOperation {
+                left,
+                operator,
+                right,
+            } => {
+                write!(f, "({left}) {operator} ({right})")
+            }
+        }
+    }
+}
+
+impl Display for Statement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Statement::Create(create) => match create {
+                Create::Table { name, columns } => {
+                    write!(f, "CREATE TABLE {name} ({})", join(columns, ","));
+                }
+
+                Create::Database(name) => {
+                    write!(f, "CREATE DATABASE {name}");
+                }
+            },
+
+            Statement::Select {
+                columns,
+                from,
+                r#where,
+            } => {
+                write!(f, "SELECT {} FROM {from}", join(columns, ","));
+                if let Some(expr) = r#where {
+                    write!(f, "WHERE {expr}");
+                }
+            }
+
+            Statement::Delete { from, r#where } => {
+                write!(f, "DELETE FROM {from}");
+                if let Some(expr) = r#where {
+                    write!(f, "WHERE {expr}");
+                }
+            }
+
+            Statement::Update {
+                table,
+                columns,
+                r#where,
+            } => {
+                write!(f, "UPDATE {table} SET {}", join(columns, ","));
+                if let Some(expr) = r#where {
+                    write!(f, "WHERE {expr}");
+                }
+            }
+
+            Statement::Insert {
+                into,
+                columns,
+                values,
+            } => {
+                write!(
+                    f,
+                    "INSERT INTO {into} ({}) VALUES ({})",
+                    join(columns, ","),
+                    join(values, ",")
+                );
+            }
+
+            Statement::Drop(drop) => {
+                match drop {
+                    Drop::Table(name) => write!(f, "DROP TABLE {name}"),
+                    Drop::Database(name) => write!(f, "DROP DATABASE {name}"),
+                };
+            }
+        };
+
+        f.write_str(";")
+    }
 }

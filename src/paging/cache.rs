@@ -355,7 +355,7 @@ impl<I: Seek + Read + Write> Cache<I> {
 
     /// Loads a page into the buffer pool. Doesn't matter where the page comes
     /// from, it could have been created in memory or read from disk.
-    fn load_page(&mut self, mut page: Page) -> io::Result<FrameId> {
+    fn load_page(&mut self, page: Page) -> io::Result<FrameId> {
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
             let frame_id = self.buffer.len();

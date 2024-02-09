@@ -89,6 +89,15 @@ pub(crate) enum Payload<'s> {
     Reassembled(Box<[u8]>),
 }
 
+impl<'s> AsRef<[u8]> for Payload<'s> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::PageRef(r) => r,
+            Self::Reassembled(payload) => &payload,
+        }
+    }
+}
+
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
 /// Sorting and Searching" and SQLite 2.X.X
 ///
@@ -239,9 +248,12 @@ pub(crate) enum Payload<'s> {
 /// the current node. Left child is stored in the cell header and points to
 /// the child that has keys less than the one in the cell. For the slotted page
 /// details and omitted fields see the documentation of [`super::page`] module.
-pub(crate) struct BTree<F, C: BytesCmp = MemCmp> {
+pub(crate) struct BTree<'c, F, C: BytesCmp = MemCmp> {
+    /// Root page.
+    root: PageNumber,
+
     /// Read-Write page cache.
-    cache: Cache<F>,
+    cache: &'c mut Cache<F>,
 
     /// Bytes comparator used to obtain [`Ordering`] instances from binary data.
     comparator: C,
@@ -249,96 +261,49 @@ pub(crate) struct BTree<F, C: BytesCmp = MemCmp> {
     /// Number of siblings to examine at each side when balancing a node.
     /// See [`Self::load_siblings`].
     balance_siblings_per_side: usize,
-
-    len: usize, // TODO: Free list
 }
 
-impl<F, C: BytesCmp> BTree<F, C> {
+impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
     #[allow(dead_code)]
     pub fn new_with_comparator(
-        cache: Cache<F>,
+        cache: &'c mut Cache<F>,
+        root: PageNumber,
         balance_siblings_per_side: usize,
         comparator: C,
     ) -> Self {
         Self {
             cache,
+            root,
             comparator,
             balance_siblings_per_side,
-            len: 1,
         }
-    }
-}
-
-impl<C: BytesCmp> BTree<File, C> {
-    /// Creates a new [`BTree`] at the given `path` in the file system.
-    pub fn new_at_path_with_comparator<P: AsRef<Path>>(
-        path: P,
-        page_size: usize,
-        comparator: C,
-    ) -> io::Result<Self> {
-        let file = File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-
-        let metadata = file.metadata()?;
-
-        if !metadata.is_file() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
-        }
-
-        let block_size = Disk::from(&path).block_size()?;
-
-        // TODO: Add magic number & header to file.
-        let mut cache = Cache::new(Pager::new(file, page_size, block_size));
-        let balance_siblings_per_side = BALANCE_SIBLINGS_PER_SIDE;
-
-        // TODO: Init root while we don't have a header.
-        if metadata.size() == 0 {
-            let new_root = Page::new(0, page_size as _);
-            cache.pager.write(new_root.number, new_root.buffer())?;
-        }
-
-        // TODO: Take free pages into account.
-        let len = std::cmp::max(metadata.len() as usize / page_size, 1);
-
-        Ok(Self {
-            cache,
-            len,
-            comparator,
-            balance_siblings_per_side,
-        })
-    }
-}
-
-impl BTree<File> {
-    /// Creates a new [`BTree`] at the given `path` in the file system.
-    pub fn new_at_path<P: AsRef<Path>>(path: P, page_size: usize) -> io::Result<Self> {
-        Self::new_at_path_with_comparator(path, page_size, MemCmp)
     }
 }
 
 /// Default value for [`BTree::balance_siblings_per_side`].
 const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 
-impl<F> BTree<F> {
+impl<'c, F> BTree<'c, F> {
     #[allow(dead_code)]
-    pub fn new(cache: Cache<F>, balance_siblings_per_side: usize) -> Self {
+    pub fn new(
+        cache: &'c mut Cache<F>,
+        root: PageNumber,
+        balance_siblings_per_side: usize,
+    ) -> Self {
         Self {
             cache,
+            root,
             comparator: MemCmp,
             balance_siblings_per_side,
-            len: 1,
         }
     }
 }
 
-impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
+impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
     /// details.
     pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<Payload>> {
-        let search = self.search(0, entry, &mut Vec::new())?;
+        let search = self.search(self.root, entry, &mut Vec::new())?;
 
         match search.index {
             Err(_) => Ok(None),
@@ -527,7 +492,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     /// rearranging keys and splitting nodes after inserts.
     pub fn insert(&mut self, entry: Vec<u8>) -> io::Result<()> {
         let mut parents = Vec::new();
-        let search = self.search(0, &entry, &mut parents)?;
+        let search = self.search(self.root, &entry, &mut parents)?;
 
         let mut new_cell = self.alloc_cell(entry)?;
         let node = self.cache.get_mut(search.page)?;
@@ -670,7 +635,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         entry: &[u8],
         parents: &mut Vec<PageNumber>,
     ) -> io::Result<Option<(Box<[u8]>, PageNumber)>> {
-        let search = self.search(0, entry, parents)?;
+        let search = self.search(self.root, entry, parents)?;
         let node = self.cache.get(search.page)?;
 
         // Can't remove entry, key not found.
@@ -758,6 +723,58 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
         parents: &mut Vec<PageNumber>,
     ) -> io::Result<(PageNumber, u16)> {
         self.search_leaf_key(page, parents, LeafKeySearch::Min)
+    }
+
+    pub fn max(&mut self) -> io::Result<Option<Payload>> {
+        if self.cache.get(self.root)?.len() == 0 {
+            return Ok(None);
+        }
+
+        let (page, slot) = self.search_max_key(self.root, &mut Vec::new())?;
+
+        if self.cache.get(page)?.len() == 0 {
+            return Ok(None);
+        }
+
+        self.reassemble_payload(page, slot).map(Some)
+    }
+
+    pub fn iter(&'c mut self) -> impl Iterator<Item = io::Result<Box<[u8]>>> + 'c {
+        let mut children = vec![self.root];
+        let mut slot = 0;
+
+        // TODO: Unwrap & Payload Box/Ref & repeated code
+        std::iter::from_fn(move || {
+            if children.is_empty() {
+                return None;
+            }
+
+            let page = children[0];
+
+            if slot < self.cache.get(page).unwrap().len() {
+                let payload = match self.reassemble_payload(page, slot).unwrap() {
+                    Payload::PageRef(r) => Box::from(r),
+                    Payload::Reassembled(b) => b,
+                };
+                slot += 1;
+                return Some(Ok(payload));
+            }
+
+            children.remove(0);
+            children.extend(self.cache.get(page).unwrap().iter_children());
+            slot = 1;
+
+            if children.is_empty() {
+                return None;
+            }
+
+            let payload = match self.reassemble_payload(page, 0).unwrap() {
+                Payload::PageRef(r) => Box::from(r),
+                Payload::Reassembled(b) => b,
+            };
+
+            Some(Ok(payload))
+        })
     }
 
     /// B*-Tree balancing algorithm inspired by (or rather stolen from) SQLite
@@ -1434,24 +1451,30 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     fn balance(&mut self, mut page: PageNumber, mut parents: Vec<PageNumber>) -> io::Result<()> {
         let node = self.cache.get(page)?;
 
+        // Started from the bottom now we're here :)
+        let is_root = parents.is_empty();
+
         // Nothing to do, the node is balanced.
-        if !node.is_overflow() && !node.is_underflow() {
+        if !node.is_overflow() && !node.is_underflow(is_root) {
             return Ok(());
         }
 
         // Root underflow.
-        if node.is_root() && node.is_underflow() {
+        if is_root && node.is_underflow(is_root) {
             let child_page = node.header().right_child;
             let mut child_node = self.cache.get(child_page)?.clone();
             self.cache.get_mut(page)?.append(&mut child_node);
-            self.free_page(child_page);
+            self.cache.pager.free_page(child_page)?;
 
             return Ok(());
         }
 
         // Root overflow.
-        if node.is_root() && node.is_overflow() {
-            let mut old_root = Page::new(self.allocate_page(), self.cache.pager.page_size as u16);
+        if is_root && node.is_overflow() {
+            let mut old_root = Page::new(
+                self.cache.pager.alloc_page()?,
+                self.cache.pager.page_size as u16,
+            );
 
             let root = self.cache.get_mut(page)?;
             old_root.append(root);
@@ -1529,7 +1552,10 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let new_page = Page::new(self.allocate_page(), self.cache.pager.page_size as _);
+            let new_page = Page::new(
+                self.cache.pager.alloc_page()?,
+                self.cache.pager.page_size as _,
+            );
             let parent_index = siblings.last().unwrap().index + 1;
             siblings.push(Sibling::new(new_page.number, parent_index));
             self.cache.load_from_mem(new_page)?;
@@ -1537,7 +1563,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // Free unused pages.
         while number_of_cells_per_page.len() < siblings.len() {
-            self.free_page(siblings.pop().unwrap().page);
+            self.cache.pager.free_page(siblings.pop().unwrap().page);
         }
 
         // Begin redistribution.
@@ -1649,8 +1675,10 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
 
         // TODO: Allocate pages in sequential order to avoid random IO.
         while stored_bytes < payload.len() {
-            let mut overflow_page =
-                OverflowPage::new(self.allocate_page(), self.cache.pager.page_size as _);
+            let mut overflow_page = OverflowPage::new(
+                self.cache.pager.alloc_page()?,
+                self.cache.pager.page_size as _,
+            );
 
             let overflow_bytes = min(
                 OverflowPage::usable_space(self.cache.pager.page_size as _) as usize,
@@ -1692,7 +1720,7 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
             self.cache
                 .pager
                 .read(unused_page.number, unused_page.buffer_mut())?;
-            self.free_page(unused_page.number);
+            self.cache.pager.free_page(unused_page.number);
             overflow_page = unused_page.header().next;
         }
 
@@ -1748,29 +1776,6 @@ impl<F: Seek + Read + Write, C: BytesCmp> BTree<F, C> {
     //         }
     //     })
     // }
-
-    /// Returns a free page.
-    fn allocate_page(&mut self) -> u32 {
-        // TODO: Free list.
-        let page = self.len;
-        self.len += 1;
-
-        page as PageNumber
-    }
-
-    /// Drops a currently allocated page.
-    fn free_page(&mut self, page: PageNumber) {
-        self.cache.invalidate(page);
-
-        let mut buf = vec![0; self.cache.pager.page_size];
-        let s = "FREE PAGE".as_bytes();
-        buf[..s.len()].copy_from_slice(s);
-
-        // TODO: Free list.
-        self.cache.pager.write(page, &buf).unwrap();
-
-        // self.len -= 1; // TODO: Next free page is grabed from here
-    }
 
     // Testing/Debugging only.
     fn read_into_mem(&mut self, root: PageNumber, buf: &mut Vec<Page>) -> io::Result<()> {
@@ -1853,8 +1858,9 @@ mod tests {
 
     use super::{BTree, BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
+        database::{Header, MAGIC},
         paging::{
-            cache::Cache,
+            cache::{self, Cache},
             pager::{PageNumber, Pager},
         },
         storage::{
@@ -1915,17 +1921,26 @@ mod tests {
             self
         }
 
-        fn try_build(self) -> io::Result<BTree<MemBuf>> {
+        fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf>> {
             let page_size = optimal_page_size_for(self.order);
             let buf = io::Cursor::new(Vec::new());
 
+            // TODO: Do something about leaking, we shouldn't need that here.
             let mut btree = BTree::new(
-                Cache::new(Pager::new(buf, page_size, page_size)),
+                Box::leak(Box::new(Cache::new(Pager::new(buf, page_size, page_size)))),
+                1,
                 self.balance_siblings_per_side,
             );
 
-            let root = Page::new(0, page_size as _);
+            btree.cache.pager.write_header(Header {
+                magic: MAGIC,
+                page_size: page_size as _,
+                total_pages: 2,
+                first_free_page: 0,
+            })?;
+
             // Init root.
+            let root = Page::new(btree.root, page_size as _);
             btree.cache.pager.write(root.number, root.buffer())?;
 
             btree.extend_from_keys(self.keys)?;
@@ -1938,7 +1953,7 @@ mod tests {
     /// up tests as it avoids disk IO and system calls.
     type MemBuf = io::Cursor<Vec<u8>>;
 
-    impl BTree<MemBuf> {
+    impl<'c> BTree<'c, MemBuf> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
             let mut page = Page::new(root, self.cache.pager.page_size as _);
             self.cache.pager.read(root, page.buffer_mut())?;
@@ -1999,11 +2014,11 @@ mod tests {
             .size() as _
     }
 
-    impl TryFrom<BTree<MemBuf>> for Node {
+    impl<'c> TryFrom<BTree<'c, MemBuf>> for Node {
         type Error = io::Error;
 
         fn try_from(mut btree: BTree<MemBuf>) -> Result<Self, Self::Error> {
-            btree.into_test_nodes(0)
+            btree.into_test_nodes(btree.root)
         }
     }
 
@@ -3238,10 +3253,15 @@ mod tests {
             vec![8],
         ];
 
-        let mut btree = BTree::new(
-            Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size)),
-            1,
-        );
+        let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
+        let mut btree = BTree::new(&mut cache, 1, 1);
+
+        btree.cache.pager.write_header(Header {
+            magic: MAGIC,
+            page_size: page_size as _,
+            total_pages: 2,
+            first_free_page: 0,
+        })?;
 
         for (i, size) in payload_sizes.iter().flatten().enumerate() {
             let mut entry = vec![0; *size];
@@ -3283,10 +3303,15 @@ mod tests {
             large_key.extend(&(0..=255).collect::<Vec<u8>>());
         }
 
-        let mut btree = BTree::new(
-            Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size)),
-            1,
-        );
+        let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
+        let mut btree = BTree::new(&mut cache, 1, 1);
+
+        btree.cache.pager.write_header(Header {
+            magic: MAGIC,
+            page_size: page_size as _,
+            total_pages: 2,
+            first_free_page: 0,
+        })?;
 
         btree.insert(large_key.clone())?;
 

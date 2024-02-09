@@ -629,9 +629,9 @@ impl Page {
     }
 
     /// Returns `true` if this page is underflow.
-    pub fn is_underflow(&self) -> bool {
+    pub fn is_underflow(&self, is_root: bool) -> bool {
         self.len() == 0
-            || !self.is_root() && self.header().free_space > Self::usable_space(self.size()) / 2
+            || !is_root && self.header().free_space > Self::usable_space(self.size()) / 2
     }
 
     /// Returns `true` if this page is overflow.
@@ -652,12 +652,6 @@ impl Page {
     /// Returns `true` if this page has no children.
     pub fn is_leaf(&self) -> bool {
         self.header().right_child == 0
-    }
-
-    /// Returns `true` if this page is the root page.
-    pub fn is_root(&self) -> bool {
-        // TODO: Probably not necessary since we store parents in a list.
-        self.number == 0
     }
 
     /// Adds `cell` to this page, possibly overflowing the page.
@@ -1141,6 +1135,10 @@ pub(crate) struct OverflowPage {
     /// In-memory page buffer.
     buffer: NonNull<[u8]>,
 }
+
+/// We can reuse the overflow page to represent free pages since we only need
+/// a linked list of pages.
+pub(crate) type FreePage = OverflowPage;
 
 impl OverflowPage {
     pub fn new(number: PageNumber, size: u16) -> Self {

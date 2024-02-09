@@ -1,6 +1,11 @@
 //! IO pager implementation.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::{
+    io::{self, Read, Seek, SeekFrom, Write},
+    ptr,
+};
+
+use crate::{database::Header, storage::page::FreePage};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -166,6 +171,77 @@ impl<F: Seek + Write> Pager<F> {
 
         // TODO: If page_size > block_size check if all blocks need to be written
         self.io.write(buf)
+    }
+}
+
+impl<F: Seek + Read + Write> Pager<F> {
+    pub fn read_header(&mut self) -> io::Result<Header> {
+        // TODO: Cache header.
+        let mut buf = vec![0; self.page_size];
+        self.read(0, &mut buf)?;
+
+        // SAFETY: Unless somebody manually touched the DB file this should be
+        // safe.
+        unsafe { Ok(ptr::read(buf.as_ptr().cast())) }
+    }
+
+    pub fn write_header(&mut self, header: Header) -> io::Result<()> {
+        // TODO: Cache header.
+        let mut buf = Vec::with_capacity(self.page_size);
+        buf.resize(self.page_size, 0);
+
+        // SAFETY: Buffer has enough space, page_size should always be greater
+        // than size_of<Header>()
+        unsafe { ptr::write(buf.as_mut_ptr().cast(), header) };
+
+        self.write(0, &buf).map(|_| ())
+    }
+
+    pub fn alloc_page(&mut self) -> io::Result<PageNumber> {
+        let mut header = self.read_header()?;
+
+        let free_page = if header.first_free_page == 0 {
+            // If there are no free pages, then simply increase length by one.
+            let page = header.total_pages;
+            header.total_pages += 1;
+            page
+        } else {
+            // Otherwise use one of the free pages.
+            let mut page = FreePage::new(header.first_free_page, self.page_size as _);
+            self.read(page.number, page.buffer_mut())?;
+            header.first_free_page = page.header().next;
+            page.number
+        };
+
+        self.write_header(header)?;
+
+        Ok(free_page)
+    }
+
+    pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
+        // Initialize last free page.
+        let last_free = FreePage::new(page_number, self.page_size as _);
+        self.write(last_free.number, last_free.buffer())?;
+
+        let mut header = self.read_header()?;
+
+        if header.first_free_page == 0 {
+            header.first_free_page = page_number;
+            return self.write_header(header);
+        }
+
+        let mut free_page = FreePage::new(header.first_free_page, self.page_size as _);
+        self.read(free_page.number, free_page.buffer_mut())?;
+
+        while free_page.header().next != 0 {
+            free_page = FreePage::new(free_page.header().next, self.page_size as _);
+            self.read(free_page.number, free_page.buffer_mut())?;
+        }
+
+        free_page.header_mut().next = page_number;
+        self.write(free_page.number, free_page.buffer())?;
+
+        Ok(())
     }
 }
 

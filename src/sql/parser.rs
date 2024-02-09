@@ -10,7 +10,7 @@ use super::{
 
 /// Parser error kind.
 #[derive(Debug, PartialEq)]
-enum ErrorKind {
+pub enum ErrorKind {
     TokenizerError(tokenizer::ErrorKind),
 
     Expected { expected: Token, found: Token },
@@ -84,8 +84,8 @@ impl From<ErrorKind> for String {
 /// originated.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ParserError {
-    kind: ErrorKind,
-    location: Location,
+    pub kind: ErrorKind,
+    pub location: Location,
 }
 
 impl ParserError {
