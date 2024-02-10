@@ -49,6 +49,8 @@ pub(crate) enum Keyword {
     Database,
     Int,
     Varchar,
+    Order,
+    By,
     /// Not a keyword, used for convenience. See [`super::tokenizer::Tokenizer`].
     None,
 }
@@ -125,6 +127,8 @@ impl Display for Keyword {
             Self::Database => f.write_str("DATABASE"),
             Self::Int => f.write_str("INT"),
             Self::Varchar => f.write_str("VARCHAR"),
+            Self::Order => f.write_str("ORDER"),
+            Self::By => f.write_str("BY"),
             Self::None => f.write_str("_"),
         }
     }

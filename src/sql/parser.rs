@@ -151,10 +151,13 @@ impl<'i> Parser<'i> {
 
                 let (from, r#where) = self.parse_from_and_optional_where()?;
 
+                let order_by = self.parse_optional_order_by()?;
+
                 Statement::Select {
                     columns,
                     from,
                     r#where,
+                    order_by,
                 }
             }
 
@@ -191,7 +194,7 @@ impl<'i> Parser<'i> {
             Keyword::Insert => {
                 self.expect_keyword(Keyword::Into)?;
                 let into = self.parse_identifier()?;
-                let columns = self.parse_identifier_list()?;
+                let columns = self.parse_identifier_list(true)?;
 
                 self.expect_keyword(Keyword::Values)?;
                 let values = self.parse_comma_separated_expressions()?;
@@ -431,8 +434,8 @@ impl<'i> Parser<'i> {
     }
 
     /// Expects a list of identifiers, not complete expressions.
-    fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
-        self.parse_comma_separated(Self::parse_identifier, true)
+    fn parse_identifier_list(&mut self, required_parenthesis: bool) -> ParseResult<Vec<String>> {
+        self.parse_comma_separated(Self::parse_identifier, required_parenthesis)
     }
 
     /// Parses the entire `WHERE` clause if the next token is [`Keyword::Where`].
@@ -457,6 +460,17 @@ impl<'i> Parser<'i> {
         let r#where = self.parse_optional_where()?;
 
         Ok((from, r#where))
+    }
+
+    /// Parses the `ORDER BY` clause at the end of `SELECT` statements. It only
+    /// works with identifiers (not expressions) for now.
+    fn parse_optional_order_by(&mut self) -> ParseResult<Vec<String>> {
+        if self.consume_optional_keyword(Keyword::Order) {
+            self.expect_keyword(Keyword::By)?;
+            self.parse_identifier_list(false)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Same as [`Self::expect_token`] but takes [`Keyword`] variants instead.
@@ -651,7 +665,8 @@ mod tests {
                     Expression::Identifier("name".into())
                 ],
                 from: "users".into(),
-                r#where: None
+                r#where: None,
+                order_by: vec![]
             })
         )
     }
@@ -665,7 +680,8 @@ mod tests {
             Ok(Statement::Select {
                 columns: vec![Expression::Wildcard],
                 from: "users".into(),
-                r#where: None
+                r#where: None,
+                order_by: vec![]
             })
         )
     }
@@ -687,7 +703,8 @@ mod tests {
                     left: Box::new(Expression::Identifier("price".into())),
                     operator: BinaryOperator::GtEq,
                     right: Box::new(Expression::Value(Value::Number("100".into())))
-                })
+                }),
+                order_by: vec![]
             })
         )
     }
@@ -746,7 +763,26 @@ mod tests {
                             })
                         }),
                     })
-                })
+                }),
+                order_by: vec![],
+            })
+        )
+    }
+
+    #[test]
+    fn parse_select_order_by() {
+        let sql = "SELECT name, email FROM users ORDER BY email;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Ok(Statement::Select {
+                columns: vec![
+                    Expression::Identifier("name".into()),
+                    Expression::Identifier("email".into())
+                ],
+                from: "users".into(),
+                r#where: None,
+                order_by: vec!["email".into()]
             })
         )
     }
@@ -949,6 +985,7 @@ mod tests {
                     columns: vec![Expression::Wildcard],
                     from: "products".into(),
                     r#where: None,
+                    order_by: vec![],
                 }
             ])
         )

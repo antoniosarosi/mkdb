@@ -359,6 +359,8 @@ impl<'i> Tokenizer<'i> {
             "DATABASE" => Keyword::Database,
             "INT" => Keyword::Int,
             "VARCHAR" => Keyword::Varchar,
+            "ORDER" => Keyword::Order,
+            "BY" => Keyword::By,
             _ => Keyword::None,
         };
 
@@ -469,6 +471,35 @@ mod tests {
                 Token::GtEq,
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("100".into()),
+                Token::SemiColon,
+                Token::Eof,
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_select_order_by() {
+        let sql = "SELECT name, email FROM users ORDER BY email;";
+
+        assert_eq!(
+            Tokenizer::new(sql).tokenize(),
+            Ok(vec![
+                Token::Keyword(Keyword::Select),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("name".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("email".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::From),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("users".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Order),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::By),
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("email".into()),
                 Token::SemiColon,
                 Token::Eof,
             ])

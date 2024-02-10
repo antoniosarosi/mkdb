@@ -743,7 +743,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut children = vec![self.root];
         let mut slot = 0;
 
-        // TODO: Unwrap & Payload Box/Ref & repeated code
+        // TODO: Unwrap & Payload Box/Ref & repeated code fix this bruh
         std::iter::from_fn(move || {
             if children.is_empty() {
                 return None;
@@ -767,6 +767,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             if children.is_empty() {
                 return None;
             }
+
+            let page = children[0];
 
             let payload = match self.reassemble_payload(page, 0).unwrap() {
                 Payload::PageRef(r) => Box::from(r),

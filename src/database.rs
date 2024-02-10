@@ -1,8 +1,7 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     io::{self, Read, Seek, Write},
-    ptr,
-    sync::RwLock,
 };
 
 use crate::{
@@ -11,10 +10,7 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, Value,
     },
-    storage::{
-        page::{OverflowPage, Page},
-        BTree, BytesCmp,
-    },
+    storage::{page::Page, BTree, BytesCmp},
 };
 
 /// Name of the meta-table used to keep track of other tables.
@@ -53,7 +49,7 @@ pub(crate) struct Database<I> {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct Exec {
+pub(crate) struct QueryExec {
     schema: Vec<Column>,
     results: Vec<Vec<Value>>,
 }
@@ -76,9 +72,9 @@ impl From<ParserError> for DbError {
     }
 }
 
-type QueryResult = Result<Exec, DbError>;
+type QueryResult = Result<QueryExec, DbError>;
 
-impl Exec {
+impl QueryExec {
     fn get(&self, row: usize, column: &str) -> Option<Value> {
         self.schema
             .iter()
@@ -138,6 +134,67 @@ impl<I> Database<I> {
 }
 
 impl<I: Seek + Read + Write> Database<I> {
+    fn exec_where_clause(values: &Vec<Value>, schema: &Vec<Column>, expr: &Expression) -> Value {
+        match expr {
+            Expression::BinaryOperation {
+                left,
+                operator,
+                right,
+            } => {
+                let left = Self::exec_where_clause(values, schema, &left);
+                let right = Self::exec_where_clause(values, schema, &right);
+
+                match operator {
+                    BinaryOperator::Eq => Value::Bool(left == right),
+                    BinaryOperator::Neq => Value::Bool(left != right),
+                    BinaryOperator::And => Value::Bool(left.is_truthy() && right.is_truthy()),
+                    BinaryOperator::Or => Value::Bool(left.is_truthy() || right.is_truthy()),
+                    BinaryOperator::Lt => Value::Bool(left < right),
+                    BinaryOperator::LtEq => Value::Bool(left <= right),
+                    BinaryOperator::Gt => Value::Bool(left > right),
+                    BinaryOperator::GtEq => Value::Bool(left >= right),
+
+                    op => {
+                        let Value::Number(left) = left else {
+                            todo!("return some error");
+                        };
+
+                        let Value::Number(right) = right else {
+                            todo!("return some error");
+                        };
+
+                        // TODO: Different types of integers
+                        let left = left.parse::<u32>().unwrap();
+                        let right = right.parse::<u32>().unwrap();
+
+                        let result = match op {
+                            BinaryOperator::Plus => left + right,
+                            BinaryOperator::Minus => left - right,
+                            BinaryOperator::Mul => left * right,
+                            BinaryOperator::Div => left / right,
+                            _ => unreachable!(),
+                        };
+
+                        Value::Number(result.to_string())
+                    }
+                }
+            }
+
+            Expression::Value(v) => v.clone(),
+
+            Expression::Identifier(ident) => {
+                // TODO: Store the position somewhere.
+                let p = schema
+                    .iter()
+                    .position(|c| &c.name == ident)
+                    .expect(&format!("todo: invalid column {ident}"));
+                values[p].clone()
+            }
+
+            _ => todo!("return error"),
+        }
+    }
+
     fn serialize_values(values: Vec<Value>) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -260,7 +317,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     VALUES ("table", "{name}", {root_page}, "{name}", '{stmt_sql}');
                 "#))?;
 
-                Ok(Exec {
+                Ok(QueryExec {
                     schema: Vec::new(),
                     results: Vec::new(),
                 })
@@ -334,7 +391,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 btree.insert(buf)?;
 
-                Ok(Exec {
+                Ok(QueryExec {
                     schema: Vec::new(),
                     results: Vec::new(),
                 })
@@ -344,6 +401,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 columns,
                 from,
                 r#where,
+                order_by,
             } => {
                 let (mut schema, root) = 'meta: {
                     if from == MKDB_META {
@@ -400,6 +458,12 @@ impl<I: Seek + Read + Write> Database<I> {
                     // TODO: Deserialize only needed values instead of all and the cloning...
                     let values = Self::deserialize_values(row?, &schema);
 
+                    if let Some(expr) = &r#where {
+                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                            continue;
+                        }
+                    }
+
                     let mut result = Vec::new();
 
                     for ident in &identifiers {
@@ -413,12 +477,39 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 let mut results_schema = Vec::new();
 
-                for i in identifiers {
-                    let c = schema.remove(schema.iter().position(|s| s.name == i).unwrap());
+                for ident in identifiers {
+                    let c = schema.remove(schema.iter().position(|s| s.name == ident).unwrap());
                     results_schema.push(c);
                 }
 
-                Ok(Exec {
+                // TODO: Order by can contain column that we didn't select.
+                if !order_by.is_empty() {
+                    let order_by_cols = order_by
+                        .iter()
+                        .map(|o| results_schema.iter().position(|r| &r.name == o).unwrap())
+                        .collect::<Vec<_>>();
+
+                    results.sort_by(|a, b| {
+                        for i in &order_by_cols {
+                            let cmp = match (&a[*i], &b[*i]) {
+                                (Value::Number(a), Value::Number(b)) => {
+                                    a.parse::<u32>().unwrap().cmp(&b.parse().unwrap())
+                                }
+                                (Value::String(a), Value::String(b)) => a.cmp(b),
+                                (Value::Bool(a), Value::Bool(b)) => todo!("order bools"),
+                                _ => unreachable!("columns should have the same type"),
+                            };
+
+                            if cmp != Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+
+                        Ordering::Equal
+                    })
+                }
+
+                Ok(QueryExec {
                     schema: results_schema,
                     results,
                 })
@@ -435,7 +526,7 @@ mod tests {
 
     use super::{Database, DbError};
     use crate::{
-        database::{mkdb_meta_schema, Exec, Header, MAGIC, MKDB_META_ROOT},
+        database::{mkdb_meta_schema, Header, QueryExec, MAGIC, MKDB_META_ROOT},
         paging::{cache::Cache, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
@@ -470,7 +561,7 @@ mod tests {
 
         assert_eq!(
             query,
-            Exec {
+            QueryExec {
                 schema: mkdb_meta_schema(),
                 results: vec![vec![
                     Value::String("table".into()),
@@ -497,7 +588,7 @@ mod tests {
 
         assert_eq!(
             query,
-            Exec {
+            QueryExec {
                 schema: vec![
                     Column {
                         name: "id".into(),
@@ -513,6 +604,116 @@ mod tests {
                 results: vec![
                     vec![Value::Number("1".into()), Value::String("John Doe".into())],
                     vec![Value::Number("2".into()), Value::String("Jane Doe".into())],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_many() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let create_table = r#"
+            CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name VARCHAR(255),
+                email VARCHAR(255) UNIQUE
+            );
+        "#;
+
+        db.execute(create_table.into())?;
+
+        let mut expected = Vec::new();
+
+        for i in 1..=100 {
+            let name = format!("User {i}");
+            let email = format!("user{i}@test.com");
+
+            expected.push(vec![
+                Value::Number(i.to_string()),
+                Value::String(name.clone()),
+                Value::String(email.clone()),
+            ]);
+
+            let insert =
+                format!("INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');");
+
+            db.execute(insert.into())?;
+        }
+
+        let query = db.execute("SELECT * FROM users ORDER BY id;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExec {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None,
+                    },
+                    Column {
+                        name: "email".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: Some(Constraint::Unique),
+                    }
+                ],
+                results: expected
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+
+        let query = db.execute("SELECT * FROM users WHERE age > 18;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExec {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ],
+                results: vec![
+                    vec![
+                        Value::Number("2".into()),
+                        Value::String("Jane Doe".into()),
+                        Value::Number("22".into())
+                    ],
+                    vec![
+                        Value::Number("3".into()),
+                        Value::String("Some Dude".into()),
+                        Value::Number("24".into())
+                    ],
                 ]
             }
         );

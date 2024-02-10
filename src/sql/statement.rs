@@ -9,6 +9,7 @@ pub(crate) enum Statement {
         columns: Vec<Expression>,
         from: String,
         r#where: Option<Expression>,
+        order_by: Vec<String>,
     },
 
     Delete {
@@ -81,6 +82,30 @@ pub(crate) enum Value {
     Number(String),
     String(String),
     Bool(bool),
+}
+
+impl Value {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Self::Bool(b) => *b,
+            Self::Number(n) => n.parse::<u32>().unwrap() != 0,
+            Self::String(s) => !s.is_empty(),
+        }
+    }
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Number(a), Value::Number(b)) => {
+                // TODO: Other integer types
+                a.parse::<u32>().unwrap().partial_cmp(&b.parse().unwrap())
+            }
+            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            _ => None, // TODO: Return error instead.
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -200,17 +225,21 @@ impl Display for Statement {
                 columns,
                 from,
                 r#where,
+                order_by,
             } => {
                 write!(f, "SELECT {} FROM {from}", join(columns, ","));
                 if let Some(expr) = r#where {
-                    write!(f, "WHERE {expr}");
+                    write!(f, " WHERE {expr}");
+                }
+                if !order_by.is_empty() {
+                    write!(f, " ORDER BY {}", join(order_by, ","));
                 }
             }
 
             Statement::Delete { from, r#where } => {
                 write!(f, "DELETE FROM {from}");
                 if let Some(expr) = r#where {
-                    write!(f, "WHERE {expr}");
+                    write!(f, " WHERE {expr}");
                 }
             }
 
@@ -221,7 +250,7 @@ impl Display for Statement {
             } => {
                 write!(f, "UPDATE {table} SET {}", join(columns, ","));
                 if let Some(expr) = r#where {
-                    write!(f, "WHERE {expr}");
+                    write!(f, " WHERE {expr}");
                 }
             }
 
