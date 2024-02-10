@@ -8,28 +8,42 @@ mod paging;
 mod sql;
 mod storage;
 
-use std::io;
+use std::{
+    env,
+    io::{self, Read, Write},
+    net::TcpListener,
+};
+
+use crate::database::Database;
 
 fn main() -> io::Result<()> {
-    // let mut btree = storage::BTree::new_at_path("btree.bin", 72)?;
-    // for i in 1_u32..=46 {
-    //     btree.insert(Vec::from(i.to_be_bytes()))?;
-    // }
+    let file = env::args().nth(1).expect("database file not provided");
 
-    // eprintln!(
-    //     "Get check: btree.get({}) = {:?}",
-    //     5,
-    //     btree.get(&5_u32.to_be_bytes())?
-    // );
+    let listener = TcpListener::bind("127.0.0.1:8000")?;
+    println!("Listening on 8000");
 
-    // eprintln!(
-    //     "Remove check: btree.remove({}) = {:?}",
-    //     46,
-    //     btree.remove(&46_u32.to_be_bytes())?
-    // );
-    // eprintln!("BTree in JSON format goes to STDOUT\n");
+    let mut db = Database::init(file)?;
 
-    // println!("{}", btree.json()?);
+    for stream in listener.incoming() {
+        let stream = &mut stream.unwrap();
+        let conn = stream.peer_addr().unwrap().to_string();
+        println!("Connection from {}", conn);
+
+        let mut statement = String::new();
+
+        while let Some(byte) = stream.bytes().next() {
+            let byte = byte.unwrap();
+            statement.push(byte.into());
+            if byte == b';' {
+                match db.execute(statement) {
+                    Ok(result) => stream.write(result.as_ascii_table().as_bytes()),
+                    Err(e) => stream.write(e.to_string().as_bytes()),
+                };
+                stream.write("\n".as_bytes());
+                statement = String::new();
+            }
+        }
+    }
 
     Ok(())
 }

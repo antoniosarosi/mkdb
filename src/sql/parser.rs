@@ -1,4 +1,5 @@
 use core::iter::Peekable;
+use std::fmt::Display;
 
 use super::{
     statement::{
@@ -34,17 +35,18 @@ impl ErrorKind {
             Token::Identifier(_) => "identifier".into(),
             Token::Number(_) => "number".into(),
             Token::String(_) => "string".into(),
-            _ => format!("{token}"),
+            _ => format!("'{token}'"),
         }
     }
 }
 
-impl From<ErrorKind> for String {
-    fn from(kind: ErrorKind) -> Self {
-        match kind {
-            ErrorKind::TokenizerError(err) => err.into(),
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorKind::TokenizerError(err) => write!(f, "{err}"),
 
-            ErrorKind::Expected { expected, found } => format!(
+            ErrorKind::Expected { expected, found } => write!(
+                f,
                 "expected {}, found '{found}' instead",
                 ErrorKind::expected_token_string(&expected)
             ),
@@ -60,22 +62,22 @@ impl From<ErrorKind> for String {
                 }
 
                 if expected.len() > 1 {
-                    one_of.push_str("or ");
+                    one_of.push_str(" or ");
                     one_of.push_str(&ErrorKind::expected_token_string(
                         &expected[expected.len() - 1],
                     ));
                 }
 
-                format!("expected {one_of}. Found {found} instead")
+                write!(f, "expected {one_of}. Found '{found}' instead")
             }
 
             ErrorKind::UnexpectedOrUnsupported(token) => {
-                format!("unexpected or unsupported token {token}")
+                write!(f, "unexpected or unsupported token {token}")
             }
 
-            ErrorKind::UnexpectedEof => "unexpected EOF".into(),
+            ErrorKind::UnexpectedEof => f.write_str("unexpected EOF"),
 
-            ErrorKind::Other(message) => message,
+            ErrorKind::Other(message) => f.write_str(&message),
         }
     }
 }
@@ -86,6 +88,12 @@ impl From<ErrorKind> for String {
 pub(crate) struct ParserError {
     pub kind: ErrorKind,
     pub location: Location,
+}
+
+impl Display for ParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind.to_string())
+    }
 }
 
 impl ParserError {

@@ -1,11 +1,19 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    fmt::Display,
+    fs::File,
     io::{self, Read, Seek, Write},
+    os::unix::fs::MetadataExt,
+    path::Path,
 };
 
 use crate::{
-    paging::{cache::Cache, pager::PageNumber},
+    os::{Disk, HardwareBlockSize},
+    paging::{
+        cache::Cache,
+        pager::{PageNumber, Pager},
+    },
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, Value,
@@ -49,7 +57,7 @@ pub(crate) struct Database<I> {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct QueryExec {
+pub(crate) struct QueryExecution {
     schema: Vec<Column>,
     results: Vec<Vec<Value>>,
 }
@@ -58,6 +66,15 @@ pub(crate) struct QueryExec {
 pub(crate) enum DbError {
     Io(io::Error),
     Parser(ParserError),
+}
+
+impl Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Parser(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 impl From<io::Error> for DbError {
@@ -72,9 +89,9 @@ impl From<ParserError> for DbError {
     }
 }
 
-type QueryResult = Result<QueryExec, DbError>;
+type QueryResult = Result<QueryExecution, DbError>;
 
-impl QueryExec {
+impl QueryExecution {
     fn get(&self, row: usize, column: &str) -> Option<Value> {
         self.schema
             .iter()
@@ -85,6 +102,64 @@ impl QueryExec {
 
     fn is_empty(&self) -> bool {
         self.results.is_empty()
+    }
+
+    pub fn as_ascii_table(&self) -> String {
+        let mut width: Vec<_> = self.schema.iter().map(|column| column.name.len()).collect();
+        // TODO: Remove repeated calls to "to_string()".
+        for row in &self.results {
+            for (i, col) in row.iter().enumerate() {
+                if col.to_string().len() > width[i] {
+                    width[i] = col.to_string().len();
+                }
+            }
+        }
+
+        width.iter_mut().for_each(|w| *w += 2);
+
+        let mut border = String::from('+');
+        border.push_str(
+            &width
+                .iter()
+                .map(|w| "-".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("+"),
+        );
+        border.push('+');
+
+        let make_row = |row: Vec<String>| -> String {
+            let mut string = String::from('|');
+
+            let mut buf = Vec::new();
+            for (i, col) in row.iter().enumerate() {
+                let text = format!(" {col}");
+                let trailing_spaces = " ".repeat(width[i] - text.len());
+                buf.push(format!("{text}{trailing_spaces}"));
+            }
+
+            string.push_str(&buf.join("|"));
+            string.push('|');
+
+            string
+        };
+
+        let mut string = String::from(&border);
+        string.push('\n');
+        string.push_str(&make_row(
+            self.schema.iter().map(|c| c.name.clone()).collect(),
+        ));
+        string.push('\n');
+        string.push_str(&border);
+        string.push('\n');
+        for row in &self.results {
+            string.push_str(&make_row(row.iter().map(ToString::to_string).collect()));
+            string.push('\n');
+        }
+        if !self.results.is_empty() {
+            string.push_str(&border);
+        }
+
+        string
     }
 }
 
@@ -130,6 +205,42 @@ impl<I> Database<I> {
             cache,
             row_ids: HashMap::new(),
         }
+    }
+}
+
+impl Database<File> {
+    pub fn init(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        let metadata = file.metadata()?;
+
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
+        }
+
+        // TODO: Constant
+        let page_size = 4096;
+        let block_size = Disk::from(&path).block_size()?;
+
+        let mut pager = Pager::new(file, page_size, block_size);
+
+        if pager.read_header()?.magic != MAGIC {
+            pager.write_header(Header {
+                magic: MAGIC,
+                page_size: page_size as _,
+                total_pages: 2,
+                first_free_page: 0,
+            })?;
+
+            let root = Page::new(MKDB_META_ROOT, page_size as _);
+            pager.write(MKDB_META_ROOT, root.buffer())?;
+        }
+
+        Ok(Database::new(Cache::new(pager)))
     }
 }
 
@@ -285,7 +396,7 @@ impl<I: Seek + Read + Write> Database<I> {
         row_id
     }
 
-    fn execute(&mut self, input: String) -> QueryResult {
+    pub fn execute(&mut self, input: String) -> QueryResult {
         let mut parser = Parser::new(&input);
 
         let mut statements = parser.try_parse()?;
@@ -317,7 +428,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     VALUES ("table", "{name}", {root_page}, "{name}", '{stmt_sql}');
                 "#))?;
 
-                Ok(QueryExec {
+                Ok(QueryExecution {
                     schema: Vec::new(),
                     results: Vec::new(),
                 })
@@ -391,7 +502,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 btree.insert(buf)?;
 
-                Ok(QueryExec {
+                Ok(QueryExecution {
                     schema: Vec::new(),
                     results: Vec::new(),
                 })
@@ -509,7 +620,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     })
                 }
 
-                Ok(QueryExec {
+                Ok(QueryExecution {
                     schema: results_schema,
                     results,
                 })
@@ -526,7 +637,7 @@ mod tests {
 
     use super::{Database, DbError};
     use crate::{
-        database::{mkdb_meta_schema, Header, QueryExec, MAGIC, MKDB_META_ROOT},
+        database::{mkdb_meta_schema, Header, QueryExecution, MAGIC, MKDB_META_ROOT},
         paging::{cache::Cache, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
@@ -561,7 +672,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExec {
+            QueryExecution {
                 schema: mkdb_meta_schema(),
                 results: vec![vec![
                     Value::String("table".into()),
@@ -588,7 +699,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExec {
+            QueryExecution {
                 schema: vec![
                     Column {
                         name: "id".into(),
@@ -647,7 +758,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExec {
+            QueryExecution {
                 schema: vec![
                     Column {
                         name: "id".into(),
@@ -685,7 +796,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExec {
+            QueryExecution {
                 schema: vec![
                     Column {
                         name: "id".into(),
@@ -714,6 +825,53 @@ mod tests {
                         Value::String("Some Dude".into()),
                         Value::Number("24".into())
                     ],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_multiple_tables() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let t1 = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
+        let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
+        let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
+
+        db.execute(t1.into())?;
+        db.execute(t2.into())?;
+        db.execute(t3.into())?;
+
+        let query = db.execute("SELECT * FROM mkdb_meta;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExecution {
+                schema: mkdb_meta_schema(),
+                results: vec![
+                    vec![
+                        Value::String("table".into()),
+                        Value::String("users".into()),
+                        Value::Number("2".into()),
+                        Value::String("users".into()),
+                        Value::String(Parser::new(&t1).try_parse().unwrap()[0].to_string())
+                    ],
+                    vec![
+                        Value::String("table".into()),
+                        Value::String("tasks".into()),
+                        Value::Number("3".into()),
+                        Value::String("tasks".into()),
+                        Value::String(Parser::new(&t2).try_parse().unwrap()[0].to_string())
+                    ],
+                    vec![
+                        Value::String("table".into()),
+                        Value::String("products".into()),
+                        Value::Number("4".into()),
+                        Value::String("products".into()),
+                        Value::String(Parser::new(&t3).try_parse().unwrap()[0].to_string())
+                    ]
                 ]
             }
         );

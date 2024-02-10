@@ -1,4 +1,4 @@
-use std::{iter::Peekable, str::Chars};
+use std::{fmt::Display, iter::Peekable, str::Chars};
 
 use super::token::{Keyword, Token, Whitespace};
 
@@ -127,23 +127,26 @@ pub(crate) enum ErrorKind {
     Other(String),
 }
 
-impl From<ErrorKind> for String {
-    fn from(kind: ErrorKind) -> String {
-        match kind {
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             ErrorKind::UnexpectedOrUnsupportedToken(token) => {
-                format!("unexpected or unsupported token '{token}'")
+                write!(f, "unexpected or unsupported token '{token}'")
             }
 
             ErrorKind::UnexpectedWhileParsingOperator {
                 unexpected,
                 operator,
-            } => format!("unexpected token '{unexpected}' while parsing '{operator}' operator"),
+            } => write!(
+                f,
+                "unexpected token '{unexpected}' while parsing '{operator}' operator"
+            ),
 
-            ErrorKind::StringNotClosed => "double quoted string not closed".into(),
+            ErrorKind::StringNotClosed => f.write_str("double quoted string not closed"),
 
-            ErrorKind::OperatorNotClosed(operator) => format!("'{operator}' operator not closed"),
+            ErrorKind::OperatorNotClosed(operator) => write!(f, "'{operator}' operator not closed"),
 
-            ErrorKind::Other(message) => message,
+            ErrorKind::Other(message) => f.write_str(&message),
         }
     }
 }
