@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
-    os::unix::fs::MetadataExt,
+    mem,
     path::Path,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     },
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
-        Statement, Value,
+        Statement, UnaryOperator, Value,
     },
     storage::{page::Page, BTree, BytesCmp},
 };
@@ -63,8 +63,23 @@ pub(crate) struct QueryExecution {
 }
 
 #[derive(Debug, PartialEq)]
-enum SqlError {
+pub(crate) enum TypeError {
+    CannotApplyUnary {
+        operator: UnaryOperator,
+        value: Value,
+    },
+    CannotApplyBinary {
+        left: Value,
+        operator: BinaryOperator,
+        right: Value,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SqlError {
     InvalidTable(String),
+    InvalidColumn(String),
+    TypeError(TypeError),
     Other(String),
 }
 
@@ -72,6 +87,21 @@ impl Display for SqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
+            Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
+            Self::TypeError(type_error) => match type_error {
+                TypeError::CannotApplyUnary { operator, value } => {
+                    write!(f, "cannot apply unary operator '{operator}' to {value}")
+                }
+
+                TypeError::CannotApplyBinary {
+                    left,
+                    operator,
+                    right,
+                } => write!(
+                    f,
+                    "cannot binary operator '{operator}' to {left} and {right}"
+                ),
+            },
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -103,6 +133,12 @@ impl From<io::Error> for DbError {
 impl From<ParserError> for DbError {
     fn from(e: ParserError) -> Self {
         Self::Parser(e)
+    }
+}
+
+impl From<SqlError> for DbError {
+    fn from(e: SqlError) -> Self {
+        Self::Sql(e)
     }
 }
 
@@ -262,40 +298,90 @@ impl Database<File> {
 }
 
 impl<I: Seek + Read + Write> Database<I> {
-    fn exec_where_clause(values: &Vec<Value>, schema: &Vec<Column>, expr: &Expression) -> Value {
+    fn resolve_expression(
+        values: &Vec<Value>,
+        schema: &Vec<Column>,
+        expr: &Expression,
+    ) -> Result<Value, SqlError> {
         match expr {
+            Expression::Value(value) => Ok(value.clone()),
+
+            Expression::Identifier(ident) => {
+                // TODO: Store the position somewhere.
+                match schema.iter().position(|column| &column.name == ident) {
+                    Some(index) => Ok(values[index].clone()),
+                    None => Err(SqlError::InvalidColumn(ident.clone())),
+                }
+            }
+
+            Expression::UnaryOperation { operator, expr } => {
+                match Self::resolve_expression(values, schema, expr)? {
+                    Value::Number(mut num) => {
+                        if let UnaryOperator::Minus = operator {
+                            if num.as_bytes()[0] == b'-' {
+                                num.remove(0);
+                            } else {
+                                num.insert(0, '-');
+                            };
+                        }
+
+                        Ok(Value::Number(num))
+                    }
+
+                    value => Err(SqlError::TypeError(TypeError::CannotApplyUnary {
+                        operator: *operator,
+                        value,
+                    })),
+                }
+            }
+
             Expression::BinaryOperation {
                 left,
                 operator,
                 right,
             } => {
-                let left = Self::exec_where_clause(values, schema, &left);
-                let right = Self::exec_where_clause(values, schema, &right);
+                let left = Self::resolve_expression(values, schema, &left)?;
+                let right = Self::resolve_expression(values, schema, &right)?;
 
-                match operator {
+                let mismatched_types = SqlError::TypeError(TypeError::CannotApplyBinary {
+                    left: left.clone(),
+                    operator: *operator,
+                    right: right.clone(),
+                });
+
+                if mem::discriminant(&left) != mem::discriminant(&right) {
+                    return Err(mismatched_types);
+                }
+
+                Ok(match operator {
                     BinaryOperator::Eq => Value::Bool(left == right),
                     BinaryOperator::Neq => Value::Bool(left != right),
-                    BinaryOperator::And => Value::Bool(left.is_truthy() && right.is_truthy()),
-                    BinaryOperator::Or => Value::Bool(left.is_truthy() || right.is_truthy()),
                     BinaryOperator::Lt => Value::Bool(left < right),
                     BinaryOperator::LtEq => Value::Bool(left <= right),
                     BinaryOperator::Gt => Value::Bool(left > right),
                     BinaryOperator::GtEq => Value::Bool(left >= right),
 
-                    op => {
-                        let Value::Number(left) = left else {
-                            todo!("return some error");
+                    logical @ (BinaryOperator::And | BinaryOperator::Or) => {
+                        let (Value::Bool(left), Value::Bool(right)) = (left, right) else {
+                            return Err(mismatched_types);
                         };
 
-                        let Value::Number(right) = right else {
-                            todo!("return some error");
+                        match logical {
+                            BinaryOperator::And => Value::Bool(left && right),
+                            BinaryOperator::Or => Value::Bool(left || right),
+                            _ => unreachable!(),
+                        }
+                    }
+
+                    arithmetic => {
+                        let (Value::Number(left), Value::Number(right)) = (left, right) else {
+                            return Err(mismatched_types);
                         };
 
-                        // TODO: Different types of integers
-                        let left = left.parse::<u32>().unwrap();
-                        let right = right.parse::<u32>().unwrap();
+                        let left = left.parse::<i128>().unwrap();
+                        let right = right.parse::<i128>().unwrap();
 
-                        let result = match op {
+                        let result = match arithmetic {
                             BinaryOperator::Plus => left + right,
                             BinaryOperator::Minus => left - right,
                             BinaryOperator::Mul => left * right,
@@ -305,50 +391,48 @@ impl<I: Seek + Read + Write> Database<I> {
 
                         Value::Number(result.to_string())
                     }
-                }
+                })
             }
 
-            Expression::Value(v) => v.clone(),
-
-            Expression::Identifier(ident) => {
-                // TODO: Store the position somewhere.
-                let p = schema
-                    .iter()
-                    .position(|c| &c.name == ident)
-                    .expect(&format!("todo: invalid column {ident}"));
-                values[p].clone()
-            }
-
-            _ => todo!("return error"),
+            Expression::Wildcard => unreachable!(),
         }
     }
 
-    fn serialize_values(values: &Vec<Value>) -> Vec<u8> {
+    fn serialize_values(schema: &Vec<Column>, values: &Vec<Value>) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // TODO: Alignment.
-        for v in values {
-            match v {
-                Value::String(string) => {
+        for (col, val) in schema.iter().zip(values) {
+            match (&col.data_type, val) {
+                (DataType::Varchar(max), Value::String(string)) => {
                     let length = string.len().to_le_bytes();
 
                     // TODO: Strings longer than 65536 chars are not handled.
-                    let n_bytes = if string.len() <= u8::MAX as usize {
-                        1
-                    } else {
-                        2
-                    };
+                    let n_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
 
                     buf.extend_from_slice(&length[..n_bytes]);
                     buf.extend_from_slice(string.as_bytes());
                 }
 
-                Value::Number(num) => {
-                    // TODO: Support for types other than u32
+                (DataType::Int, Value::Number(num)) => {
+                    buf.extend_from_slice(&num.parse::<i32>().unwrap().to_le_bytes());
+                }
+
+                (DataType::UnsignedInt, Value::Number(num)) => {
                     buf.extend_from_slice(&num.parse::<u32>().unwrap().to_le_bytes());
                 }
 
-                Value::Bool(bool) => buf.push(u8::from(*bool)),
+                (DataType::BigInt, Value::Number(num)) => {
+                    buf.extend_from_slice(&num.parse::<i64>().unwrap().to_le_bytes());
+                }
+
+                (DataType::UnsignedBigInt, Value::Number(num)) => {
+                    buf.extend_from_slice(&num.parse::<u64>().unwrap().to_le_bytes());
+                }
+
+                (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
+
+                _ => unreachable!("attempt to serialize wrong data type: {col} -> {val}"),
             }
         }
 
@@ -359,29 +443,58 @@ impl<I: Seek + Read + Write> Database<I> {
         let mut values = Vec::new();
 
         // Skip row_id
-        // TODO: Integrate RowID into Data type
         let mut idx = 8;
 
         for column in schema {
             match column.data_type {
-                DataType::Varchar(_) => {
-                    // TODO: Strings longer than 255 should always use 2 bytes to store the length.
-                    let length = buf[idx];
-                    idx += 1;
+                DataType::Varchar(max) => {
+                    let length = if max <= u8::MAX as usize {
+                        let len = buf[idx];
+                        idx += 1;
+                        len as usize
+                    } else {
+                        let len = u16::from_le_bytes(buf[idx..idx + 2].try_into().unwrap());
+                        idx += 2;
+                        len as usize
+                    };
+
                     // TODO: Used lossy to avoid converting to Vec<u8>, check how to make this better.
                     values.push(Value::String(
-                        String::from_utf8_lossy(&buf[idx..(idx + length as usize)]).to_string(),
+                        String::from_utf8_lossy(&buf[idx..(idx + length)]).to_string(),
                     ));
-                    idx += length as usize;
+                    idx += length;
                 }
 
                 DataType::Int => {
                     values.push(Value::Number(
+                        i32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap()).to_string(),
+                    ));
+
+                    idx += 4;
+                }
+
+                DataType::UnsignedInt => {
+                    values.push(Value::Number(
                         u32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap()).to_string(),
                     ));
 
-                    // TODO: Numbers other than u32
                     idx += 4;
+                }
+
+                DataType::BigInt => {
+                    values.push(Value::Number(
+                        i64::from_le_bytes(buf[idx..idx + 8].try_into().unwrap()).to_string(),
+                    ));
+
+                    idx += 8;
+                }
+
+                DataType::UnsignedBigInt => {
+                    values.push(Value::Number(
+                        u64::from_le_bytes(buf[idx..idx + 8].try_into().unwrap()).to_string(),
+                    ));
+
+                    idx += 8;
                 }
 
                 DataType::Bool => {
@@ -516,7 +629,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
 
                 let mut buf = Vec::from(row_id.to_le_bytes());
-                buf.append(&mut Self::serialize_values(&values_only));
+                buf.append(&mut Self::serialize_values(&schema, &values_only));
 
                 btree.insert(buf)?;
 
@@ -588,7 +701,9 @@ impl<I: Seek + Read + Write> Database<I> {
                     let values = Self::deserialize_values(row?, &schema);
 
                     if let Some(expr) = &r#where {
-                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                        if let Value::Bool(false) =
+                            Self::resolve_expression(&values, &schema, &expr)?
+                        {
                             continue;
                         }
                     }
@@ -690,7 +805,9 @@ impl<I: Seek + Read + Write> Database<I> {
                     let values = Self::deserialize_values(row, &schema);
 
                     if let Some(expr) = &r#where {
-                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                        if let Value::Bool(false) =
+                            Self::resolve_expression(&values, &schema, &expr)?
+                        {
                             continue;
                         }
                     }
@@ -793,7 +910,9 @@ impl<I: Seek + Read + Write> Database<I> {
                     let mut values = Self::deserialize_values(row, &schema);
 
                     if let Some(expr) = &r#where {
-                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                        if let Value::Bool(false) =
+                            Self::resolve_expression(&values, &schema, &expr)?
+                        {
                             continue;
                         }
                     }
@@ -801,7 +920,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     for (col, expr) in &assignments {
                         let v = match **expr {
                             Expression::Value(ref v) => v.clone(),
-                            _ => Self::exec_where_clause(&values, &schema, expr),
+                            _ => Self::resolve_expression(&values, &schema, expr)?,
                         };
 
                         let p = schema.iter().position(|s| &s.name == col).unwrap();
@@ -809,7 +928,7 @@ impl<I: Seek + Read + Write> Database<I> {
                         values[p] = v;
 
                         let mut buf = Vec::from(row_id.to_le_bytes());
-                        buf.append(&mut Self::serialize_values(&values));
+                        buf.append(&mut Self::serialize_values(&schema, &values));
 
                         updates.push(buf);
                     }

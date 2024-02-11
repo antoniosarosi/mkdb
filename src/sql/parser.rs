@@ -3,11 +3,15 @@ use std::fmt::Display;
 
 use super::{
     statement::{
-        BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression, Statement, Value,
+        BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression, Statement,
+        UnaryOperator, Value,
     },
     token::{Keyword, Token},
     tokenizer::{self, Location, TokenWithLocation, Tokenizer, TokenizerError},
 };
+
+/// See [`Parser::get_next_precedence`] for details.
+const UNARY_ARITHMETIC_OPERATOR_PRECEDENCE: u8 = 50;
 
 /// Parser error kind.
 #[derive(Debug, PartialEq)]
@@ -276,6 +280,18 @@ impl<'i> Parser<'i> {
             Token::Number(num) => Ok(Expression::Value(Value::Number(num))),
             Token::String(string) => Ok(Expression::Value(Value::String(string))),
 
+            token @ (Token::Minus | Token::Plus) => {
+                let operator = match token {
+                    Token::Plus => UnaryOperator::Plus,
+                    Token::Minus => UnaryOperator::Minus,
+                    _ => unreachable!(),
+                };
+
+                let expr = Box::new(self.parse_expr(UNARY_ARITHMETIC_OPERATOR_PRECEDENCE)?);
+
+                Ok(Expression::UnaryOperation { operator, expr })
+            }
+
             Token::LeftParen => {
                 let expr = self.parse_expression()?;
                 self.expect_token(Token::RightParen)?;
@@ -287,6 +303,9 @@ impl<'i> Parser<'i> {
                     Token::Identifier(Default::default()),
                     Token::Number(Default::default()),
                     Token::String(Default::default()),
+                    Token::Mul,
+                    Token::Minus,
+                    Token::Plus,
                     Token::LeftParen,
                 ],
                 found: unexpected,
@@ -345,7 +364,16 @@ impl<'i> Parser<'i> {
         let name = self.parse_identifier()?;
 
         let data_type = match self.expect_one_of(&Self::supported_data_types())? {
-            Keyword::Int => DataType::Int,
+            int @ (Keyword::Int | Keyword::BigInt) => {
+                let unsigned = self.consume_optional_keyword(Keyword::Unsigned);
+                match (int, unsigned) {
+                    (Keyword::Int, true) => DataType::UnsignedInt,
+                    (Keyword::Int, false) => DataType::Int,
+                    (Keyword::BigInt, true) => DataType::UnsignedBigInt,
+                    (Keyword::BigInt, false) => DataType::BigInt,
+                    _ => unreachable!(),
+                }
+            }
 
             Keyword::Varchar => {
                 self.expect_token(Token::LeftParen)?;
@@ -635,7 +663,7 @@ impl<'i> Parser<'i> {
 
     /// Data type that can be used for column definitions.
     fn supported_data_types() -> Vec<Keyword> {
-        vec![Keyword::Int, Keyword::Varchar]
+        vec![Keyword::Int, Keyword::BigInt, Keyword::Varchar]
     }
 
     /// Supported binary operators.
@@ -1102,6 +1130,34 @@ mod tests {
     }
 
     #[test]
+    fn unary_arithmetic_operator_precedence() {
+        let expr = "-2 * -(2 + 2 * 2)";
+
+        assert_eq!(
+            Parser::new(expr).parse_expression(),
+            Ok(Expression::BinaryOperation {
+                left: Box::new(Expression::UnaryOperation {
+                    operator: UnaryOperator::Minus,
+                    expr: Box::new(Expression::Value(Value::Number("2".into())))
+                }),
+                operator: BinaryOperator::Mul,
+                right: Box::new(Expression::UnaryOperation {
+                    operator: UnaryOperator::Minus,
+                    expr: Box::new(Expression::BinaryOperation {
+                        left: Box::new(Expression::Value(Value::Number("2".into()))),
+                        operator: BinaryOperator::Plus,
+                        right: Box::new(Expression::BinaryOperation {
+                            left: Box::new(Expression::Value(Value::Number("2".into()))),
+                            operator: BinaryOperator::Mul,
+                            right: Box::new(Expression::Value(Value::Number("2".into()))),
+                        })
+                    })
+                })
+            })
+        )
+    }
+
+    #[test]
     fn parse_unterminated_statement() {
         let sql = "SELECT * FROM users";
 
@@ -1129,6 +1185,9 @@ mod tests {
                         Token::Identifier(Default::default()),
                         Token::Number(Default::default()),
                         Token::String(Default::default()),
+                        Token::Mul,
+                        Token::Minus,
+                        Token::Plus,
                         Token::LeftParen
                     ],
                     found: Token::Eof
@@ -1198,7 +1257,10 @@ mod tests {
                         Token::Identifier(Default::default()),
                         Token::Number(Default::default()),
                         Token::String(Default::default()),
-                        Token::LeftParen,
+                        Token::Mul,
+                        Token::Minus,
+                        Token::Plus,
+                        Token::LeftParen
                     ],
                     found: Token::RightParen,
                 },

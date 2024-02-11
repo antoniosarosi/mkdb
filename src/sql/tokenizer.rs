@@ -2,11 +2,12 @@ use std::{fmt::Display, iter::Peekable, str::Chars};
 
 use super::token::{Keyword, Token, Whitespace};
 
+/// Token location.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Location {
-    /// Line number.
+    /// Line number starting at 1.
     pub line: usize,
-    /// Column number.
+    /// Column number starting at 1.
     pub col: usize,
 }
 
@@ -142,11 +143,11 @@ impl Display for ErrorKind {
                 "unexpected token '{unexpected}' while parsing '{operator}' operator"
             ),
 
-            ErrorKind::StringNotClosed => f.write_str("double quoted string not closed"),
+            ErrorKind::StringNotClosed => f.write_str("string not closed"),
 
             ErrorKind::OperatorNotClosed(operator) => write!(f, "'{operator}' operator not closed"),
 
-            ErrorKind::Other(message) => f.write_str(&message),
+            ErrorKind::Other(message) => f.write_str(message),
         }
     }
 }
@@ -177,8 +178,9 @@ type TokenResult = Result<Token, TokenizerError>;
 
 impl<'i> Tokenizer<'i> {
     /// Creates a new tokenizer for the given `input`. The tokenizer won't parse
-    /// anything until [`Tokenizer::next_token`] through helper functions or
-    /// iterators. See [`Tokenizer::iter_mut`] and [`Tokenizer::tokenize`].
+    /// anything until [`Tokenizer::next_token`] is called through helper
+    /// functions or iterators. See [`Tokenizer::iter`] and
+    /// [`Tokenizer::tokenize`].
     pub fn new(input: &'i str) -> Self {
         Self {
             stream: Stream::new(input),
@@ -189,7 +191,7 @@ impl<'i> Tokenizer<'i> {
     /// Creates an iterator over [`Self`]. Used mainly to parse tokens as they
     /// are found instead of waiting for the tokenizer to consume the entire
     /// input string.
-    pub fn iter_mut<'t>(&'t mut self) -> IterMut<'t, 'i> {
+    pub fn iter<'t>(&'t mut self) -> Iter<'t, 'i> {
         self.into_iter()
     }
 
@@ -197,7 +199,7 @@ impl<'i> Tokenizer<'i> {
     /// into [`Token`] variants. If an error is encountered in the process, this
     /// function returns immediately.
     pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
-        self.iter_mut()
+        self.iter()
             .map(|result| result.map(TokenWithLocation::token_only))
             .collect()
     }
@@ -313,7 +315,8 @@ impl<'i> Tokenizer<'i> {
         Err(TokenizerError::new(kind, self.stream.location()))
     }
 
-    /// Parses a double quoted string like `"this one"` into [`Token::String`].
+    /// Parses a single quoted or double quoted string like `"this one"` into
+    /// [`Token::String`].
     fn tokenize_string(&mut self) -> TokenResult {
         let quote = self.stream.next().unwrap();
 
@@ -326,7 +329,7 @@ impl<'i> Tokenizer<'i> {
         }
     }
 
-    /// Tokenizes numbers like `1234`. Floats and negatives not supported.
+    /// Tokenizes numbers like `1234`. Floats are not supported.
     fn tokenize_number(&mut self) -> TokenResult {
         Ok(Token::Number(
             self.stream.take_while(char::is_ascii_digit).collect(),
@@ -341,6 +344,8 @@ impl<'i> Tokenizer<'i> {
             .take_while(Token::is_part_of_ident_or_keyword)
             .collect();
 
+        // TODO: Use [phf](https://docs.rs/phf/) or something similar if this
+        // keeps growing.
         let keyword = match value.to_uppercase().as_str() {
             "SELECT" => Keyword::Select,
             "CREATE" => Keyword::Create,
@@ -361,6 +366,8 @@ impl<'i> Tokenizer<'i> {
             "TABLE" => Keyword::Table,
             "DATABASE" => Keyword::Database,
             "INT" => Keyword::Int,
+            "BIGINT" => Keyword::BigInt,
+            "UNSIGNED" => Keyword::Unsigned,
             "VARCHAR" => Keyword::Varchar,
             "ORDER" => Keyword::Order,
             "BY" => Keyword::By,
@@ -374,12 +381,12 @@ impl<'i> Tokenizer<'i> {
     }
 }
 
-/// Struct returned by [`Tokenizer::iter_mut`].
-pub(super) struct IterMut<'t, 'i> {
+/// Struct returned by [`Tokenizer::iter`].
+pub(super) struct Iter<'t, 'i> {
     tokenizer: &'t mut Tokenizer<'i>,
 }
 
-impl<'t, 'i> Iterator for IterMut<'t, 'i> {
+impl<'t, 'i> Iterator for Iter<'t, 'i> {
     type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -388,11 +395,11 @@ impl<'t, 'i> Iterator for IterMut<'t, 'i> {
 }
 
 impl<'t, 'i> IntoIterator for &'t mut Tokenizer<'i> {
-    type IntoIter = IterMut<'t, 'i>;
+    type IntoIter = Iter<'t, 'i>;
     type Item = Result<TokenWithLocation, TokenizerError>;
 
     fn into_iter(self) -> Self::IntoIter {
-        IterMut { tokenizer: self }
+        Iter { tokenizer: self }
     }
 }
 

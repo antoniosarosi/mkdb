@@ -1,4 +1,4 @@
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write};
 
 /// SQL tokens.
 #[derive(PartialEq, Debug)]
@@ -48,6 +48,8 @@ pub(crate) enum Keyword {
     Table,
     Database,
     Int,
+    BigInt,
+    Unsigned,
     Varchar,
     Order,
     By,
@@ -78,7 +80,7 @@ impl From<&Keyword> for Token {
 }
 
 impl Display for Token {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Eof => f.write_str("EOF"),
             Self::Whitespace(whitespace) => write!(f, "{whitespace}"),
@@ -105,41 +107,43 @@ impl Display for Token {
 }
 
 impl Display for Keyword {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Select => f.write_str("SELECT"),
-            Self::Create => f.write_str("CREATE"),
-            Self::Update => f.write_str("UPDATE"),
-            Self::Delete => f.write_str("DELETE"),
-            Self::Insert => f.write_str("INSERT"),
-            Self::Into => f.write_str("INTO"),
-            Self::Values => f.write_str("VALUES"),
-            Self::Set => f.write_str("SET"),
-            Self::Drop => f.write_str("DROP"),
-            Self::From => f.write_str("FROM"),
-            Self::Where => f.write_str("WHERE"),
-            Self::And => f.write_str("AND"),
-            Self::Or => f.write_str("OR"),
-            Self::Primary => f.write_str("PRIMARY"),
-            Self::Key => f.write_str("KEY"),
-            Self::Unique => f.write_str("UNIQUE"),
-            Self::Table => f.write_str("TABLE"),
-            Self::Database => f.write_str("DATABASE"),
-            Self::Int => f.write_str("INT"),
-            Self::Varchar => f.write_str("VARCHAR"),
-            Self::Order => f.write_str("ORDER"),
-            Self::By => f.write_str("BY"),
-            Self::None => f.write_str("_"),
-        }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Select => "SELECT",
+            Self::Create => "CREATE",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::Insert => "INSERT",
+            Self::Into => "INTO",
+            Self::Values => "VALUES",
+            Self::Set => "SET",
+            Self::Drop => "DROP",
+            Self::From => "FROM",
+            Self::Where => "WHERE",
+            Self::And => "AND",
+            Self::Or => "OR",
+            Self::Primary => "PRIMARY",
+            Self::Key => "KEY",
+            Self::Unique => "UNIQUE",
+            Self::Table => "TABLE",
+            Self::Database => "DATABASE",
+            Self::Int => "INT",
+            Self::BigInt => "BIGINT",
+            Self::Unsigned => "UNSIGNED",
+            Self::Varchar => "VARCHAR",
+            Self::Order => "ORDER",
+            Self::By => "BY",
+            Self::None => "_",
+        })
     }
 }
 
 impl Display for Whitespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Space => f.write_str(" "),
-            Self::Tab => f.write_str("\t"),
-            Self::Newline => f.write_str("\n"),
-        }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char(match self {
+            Self::Space => ' ',
+            Self::Tab => '\t',
+            Self::Newline => '\n',
+        })
     }
 }

@@ -1,4 +1,4 @@
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write};
 
 /// SQL statement.
 #[derive(Debug, PartialEq)]
@@ -46,9 +46,14 @@ pub(crate) enum Expression {
         operator: BinaryOperator,
         right: Box<Self>,
     },
+
+    UnaryOperation {
+        operator: UnaryOperator,
+        expr: Box<Self>,
+    },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum BinaryOperator {
     Eq,
     Neq,
@@ -64,6 +69,12 @@ pub(crate) enum BinaryOperator {
     Or,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) enum UnaryOperator {
+    Plus,
+    Minus,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Constraint {
     PrimaryKey,
@@ -73,6 +84,9 @@ pub(crate) enum Constraint {
 #[derive(Debug, PartialEq)]
 pub(crate) enum DataType {
     Int,
+    UnsignedInt,
+    BigInt,
+    UnsignedBigInt,
     Bool,
     Varchar(usize),
 }
@@ -84,26 +98,15 @@ pub(crate) enum Value {
     Bool(bool),
 }
 
-impl Value {
-    pub fn is_truthy(&self) -> bool {
-        match self {
-            Self::Bool(b) => *b,
-            Self::Number(n) => n.parse::<u32>().unwrap() != 0,
-            Self::String(s) => !s.is_empty(),
-        }
-    }
-}
-
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Value::Number(a), Value::Number(b)) => {
-                // TODO: Other integer types
-                a.parse::<u32>().unwrap().partial_cmp(&b.parse().unwrap())
+                a.parse::<i128>().unwrap().partial_cmp(&b.parse().unwrap())
             }
             (Value::String(a), Value::String(b)) => a.partial_cmp(b),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
-            _ => None, // TODO: Return error instead.
+            _ => None,
         }
     }
 }
@@ -140,6 +143,9 @@ impl Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DataType::Int => f.write_str("INT"),
+            DataType::UnsignedInt => f.write_str("INT UNSIGNED"),
+            DataType::BigInt => f.write_str("BIGINT"),
+            DataType::UnsignedBigInt => f.write_str("BIGINT UNSIGNED"),
             DataType::Bool => f.write_str("BOOL"),
             DataType::Varchar(max) => write!(f, "VARCHAR({max})"),
         }
@@ -158,14 +164,14 @@ impl Display for Value {
 
 impl Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.name, self.data_type);
+        write!(f, "{} {}", self.name, self.data_type)?;
 
         if let Some(constraint) = &self.constraint {
-            f.write_str(" ");
+            f.write_char(' ')?;
             f.write_str(match constraint {
                 Constraint::PrimaryKey => "PRIMARY KEY",
                 Constraint::Unique => "UNIQUE",
-            });
+            })?;
         }
 
         Ok(())
@@ -191,18 +197,30 @@ impl Display for BinaryOperator {
     }
 }
 
+impl Display for UnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char(match self {
+            UnaryOperator::Minus => '-',
+            UnaryOperator::Plus => '+',
+        })
+    }
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Identifier(ident) => f.write_str(ident),
             Expression::Value(value) => write!(f, "{value}"),
-            Expression::Wildcard => f.write_str("*"),
+            Expression::Wildcard => f.write_char('*'),
             Expression::BinaryOperation {
                 left,
                 operator,
                 right,
             } => {
                 write!(f, "({left}) {operator} ({right})")
+            }
+            Expression::UnaryOperation { operator, expr } => {
+                write!(f, "{operator}({expr})")
             }
         }
     }
@@ -213,11 +231,11 @@ impl Display for Statement {
         match self {
             Statement::Create(create) => match create {
                 Create::Table { name, columns } => {
-                    write!(f, "CREATE TABLE {name} ({})", join(columns, ","));
+                    write!(f, "CREATE TABLE {name} ({})", join(columns, ","))?;
                 }
 
                 Create::Database(name) => {
-                    write!(f, "CREATE DATABASE {name}");
+                    write!(f, "CREATE DATABASE {name}")?;
                 }
             },
 
@@ -227,19 +245,19 @@ impl Display for Statement {
                 r#where,
                 order_by,
             } => {
-                write!(f, "SELECT {} FROM {from}", join(columns, ","));
+                write!(f, "SELECT {} FROM {from}", join(columns, ","))?;
                 if let Some(expr) = r#where {
-                    write!(f, " WHERE {expr}");
+                    write!(f, " WHERE {expr}")?;
                 }
                 if !order_by.is_empty() {
-                    write!(f, " ORDER BY {}", join(order_by, ","));
+                    write!(f, " ORDER BY {}", join(order_by, ","))?;
                 }
             }
 
             Statement::Delete { from, r#where } => {
-                write!(f, "DELETE FROM {from}");
+                write!(f, "DELETE FROM {from}")?;
                 if let Some(expr) = r#where {
-                    write!(f, " WHERE {expr}");
+                    write!(f, " WHERE {expr}")?;
                 }
             }
 
@@ -248,9 +266,9 @@ impl Display for Statement {
                 columns,
                 r#where,
             } => {
-                write!(f, "UPDATE {table} SET {}", join(columns, ","));
+                write!(f, "UPDATE {table} SET {}", join(columns, ","))?;
                 if let Some(expr) = r#where {
-                    write!(f, " WHERE {expr}");
+                    write!(f, " WHERE {expr}")?;
                 }
             }
 
@@ -264,17 +282,17 @@ impl Display for Statement {
                     "INSERT INTO {into} ({}) VALUES ({})",
                     join(columns, ","),
                     join(values, ",")
-                );
+                )?;
             }
 
             Statement::Drop(drop) => {
                 match drop {
-                    Drop::Table(name) => write!(f, "DROP TABLE {name}"),
-                    Drop::Database(name) => write!(f, "DROP DATABASE {name}"),
+                    Drop::Table(name) => write!(f, "DROP TABLE {name}")?,
+                    Drop::Database(name) => write!(f, "DROP DATABASE {name}")?,
                 };
             }
         };
 
-        f.write_str(";")
+        f.write_char(';')
     }
 }
