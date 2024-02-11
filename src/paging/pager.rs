@@ -243,6 +243,10 @@ impl<F: Seek + Read + Write> Pager<F> {
 
         Ok(())
     }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
+    }
 }
 
 #[cfg(test)]

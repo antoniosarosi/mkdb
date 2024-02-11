@@ -412,7 +412,7 @@ impl<I: Seek + Read + Write> Cache<I> {
             self.write_frame(frame_id)?;
         }
 
-        Ok(())
+        self.pager.flush()
     }
 
     /// Writes the frame to disk if dirty. Otherwise it does nothing.

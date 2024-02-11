@@ -31,15 +31,25 @@ fn main() -> io::Result<()> {
 
         let mut statement = String::new();
 
+        let exit_command = "quit";
+
         while let Some(byte) = stream.bytes().next() {
             let byte = byte.unwrap();
             statement.push(byte.into());
+
+            if statement.len() >= exit_command.len()
+                && &statement[statement.len() - exit_command.len()..] == exit_command
+            {
+                println!("Close {conn} connection");
+                break;
+            }
+
             if byte == b';' {
-                match db.execute(statement) {
+                let _ = match db.execute(statement) {
                     Ok(result) => stream.write(result.as_ascii_table().as_bytes()),
                     Err(e) => stream.write(e.to_string().as_bytes()),
                 };
-                stream.write("\n".as_bytes());
+                stream.write("\n".as_bytes()).unwrap();
                 statement = String::new();
             }
         }

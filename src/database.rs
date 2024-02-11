@@ -62,10 +62,26 @@ pub(crate) struct QueryExecution {
     results: Vec<Vec<Value>>,
 }
 
+#[derive(Debug, PartialEq)]
+enum SqlError {
+    InvalidTable(String),
+    Other(String),
+}
+
+impl Display for SqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum DbError {
     Io(io::Error),
     Parser(ParserError),
+    Sql(SqlError),
 }
 
 impl Display for DbError {
@@ -73,6 +89,7 @@ impl Display for DbError {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::Parser(e) => write!(f, "{e}"),
+            Self::Sql(e) => write!(f, "{e}"),
         }
     }
 }
@@ -306,7 +323,7 @@ impl<I: Seek + Read + Write> Database<I> {
         }
     }
 
-    fn serialize_values(values: Vec<Value>) -> Vec<u8> {
+    fn serialize_values(values: &Vec<Value>) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // TODO: Alignment.
@@ -331,7 +348,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     buf.extend_from_slice(&num.parse::<u32>().unwrap().to_le_bytes());
                 }
 
-                Value::Bool(bool) => buf.push(u8::from(bool)),
+                Value::Bool(bool) => buf.push(u8::from(*bool)),
             }
         }
 
@@ -387,7 +404,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
         let row_id = if let Some(max) = btree.max().unwrap() {
-            u64::from_le_bytes(max.as_ref()[..8].try_into().unwrap())
+            u64::from_le_bytes(max.as_ref()[..8].try_into().unwrap()) + 1
         } else {
             1
         };
@@ -449,7 +466,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     ))?;
 
                     if query.is_empty() {
-                        todo!("table doesn't exists");
+                        return Err(DbError::Sql(SqlError::InvalidTable(into)));
                     }
 
                     // TODO: Find some way to avoid parsing SQL every time.
@@ -493,12 +510,13 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 let row_id = self.next_row_id(into, root);
+                println!("Using row id {row_id}");
 
                 let mut btree =
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
 
                 let mut buf = Vec::from(row_id.to_le_bytes());
-                buf.append(&mut Self::serialize_values(values_only));
+                buf.append(&mut Self::serialize_values(&values_only));
 
                 btree.insert(buf)?;
 
@@ -524,7 +542,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     ))?;
 
                     if query.is_empty() {
-                        todo!("table doesn't exist");
+                        return Err(DbError::Sql(SqlError::InvalidTable(from)));
                     }
 
                     // TODO: Find some way to avoid parsing SQL every time.
@@ -623,6 +641,191 @@ impl<I: Seek + Read + Write> Database<I> {
                 Ok(QueryExecution {
                     schema: results_schema,
                     results,
+                })
+            }
+
+            Statement::Delete { from, r#where } => {
+                let (mut schema, root) = 'meta: {
+                    if from == MKDB_META {
+                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
+                    }
+
+                    let query = self.execute(format!(
+                        "SELECT root, sql FROM {MKDB_META} where table_name = '{from}';"
+                    ))?;
+
+                    if query.is_empty() {
+                        return Err(DbError::Sql(SqlError::InvalidTable(from)));
+                    }
+
+                    // TODO: Find some way to avoid parsing SQL every time.
+                    let schema = match query.get(0, "sql") {
+                        Some(Value::String(sql)) => {
+                            match Parser::new(&sql).try_parse()?.remove(0) {
+                                Statement::Create(Create::Table { columns, .. }) => columns,
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let root = match query.get(0, "root") {
+                        Some(Value::Number(root)) => root.parse().unwrap(),
+                        _ => unreachable!(),
+                    };
+
+                    (schema, root)
+                };
+
+                let mut btree =
+                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+
+                // TODO: Use some cursor or something to delete as we traverse the tree.
+                let mut row_ids = Vec::new();
+
+                for row in btree.iter() {
+                    // TODO: Deserialize only needed values instead of all and the cloning...
+                    let row = row?;
+                    let row_id = u64::from_le_bytes(row[..8].try_into().unwrap());
+                    let values = Self::deserialize_values(row, &schema);
+
+                    if let Some(expr) = &r#where {
+                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                            continue;
+                        }
+                    }
+
+                    row_ids.push(row_id);
+                }
+
+                // TODO: Second mutable borrow occurs here?
+                let mut btree =
+                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+
+                for r in row_ids {
+                    btree.remove(&r.to_le_bytes())?;
+                }
+
+                Ok(QueryExecution {
+                    schema: Vec::new(),
+                    results: Vec::new(),
+                })
+            }
+
+            Statement::Update {
+                table,
+                columns,
+                r#where,
+            } => {
+                let (mut schema, root) = 'meta: {
+                    if table == MKDB_META {
+                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
+                    }
+
+                    let query = self.execute(format!(
+                        "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
+                    ))?;
+
+                    if query.is_empty() {
+                        return Err(DbError::Sql(SqlError::InvalidTable(table)));
+                    }
+
+                    // TODO: Find some way to avoid parsing SQL every time.
+                    let schema = match query.get(0, "sql") {
+                        Some(Value::String(sql)) => {
+                            match Parser::new(&sql).try_parse()?.remove(0) {
+                                Statement::Create(Create::Table { columns, .. }) => columns,
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let root = match query.get(0, "root") {
+                        Some(Value::Number(root)) => root.parse().unwrap(),
+                        _ => unreachable!(),
+                    };
+
+                    (schema, root)
+                };
+
+                let mut assignments = Vec::new();
+
+                for c in columns {
+                    match c {
+                        Expression::BinaryOperation {
+                            left,
+                            operator,
+                            right,
+                        } => match operator {
+                            BinaryOperator::Eq => {
+                                let Expression::Identifier(ident) = *left else {
+                                    return Err(DbError::Sql(SqlError::Other(
+                                        "must be identifier".into(),
+                                    )));
+                                };
+
+                                assignments.push((ident, right));
+                            }
+                            _ => {
+                                return Err(DbError::Sql(SqlError::Other(String::from(
+                                    "UPDATE must have assignments",
+                                ))))
+                            }
+                        },
+                        _ => {
+                            return Err(DbError::Sql(SqlError::Other(String::from(
+                                "UPDATE must have assignments",
+                            ))))
+                        }
+                    }
+                }
+
+                let mut btree =
+                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+
+                let mut updates = Vec::new();
+
+                for row in btree.iter() {
+                    // TODO: Deserialize only needed values instead of all and then cloning...
+                    let row = row?;
+                    let row_id = u64::from_le_bytes(row[..8].try_into().unwrap());
+                    let mut values = Self::deserialize_values(row, &schema);
+
+                    if let Some(expr) = &r#where {
+                        if !Self::exec_where_clause(&values, &schema, &expr).is_truthy() {
+                            continue;
+                        }
+                    }
+
+                    for (col, expr) in &assignments {
+                        let v = match **expr {
+                            Expression::Value(ref v) => v.clone(),
+                            _ => Self::exec_where_clause(&values, &schema, expr),
+                        };
+
+                        let p = schema.iter().position(|s| &s.name == col).unwrap();
+
+                        values[p] = v;
+
+                        let mut buf = Vec::from(row_id.to_le_bytes());
+                        buf.append(&mut Self::serialize_values(&values));
+
+                        updates.push(buf);
+                    }
+                }
+
+                // TODO: Second mutable borrow...
+                let mut btree =
+                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+
+                for u in updates {
+                    btree.insert(u)?;
+                }
+
+                Ok(QueryExecution {
+                    schema: Vec::new(),
+                    results: Vec::new(),
                 })
             }
 
@@ -871,6 +1074,202 @@ mod tests {
                         Value::Number("4".into()),
                         Value::String("products".into()),
                         Value::String(Parser::new(&t3).try_parse().unwrap()[0].to_string())
+                    ]
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn delete_all() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+
+        db.execute("DELETE FROM users;".into())?;
+
+        let query = db.execute("SELECT * FROM users;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExecution {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ],
+                results: vec![]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn delete_where() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+
+        db.execute("DELETE FROM users WHERE age > 18;".into())?;
+
+        let query = db.execute("SELECT * FROM users;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExecution {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ],
+                results: vec![vec![
+                    Value::Number("1".into()),
+                    Value::String("John Doe".into()),
+                    Value::Number("18".into())
+                ]]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn update() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+
+        db.execute("UPDATE users SET age = 20;".into())?;
+
+        let query = db.execute("SELECT * FROM users;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExecution {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ],
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("20".into())
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::String("Jane Doe".into()),
+                        Value::Number("20".into())
+                    ],
+                    vec![
+                        Value::Number("3".into()),
+                        Value::String("Some Dude".into()),
+                        Value::Number("20".into())
+                    ]
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_where() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
+        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+
+        db.execute("UPDATE users SET age = 20, name = 'Updated Name' WHERE age > 18;".into())?;
+
+        let query = db.execute("SELECT * FROM users;".into())?;
+
+        assert_eq!(
+            query,
+            QueryExecution {
+                schema: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ],
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("18".into())
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::String("Updated Name".into()),
+                        Value::Number("20".into())
+                    ],
+                    vec![
+                        Value::Number("3".into()),
+                        Value::String("Updated Name".into()),
+                        Value::Number("20".into())
                     ]
                 ]
             }

@@ -1464,9 +1464,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Root underflow.
         if is_root && node.is_underflow(is_root) {
             let child_page = node.header().right_child;
-            let mut child_node = self.cache.get(child_page)?.clone();
-            self.cache.get_mut(page)?.append(&mut child_node);
-            self.cache.pager.free_page(child_page)?;
+
+            if child_page != 0 {
+                let mut child_node = self.cache.get(child_page)?.clone();
+                self.cache.get_mut(page)?.append(&mut child_node);
+                self.cache.pager.free_page(child_page)?;
+            }
 
             return Ok(());
         }
