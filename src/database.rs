@@ -153,66 +153,82 @@ impl QueryExecution {
             .flatten()
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
 
     pub fn as_ascii_table(&self) -> String {
-        let mut width: Vec<_> = self.schema.iter().map(|column| column.name.len()).collect();
-        // TODO: Remove repeated calls to "to_string()".
-        for row in &self.results {
+        // Initialize width of each column to the length of the table headers.
+        let mut widths: Vec<usize> = self.schema.iter().map(|column| column.name.len()).collect();
+
+        // We only need strings.
+        let rows: Vec<Vec<String>> = self
+            .results
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect();
+
+        // Find the maximum width for each column.
+        for row in &rows {
             for (i, col) in row.iter().enumerate() {
-                if col.to_string().len() > width[i] {
-                    width[i] = col.to_string().len();
+                if col.len() > widths[i] {
+                    widths[i] = col.len();
                 }
             }
         }
 
-        width.iter_mut().for_each(|w| *w += 2);
+        // We'll add both a leading and trailing space to the widest string in
+        // each column, so increase width by 2.
+        widths.iter_mut().for_each(|w| *w += 2);
 
+        // Create border according to width: +-----+---------+------+-----+
         let mut border = String::from('+');
-        border.push_str(
-            &width
-                .iter()
-                .map(|w| "-".repeat(*w))
-                .collect::<Vec<_>>()
-                .join("+"),
-        );
-        border.push('+');
+        for width in &widths {
+            for _ in 0..*width {
+                border.push('-');
+            }
+            border.push('+');
+        }
 
-        let make_row = |row: Vec<String>| -> String {
+        // Builds one row: | for | example | this | one |
+        let make_row = |row: &Vec<String>| -> String {
             let mut string = String::from('|');
 
-            let mut buf = Vec::new();
             for (i, col) in row.iter().enumerate() {
-                let text = format!(" {col}");
-                let trailing_spaces = " ".repeat(width[i] - text.len());
-                buf.push(format!("{text}{trailing_spaces}"));
+                string.push(' ');
+                string.push_str(&col);
+                for _ in 0..widths[i] - col.len() - 1 {
+                    string.push(' ');
+                }
+                string.push('|');
             }
-
-            string.push_str(&buf.join("|"));
-            string.push('|');
 
             string
         };
 
-        let mut string = String::from(&border);
-        string.push('\n');
-        string.push_str(&make_row(
-            self.schema.iter().map(|c| c.name.clone()).collect(),
+        // Header
+        let mut table = String::from(&border);
+        table.push('\n');
+
+        table.push_str(&make_row(
+            &self.schema.iter().map(|col| col.name.clone()).collect(),
         ));
-        string.push('\n');
-        string.push_str(&border);
-        string.push('\n');
-        for row in &self.results {
-            string.push_str(&make_row(row.iter().map(ToString::to_string).collect()));
-            string.push('\n');
-        }
-        if !self.results.is_empty() {
-            string.push_str(&border);
+        table.push('\n');
+
+        table.push_str(&border);
+        table.push('\n');
+
+        // Content
+        for row in &rows {
+            table.push_str(&make_row(row));
+            table.push('\n');
         }
 
-        string
+        if !rows.is_empty() {
+            table.push_str(&border);
+        }
+
+        table
     }
 }
 
@@ -623,7 +639,6 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 let row_id = self.next_row_id(into, root);
-                println!("Using row id {row_id}");
 
                 let mut btree =
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
