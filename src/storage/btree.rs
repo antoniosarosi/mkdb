@@ -274,8 +274,7 @@ pub(crate) struct BTree<'c, F, C> {
 }
 
 impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
-    #[allow(dead_code)]
-    pub fn new_with_comparator(
+    pub fn new(
         cache: &'c mut Cache<F>,
         root: PageNumber,
         balance_siblings_per_side: usize,
@@ -291,7 +290,7 @@ impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
 }
 
 /// Default value for [`BTree::balance_siblings_per_side`].
-const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
+pub(crate) const DEFAULT_BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 
 impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
@@ -1855,7 +1854,7 @@ mod tests {
 
     use std::{io, mem};
 
-    use super::{BTree, FixedSizeMemCmp, BALANCE_SIBLINGS_PER_SIDE};
+    use super::{BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
         database::{Header, MAGIC},
         paging::{
@@ -1887,10 +1886,23 @@ mod tests {
         }
     }
 
+    /// Fixed size key used for most of the tests.
+    type Key = u32;
+
+    /// Serialize into big endian and use [`FixedSizeMemCmp`] for comparisons.
+    fn serialize_key(key: Key) -> [u8; mem::size_of::<Key>()] {
+        key.to_be_bytes()
+    }
+
+    fn deserialize_key(buf: &[u8]) -> Key {
+        Key::from_be_bytes(buf[..mem::size_of::<Key>()].try_into().unwrap())
+    }
+
     /// Builder for [`BTree<MemBuf>`] with fixed size keys.
     struct Builder {
-        keys: Vec<u32>,
+        keys: Vec<Key>,
         order: usize,
+        page_size: Option<usize>,
         balance_siblings_per_side: usize,
     }
 
@@ -1899,13 +1911,14 @@ mod tests {
             Builder {
                 keys: vec![],
                 order: 4,
-                balance_siblings_per_side: BALANCE_SIBLINGS_PER_SIDE,
+                page_size: None,
+                balance_siblings_per_side: DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
             }
         }
     }
 
     impl Builder {
-        fn keys(mut self, keys: impl IntoIterator<Item = u32>) -> Self {
+        fn keys(mut self, keys: impl IntoIterator<Item = Key>) -> Self {
             self.keys = keys.into_iter().collect();
             self
         }
@@ -1915,21 +1928,26 @@ mod tests {
             self
         }
 
+        fn page_size(mut self, page_size: usize) -> Self {
+            self.page_size = Some(page_size);
+            self
+        }
+
         fn balance_siblings_per_side(mut self, balance_siblings_per_side: usize) -> Self {
             self.balance_siblings_per_side = balance_siblings_per_side;
             self
         }
 
         fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf, FixedSizeMemCmp>> {
-            let page_size = optimal_page_size_for(self.order);
+            let page_size = self.page_size.unwrap_or(optimal_page_size_for(self.order));
             let buf = io::Cursor::new(Vec::new());
 
             // TODO: Do something about leaking, we shouldn't need that here.
-            let mut btree = BTree::new_with_comparator(
+            let mut btree = BTree::new(
                 Box::leak(Box::new(Cache::new(Pager::new(buf, page_size, page_size)))),
                 1,
                 self.balance_siblings_per_side,
-                FixedSizeMemCmp::for_type::<u32>(),
+                FixedSizeMemCmp::for_type::<Key>(),
             );
 
             btree.cache.pager.write_header(Header {
@@ -1960,7 +1978,7 @@ mod tests {
 
             let mut node = Node {
                 keys: (0..page.len())
-                    .map(|i| u32::from_be_bytes(page.cell(i).content[..4].try_into().unwrap()))
+                    .map(|i| deserialize_key(page.cell(i).content))
                     .collect(),
                 children: vec![],
             };
@@ -1976,17 +1994,17 @@ mod tests {
             Builder::default()
         }
 
-        fn insert_key(&mut self, key: u32) -> io::Result<()> {
-            self.insert(Vec::from(key.to_be_bytes()))
+        fn insert_key(&mut self, key: Key) -> io::Result<()> {
+            self.insert(Vec::from(serialize_key(key)))
         }
 
-        fn remove_key(&mut self, key: u32) -> io::Result<Option<Box<[u8]>>> {
-            self.remove(&key.to_be_bytes())
+        fn remove_key(&mut self, key: Key) -> io::Result<Option<Box<[u8]>>> {
+            self.remove(&serialize_key(key))
         }
 
-        fn extend_from_keys(&mut self, keys: impl IntoIterator<Item = u32>) -> io::Result<()> {
+        fn extend_from_keys(&mut self, keys: impl IntoIterator<Item = Key>) -> io::Result<()> {
             for key in keys {
-                self.insert(Vec::from(key.to_be_bytes()))?;
+                self.insert(Vec::from(serialize_key(key)))?;
             }
 
             Ok(())
@@ -1996,11 +2014,9 @@ mod tests {
             &mut self,
             keys: impl IntoIterator<Item = u32>,
         ) -> io::Result<Vec<Option<Box<[u8]>>>> {
-            let mut results = Vec::new();
-            for k in keys {
-                results.push(self.remove(&k.to_be_bytes())?);
-            }
-            Ok(results)
+            keys.into_iter()
+                .map(|key| self.remove(&serialize_key(key)))
+                .collect()
         }
     }
 
@@ -3253,16 +3269,7 @@ mod tests {
             vec![8],
         ];
 
-        let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
-        let mut btree =
-            BTree::new_with_comparator(&mut cache, 1, 1, FixedSizeMemCmp::for_type::<u32>());
-
-        btree.cache.pager.write_header(Header {
-            magic: MAGIC,
-            page_size: page_size as _,
-            total_pages: 2,
-            first_free_page: 0,
-        })?;
+        let mut btree = BTree::builder().page_size(page_size).try_build()?;
 
         for (i, size) in payload_sizes.iter().flatten().enumerate() {
             let mut entry = vec![0; *size];
@@ -3304,16 +3311,7 @@ mod tests {
             large_key.extend(&(0..=255).collect::<Vec<u8>>());
         }
 
-        let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
-        let mut btree =
-            BTree::new_with_comparator(&mut cache, 1, 1, FixedSizeMemCmp::for_type::<u32>());
-
-        btree.cache.pager.write_header(Header {
-            magic: MAGIC,
-            page_size: page_size as _,
-            total_pages: 2,
-            first_free_page: 0,
-        })?;
+        let mut btree = BTree::builder().page_size(page_size).try_build()?;
 
         btree.insert(large_key.clone())?;
 

@@ -18,7 +18,7 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
     },
-    storage::{page::Page, BTree, FixedSizeMemCmp},
+    storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
 };
 
 /// Name of the meta-table used to keep track of other tables.
@@ -30,6 +30,10 @@ pub(crate) const MKDB_META_ROOT: PageNumber = 1;
 
 /// Magic number at the beginning of the database file.
 pub(crate) const MAGIC: u32 = 0xB74EE;
+
+/// Rows are uniquely identified by an 8 byte key stored in big endian at the
+/// beginning of each tuple.
+type RowId = u64;
 
 /// Database file header. Located at the beginning of the DB file.
 #[derive(Debug, Clone, Copy)]
@@ -63,19 +67,38 @@ pub(crate) enum TypeError {
         operator: BinaryOperator,
         right: Value,
     },
+    ExpectedType {
+        expected: ExpectedType,
+        found: Value,
+    },
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ExpectedExpression {
     Identifier,
     Assignment,
+    Value,
 }
 
 impl Display for ExpectedExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Identifier => "identifier",
+            Self::Value => "raw value",
             Self::Assignment => "assignment",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ExpectedType {
+    Bool,
+}
+
+impl Display for ExpectedType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bool => "boolean",
         })
     }
 }
@@ -110,6 +133,13 @@ impl Display for SqlError {
                     f,
                     "cannot binary operator '{operator}' to {left} and {right}"
                 ),
+
+                TypeError::ExpectedType { expected, found } => {
+                    write!(
+                        f,
+                        "expected type {expected} but expression resolved to {found}"
+                    )
+                }
             },
             Self::Expected { expected, found } => write!(f, "expected {expected}, found {found}"),
             Self::Other(message) => f.write_str(message),
@@ -324,6 +354,15 @@ impl Database<File> {
 }
 
 impl<I: Seek + Read + Write> Database<I> {
+    fn btree(&mut self, root: PageNumber) -> BTree<'_, I, FixedSizeMemCmp> {
+        BTree::new(
+            &mut self.cache,
+            root,
+            DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        )
+    }
+
     fn resolve_expression(
         values: &Vec<Value>,
         schema: &Vec<Column>,
@@ -424,8 +463,27 @@ impl<I: Seek + Read + Write> Database<I> {
         }
     }
 
-    fn serialize_values(schema: &Vec<Column>, values: &Vec<Value>) -> Vec<u8> {
-        let mut buf = Vec::new();
+    fn eval_where(
+        schema: &Vec<Column>,
+        values: &Vec<Value>,
+        r#where: &Option<Expression>,
+    ) -> Result<bool, SqlError> {
+        let Some(expr) = r#where else {
+            return Ok(true);
+        };
+
+        match Self::resolve_expression(&values, &schema, &expr)? {
+            Value::Bool(b) => Ok(b),
+
+            other => Err(SqlError::TypeError(TypeError::ExpectedType {
+                expected: ExpectedType::Bool,
+                found: other,
+            })),
+        }
+    }
+
+    fn serialize_values(row_id: RowId, schema: &Vec<Column>, values: &Vec<Value>) -> Vec<u8> {
+        let mut buf = Vec::from(row_id.to_be_bytes());
 
         // TODO: Alignment.
         for (col, val) in schema.iter().zip(values) {
@@ -465,11 +523,12 @@ impl<I: Seek + Read + Write> Database<I> {
         buf
     }
 
-    fn deserialize_values(buf: Box<[u8]>, schema: &Vec<Column>) -> Vec<Value> {
+    fn deserialize_values(buf: Box<[u8]>, schema: &Vec<Column>) -> (RowId, Vec<Value>) {
         let mut values = Vec::new();
 
-        // Skip row_id
-        let mut idx = 8;
+        let mut idx = mem::size_of::<RowId>();
+
+        let row_id = RowId::from_be_bytes(buf[..idx].try_into().unwrap());
 
         for column in schema {
             match column.data_type {
@@ -530,7 +589,7 @@ impl<I: Seek + Read + Write> Database<I> {
             }
         }
 
-        values
+        (row_id, values)
     }
 
     fn table_metadata(&mut self, table: &String) -> Result<(Vec<Column>, PageNumber), DbError> {
@@ -563,18 +622,13 @@ impl<I: Seek + Read + Write> Database<I> {
         Ok((schema, root))
     }
 
-    fn next_row_id(&mut self, table: String, root: PageNumber) -> u64 {
+    fn next_row_id(&mut self, table: String, root: PageNumber) -> RowId {
         if let Some(row_id) = self.row_ids.get_mut(&table) {
             *row_id += 1;
             return *row_id;
         }
 
-        let mut btree = BTree::new_with_comparator(
-            &mut self.cache,
-            root,
-            1,
-            FixedSizeMemCmp::for_type::<u64>(),
-        );
+        let mut btree = self.btree(root);
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
         let row_id = if let Some(max) = btree.max().unwrap() {
@@ -601,7 +655,7 @@ impl<I: Seek + Read + Write> Database<I> {
         let sql = statement.to_string();
 
         // TODO: Parse and execute statements one by one.
-        // TODO: SQL injections.
+        // TODO: SQL injections through the table name?.
         match statement {
             Statement::Create(Create::Table { name, columns }) => {
                 let table_root = Page::new(
@@ -643,29 +697,29 @@ impl<I: Seek + Read + Write> Database<I> {
                 let mut values_only = vec![Value::Bool(false); values.len()];
 
                 for (col, expr) in columns.iter().zip(values) {
-                    match expr {
-                        Expression::Value(value) => {
-                            // TODO: Do something about O(n^2)
-                            let idx = schema.iter().position(|c| &c.name == col).unwrap();
-                            values_only[idx] = value;
+                    let value = match Self::resolve_expression(&Vec::new(), &Vec::new(), &expr) {
+                        Ok(value) => value,
+
+                        Err(SqlError::InvalidColumn(col)) => {
+                            Err(DbError::Sql(SqlError::Expected {
+                                expected: ExpectedExpression::Value,
+                                found: expr,
+                            }))?
                         }
-                        _ => todo!("resolve the value or throw error if not possible"),
-                    }
+
+                        Err(e) => Err(e)?,
+                    };
+
+                    // TODO: Do something about O(n^2)
+                    let idx = schema.iter().position(|c| &c.name == col).unwrap();
+                    values_only[idx] = value;
                 }
 
                 let row_id = self.next_row_id(into, root);
 
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                let mut btree = self.btree(root);
 
-                let mut buf = Vec::from(row_id.to_be_bytes());
-                buf.append(&mut Self::serialize_values(&schema, &values_only));
-
-                btree.insert(buf)?;
+                btree.insert(Self::serialize_values(row_id, &schema, &values_only))?;
 
                 Ok(QueryExecution {
                     schema: Vec::new(),
@@ -683,21 +737,16 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 let mut results = Vec::new();
 
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                let mut btree = self.btree(root);
 
                 let mut identifiers = Vec::new();
 
-                for c in &columns {
-                    match c {
+                for select_col in &columns {
+                    match select_col {
                         Expression::Identifier(ident) => identifiers.push(ident.to_owned()),
                         Expression::Wildcard => {
-                            for s in &schema {
-                                identifiers.push(s.name.to_owned());
+                            for col in &schema {
+                                identifiers.push(col.name.to_owned());
                             }
                         }
                         _ => todo!("resolve expressions"),
@@ -706,14 +755,10 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and the cloning...
-                    let values = Self::deserialize_values(row?, &schema);
+                    let (_, values) = Self::deserialize_values(row?, &schema);
 
-                    if let Some(expr) = &r#where {
-                        if let Value::Bool(false) =
-                            Self::resolve_expression(&values, &schema, &expr)?
-                        {
-                            continue;
-                        }
+                    if !Self::eval_where(&schema, &values, &r#where)? {
+                        continue;
                     }
 
                     let mut result = Vec::new();
@@ -745,10 +790,12 @@ impl<I: Seek + Read + Write> Database<I> {
                         for i in &order_by_cols {
                             let cmp = match (&a[*i], &b[*i]) {
                                 (Value::Number(a), Value::Number(b)) => {
-                                    a.parse::<u32>().unwrap().cmp(&b.parse().unwrap())
+                                    // TODO: Use i128 or a bunch of IFs to determine the actual
+                                    // type? What's faster?
+                                    a.parse::<i128>().unwrap().cmp(&b.parse().unwrap())
                                 }
                                 (Value::String(a), Value::String(b)) => a.cmp(b),
-                                (Value::Bool(a), Value::Bool(b)) => todo!("order bools"),
+                                (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
                                 _ => unreachable!("columns should have the same type"),
                             };
 
@@ -770,12 +817,7 @@ impl<I: Seek + Read + Write> Database<I> {
             Statement::Delete { from, r#where } => {
                 let (schema, root) = self.table_metadata(&from)?;
 
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                let mut btree = self.btree(root);
 
                 // TODO: Use some cursor or something to delete as we traverse the tree.
                 let mut row_ids = Vec::new();
@@ -783,27 +825,17 @@ impl<I: Seek + Read + Write> Database<I> {
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and the cloning...
                     let row = row?;
-                    let row_id = u64::from_be_bytes(row[..8].try_into().unwrap());
-                    let values = Self::deserialize_values(row, &schema);
+                    let (row_id, values) = Self::deserialize_values(row, &schema);
 
-                    if let Some(expr) = &r#where {
-                        if let Value::Bool(false) =
-                            Self::resolve_expression(&values, &schema, &expr)?
-                        {
-                            continue;
-                        }
+                    if !Self::eval_where(&schema, &values, &r#where)? {
+                        continue;
                     }
 
                     row_ids.push(row_id);
                 }
 
                 // TODO: Second mutable borrow occurs here?
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                let mut btree = self.btree(root);
 
                 for r in row_ids {
                     btree.remove(&r.to_be_bytes())?;
@@ -847,27 +879,17 @@ impl<I: Seek + Read + Write> Database<I> {
                     assignments.push((ident, right));
                 }
 
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                let mut btree = self.btree(root);
 
                 let mut updates = Vec::new();
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and then cloning...
                     let row = row?;
-                    let row_id = u64::from_be_bytes(row[..8].try_into().unwrap());
-                    let mut values = Self::deserialize_values(row, &schema);
+                    let (row_id, mut values) = Self::deserialize_values(row, &schema);
 
-                    if let Some(expr) = &r#where {
-                        if let Value::Bool(false) =
-                            Self::resolve_expression(&values, &schema, &expr)?
-                        {
-                            continue;
-                        }
+                    if !Self::eval_where(&schema, &values, &r#where)? {
+                        continue;
                     }
 
                     for (col, expr) in &assignments {
@@ -880,20 +902,12 @@ impl<I: Seek + Read + Write> Database<I> {
 
                         values[p] = v;
 
-                        let mut buf = Vec::from(row_id.to_be_bytes());
-                        buf.append(&mut Self::serialize_values(&schema, &values));
-
-                        updates.push(buf);
+                        updates.push(Self::serialize_values(row_id, &schema, &values));
                     }
                 }
 
-                // TODO: Second mutable borrow...
-                let mut btree = BTree::new_with_comparator(
-                    &mut self.cache,
-                    root,
-                    1,
-                    FixedSizeMemCmp::for_type::<u64>(),
-                );
+                // TODO: Second mutable borrow occurs here?
+                let mut btree = self.btree(root);
 
                 for update in updates {
                     btree.insert(update)?;
