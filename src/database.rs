@@ -36,8 +36,7 @@ pub(crate) struct RowIdComparator;
 impl BytesCmp for RowIdComparator {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         // TODO: Store Row ID in Big Endian format to avoid parsing.
-        u64::from_le_bytes(a[..8].try_into().unwrap())
-            .cmp(&u64::from_le_bytes(b[..8].try_into().unwrap()))
+        a[..8].cmp(&b[..8])
     }
 }
 
@@ -76,10 +75,29 @@ pub(crate) enum TypeError {
 }
 
 #[derive(Debug, PartialEq)]
+pub(crate) enum ExpectedExpression {
+    Identifier,
+    Assignment,
+}
+
+impl Display for ExpectedExpression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Identifier => "identifier",
+            Self::Assignment => "assignment",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub(crate) enum SqlError {
     InvalidTable(String),
     InvalidColumn(String),
     TypeError(TypeError),
+    Expected {
+        expected: ExpectedExpression,
+        found: Expression,
+    },
     Other(String),
 }
 
@@ -102,6 +120,7 @@ impl Display for SqlError {
                     "cannot binary operator '{operator}' to {left} and {right}"
                 ),
             },
+            Self::Expected { expected, found } => write!(f, "expected {expected}, found {found}"),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -474,7 +493,7 @@ impl<I: Seek + Read + Write> Database<I> {
                         len as usize
                     };
 
-                    // TODO: Used lossy to avoid converting to Vec<u8>, check how to make this better.
+                    // TODO: Check if we should use from_ut8_lossy() or from_utf8()
                     values.push(Value::String(
                         String::from_utf8_lossy(&buf[idx..(idx + length)]).to_string(),
                     ));
@@ -523,6 +542,36 @@ impl<I: Seek + Read + Write> Database<I> {
         values
     }
 
+    fn table_metadata(&mut self, table: &String) -> Result<(Vec<Column>, PageNumber), DbError> {
+        if table == MKDB_META {
+            return Ok((mkdb_meta_schema(), MKDB_META_ROOT));
+        }
+
+        let query = self.execute(format!(
+            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
+        ))?;
+
+        if query.is_empty() {
+            return Err(DbError::Sql(SqlError::InvalidTable(table.clone())));
+        }
+
+        // TODO: Find some way to avoid parsing SQL every time.
+        let schema = match query.get(0, "sql") {
+            Some(Value::String(sql)) => match Parser::new(&sql).parse_statement()? {
+                Statement::Create(Create::Table { columns, .. }) => columns,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+
+        let root = match query.get(0, "root") {
+            Some(Value::Number(root)) => root.parse().unwrap(),
+            _ => unreachable!(),
+        };
+
+        Ok((schema, root))
+    }
+
     fn next_row_id(&mut self, table: String, root: PageNumber) -> u64 {
         if let Some(row_id) = self.row_ids.get_mut(&table) {
             *row_id += 1;
@@ -533,7 +582,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
         let row_id = if let Some(max) = btree.max().unwrap() {
-            u64::from_le_bytes(max.as_ref()[..8].try_into().unwrap()) + 1
+            u64::from_be_bytes(max.as_ref()[..8].try_into().unwrap()) + 1
         } else {
             1
         };
@@ -553,7 +602,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
         let statement = statements.remove(0);
 
-        let stmt_sql = statement.to_string();
+        let sql = statement.to_string();
 
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections.
@@ -571,7 +620,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 #[rustfmt::skip]
                 self.execute(format!(r#"
                     INSERT INTO {MKDB_META} (type, name, root, table_name, sql)
-                    VALUES ("table", "{name}", {root_page}, "{name}", '{stmt_sql}');
+                    VALUES ("table", "{name}", {root_page}, "{name}", '{sql}');
                 "#))?;
 
                 Ok(QueryExecution {
@@ -585,37 +634,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 columns,
                 values,
             } => {
-                let (schema, root) = 'meta: {
-                    if into == MKDB_META {
-                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
-                    }
-
-                    let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table_name = '{into}';"
-                    ))?;
-
-                    if query.is_empty() {
-                        return Err(DbError::Sql(SqlError::InvalidTable(into)));
-                    }
-
-                    // TODO: Find some way to avoid parsing SQL every time.
-                    let schema = match query.get(0, "sql") {
-                        Some(Value::String(sql)) => {
-                            match Parser::new(&sql).try_parse()?.remove(0) {
-                                Statement::Create(Create::Table { columns, .. }) => columns,
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let root = match query.get(0, "root") {
-                        Some(Value::Number(root)) => root.parse().unwrap(),
-                        _ => unreachable!(),
-                    };
-
-                    (schema, root)
-                };
+                let (schema, root) = self.table_metadata(&into)?;
 
                 if columns.len() != values.len() {
                     todo!("number of columns doesn't match values");
@@ -643,7 +662,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 let mut btree =
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
 
-                let mut buf = Vec::from(row_id.to_le_bytes());
+                let mut buf = Vec::from(row_id.to_be_bytes());
                 buf.append(&mut Self::serialize_values(&schema, &values_only));
 
                 btree.insert(buf)?;
@@ -660,37 +679,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 r#where,
                 order_by,
             } => {
-                let (mut schema, root) = 'meta: {
-                    if from == MKDB_META {
-                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
-                    }
-
-                    let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table_name = '{from}';"
-                    ))?;
-
-                    if query.is_empty() {
-                        return Err(DbError::Sql(SqlError::InvalidTable(from)));
-                    }
-
-                    // TODO: Find some way to avoid parsing SQL every time.
-                    let schema = match query.get(0, "sql") {
-                        Some(Value::String(sql)) => {
-                            match Parser::new(&sql).try_parse()?.remove(0) {
-                                Statement::Create(Create::Table { columns, .. }) => columns,
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let root = match query.get(0, "root") {
-                        Some(Value::Number(root)) => root.parse().unwrap(),
-                        _ => unreachable!(),
-                    };
-
-                    (schema, root)
-                };
+                let (mut schema, root) = self.table_metadata(&from)?;
 
                 let mut results = Vec::new();
 
@@ -775,37 +764,7 @@ impl<I: Seek + Read + Write> Database<I> {
             }
 
             Statement::Delete { from, r#where } => {
-                let (mut schema, root) = 'meta: {
-                    if from == MKDB_META {
-                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
-                    }
-
-                    let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table_name = '{from}';"
-                    ))?;
-
-                    if query.is_empty() {
-                        return Err(DbError::Sql(SqlError::InvalidTable(from)));
-                    }
-
-                    // TODO: Find some way to avoid parsing SQL every time.
-                    let schema = match query.get(0, "sql") {
-                        Some(Value::String(sql)) => {
-                            match Parser::new(&sql).try_parse()?.remove(0) {
-                                Statement::Create(Create::Table { columns, .. }) => columns,
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let root = match query.get(0, "root") {
-                        Some(Value::Number(root)) => root.parse().unwrap(),
-                        _ => unreachable!(),
-                    };
-
-                    (schema, root)
-                };
+                let (schema, root) = self.table_metadata(&from)?;
 
                 let mut btree =
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
@@ -816,7 +775,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and the cloning...
                     let row = row?;
-                    let row_id = u64::from_le_bytes(row[..8].try_into().unwrap());
+                    let row_id = u64::from_be_bytes(row[..8].try_into().unwrap());
                     let values = Self::deserialize_values(row, &schema);
 
                     if let Some(expr) = &r#where {
@@ -835,7 +794,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
 
                 for r in row_ids {
-                    btree.remove(&r.to_le_bytes())?;
+                    btree.remove(&r.to_be_bytes())?;
                 }
 
                 Ok(QueryExecution {
@@ -849,68 +808,31 @@ impl<I: Seek + Read + Write> Database<I> {
                 columns,
                 r#where,
             } => {
-                let (mut schema, root) = 'meta: {
-                    if table == MKDB_META {
-                        break 'meta (mkdb_meta_schema(), MKDB_META_ROOT);
-                    }
-
-                    let query = self.execute(format!(
-                        "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
-                    ))?;
-
-                    if query.is_empty() {
-                        return Err(DbError::Sql(SqlError::InvalidTable(table)));
-                    }
-
-                    // TODO: Find some way to avoid parsing SQL every time.
-                    let schema = match query.get(0, "sql") {
-                        Some(Value::String(sql)) => {
-                            match Parser::new(&sql).try_parse()?.remove(0) {
-                                Statement::Create(Create::Table { columns, .. }) => columns,
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let root = match query.get(0, "root") {
-                        Some(Value::Number(root)) => root.parse().unwrap(),
-                        _ => unreachable!(),
-                    };
-
-                    (schema, root)
-                };
+                let (schema, root) = self.table_metadata(&table)?;
 
                 let mut assignments = Vec::new();
 
-                for c in columns {
-                    match c {
-                        Expression::BinaryOperation {
-                            left,
-                            operator,
-                            right,
-                        } => match operator {
-                            BinaryOperator::Eq => {
-                                let Expression::Identifier(ident) = *left else {
-                                    return Err(DbError::Sql(SqlError::Other(
-                                        "must be identifier".into(),
-                                    )));
-                                };
+                for col in columns {
+                    let Expression::BinaryOperation {
+                        left,
+                        operator: BinaryOperator::Eq,
+                        right,
+                    } = col
+                    else {
+                        return Err(DbError::Sql(SqlError::Expected {
+                            expected: ExpectedExpression::Assignment,
+                            found: col,
+                        }));
+                    };
 
-                                assignments.push((ident, right));
-                            }
-                            _ => {
-                                return Err(DbError::Sql(SqlError::Other(String::from(
-                                    "UPDATE must have assignments",
-                                ))))
-                            }
-                        },
-                        _ => {
-                            return Err(DbError::Sql(SqlError::Other(String::from(
-                                "UPDATE must have assignments",
-                            ))))
-                        }
-                    }
+                    let Expression::Identifier(ident) = *left else {
+                        return Err(DbError::Sql(SqlError::Expected {
+                            expected: ExpectedExpression::Identifier,
+                            found: *left,
+                        }));
+                    };
+
+                    assignments.push((ident, right));
                 }
 
                 let mut btree =
@@ -921,7 +843,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and then cloning...
                     let row = row?;
-                    let row_id = u64::from_le_bytes(row[..8].try_into().unwrap());
+                    let row_id = u64::from_be_bytes(row[..8].try_into().unwrap());
                     let mut values = Self::deserialize_values(row, &schema);
 
                     if let Some(expr) = &r#where {
@@ -942,7 +864,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
                         values[p] = v;
 
-                        let mut buf = Vec::from(row_id.to_le_bytes());
+                        let mut buf = Vec::from(row_id.to_be_bytes());
                         buf.append(&mut Self::serialize_values(&schema, &values));
 
                         updates.push(buf);
@@ -953,8 +875,8 @@ impl<I: Seek + Read + Write> Database<I> {
                 let mut btree =
                     BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
 
-                for u in updates {
-                    btree.insert(u)?;
+                for update in updates {
+                    btree.insert(update)?;
                 }
 
                 Ok(QueryExecution {
@@ -1016,7 +938,7 @@ mod tests {
                     Value::String("users".into()),
                     Value::Number("2".into()),
                     Value::String("users".into()),
-                    Value::String(Parser::new(&sql).try_parse().unwrap()[0].to_string())
+                    Value::String(Parser::new(&sql).parse_statement()?.to_string())
                 ]]
             }
         );
@@ -1193,21 +1115,21 @@ mod tests {
                         Value::String("users".into()),
                         Value::Number("2".into()),
                         Value::String("users".into()),
-                        Value::String(Parser::new(&t1).try_parse().unwrap()[0].to_string())
+                        Value::String(Parser::new(&t1).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("tasks".into()),
                         Value::Number("3".into()),
                         Value::String("tasks".into()),
-                        Value::String(Parser::new(&t2).try_parse().unwrap()[0].to_string())
+                        Value::String(Parser::new(&t2).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("products".into()),
                         Value::Number("4".into()),
                         Value::String("products".into()),
-                        Value::String(Parser::new(&t3).try_parse().unwrap()[0].to_string())
+                        Value::String(Parser::new(&t3).parse_statement()?.to_string())
                     ]
                 ]
             }

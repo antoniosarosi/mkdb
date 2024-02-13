@@ -131,12 +131,20 @@ pub(crate) enum Drop {
     Database(String),
 }
 
-fn join<T: ToString>(values: &Vec<T>, separator: &str) -> String {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(separator)
+/// Optimized version of [`std::slice::Join`] with no intermediary [`Vec`] and
+/// strings.
+fn join<T: Display>(values: &Vec<T>, separator: &str) -> String {
+    let mut joined = String::new();
+
+    // TODO: What exactly can fail here? Out of memory?
+    write!(joined, "{}", &values[0]).unwrap();
+
+    for value in values[1..].iter() {
+        joined.push_str(separator);
+        write!(joined, "{value}").unwrap();
+    }
+
+    joined
 }
 
 impl Display for DataType {
@@ -231,7 +239,7 @@ impl Display for Statement {
         match self {
             Statement::Create(create) => match create {
                 Create::Table { name, columns } => {
-                    write!(f, "CREATE TABLE {name} ({})", join(columns, ","))?;
+                    write!(f, "CREATE TABLE {name} ({})", join(columns, ", "))?;
                 }
 
                 Create::Database(name) => {
@@ -245,12 +253,12 @@ impl Display for Statement {
                 r#where,
                 order_by,
             } => {
-                write!(f, "SELECT {} FROM {from}", join(columns, ","))?;
+                write!(f, "SELECT {} FROM {from}", join(columns, ", "))?;
                 if let Some(expr) = r#where {
                     write!(f, " WHERE {expr}")?;
                 }
                 if !order_by.is_empty() {
-                    write!(f, " ORDER BY {}", join(order_by, ","))?;
+                    write!(f, " ORDER BY {}", join(order_by, ", "))?;
                 }
             }
 
@@ -266,7 +274,7 @@ impl Display for Statement {
                 columns,
                 r#where,
             } => {
-                write!(f, "UPDATE {table} SET {}", join(columns, ","))?;
+                write!(f, "UPDATE {table} SET {}", join(columns, ", "))?;
                 if let Some(expr) = r#where {
                     write!(f, " WHERE {expr}")?;
                 }
@@ -280,8 +288,8 @@ impl Display for Statement {
                 write!(
                     f,
                     "INSERT INTO {into} ({}) VALUES ({})",
-                    join(columns, ","),
-                    join(values, ",")
+                    join(columns, ", "),
+                    join(values, ", ")
                 )?;
             }
 

@@ -155,7 +155,7 @@ impl<'i> Parser<'i> {
 
     /// Parses a single SQL statement in the input string. If the statement
     /// terminator is not found then it returns [`Err`].
-    fn parse_statement(&mut self) -> ParseResult<Statement> {
+    pub fn parse_statement(&mut self) -> ParseResult<Statement> {
         let statement = match self.expect_one_of(&Self::supported_statements())? {
             Keyword::Select => {
                 let columns = self.parse_comma_separated_expressions()?;
