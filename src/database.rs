@@ -18,7 +18,7 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
     },
-    storage::{page::Page, BTree, BytesCmp},
+    storage::{page::Page, BTree, FixedSizeMemCmp},
 };
 
 /// Name of the meta-table used to keep track of other tables.
@@ -30,15 +30,6 @@ pub(crate) const MKDB_META_ROOT: PageNumber = 1;
 
 /// Magic number at the beginning of the database file.
 pub(crate) const MAGIC: u32 = 0xB74EE;
-
-pub(crate) struct RowIdComparator;
-
-impl BytesCmp for RowIdComparator {
-    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-        // TODO: Store Row ID in Big Endian format to avoid parsing.
-        a[..8].cmp(&b[..8])
-    }
-}
 
 /// Database file header. Located at the beginning of the DB file.
 #[derive(Debug, Clone, Copy)]
@@ -578,7 +569,12 @@ impl<I: Seek + Read + Write> Database<I> {
             return *row_id;
         }
 
-        let mut btree = BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+        let mut btree = BTree::new_with_comparator(
+            &mut self.cache,
+            root,
+            1,
+            FixedSizeMemCmp::for_type::<u64>(),
+        );
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
         let row_id = if let Some(max) = btree.max().unwrap() {
@@ -659,8 +655,12 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 let row_id = self.next_row_id(into, root);
 
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 let mut buf = Vec::from(row_id.to_be_bytes());
                 buf.append(&mut Self::serialize_values(&schema, &values_only));
@@ -683,8 +683,12 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 let mut results = Vec::new();
 
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 let mut identifiers = Vec::new();
 
@@ -766,8 +770,12 @@ impl<I: Seek + Read + Write> Database<I> {
             Statement::Delete { from, r#where } => {
                 let (schema, root) = self.table_metadata(&from)?;
 
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 // TODO: Use some cursor or something to delete as we traverse the tree.
                 let mut row_ids = Vec::new();
@@ -790,8 +798,12 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 // TODO: Second mutable borrow occurs here?
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 for r in row_ids {
                     btree.remove(&r.to_be_bytes())?;
@@ -835,8 +847,12 @@ impl<I: Seek + Read + Write> Database<I> {
                     assignments.push((ident, right));
                 }
 
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 let mut updates = Vec::new();
 
@@ -872,8 +888,12 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 // TODO: Second mutable borrow...
-                let mut btree =
-                    BTree::new_with_comparator(&mut self.cache, root, 1, RowIdComparator);
+                let mut btree = BTree::new_with_comparator(
+                    &mut self.cache,
+                    root,
+                    1,
+                    FixedSizeMemCmp::for_type::<u64>(),
+                );
 
                 for update in updates {
                     btree.insert(update)?;

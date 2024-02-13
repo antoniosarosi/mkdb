@@ -3,4 +3,4 @@
 mod btree;
 pub(crate) mod page;
 
-pub(crate) use btree::{BTree, BytesCmp};
+pub(crate) use btree::{BTree, BytesCmp, FixedSizeMemCmp};

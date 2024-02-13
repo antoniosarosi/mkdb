@@ -3,25 +3,29 @@
 use std::{
     cmp::{min, Ordering},
     collections::VecDeque,
-    fs::File,
     io,
     io::{Read, Seek, Write},
     mem,
-    os::unix::fs::MetadataExt,
-    path::Path,
 };
 
 use super::page::{Cell, OverflowPage, Page, SlotId};
-use crate::{
-    os::{Disk, HardwareBlockSize},
-    paging::{
-        cache::Cache,
-        pager::{PageNumber, Pager},
-    },
-};
+use crate::paging::{cache::Cache, pager::PageNumber};
 
-/// [`BTree`] key comparator. Keys are stored in binary, so we need a way to
-/// determine the correct [`Ordering`].
+/// [`BTree`] key comparator. Entries are stored in binary, so we need a way to
+/// determine the correct [`Ordering`]. Whenever two entries need to be
+/// compared, the [`BTree`] will call [`BytesCmp::bytes_cmp`] passing both
+/// binary slices as parameters. For example, suppose we need to compare the
+/// following two slices:
+///
+/// ```rust
+/// let A = [1, 0, 0, 0];
+/// let B = [2, 0, 0, 0, 0, 0, 0, 0];
+/// ```
+///
+/// The [`BTree`] will just call the comparator function with `A` and `B`, it
+/// is up to the implementer to determine the [`Ordering`]. The format of `A`
+/// and `B` is also defined by the [`BTree`] user, since the [`BTree`] only
+/// receives binary buffers as parameters.
 pub(crate) trait BytesCmp {
     /// Compares two byte arrays and returns the corresponding [`Ordering`].
     ///
@@ -32,15 +36,21 @@ pub(crate) trait BytesCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering;
 }
 
-/// Default byte comparator for [`BTree`]. It does the good old `memcmp`. This
-/// is handy for integer keys, since storing them in big endian will yield the
-/// correct results.
-pub struct MemCmp;
+/// Compares the first `self.0` number of bytes using the good old `memcmp`.
+/// This is more useful than it seems at first glance because if we store keys
+/// at the beginning of the binary buffer in big endian format, then this is
+/// all we need to successfuly determine the [`Ordering`].
+pub(crate) struct FixedSizeMemCmp(usize);
 
-impl BytesCmp for MemCmp {
+impl FixedSizeMemCmp {
+    pub fn for_type<T>() -> Self {
+        Self(mem::size_of::<T>())
+    }
+}
+
+impl BytesCmp for FixedSizeMemCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
-        let size = std::cmp::min(a.len(), b.len());
-        a[..size].cmp(&b[..size])
+        a[..self.0].cmp(&b[..self.0])
     }
 }
 
@@ -248,7 +258,7 @@ impl<'s> AsRef<[u8]> for Payload<'s> {
 /// the current node. Left child is stored in the cell header and points to
 /// the child that has keys less than the one in the cell. For the slotted page
 /// details and omitted fields see the documentation of [`super::page`] module.
-pub(crate) struct BTree<'c, F, C: BytesCmp = MemCmp> {
+pub(crate) struct BTree<'c, F, C> {
     /// Root page.
     root: PageNumber,
 
@@ -282,22 +292,6 @@ impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
 
 /// Default value for [`BTree::balance_siblings_per_side`].
 const BALANCE_SIBLINGS_PER_SIDE: usize = 1;
-
-impl<'c, F> BTree<'c, F> {
-    #[allow(dead_code)]
-    pub fn new(
-        cache: &'c mut Cache<F>,
-        root: PageNumber,
-        balance_siblings_per_side: usize,
-    ) -> Self {
-        Self {
-            cache,
-            root,
-            comparator: MemCmp,
-            balance_siblings_per_side,
-        }
-    }
-}
 
 impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
@@ -1861,7 +1855,7 @@ mod tests {
 
     use std::{io, mem};
 
-    use super::{BTree, BALANCE_SIBLINGS_PER_SIDE};
+    use super::{BTree, FixedSizeMemCmp, BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
         database::{Header, MAGIC},
         paging::{
@@ -1926,15 +1920,16 @@ mod tests {
             self
         }
 
-        fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf>> {
+        fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf, FixedSizeMemCmp>> {
             let page_size = optimal_page_size_for(self.order);
             let buf = io::Cursor::new(Vec::new());
 
             // TODO: Do something about leaking, we shouldn't need that here.
-            let mut btree = BTree::new(
+            let mut btree = BTree::new_with_comparator(
                 Box::leak(Box::new(Cache::new(Pager::new(buf, page_size, page_size)))),
                 1,
                 self.balance_siblings_per_side,
+                FixedSizeMemCmp::for_type::<u32>(),
             );
 
             btree.cache.pager.write_header(Header {
@@ -1958,7 +1953,7 @@ mod tests {
     /// up tests as it avoids disk IO and system calls.
     type MemBuf = io::Cursor<Vec<u8>>;
 
-    impl<'c> BTree<'c, MemBuf> {
+    impl<'c> BTree<'c, MemBuf, FixedSizeMemCmp> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
             let mut page = Page::new(root, self.cache.pager.page_size as _);
             self.cache.pager.read(root, page.buffer_mut())?;
@@ -2019,10 +2014,10 @@ mod tests {
             .size() as _
     }
 
-    impl<'c> TryFrom<BTree<'c, MemBuf>> for Node {
+    impl<'c> TryFrom<BTree<'c, MemBuf, FixedSizeMemCmp>> for Node {
         type Error = io::Error;
 
-        fn try_from(mut btree: BTree<MemBuf>) -> Result<Self, Self::Error> {
+        fn try_from(mut btree: BTree<MemBuf, FixedSizeMemCmp>) -> Result<Self, Self::Error> {
             btree.into_test_nodes(btree.root)
         }
     }
@@ -3259,7 +3254,8 @@ mod tests {
         ];
 
         let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
-        let mut btree = BTree::new(&mut cache, 1, 1);
+        let mut btree =
+            BTree::new_with_comparator(&mut cache, 1, 1, FixedSizeMemCmp::for_type::<u32>());
 
         btree.cache.pager.write_header(Header {
             magic: MAGIC,
@@ -3309,7 +3305,8 @@ mod tests {
         }
 
         let mut cache = Cache::new(Pager::new(MemBuf::new(Vec::new()), page_size, page_size));
-        let mut btree = BTree::new(&mut cache, 1, 1);
+        let mut btree =
+            BTree::new_with_comparator(&mut cache, 1, 1, FixedSizeMemCmp::for_type::<u32>());
 
         btree.cache.pager.write_header(Header {
             magic: MAGIC,
