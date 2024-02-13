@@ -21,6 +21,9 @@ use crate::{
     storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
 };
 
+/// Database file default page size.
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 4096;
+
 /// Name of the meta-table used to keep track of other tables.
 pub(crate) const MKDB_META: &str = "mkdb_meta";
 
@@ -51,9 +54,10 @@ pub(crate) struct Database<I> {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct QueryExecution {
+pub(crate) struct QueryResolution {
     schema: Vec<Column>,
     results: Vec<Vec<Value>>,
+    index_map: HashMap<String, usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +111,8 @@ impl Display for ExpectedType {
 pub(crate) enum SqlError {
     InvalidTable(String),
     InvalidColumn(String),
+    ColumnValueCountMismatch,
+    MissingColumns,
     TypeError(TypeError),
     Expected {
         expected: ExpectedExpression,
@@ -120,6 +126,10 @@ impl Display for SqlError {
         match self {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
             Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
+            Self::ColumnValueCountMismatch => f.write_str("number of columns doesn't match values"),
+            Self::MissingColumns => {
+                f.write_str("default values are not supported, all columns must be specified")
+            }
             Self::TypeError(type_error) => match type_error {
                 TypeError::CannotApplyUnary { operator, value } => {
                     write!(f, "cannot apply unary operator '{operator}' to {value}")
@@ -182,15 +192,33 @@ impl From<SqlError> for DbError {
     }
 }
 
-type QueryResult = Result<QueryExecution, DbError>;
+type QueryResult = Result<QueryResolution, DbError>;
 
-impl QueryExecution {
-    fn get(&self, row: usize, column: &str) -> Option<Value> {
-        self.schema
+impl QueryResolution {
+    fn new(schema: Vec<Column>, results: Vec<Vec<Value>>) -> Self {
+        let index_map = schema
             .iter()
-            .position(|c| c.name == column)
-            .map(|position| self.results.get(row)?.get(position).map(ToOwned::to_owned))
-            .flatten()
+            .enumerate()
+            .map(|(i, col)| (col.name.clone(), i))
+            .collect();
+
+        Self {
+            schema,
+            results,
+            index_map,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            schema: Vec::new(),
+            results: Vec::new(),
+            index_map: HashMap::new(),
+        }
+    }
+
+    fn get(&self, row: usize, column: &str) -> Option<&Value> {
+        self.results.get(row)?.get(*self.index_map.get(column)?)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -299,10 +327,11 @@ fn mkdb_meta_schema() -> Vec<Column> {
             data_type: DataType::Varchar(255),
             constraint: Some(Constraint::Unique),
         },
-        // SQL used to create the index or table. TODO: Max char length
+        // SQL used to create the index or table.
+        // TODO: Implement and use some TEXT data type with higher length limits.
         Column {
             name: String::from("sql"),
-            data_type: DataType::Varchar(255),
+            data_type: DataType::Varchar(1000),
             constraint: None,
         },
     ]
@@ -331,26 +360,34 @@ impl Database<File> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
         }
 
-        // TODO: Constant
-        let page_size = 4096;
         let block_size = Disk::from(&path).block_size()?;
 
-        let mut pager = Pager::new(file, page_size, block_size);
+        let mut pager = Pager::new(file, DEFAULT_PAGE_SIZE, block_size);
 
+        // TODO: Recreate the pager if the file exists and the header page size
+        // is different than the default.
         if pager.read_header()?.magic != MAGIC {
             pager.write_header(Header {
                 magic: MAGIC,
-                page_size: page_size as _,
+                page_size: DEFAULT_PAGE_SIZE as _,
                 total_pages: 2,
                 first_free_page: 0,
             })?;
 
-            let root = Page::new(MKDB_META_ROOT, page_size as _);
+            let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
             pager.write(MKDB_META_ROOT, root.buffer())?;
         }
 
         Ok(Database::new(Cache::new(pager)))
     }
+}
+
+fn deserialize_row_id(buf: &[u8]) -> RowId {
+    RowId::from_be_bytes(buf[..mem::size_of::<RowId>()].try_into().unwrap())
+}
+
+fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
+    row_id.to_be_bytes()
 }
 
 impl<I: Seek + Read + Write> Database<I> {
@@ -443,6 +480,7 @@ impl<I: Seek + Read + Write> Database<I> {
                             return Err(mismatched_types);
                         };
 
+                        // TODO: Use some big-int library? Create our own type?
                         let left = left.parse::<i128>().unwrap();
                         let right = right.parse::<i128>().unwrap();
 
@@ -483,7 +521,13 @@ impl<I: Seek + Read + Write> Database<I> {
     }
 
     fn serialize_values(row_id: RowId, schema: &Vec<Column>, values: &Vec<Value>) -> Vec<u8> {
-        let mut buf = Vec::from(row_id.to_be_bytes());
+        let mut buf = Vec::from(serialize_row_id(row_id));
+
+        macro_rules! serialize_little_endian {
+            ($num:expr, $int:ty) => {
+                $num.parse::<$int>().unwrap().to_le_bytes()
+            };
+        }
 
         // TODO: Alignment.
         for (col, val) in schema.iter().zip(values) {
@@ -491,7 +535,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 (DataType::Varchar(max), Value::String(string)) => {
                     let length = string.len().to_le_bytes();
 
-                    // TODO: Strings longer than 65536 chars are not handled.
+                    // TODO: Strings longer than 65535 chars are not handled.
                     let n_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
 
                     buf.extend_from_slice(&length[..n_bytes]);
@@ -499,24 +543,24 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 (DataType::Int, Value::Number(num)) => {
-                    buf.extend_from_slice(&num.parse::<i32>().unwrap().to_le_bytes());
+                    buf.extend_from_slice(&serialize_little_endian!(num, i32));
                 }
 
                 (DataType::UnsignedInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&num.parse::<u32>().unwrap().to_le_bytes());
+                    buf.extend_from_slice(&serialize_little_endian!(num, u32));
                 }
 
                 (DataType::BigInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&num.parse::<i64>().unwrap().to_le_bytes());
+                    buf.extend_from_slice(&serialize_little_endian!(num, i64));
                 }
 
                 (DataType::UnsignedBigInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&num.parse::<u64>().unwrap().to_le_bytes());
+                    buf.extend_from_slice(&serialize_little_endian!(num, u64));
                 }
 
                 (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
 
-                _ => unreachable!("attempt to serialize wrong data type: {col} -> {val}"),
+                _ => unreachable!("attempt to serialize {val} into {}", col.data_type),
             }
         }
 
@@ -525,66 +569,77 @@ impl<I: Seek + Read + Write> Database<I> {
 
     fn deserialize_values(buf: Box<[u8]>, schema: &Vec<Column>) -> (RowId, Vec<Value>) {
         let mut values = Vec::new();
+        let row_id = deserialize_row_id(&buf);
+        let mut index = mem::size_of::<RowId>();
 
-        let mut idx = mem::size_of::<RowId>();
+        macro_rules! deserialize_little_endian {
+            ($buf:expr, $index:expr, $int:ty) => {
+                <$int>::from_le_bytes(
+                    $buf[index..index + mem::size_of::<$int>()]
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+        }
 
-        let row_id = RowId::from_be_bytes(buf[..idx].try_into().unwrap());
+        macro_rules! deserialize_little_endian_to_str {
+            ($buf:expr, $index:expr, $int:ty) => {
+                deserialize_little_endian!($buf, $index, $int).to_string()
+            };
+        }
 
+        // TODO: Alignment.
         for column in schema {
             match column.data_type {
                 DataType::Varchar(max) => {
                     let length = if max <= u8::MAX as usize {
-                        let len = buf[idx];
-                        idx += 1;
+                        let len = buf[index];
+                        index += 1;
                         len as usize
                     } else {
-                        let len = u16::from_le_bytes(buf[idx..idx + 2].try_into().unwrap());
-                        idx += 2;
+                        let len = deserialize_little_endian!(buf, index, u16);
+                        index += 2;
                         len as usize
                     };
 
                     // TODO: Check if we should use from_ut8_lossy() or from_utf8()
                     values.push(Value::String(
-                        String::from_utf8_lossy(&buf[idx..(idx + length)]).to_string(),
+                        String::from_utf8_lossy(&buf[index..(index + length)]).to_string(),
                     ));
-                    idx += length;
+                    index += length;
                 }
 
                 DataType::Int => {
-                    values.push(Value::Number(
-                        i32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap()).to_string(),
-                    ));
-
-                    idx += 4;
+                    values.push(Value::Number(deserialize_little_endian_to_str!(
+                        buf, index, i32
+                    )));
+                    index += mem::size_of::<i32>();
                 }
 
                 DataType::UnsignedInt => {
-                    values.push(Value::Number(
-                        u32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap()).to_string(),
-                    ));
-
-                    idx += 4;
+                    values.push(Value::Number(deserialize_little_endian_to_str!(
+                        buf, index, u32
+                    )));
+                    index += mem::size_of::<u32>();
                 }
 
                 DataType::BigInt => {
-                    values.push(Value::Number(
-                        i64::from_le_bytes(buf[idx..idx + 8].try_into().unwrap()).to_string(),
-                    ));
-
-                    idx += 8;
+                    values.push(Value::Number(deserialize_little_endian_to_str!(
+                        buf, index, i64
+                    )));
+                    index += mem::size_of::<i64>();
                 }
 
                 DataType::UnsignedBigInt => {
-                    values.push(Value::Number(
-                        u64::from_le_bytes(buf[idx..idx + 8].try_into().unwrap()).to_string(),
-                    ));
-
-                    idx += 8;
+                    values.push(Value::Number(deserialize_little_endian_to_str!(
+                        buf, index, u64
+                    )));
+                    index += mem::size_of::<u64>();
                 }
 
                 DataType::Bool => {
-                    values.push(Value::Bool(if buf[idx] == 0 { false } else { true }));
-                    idx += 1;
+                    values.push(Value::Bool(if buf[index] == 0 { false } else { true }));
+                    index += mem::size_of::<bool>();
                 }
             }
         }
@@ -622,23 +677,23 @@ impl<I: Seek + Read + Write> Database<I> {
         Ok((schema, root))
     }
 
-    fn next_row_id(&mut self, table: String, root: PageNumber) -> RowId {
+    fn next_row_id(&mut self, table: String, root: PageNumber) -> io::Result<RowId> {
         if let Some(row_id) = self.row_ids.get_mut(&table) {
             *row_id += 1;
-            return *row_id;
+            return Ok(*row_id);
         }
 
         let mut btree = self.btree(root);
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
-        let row_id = if let Some(max) = btree.max().unwrap() {
-            u64::from_be_bytes(max.as_ref()[..8].try_into().unwrap()) + 1
+        let row_id = if let Some(max) = btree.max()? {
+            deserialize_row_id(max.as_ref()) + 1
         } else {
             1
         };
 
         self.row_ids.insert(table, row_id);
-        row_id
+        Ok(row_id)
     }
 
     pub fn execute(&mut self, input: String) -> QueryResult {
@@ -673,10 +728,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     VALUES ("table", "{name}", {root_page}, "{name}", '{sql}');
                 "#))?;
 
-                Ok(QueryExecution {
-                    schema: Vec::new(),
-                    results: Vec::new(),
-                })
+                Ok(QueryResolution::empty())
             }
 
             Statement::Insert {
@@ -687,11 +739,11 @@ impl<I: Seek + Read + Write> Database<I> {
                 let (schema, root) = self.table_metadata(&into)?;
 
                 if columns.len() != values.len() {
-                    todo!("number of columns doesn't match values");
+                    return Err(DbError::Sql(SqlError::ColumnValueCountMismatch));
                 }
 
                 if schema.len() != columns.len() {
-                    todo!("missing columns");
+                    return Err(DbError::Sql(SqlError::MissingColumns));
                 }
 
                 let mut values_only = vec![Value::Bool(false); values.len()];
@@ -715,16 +767,13 @@ impl<I: Seek + Read + Write> Database<I> {
                     values_only[idx] = value;
                 }
 
-                let row_id = self.next_row_id(into, root);
+                let row_id = self.next_row_id(into, root)?;
 
                 let mut btree = self.btree(root);
 
                 btree.insert(Self::serialize_values(row_id, &schema, &values_only))?;
 
-                Ok(QueryExecution {
-                    schema: Vec::new(),
-                    results: Vec::new(),
-                })
+                Ok(QueryResolution::empty())
             }
 
             Statement::Select {
@@ -790,8 +839,8 @@ impl<I: Seek + Read + Write> Database<I> {
                         for i in &order_by_cols {
                             let cmp = match (&a[*i], &b[*i]) {
                                 (Value::Number(a), Value::Number(b)) => {
-                                    // TODO: Use i128 or a bunch of IFs to determine the actual
-                                    // type? What's faster?
+                                    // TODO: Use i128 / bigint type /custom type or a bunch
+                                    // of IFs to determine the actual type? What's faster?
                                     a.parse::<i128>().unwrap().cmp(&b.parse().unwrap())
                                 }
                                 (Value::String(a), Value::String(b)) => a.cmp(b),
@@ -808,10 +857,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     })
                 }
 
-                Ok(QueryExecution {
-                    schema: results_schema,
-                    results,
-                })
+                Ok(QueryResolution::new(results_schema, results))
             }
 
             Statement::Delete { from, r#where } => {
@@ -837,14 +883,11 @@ impl<I: Seek + Read + Write> Database<I> {
                 // TODO: Second mutable borrow occurs here?
                 let mut btree = self.btree(root);
 
-                for r in row_ids {
-                    btree.remove(&r.to_be_bytes())?;
+                for row_id in row_ids {
+                    btree.remove(&serialize_row_id(row_id))?;
                 }
 
-                Ok(QueryExecution {
-                    schema: Vec::new(),
-                    results: Vec::new(),
-                })
+                Ok(QueryResolution::empty())
             }
 
             Statement::Update {
@@ -913,10 +956,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     btree.insert(update)?;
                 }
 
-                Ok(QueryExecution {
-                    schema: Vec::new(),
-                    results: Vec::new(),
-                })
+                Ok(QueryResolution::empty())
             }
 
             _ => todo!("rest of SQL statements"),
@@ -930,7 +970,7 @@ mod tests {
 
     use super::{Database, DbError};
     use crate::{
-        database::{mkdb_meta_schema, Header, QueryExecution, MAGIC, MKDB_META_ROOT},
+        database::{mkdb_meta_schema, Header, QueryResolution, MAGIC, MKDB_META_ROOT},
         paging::{cache::Cache, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
@@ -965,16 +1005,16 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: mkdb_meta_schema(),
-                results: vec![vec![
+            QueryResolution::new(
+                mkdb_meta_schema(),
+                vec![vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
                     Value::Number("2".into()),
                     Value::String("users".into()),
                     Value::String(Parser::new(&sql).parse_statement()?.to_string())
                 ]]
-            }
+            )
         );
 
         Ok(())
@@ -992,8 +1032,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1005,11 +1045,11 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![
+                vec![
                     vec![Value::Number("1".into()), Value::String("John Doe".into())],
                     vec![Value::Number("2".into()), Value::String("Jane Doe".into())],
                 ]
-            }
+            )
         );
 
         Ok(())
@@ -1051,8 +1091,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1069,8 +1109,8 @@ mod tests {
                         constraint: Some(Constraint::Unique),
                     }
                 ],
-                results: expected
-            }
+                expected
+            )
         );
 
         Ok(())
@@ -1089,8 +1129,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1107,7 +1147,7 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![
+                vec![
                     vec![
                         Value::Number("2".into()),
                         Value::String("Jane Doe".into()),
@@ -1119,7 +1159,7 @@ mod tests {
                         Value::Number("24".into())
                     ],
                 ]
-            }
+            )
         );
 
         Ok(())
@@ -1141,9 +1181,9 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: mkdb_meta_schema(),
-                results: vec![
+            QueryResolution::new(
+                mkdb_meta_schema(),
+                vec![
                     vec![
                         Value::String("table".into()),
                         Value::String("users".into()),
@@ -1166,7 +1206,7 @@ mod tests {
                         Value::String(Parser::new(&t3).parse_statement()?.to_string())
                     ]
                 ]
-            }
+            )
         );
 
         Ok(())
@@ -1187,8 +1227,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1205,8 +1245,8 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![]
-            }
+                vec![]
+            )
         );
 
         Ok(())
@@ -1227,8 +1267,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1245,12 +1285,12 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![vec![
+                vec![vec![
                     Value::Number("1".into()),
                     Value::String("John Doe".into()),
                     Value::Number("18".into())
                 ]]
-            }
+            )
         );
 
         Ok(())
@@ -1271,8 +1311,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1289,7 +1329,7 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![
+                vec![
                     vec![
                         Value::Number("1".into()),
                         Value::String("John Doe".into()),
@@ -1306,7 +1346,7 @@ mod tests {
                         Value::Number("20".into())
                     ]
                 ]
-            }
+            )
         );
 
         Ok(())
@@ -1327,8 +1367,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryExecution {
-                schema: vec![
+            QueryResolution::new(
+                vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1345,7 +1385,7 @@ mod tests {
                         constraint: None
                     }
                 ],
-                results: vec![
+                vec![
                     vec![
                         Value::Number("1".into()),
                         Value::String("John Doe".into()),
@@ -1362,7 +1402,7 @@ mod tests {
                         Value::Number("20".into())
                     ]
                 ]
-            }
+            )
         );
 
         Ok(())
