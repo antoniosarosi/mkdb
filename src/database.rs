@@ -444,11 +444,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 match Self::resolve_expression(values, schema, expr)? {
                     Value::Number(mut num) => {
                         if let UnaryOperator::Minus = operator {
-                            if num.as_bytes()[0] == b'-' {
-                                num.remove(0);
-                            } else {
-                                num.insert(0, '-');
-                            };
+                            num = -num;
                         }
 
                         Ok(Value::Number(num))
@@ -504,24 +500,20 @@ impl<I: Seek + Read + Write> Database<I> {
                             return Err(mismatched_types);
                         };
 
-                        // TODO: Use some big-int library? Create our own type?
-                        let left = left.parse::<i128>().unwrap();
-                        let right = right.parse::<i128>().unwrap();
-
-                        let result = match arithmetic {
+                        Value::Number(match arithmetic {
                             BinaryOperator::Plus => left + right,
                             BinaryOperator::Minus => left - right,
                             BinaryOperator::Mul => left * right,
                             BinaryOperator::Div => left / right,
                             _ => unreachable!(),
-                        };
-
-                        Value::Number(result.to_string())
+                        })
                     }
                 })
             }
 
-            Expression::Wildcard => unreachable!(),
+            Expression::Wildcard => {
+                unreachable!("wildcards should be resolved into identifiers at this point")
+            }
         }
     }
 
@@ -549,7 +541,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
         macro_rules! serialize_little_endian {
             ($num:expr, $int:ty) => {
-                $num.parse::<$int>().unwrap().to_le_bytes()
+                TryInto::<$int>::try_into(*$num).unwrap().to_le_bytes()
             };
         }
 
@@ -603,12 +595,7 @@ impl<I: Seek + Read + Write> Database<I> {
                         .try_into()
                         .unwrap(),
                 )
-            };
-        }
-
-        macro_rules! deserialize_little_endian_to_str {
-            ($buf:expr, $index:expr, $int:ty) => {
-                deserialize_little_endian!($buf, $index, $int).to_string()
+                .into()
             };
         }
 
@@ -621,9 +608,9 @@ impl<I: Seek + Read + Write> Database<I> {
                         index += 1;
                         len as usize
                     } else {
-                        let len = deserialize_little_endian!(buf, index, u16);
+                        let len: usize = deserialize_little_endian!(buf, index, u16);
                         index += 2;
-                        len as usize
+                        len
                     };
 
                     // TODO: Check if we should use from_ut8_lossy() or from_utf8()
@@ -634,30 +621,22 @@ impl<I: Seek + Read + Write> Database<I> {
                 }
 
                 DataType::Int => {
-                    values.push(Value::Number(deserialize_little_endian_to_str!(
-                        buf, index, i32
-                    )));
+                    values.push(Value::Number(deserialize_little_endian!(buf, index, i32)));
                     index += mem::size_of::<i32>();
                 }
 
                 DataType::UnsignedInt => {
-                    values.push(Value::Number(deserialize_little_endian_to_str!(
-                        buf, index, u32
-                    )));
+                    values.push(Value::Number(deserialize_little_endian!(buf, index, u32)));
                     index += mem::size_of::<u32>();
                 }
 
                 DataType::BigInt => {
-                    values.push(Value::Number(deserialize_little_endian_to_str!(
-                        buf, index, i64
-                    )));
+                    values.push(Value::Number(deserialize_little_endian!(buf, index, i64)));
                     index += mem::size_of::<i64>();
                 }
 
                 DataType::UnsignedBigInt => {
-                    values.push(Value::Number(deserialize_little_endian_to_str!(
-                        buf, index, u64
-                    )));
+                    values.push(Value::Number(deserialize_little_endian!(buf, index, u64)));
                     index += mem::size_of::<u64>();
                 }
 
@@ -696,7 +675,7 @@ impl<I: Seek + Read + Write> Database<I> {
         };
 
         let root = match query.get(0, "root") {
-            Some(Value::Number(root)) => root.parse().unwrap(),
+            Some(Value::Number(root)) => *root as PageNumber,
             _ => unreachable!(),
         };
 
@@ -921,11 +900,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     results.sort_by(|a, b| {
                         for i in &order_by_cols {
                             let cmp = match (&a[*i], &b[*i]) {
-                                (Value::Number(a), Value::Number(b)) => {
-                                    // TODO: Use i128 / bigint type /custom type or a bunch
-                                    // of IFs to determine the actual type? What's faster?
-                                    a.parse::<i128>().unwrap().cmp(&b.parse().unwrap())
-                                }
+                                (Value::Number(a), Value::Number(b)) => a.cmp(b),
                                 (Value::String(a), Value::String(b)) => a.cmp(b),
                                 (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
                                 _ => unreachable!("columns should have the same type"),
@@ -1049,7 +1024,7 @@ impl<I: Seek + Read + Write> Database<I> {
 mod tests {
     use std::io;
 
-    use super::{Database, DbError};
+    use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
         database::{
             mkdb_meta_schema, Header, QueryResolution, Schema, SqlError, TypeError, MAGIC,
@@ -1059,8 +1034,6 @@ mod tests {
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
     };
-
-    const PAGE_SIZE: usize = 4096;
 
     impl PartialEq for DbError {
         fn eq(&self, other: &Self) -> bool {
@@ -1074,16 +1047,20 @@ mod tests {
     }
 
     fn init_database() -> io::Result<Database<io::Cursor<Vec<u8>>>> {
-        let mut pager = Pager::new(io::Cursor::new(Vec::<u8>::new()), PAGE_SIZE, PAGE_SIZE);
+        let mut pager = Pager::new(
+            io::Cursor::new(Vec::<u8>::new()),
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_PAGE_SIZE,
+        );
 
         pager.write_header(Header {
             magic: MAGIC,
-            page_size: PAGE_SIZE as _,
+            page_size: DEFAULT_PAGE_SIZE as _,
             total_pages: 2,
             first_free_page: 0,
         })?;
 
-        let root = Page::new(MKDB_META_ROOT, PAGE_SIZE as _);
+        let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
         pager.write(MKDB_META_ROOT, root.buffer())?;
 
         Ok(Database::new(Cache::new(pager)))
@@ -1105,7 +1082,7 @@ mod tests {
                 vec![vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
-                    Value::Number("2".into()),
+                    Value::Number(2),
                     Value::String("users".into()),
                     Value::String(Parser::new(sql).parse_statement()?.to_string())
                 ]]
@@ -1141,8 +1118,8 @@ mod tests {
                     }
                 ]),
                 results: vec![
-                    vec![Value::Number("1".into()), Value::String("John Doe".into())],
-                    vec![Value::Number("2".into()), Value::String("Jane Doe".into())],
+                    vec![Value::Number(1), Value::String("John Doe".into())],
+                    vec![Value::Number(2), Value::String("Jane Doe".into())],
                 ]
             }
         );
@@ -1171,7 +1148,7 @@ mod tests {
             let email = format!("user{i}@test.com");
 
             expected.push(vec![
-                Value::Number(i.to_string()),
+                Value::Number(i),
                 Value::String(name.clone()),
                 Value::String(email.clone()),
             ]);
@@ -1242,14 +1219,14 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("1".into()),
+                        Value::Number(1),
                         Value::String("John Doe".into()),
-                        Value::Number("18".into())
+                        Value::Number(18)
                     ],
                     vec![
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("Jane Doe".into()),
-                        Value::Number("22".into())
+                        Value::Number(22)
                     ],
                 ]
             }
@@ -1289,16 +1266,8 @@ mod tests {
                     }
                 ]),
                 results: vec![
-                    vec![
-                        Value::Number("1".into()),
-                        Value::Number("110".into()),
-                        Value::Number("4".into()),
-                    ],
-                    vec![
-                        Value::Number("2".into()),
-                        Value::Number("40".into()),
-                        Value::Number("20".into()),
-                    ],
+                    vec![Value::Number(1), Value::Number(110), Value::Number(4),],
+                    vec![Value::Number(2), Value::Number(40), Value::Number(20),],
                 ]
             }
         );
@@ -1339,14 +1308,14 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("Jane Doe".into()),
-                        Value::Number("22".into())
+                        Value::Number(22)
                     ],
                     vec![
-                        Value::Number("3".into()),
+                        Value::Number(3),
                         Value::String("Some Dude".into()),
-                        Value::Number("24".into())
+                        Value::Number(24)
                     ],
                 ]
             }
@@ -1388,19 +1357,19 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("1".into()),
+                        Value::Number(1),
                         Value::String("John Doe".into()),
-                        Value::Number("18".into())
+                        Value::Number(18)
                     ],
                     vec![
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("John Doe".into()),
-                        Value::Number("22".into())
+                        Value::Number(22)
                     ],
                     vec![
-                        Value::Number("3".into()),
+                        Value::Number(3),
                         Value::String("Some Dude".into()),
-                        Value::Number("24".into())
+                        Value::Number(24)
                     ]
                 ]
             }
@@ -1448,15 +1417,15 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("18".into()),
+                        Value::Number(18),
                         Value::String("John Doe".into()),
-                        Value::Number("1".into()),
+                        Value::Number(1),
                         Value::Bool(true),
                     ],
                     vec![
-                        Value::Number("22".into()),
+                        Value::Number(22),
                         Value::String("Jane Doe".into()),
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::Bool(false),
                     ],
                 ]
@@ -1497,16 +1466,8 @@ mod tests {
                     }
                 ]),
                 results: vec![
-                    vec![
-                        Value::Number("1".into()),
-                        Value::Number("10".into()),
-                        Value::Number("500".into()),
-                    ],
-                    vec![
-                        Value::Number("2".into()),
-                        Value::Number("25".into()),
-                        Value::Number("1000".into()),
-                    ],
+                    vec![Value::Number(1), Value::Number(10), Value::Number(500),],
+                    vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
                 ]
             }
         );
@@ -1536,21 +1497,21 @@ mod tests {
                     vec![
                         Value::String("table".into()),
                         Value::String("users".into()),
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("users".into()),
                         Value::String(Parser::new(&t1).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("tasks".into()),
-                        Value::Number("3".into()),
+                        Value::Number(3),
                         Value::String("tasks".into()),
                         Value::String(Parser::new(&t2).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("products".into()),
-                        Value::Number("4".into()),
+                        Value::Number(4),
                         Value::String("products".into()),
                         Value::String(Parser::new(&t3).parse_statement()?.to_string())
                     ]
@@ -1635,9 +1596,9 @@ mod tests {
                     }
                 ]),
                 results: vec![vec![
-                    Value::Number("1".into()),
+                    Value::Number(1),
                     Value::String("John Doe".into()),
-                    Value::Number("18".into())
+                    Value::Number(18)
                 ]]
             }
         );
@@ -1680,19 +1641,19 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("1".into()),
+                        Value::Number(1),
                         Value::String("John Doe".into()),
-                        Value::Number("20".into())
+                        Value::Number(20)
                     ],
                     vec![
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("Jane Doe".into()),
-                        Value::Number("20".into())
+                        Value::Number(20)
                     ],
                     vec![
-                        Value::Number("3".into()),
+                        Value::Number(3),
                         Value::String("Some Dude".into()),
-                        Value::Number("20".into())
+                        Value::Number(20)
                     ]
                 ]
             }
@@ -1736,19 +1697,19 @@ mod tests {
                 ]),
                 results: vec![
                     vec![
-                        Value::Number("1".into()),
+                        Value::Number(1),
                         Value::String("John Doe".into()),
-                        Value::Number("18".into())
+                        Value::Number(18)
                     ],
                     vec![
-                        Value::Number("2".into()),
+                        Value::Number(2),
                         Value::String("Updated Name".into()),
-                        Value::Number("20".into())
+                        Value::Number(20)
                     ],
                     vec![
-                        Value::Number("3".into()),
+                        Value::Number(3),
                         Value::String("Updated Name".into()),
-                        Value::Number("20".into())
+                        Value::Number(20)
                     ]
                 ]
             }

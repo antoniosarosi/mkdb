@@ -277,7 +277,7 @@ impl<'i> Parser<'i> {
         match self.next_token()? {
             Token::Identifier(ident) => Ok(Expression::Identifier(ident)),
             Token::Mul => Ok(Expression::Wildcard),
-            Token::Number(num) => Ok(Expression::Value(Value::Number(num))),
+            Token::Number(num) => Ok(Expression::Value(Value::Number(num.parse().unwrap()))),
             Token::String(string) => Ok(Expression::Value(Value::String(string))),
             Token::Keyword(Keyword::True) => Ok(Expression::Value(Value::Bool(true))),
             Token::Keyword(Keyword::False) => Ok(Expression::Value(Value::Bool(false))),
@@ -750,7 +750,7 @@ mod tests {
                 r#where: Some(Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("price".into())),
                     operator: BinaryOperator::GtEq,
-                    right: Box::new(Expression::Value(Value::Number("100".into())))
+                    right: Box::new(Expression::Value(Value::Number(100)))
                 }),
                 order_by: vec![]
             })
@@ -779,14 +779,14 @@ mod tests {
                             right: Box::new(Expression::Identifier("discount".into())),
                         }),
                         operator: BinaryOperator::Div,
-                        right: Box::new(Expression::Value(Value::Number("100".into()))),
+                        right: Box::new(Expression::Value(Value::Number(100))),
                     }
                 ],
                 from: "products".into(),
                 r#where: Some(Expression::BinaryOperation {
                     left: Box::new(Expression::BinaryOperation {
                         left: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number("100".into()))),
+                            left: Box::new(Expression::Value(Value::Number(100))),
                             operator: BinaryOperator::LtEq,
                             right: Box::new(Expression::Identifier("price".into())),
                         }),
@@ -794,7 +794,7 @@ mod tests {
                         right: Box::new(Expression::BinaryOperation {
                             left: Box::new(Expression::Identifier("price".into())),
                             operator: BinaryOperator::Lt,
-                            right: Box::new(Expression::Value(Value::Number("1000".into()))),
+                            right: Box::new(Expression::Value(Value::Number(1000))),
                         }),
                     }),
                     operator: BinaryOperator::Or,
@@ -802,12 +802,12 @@ mod tests {
                         left: Box::new(Expression::Identifier("discount".into())),
                         operator: BinaryOperator::Lt,
                         right: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number("10".into()))),
+                            left: Box::new(Expression::Value(Value::Number(10))),
                             operator: BinaryOperator::Plus,
                             right: Box::new(Expression::BinaryOperation {
-                                left: Box::new(Expression::Value(Value::Number("2".into()))),
+                                left: Box::new(Expression::Value(Value::Number(2))),
                                 operator: BinaryOperator::Mul,
-                                right: Box::new(Expression::Value(Value::Number("20".into()))),
+                                right: Box::new(Expression::Value(Value::Number(20))),
                             })
                         }),
                     })
@@ -891,7 +891,7 @@ mod tests {
                 columns: vec![Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("is_admin".into())),
                     operator: BinaryOperator::Eq,
-                    right: Box::new(Expression::Value(Value::Number("1".into()))),
+                    right: Box::new(Expression::Value(Value::Number(1))),
                 }],
                 r#where: None,
             })
@@ -917,24 +917,24 @@ mod tests {
                         right: Box::new(Expression::BinaryOperation {
                             left: Box::new(Expression::Identifier("price".into())),
                             operator: BinaryOperator::Minus,
-                            right: Box::new(Expression::Value(Value::Number("10".into()))),
+                            right: Box::new(Expression::Value(Value::Number(10))),
                         }),
                     },
                     Expression::BinaryOperation {
                         left: Box::new(Expression::Identifier("discount".into())),
                         operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number("15".into()))),
+                        right: Box::new(Expression::Value(Value::Number(15))),
                     },
                     Expression::BinaryOperation {
                         left: Box::new(Expression::Identifier("stock".into())),
                         operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number("10".into()))),
+                        right: Box::new(Expression::Value(Value::Number(10))),
                     }
                 ],
                 r#where: Some(Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("price".into())),
                     operator: BinaryOperator::Gt,
-                    right: Box::new(Expression::Value(Value::Number("100".into()))),
+                    right: Box::new(Expression::Value(Value::Number(100))),
                 })
             })
         )
@@ -964,7 +964,7 @@ mod tests {
                 r#where: Some(Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("price".into())),
                     operator: BinaryOperator::Gt,
-                    right: Box::new(Expression::Value(Value::Number("5000".into()))),
+                    right: Box::new(Expression::Value(Value::Number(5000))),
                 })
             })
         )
@@ -980,7 +980,7 @@ mod tests {
                 into: "users".into(),
                 columns: ["id", "name", "email"].map(String::from).into(),
                 values: vec![
-                    Expression::Value(Value::Number("1".into())),
+                    Expression::Value(Value::Number(1)),
                     Expression::Value(Value::String("Test".into())),
                     Expression::Value(Value::String("test@test.com".into())),
                 ]
@@ -1025,7 +1025,7 @@ mod tests {
                     columns: vec![Expression::BinaryOperation {
                         left: Box::new(Expression::Identifier("is_admin".into())),
                         operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number("1".into()))),
+                        right: Box::new(Expression::Value(Value::Number(1))),
                     }],
                     r#where: None,
                 },
@@ -1053,16 +1053,16 @@ mod tests {
                         right: Box::new(Expression::Identifier("discount".into())),
                     }),
                     operator: BinaryOperator::Div,
-                    right: Box::new(Expression::Value(Value::Number("100".into()))),
+                    right: Box::new(Expression::Value(Value::Number(100))),
                 }),
                 operator: BinaryOperator::Lt,
                 right: Box::new(Expression::BinaryOperation {
-                    left: Box::new(Expression::Value(Value::Number("10".into()))),
+                    left: Box::new(Expression::Value(Value::Number(10))),
                     operator: BinaryOperator::Plus,
                     right: Box::new(Expression::BinaryOperation {
-                        left: Box::new(Expression::Value(Value::Number("20".into()))),
+                        left: Box::new(Expression::Value(Value::Number(20))),
                         operator: BinaryOperator::Mul,
-                        right: Box::new(Expression::Value(Value::Number("30".into()))),
+                        right: Box::new(Expression::Value(Value::Number(30))),
                     })
                 })
             })
@@ -1083,25 +1083,25 @@ mod tests {
                 }),
                 operator: BinaryOperator::GtEq,
                 right: Box::new(Expression::BinaryOperation {
-                    left: Box::new(Expression::Value(Value::Number("10".into()))),
+                    left: Box::new(Expression::Value(Value::Number(10))),
                     operator: BinaryOperator::Minus,
                     right: Box::new(Expression::BinaryOperation {
                         left: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number("20".into()))),
+                            left: Box::new(Expression::Value(Value::Number(20))),
                             operator: BinaryOperator::Plus,
-                            right: Box::new(Expression::Value(Value::Number("50".into()))),
+                            right: Box::new(Expression::Value(Value::Number(50))),
                         }),
                         operator: BinaryOperator::Div,
                         right: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number("2".into()))),
+                            left: Box::new(Expression::Value(Value::Number(2))),
                             operator: BinaryOperator::Mul,
                             right: Box::new(Expression::BinaryOperation {
-                                left: Box::new(Expression::Value(Value::Number("4".into()))),
+                                left: Box::new(Expression::Value(Value::Number(4))),
                                 operator: BinaryOperator::Plus,
                                 right: Box::new(Expression::BinaryOperation {
-                                    left: Box::new(Expression::Value(Value::Number("1".into()))),
+                                    left: Box::new(Expression::Value(Value::Number(1))),
                                     operator: BinaryOperator::Minus,
-                                    right: Box::new(Expression::Value(Value::Number("1".into()))),
+                                    right: Box::new(Expression::Value(Value::Number(1))),
                                 })
                             })
                         })
@@ -1120,7 +1120,7 @@ mod tests {
             Ok(Expression::BinaryOperation {
                 left: Box::new(Expression::BinaryOperation {
                     left: Box::new(Expression::BinaryOperation {
-                        left: Box::new(Expression::Value(Value::Number("100".into()))),
+                        left: Box::new(Expression::Value(Value::Number(100))),
                         operator: BinaryOperator::LtEq,
                         right: Box::new(Expression::Identifier("price".into())),
                     }),
@@ -1128,14 +1128,14 @@ mod tests {
                     right: Box::new(Expression::BinaryOperation {
                         left: Box::new(Expression::Identifier("price".into())),
                         operator: BinaryOperator::LtEq,
-                        right: Box::new(Expression::Value(Value::Number("200".into()))),
+                        right: Box::new(Expression::Value(Value::Number(200))),
                     }),
                 }),
                 operator: BinaryOperator::Or,
                 right: Box::new(Expression::BinaryOperation {
                     left: Box::new(Expression::Identifier("price".into())),
                     operator: BinaryOperator::Gt,
-                    right: Box::new(Expression::Value(Value::Number("1000".into()))),
+                    right: Box::new(Expression::Value(Value::Number(1000))),
                 })
             })
         )
@@ -1150,18 +1150,18 @@ mod tests {
             Ok(Expression::BinaryOperation {
                 left: Box::new(Expression::UnaryOperation {
                     operator: UnaryOperator::Minus,
-                    expr: Box::new(Expression::Value(Value::Number("2".into())))
+                    expr: Box::new(Expression::Value(Value::Number(2)))
                 }),
                 operator: BinaryOperator::Mul,
                 right: Box::new(Expression::UnaryOperation {
                     operator: UnaryOperator::Minus,
                     expr: Box::new(Expression::BinaryOperation {
-                        left: Box::new(Expression::Value(Value::Number("2".into()))),
+                        left: Box::new(Expression::Value(Value::Number(2))),
                         operator: BinaryOperator::Plus,
                         right: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number("2".into()))),
+                            left: Box::new(Expression::Value(Value::Number(2))),
                             operator: BinaryOperator::Mul,
-                            right: Box::new(Expression::Value(Value::Number("2".into()))),
+                            right: Box::new(Expression::Value(Value::Number(2))),
                         })
                     })
                 })

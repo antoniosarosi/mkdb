@@ -91,24 +91,21 @@ pub(crate) enum DataType {
     Varchar(usize),
 }
 
+// TODO: We use i128 to store numbers since we don't know their exact type in
+// expressions like "SELECT 12 + 12 FROM table". And even if we knew their exact
+// type, we would still have to match over i32, u32, i64, u64... to operate on
+// them. So what's faster?
+// - A bunch of IF statements plus OP (+,-,*,/)
+// - Using i128
+// - Using some bigint library like https://docs.rs/num-bigint/
+// - Using a custom number type
+// It's a toy database anyway, not that anyone is gonna run into integer
+// overflow issues in production :)
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Value {
-    Number(String),
+    Number(i128),
     String(String),
     Bool(bool),
-}
-
-impl PartialOrd for Value {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Value::Number(a), Value::Number(b)) => {
-                a.parse::<i128>().unwrap().partial_cmp(&b.parse().unwrap())
-            }
-            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
-            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -147,15 +144,13 @@ fn join<T: Display>(values: &Vec<T>, separator: &str) -> String {
     joined
 }
 
-impl Display for DataType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DataType::Int => f.write_str("INT"),
-            DataType::UnsignedInt => f.write_str("INT UNSIGNED"),
-            DataType::BigInt => f.write_str("BIGINT"),
-            DataType::UnsignedBigInt => f.write_str("BIGINT UNSIGNED"),
-            DataType::Bool => f.write_str("BOOL"),
-            DataType::Varchar(max) => write!(f, "VARCHAR({max})"),
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
+            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            _ => None,
         }
     }
 }
@@ -166,6 +161,19 @@ impl Display for Value {
             Value::Number(number) => write!(f, "{number}"),
             Value::String(string) => write!(f, "\"{string}\""),
             Value::Bool(bool) => f.write_str(if *bool { "TRUE" } else { "FALSE" }),
+        }
+    }
+}
+
+impl Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataType::Int => f.write_str("INT"),
+            DataType::UnsignedInt => f.write_str("INT UNSIGNED"),
+            DataType::BigInt => f.write_str("BIGINT"),
+            DataType::UnsignedBigInt => f.write_str("BIGINT UNSIGNED"),
+            DataType::Bool => f.write_str("BOOL"),
+            DataType::Varchar(max) => write!(f, "VARCHAR({max})"),
         }
     }
 }
