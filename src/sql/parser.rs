@@ -279,6 +279,8 @@ impl<'i> Parser<'i> {
             Token::Mul => Ok(Expression::Wildcard),
             Token::Number(num) => Ok(Expression::Value(Value::Number(num))),
             Token::String(string) => Ok(Expression::Value(Value::String(string))),
+            Token::Keyword(Keyword::True) => Ok(Expression::Value(Value::Bool(true))),
+            Token::Keyword(Keyword::False) => Ok(Expression::Value(Value::Bool(false))),
 
             token @ (Token::Minus | Token::Plus) => {
                 let operator = match token {
@@ -393,6 +395,8 @@ impl<'i> Parser<'i> {
                 self.expect_token(Token::RightParen)?;
                 DataType::Varchar(length)
             }
+
+            Keyword::Bool => DataType::Bool,
 
             _ => unreachable!(),
         };
@@ -663,7 +667,15 @@ impl<'i> Parser<'i> {
 
     /// Data type that can be used for column definitions.
     fn supported_data_types() -> Vec<Keyword> {
-        vec![Keyword::Int, Keyword::BigInt, Keyword::Varchar]
+        // For integers types the unsigned version doesn't need to be here.
+        // Specifying the initial keyword (INT, BIGINT) takes care of the
+        // optional UNSIGNED that follows.
+        vec![
+            Keyword::Int,
+            Keyword::BigInt,
+            Keyword::Bool,
+            Keyword::Varchar,
+        ]
     }
 
     /// Supported binary operators.

@@ -45,7 +45,7 @@ fn main() -> io::Result<()> {
             }
 
             if byte == b';' {
-                let _ = match db.execute(statement) {
+                let _ = match db.exec(&statement) {
                     Ok(result) => {
                         if !result.is_empty() {
                             stream.write(result.as_ascii_table().as_bytes())

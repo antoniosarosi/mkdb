@@ -369,6 +369,9 @@ impl<'i> Tokenizer<'i> {
             "BIGINT" => Keyword::BigInt,
             "UNSIGNED" => Keyword::Unsigned,
             "VARCHAR" => Keyword::Varchar,
+            "BOOL" => Keyword::Bool,
+            "TRUE" => Keyword::True,
+            "FALSE" => Keyword::False,
             "ORDER" => Keyword::Order,
             "BY" => Keyword::By,
             _ => Keyword::None,
@@ -565,7 +568,7 @@ mod tests {
 
     #[test]
     fn tokenize_create_table() {
-        let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
+        let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), is_admin BOOL);";
 
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
@@ -592,6 +595,11 @@ mod tests {
                 Token::LeftParen,
                 Token::Number("255".into()),
                 Token::RightParen,
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("is_admin".into()),
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::Bool),
                 Token::RightParen,
                 Token::SemiColon,
                 Token::Eof,
@@ -640,7 +648,7 @@ mod tests {
 
     #[test]
     fn tokenize_insert_into() {
-        let sql = r#"INSERT INTO users (name, email, age) VALUES ("Test", "test@test.com", 20);"#;
+        let sql = r#"INSERT INTO users (name, email, age, is_admin) VALUES ("Test", "test@test.com", 20, TRUE);"#;
 
         assert_eq!(
             Tokenizer::new(sql).tokenize(),
@@ -659,6 +667,9 @@ mod tests {
                 Token::Comma,
                 Token::Whitespace(Whitespace::Space),
                 Token::Identifier("age".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Identifier("is_admin".into()),
                 Token::RightParen,
                 Token::Whitespace(Whitespace::Space),
                 Token::Keyword(Keyword::Values),
@@ -671,6 +682,9 @@ mod tests {
                 Token::Comma,
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("20".into()),
+                Token::Comma,
+                Token::Whitespace(Whitespace::Space),
+                Token::Keyword(Keyword::True),
                 Token::RightParen,
                 Token::SemiColon,
                 Token::Eof,

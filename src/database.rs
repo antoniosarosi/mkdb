@@ -72,7 +72,7 @@ pub(crate) enum TypeError {
         right: Value,
     },
     ExpectedType {
-        expected: ExpectedType,
+        expected: DataType,
         found: Value,
     },
 }
@@ -90,19 +90,6 @@ impl Display for ExpectedExpression {
             Self::Identifier => "identifier",
             Self::Value => "raw value",
             Self::Assignment => "assignment",
-        })
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum ExpectedType {
-    Bool,
-}
-
-impl Display for ExpectedType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Bool => "boolean",
         })
     }
 }
@@ -551,7 +538,7 @@ impl<I: Seek + Read + Write> Database<I> {
             Value::Bool(b) => Ok(b),
 
             other => Err(SqlError::TypeError(TypeError::ExpectedType {
-                expected: ExpectedType::Bool,
+                expected: DataType::Bool,
                 found: other,
             })),
         }
@@ -689,7 +676,7 @@ impl<I: Seek + Read + Write> Database<I> {
             return Ok((mkdb_meta_schema(), MKDB_META_ROOT));
         }
 
-        let query = self.execute(format!(
+        let query = self.exec(&format!(
             "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
         ))?;
 
@@ -735,8 +722,8 @@ impl<I: Seek + Read + Write> Database<I> {
         Ok(row_id)
     }
 
-    pub fn execute(&mut self, input: String) -> QueryResult {
-        let mut parser = Parser::new(&input);
+    pub fn exec(&mut self, input: &str) -> QueryResult {
+        let mut parser = Parser::new(input);
 
         let mut statements = parser.try_parse()?;
 
@@ -746,12 +733,10 @@ impl<I: Seek + Read + Write> Database<I> {
 
         let statement = statements.remove(0);
 
-        let sql = statement.to_string();
-
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections through the table name?.
         match statement {
-            Statement::Create(Create::Table { name, .. }) => {
+            Statement::Create(Create::Table { name, columns }) => {
                 let table_root = Page::new(
                     self.cache.pager.alloc_page()?,
                     self.cache.pager.page_size as _,
@@ -761,11 +746,16 @@ impl<I: Seek + Read + Write> Database<I> {
                     .write(table_root.number, table_root.buffer())?;
                 let root_page = table_root.number;
 
-                #[rustfmt::skip]
-                self.execute(format!(r#"
-                    INSERT INTO {MKDB_META} (type, name, root, table_name, sql)
-                    VALUES ("table", "{name}", {root_page}, "{name}", '{sql}');
-                "#))?;
+                self.exec(&format!(
+                    r#"
+                        INSERT INTO {MKDB_META} (type, name, root, table_name, sql)
+                        VALUES ("table", "{name}", {root_page}, "{name}", '{sql}');
+                    "#,
+                    sql = Statement::Create(Create::Table {
+                        name: name.clone(),
+                        columns,
+                    })
+                ))?;
 
                 Ok(QueryResolution::empty())
             }
@@ -779,6 +769,12 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 if columns.len() != values.len() {
                     return Err(DbError::Sql(SqlError::ColumnValueCountMismatch));
+                }
+
+                for col in &columns {
+                    if !schema.index.contains_key(col) {
+                        return Err(DbError::Sql(SqlError::InvalidColumn(col.to_owned())));
+                    }
                 }
 
                 if schema.len() != columns.len() {
@@ -802,7 +798,24 @@ impl<I: Seek + Read + Write> Database<I> {
                         Err(e) => Err(e)?,
                     };
 
-                    resolved_values[schema.index_of(col).unwrap()] = value;
+                    // There should be only valid columns here, we can unwrap.
+                    let index = schema.index_of(col).unwrap();
+
+                    match (schema.columns[index].data_type, &value) {
+                        (DataType::Bool, Value::Bool(_))
+                        | (DataType::Varchar(_), Value::String(_))
+                        | (_, Value::Number(_)) => {
+                            resolved_values[schema.index_of(col).unwrap()] = value;
+                        }
+                        (expected, _) => {
+                            return Err(DbError::Sql(SqlError::TypeError(
+                                TypeError::ExpectedType {
+                                    expected,
+                                    found: value,
+                                },
+                            )))
+                        }
+                    }
                 }
 
                 let row_id = self.next_row_id(into, root)?;
@@ -1038,13 +1051,27 @@ mod tests {
 
     use super::{Database, DbError};
     use crate::{
-        database::{mkdb_meta_schema, Header, QueryResolution, Schema, MAGIC, MKDB_META_ROOT},
+        database::{
+            mkdb_meta_schema, Header, QueryResolution, Schema, SqlError, TypeError, MAGIC,
+            MKDB_META_ROOT,
+        },
         paging::{cache::Cache, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
     };
 
     const PAGE_SIZE: usize = 4096;
+
+    impl PartialEq for DbError {
+        fn eq(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
+                (Self::Parser(a), Self::Parser(b)) => a == b,
+                (Self::Sql(a), Self::Sql(b)) => a == b,
+                _ => false,
+            }
+        }
+    }
 
     fn init_database() -> io::Result<Database<io::Cursor<Vec<u8>>>> {
         let mut pager = Pager::new(io::Cursor::new(Vec::<u8>::new()), PAGE_SIZE, PAGE_SIZE);
@@ -1067,9 +1094,9 @@ mod tests {
         let mut db = init_database()?;
 
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
-        db.execute(sql.into())?;
+        db.exec(sql)?;
 
-        let query = db.execute("SELECT * FROM mkdb_meta;".into())?;
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
 
         assert_eq!(
             query,
@@ -1080,7 +1107,7 @@ mod tests {
                     Value::String("users".into()),
                     Value::Number("2".into()),
                     Value::String("users".into()),
-                    Value::String(Parser::new(&sql).parse_statement()?.to_string())
+                    Value::String(Parser::new(sql).parse_statement()?.to_string())
                 ]]
             )
         );
@@ -1092,11 +1119,11 @@ mod tests {
     fn insert_data() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));".into())?;
-        db.execute("INSERT INTO users(id, name) VALUES (1, 'John Doe');".into())?;
-        db.execute("INSERT INTO users(id, name) VALUES (2, 'Jane Doe');".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+        db.exec("INSERT INTO users(id, name) VALUES (1, 'John Doe');")?;
+        db.exec("INSERT INTO users(id, name) VALUES (2, 'Jane Doe');")?;
 
-        let query = db.execute("SELECT * FROM users;".into())?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(
             query,
@@ -1135,7 +1162,7 @@ mod tests {
             );
         "#;
 
-        db.execute(create_table.into())?;
+        db.exec(create_table)?;
 
         let mut expected = Vec::new();
 
@@ -1149,13 +1176,12 @@ mod tests {
                 Value::String(email.clone()),
             ]);
 
-            let insert =
-                format!("INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');");
-
-            db.execute(insert.into())?;
+            db.exec(&format!(
+                "INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');"
+            ))?;
         }
 
-        let query = db.execute("SELECT * FROM users ORDER BY id;".into())?;
+        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
 
         assert_eq!(
             query,
@@ -1185,15 +1211,111 @@ mod tests {
     }
 
     #[test]
+    fn insert_disordered() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(name, age, id) VALUES ('John Doe', 18, 1);")?;
+        db.exec("INSERT INTO users(name, age, id) VALUES ('Jane Doe', 22, 2);")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(
+            query,
+            QueryResolution {
+                schema: Schema::from(vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ]),
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("18".into())
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::String("Jane Doe".into()),
+                        Value::Number("22".into())
+                    ],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_expressions() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE products (id INT PRIMARY KEY, price INT, discount INT);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (1, 10*10 + 10, 2+2);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (2, 50 - 5*2, 100 / (3+2));")?;
+
+        let query = db.exec("SELECT * FROM products;")?;
+
+        assert_eq!(
+            query,
+            QueryResolution {
+                schema: Schema::from(vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "price".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    },
+                    Column {
+                        name: "discount".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ]),
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::Number("110".into()),
+                        Value::Number("4".into()),
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::Number("40".into()),
+                        Value::Number("20".into()),
+                    ],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn select_where() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        let query = db.execute("SELECT * FROM users WHERE age > 18;".into())?;
+        let query = db.exec("SELECT * FROM users WHERE age > 18;")?;
 
         assert_eq!(
             query,
@@ -1234,6 +1356,165 @@ mod tests {
     }
 
     #[test]
+    fn select_order_by() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'John Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+
+        let query = db.exec("SELECT * FROM users ORDER BY name, age;")?;
+
+        assert_eq!(
+            query,
+            QueryResolution {
+                schema: Schema::from(vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    }
+                ]),
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("18".into())
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("22".into())
+                    ],
+                    vec![
+                        Value::Number("3".into()),
+                        Value::String("Some Dude".into()),
+                        Value::Number("24".into())
+                    ]
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_disordered_columns() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT, is_admin BOOL);",
+        )?;
+        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (1, 'John Doe', 18, TRUE);")?;
+        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (2, 'Jane Doe', 22, FALSE);")?;
+
+        let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
+
+        assert_eq!(
+            query,
+            QueryResolution {
+                schema: Schema::from(vec![
+                    Column {
+                        name: "age".into(),
+                        data_type: DataType::Int,
+                        constraint: None
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Varchar(255),
+                        constraint: None
+                    },
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "is_admin".into(),
+                        data_type: DataType::Bool,
+                        constraint: None,
+                    },
+                ]),
+                results: vec![
+                    vec![
+                        Value::Number("18".into()),
+                        Value::String("John Doe".into()),
+                        Value::Number("1".into()),
+                        Value::Bool(true),
+                    ],
+                    vec![
+                        Value::Number("22".into()),
+                        Value::String("Jane Doe".into()),
+                        Value::Number("2".into()),
+                        Value::Bool(false),
+                    ],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_expressions() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE products (id INT PRIMARY KEY, price INT, discount INT);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (1, 100, 5);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (2, 250, 10);")?;
+
+        let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
+
+        assert_eq!(
+            query,
+            QueryResolution {
+                schema: Schema::from(vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Int,
+                        constraint: Some(Constraint::PrimaryKey),
+                    },
+                    Column {
+                        name: "(price) / (10)".into(),
+                        data_type: DataType::BigInt,
+                        constraint: None
+                    },
+                    Column {
+                        name: "(discount) * (100)".into(),
+                        data_type: DataType::BigInt,
+                        constraint: None
+                    }
+                ]),
+                results: vec![
+                    vec![
+                        Value::Number("1".into()),
+                        Value::Number("10".into()),
+                        Value::Number("500".into()),
+                    ],
+                    vec![
+                        Value::Number("2".into()),
+                        Value::Number("25".into()),
+                        Value::Number("1000".into()),
+                    ],
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn create_multiple_tables() -> Result<(), DbError> {
         let mut db = init_database()?;
 
@@ -1241,11 +1522,11 @@ mod tests {
         let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
         let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
 
-        db.execute(t1.into())?;
-        db.execute(t2.into())?;
-        db.execute(t3.into())?;
+        db.exec(t1)?;
+        db.exec(t2)?;
+        db.exec(t3)?;
 
-        let query = db.execute("SELECT * FROM mkdb_meta;".into())?;
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
 
         assert_eq!(
             query,
@@ -1284,14 +1565,14 @@ mod tests {
     fn delete_all() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        db.execute("DELETE FROM users;".into())?;
+        db.exec("DELETE FROM users;")?;
 
-        let query = db.execute("SELECT * FROM users;".into())?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(
             query,
@@ -1324,14 +1605,14 @@ mod tests {
     fn delete_where() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        db.execute("DELETE FROM users WHERE age > 18;".into())?;
+        db.exec("DELETE FROM users WHERE age > 18;")?;
 
-        let query = db.execute("SELECT * FROM users;".into())?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(
             query,
@@ -1368,14 +1649,14 @@ mod tests {
     fn update() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        db.execute("UPDATE users SET age = 20;".into())?;
+        db.exec("UPDATE users SET age = 20;")?;
 
-        let query = db.execute("SELECT * FROM users;".into())?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(
             query,
@@ -1424,14 +1705,14 @@ mod tests {
     fn update_where() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);".into())?;
-        db.execute("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);".into())?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        db.execute("UPDATE users SET age = 20, name = 'Updated Name' WHERE age > 18;".into())?;
+        db.exec("UPDATE users SET age = 20, name = 'Updated Name' WHERE age > 18;")?;
 
-        let query = db.execute("SELECT * FROM users;".into())?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(
             query,
@@ -1471,6 +1752,84 @@ mod tests {
                     ]
                 ]
             }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_invalid_column() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+
+        assert_eq!(
+            db.exec("SELECT incorrect_col, id, name FROM users;"),
+            Err(DbError::Sql(SqlError::InvalidColumn(
+                "incorrect_col".into()
+            )))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_invalid_column() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        assert_eq!(
+            db.exec("INSERT INTO users(id, name, incorrect_col) VALUES (1, 'John Doe', 50);"),
+            Err(DbError::Sql(SqlError::InvalidColumn(
+                "incorrect_col".into()
+            )))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_missing_columns() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+
+        assert_eq!(
+            db.exec("INSERT INTO users(id, name) VALUES (1, 'John Doe');"),
+            Err(DbError::Sql(SqlError::MissingColumns))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_column_count_mismatch() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+
+        assert_eq!(
+            db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe');"),
+            Err(DbError::Sql(SqlError::ColumnValueCountMismatch))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_type_error() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        assert_eq!(
+            db.exec("INSERT INTO users(id, name) VALUES ('String', 10);"),
+            Err(DbError::Sql(SqlError::TypeError(TypeError::ExpectedType {
+                expected: DataType::Int,
+                found: Value::String("String".into())
+            })))
         );
 
         Ok(())
