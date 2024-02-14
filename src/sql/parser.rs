@@ -182,7 +182,7 @@ impl<'i> Parser<'i> {
 
                     Keyword::Table => Create::Table {
                         name: identifier,
-                        columns: self.parse_schema()?,
+                        columns: self.parse_column_definitions()?,
                     },
 
                     _ => unreachable!(),
@@ -465,7 +465,7 @@ impl<'i> Parser<'i> {
     }
 
     /// Used to parse `CREATE TABLE` column definitions.
-    fn parse_schema(&mut self) -> ParseResult<Vec<Column>> {
+    fn parse_column_definitions(&mut self) -> ParseResult<Vec<Column>> {
         self.parse_comma_separated(Self::parse_column, true)
     }
 

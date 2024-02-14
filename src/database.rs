@@ -6,6 +6,7 @@ use std::{
     io::{self, Read, Seek, Write},
     mem,
     path::Path,
+    usize,
 };
 
 use crate::{
@@ -55,9 +56,8 @@ pub(crate) struct Database<I> {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct QueryResolution {
-    schema: Vec<Column>,
+    schema: Schema,
     results: Vec<Vec<Value>>,
-    index_map: HashMap<String, usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -192,33 +192,63 @@ impl From<SqlError> for DbError {
     }
 }
 
-type QueryResult = Result<QueryResolution, DbError>;
+#[derive(Debug, PartialEq)]
+pub(crate) struct Schema {
+    pub columns: Vec<Column>,
+    pub index: HashMap<String, usize>,
+}
 
-impl QueryResolution {
-    fn new(schema: Vec<Column>, results: Vec<Vec<Value>>) -> Self {
-        let index_map = schema
+impl Schema {
+    pub fn new(columns: Vec<Column>) -> Self {
+        let index = columns
             .iter()
             .enumerate()
             .map(|(i, col)| (col.name.clone(), i))
             .collect();
 
-        Self {
-            schema,
-            results,
-            index_map,
-        }
+        Self { columns, index }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(vec![])
+    }
+
+    pub fn index_of(&self, col: &str) -> Option<usize> {
+        self.index.get(col).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn push(&mut self, column: Column) {
+        self.index.insert(column.name.to_owned(), self.len());
+        self.columns.push(column);
+    }
+}
+
+impl From<Vec<Column>> for Schema {
+    fn from(columns: Vec<Column>) -> Self {
+        Self::new(columns)
+    }
+}
+
+type QueryResult = Result<QueryResolution, DbError>;
+
+impl QueryResolution {
+    fn new(schema: Schema, results: Vec<Vec<Value>>) -> Self {
+        Self { schema, results }
     }
 
     fn empty() -> Self {
         Self {
-            schema: Vec::new(),
+            schema: Schema::empty(),
             results: Vec::new(),
-            index_map: HashMap::new(),
         }
     }
 
     fn get(&self, row: usize, column: &str) -> Option<&Value> {
-        self.results.get(row)?.get(*self.index_map.get(column)?)
+        self.results.get(row)?.get(self.schema.index_of(column)?)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -227,7 +257,12 @@ impl QueryResolution {
 
     pub fn as_ascii_table(&self) -> String {
         // Initialize width of each column to the length of the table headers.
-        let mut widths: Vec<usize> = self.schema.iter().map(|column| column.name.len()).collect();
+        let mut widths: Vec<usize> = self
+            .schema
+            .columns
+            .iter()
+            .map(|col| col.name.len())
+            .collect();
 
         // We only need strings.
         let rows: Vec<Vec<String>> = self
@@ -279,7 +314,12 @@ impl QueryResolution {
         table.push('\n');
 
         table.push_str(&make_row(
-            &self.schema.iter().map(|col| col.name.clone()).collect(),
+            &self
+                .schema
+                .columns
+                .iter()
+                .map(|col| col.name.clone())
+                .collect(),
         ));
         table.push('\n');
 
@@ -301,8 +341,8 @@ impl QueryResolution {
 }
 
 /// Schema of the table used to keep track of the database information.
-fn mkdb_meta_schema() -> Vec<Column> {
-    vec![
+fn mkdb_meta_schema() -> Schema {
+    Schema::from(vec![
         // Either "index" or "table"
         Column {
             name: String::from("type"),
@@ -334,7 +374,7 @@ fn mkdb_meta_schema() -> Vec<Column> {
             data_type: DataType::Varchar(1000),
             constraint: None,
         },
-    ]
+    ])
 }
 
 impl<I> Database<I> {
@@ -402,19 +442,16 @@ impl<I: Seek + Read + Write> Database<I> {
 
     fn resolve_expression(
         values: &Vec<Value>,
-        schema: &Vec<Column>,
+        schema: &Schema,
         expr: &Expression,
     ) -> Result<Value, SqlError> {
         match expr {
             Expression::Value(value) => Ok(value.clone()),
 
-            Expression::Identifier(ident) => {
-                // TODO: Store the position somewhere.
-                match schema.iter().position(|column| &column.name == ident) {
-                    Some(index) => Ok(values[index].clone()),
-                    None => Err(SqlError::InvalidColumn(ident.clone())),
-                }
-            }
+            Expression::Identifier(ident) => match schema.index_of(&ident) {
+                Some(index) => Ok(values[index].clone()),
+                None => Err(SqlError::InvalidColumn(ident.clone())),
+            },
 
             Expression::UnaryOperation { operator, expr } => {
                 match Self::resolve_expression(values, schema, expr)? {
@@ -502,7 +539,7 @@ impl<I: Seek + Read + Write> Database<I> {
     }
 
     fn eval_where(
-        schema: &Vec<Column>,
+        schema: &Schema,
         values: &Vec<Value>,
         r#where: &Option<Expression>,
     ) -> Result<bool, SqlError> {
@@ -520,7 +557,7 @@ impl<I: Seek + Read + Write> Database<I> {
         }
     }
 
-    fn serialize_values(row_id: RowId, schema: &Vec<Column>, values: &Vec<Value>) -> Vec<u8> {
+    fn serialize_values(row_id: RowId, schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
         let mut buf = Vec::from(serialize_row_id(row_id));
 
         macro_rules! serialize_little_endian {
@@ -530,7 +567,7 @@ impl<I: Seek + Read + Write> Database<I> {
         }
 
         // TODO: Alignment.
-        for (col, val) in schema.iter().zip(values) {
+        for (col, val) in schema.columns.iter().zip(values) {
             match (&col.data_type, val) {
                 (DataType::Varchar(max), Value::String(string)) => {
                     let length = string.len().to_le_bytes();
@@ -567,7 +604,7 @@ impl<I: Seek + Read + Write> Database<I> {
         buf
     }
 
-    fn deserialize_values(buf: Box<[u8]>, schema: &Vec<Column>) -> (RowId, Vec<Value>) {
+    fn deserialize_values(buf: Box<[u8]>, schema: &Schema) -> (RowId, Vec<Value>) {
         let mut values = Vec::new();
         let row_id = deserialize_row_id(&buf);
         let mut index = mem::size_of::<RowId>();
@@ -589,7 +626,7 @@ impl<I: Seek + Read + Write> Database<I> {
         }
 
         // TODO: Alignment.
-        for column in schema {
+        for column in &schema.columns {
             match column.data_type {
                 DataType::Varchar(max) => {
                     let length = if max <= u8::MAX as usize {
@@ -647,7 +684,7 @@ impl<I: Seek + Read + Write> Database<I> {
         (row_id, values)
     }
 
-    fn table_metadata(&mut self, table: &String) -> Result<(Vec<Column>, PageNumber), DbError> {
+    fn table_metadata(&mut self, table: &String) -> Result<(Schema, PageNumber), DbError> {
         if table == MKDB_META {
             return Ok((mkdb_meta_schema(), MKDB_META_ROOT));
         }
@@ -660,10 +697,12 @@ impl<I: Seek + Read + Write> Database<I> {
             return Err(DbError::Sql(SqlError::InvalidTable(table.clone())));
         }
 
-        // TODO: Find some way to avoid parsing SQL every time.
+        // TODO: Find some way to avoid parsing SQL every time. Probably a
+        // hash map of table name -> schema, we wouldn't even need to update it
+        // as we don't support ALTER table statements.
         let schema = match query.get(0, "sql") {
             Some(Value::String(sql)) => match Parser::new(&sql).parse_statement()? {
-                Statement::Create(Create::Table { columns, .. }) => columns,
+                Statement::Create(Create::Table { columns, .. }) => Schema::from(columns),
                 _ => unreachable!(),
             },
             _ => unreachable!(),
@@ -712,9 +751,9 @@ impl<I: Seek + Read + Write> Database<I> {
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections through the table name?.
         match statement {
-            Statement::Create(Create::Table { name, columns }) => {
+            Statement::Create(Create::Table { name, .. }) => {
                 let table_root = Page::new(
-                    self.cache.pager.alloc_page().unwrap(),
+                    self.cache.pager.alloc_page()?,
                     self.cache.pager.page_size as _,
                 );
                 self.cache
@@ -746,13 +785,14 @@ impl<I: Seek + Read + Write> Database<I> {
                     return Err(DbError::Sql(SqlError::MissingColumns));
                 }
 
-                let mut values_only = vec![Value::Bool(false); values.len()];
+                let mut resolved_values = vec![Value::Bool(false); values.len()];
 
                 for (col, expr) in columns.iter().zip(values) {
-                    let value = match Self::resolve_expression(&Vec::new(), &Vec::new(), &expr) {
+                    let value = match Self::resolve_expression(&Vec::new(), &Schema::empty(), &expr)
+                    {
                         Ok(value) => value,
 
-                        Err(SqlError::InvalidColumn(col)) => {
+                        Err(SqlError::InvalidColumn(_col)) => {
                             Err(DbError::Sql(SqlError::Expected {
                                 expected: ExpectedExpression::Value,
                                 found: expr,
@@ -762,48 +802,69 @@ impl<I: Seek + Read + Write> Database<I> {
                         Err(e) => Err(e)?,
                     };
 
-                    // TODO: Do something about O(n^2)
-                    let idx = schema.iter().position(|c| &c.name == col).unwrap();
-                    values_only[idx] = value;
+                    resolved_values[schema.index_of(col).unwrap()] = value;
                 }
 
                 let row_id = self.next_row_id(into, root)?;
 
                 let mut btree = self.btree(root);
 
-                btree.insert(Self::serialize_values(row_id, &schema, &values_only))?;
+                btree.insert(Self::serialize_values(row_id, &schema, &resolved_values))?;
 
                 Ok(QueryResolution::empty())
             }
 
             Statement::Select {
-                columns,
+                mut columns,
                 from,
                 r#where,
                 order_by,
             } => {
-                let (mut schema, root) = self.table_metadata(&from)?;
+                let (schema, root) = self.table_metadata(&from)?;
+
+                let mut results_schema = Schema::empty();
+                let mut unknown_types = Vec::new();
+
+                columns = {
+                    let mut resolved_wildcards = Vec::new();
+                    for expr in columns {
+                        if let &Expression::Wildcard = &expr {
+                            for col in &schema.columns {
+                                resolved_wildcards
+                                    .push(Expression::Identifier(col.name.to_owned()));
+                            }
+                        } else {
+                            resolved_wildcards.push(expr);
+                        }
+                    }
+                    resolved_wildcards
+                };
+
+                // Adjust results schema
+                for (i, expr) in columns.iter().enumerate() {
+                    match expr {
+                        Expression::Identifier(ident) => match schema.index_of(ident) {
+                            Some(index) => results_schema.push(schema.columns[index].clone()),
+                            None => Err(DbError::Sql(SqlError::InvalidColumn(ident.clone())))?,
+                        },
+
+                        _ => {
+                            results_schema.push(Column {
+                                name: expr.to_string(),    // TODO: AS alias
+                                data_type: DataType::Bool, // We'll set it later
+                                constraint: None,
+                            });
+
+                            unknown_types.push(i);
+                        }
+                    }
+                }
 
                 let mut results = Vec::new();
 
                 let mut btree = self.btree(root);
 
-                let mut identifiers = Vec::new();
-
-                for select_col in &columns {
-                    match select_col {
-                        Expression::Identifier(ident) => identifiers.push(ident.to_owned()),
-                        Expression::Wildcard => {
-                            for col in &schema {
-                                identifiers.push(col.name.to_owned());
-                            }
-                        }
-                        _ => todo!("resolve expressions"),
-                    }
-                }
-
                 for row in btree.iter() {
-                    // TODO: Deserialize only needed values instead of all and the cloning...
                     let (_, values) = Self::deserialize_values(row?, &schema);
 
                     if !Self::eval_where(&schema, &values, &r#where)? {
@@ -812,28 +873,37 @@ impl<I: Seek + Read + Write> Database<I> {
 
                     let mut result = Vec::new();
 
-                    for ident in &identifiers {
-                        // TODO: O(n^2)
-                        let p = schema.iter().position(|s| &s.name == ident).unwrap();
-                        result.push(values[p].clone());
+                    for expr in &columns {
+                        result.push(Self::resolve_expression(&values, &schema, expr)?);
                     }
 
                     results.push(result);
                 }
 
-                let mut results_schema = Vec::new();
-
-                for ident in identifiers {
-                    let c = schema.remove(schema.iter().position(|s| s.name == ident).unwrap());
-                    results_schema.push(c);
+                // We already set the default of unknown types as bools, if
+                // it's a number then change it to BigInt. We don't support any
+                // expressions that produce strings. And we don't use the types
+                // of results for anything now anyway.
+                if !results.is_empty() {
+                    for i in unknown_types {
+                        if let Value::Number(_) = &results[0][i] {
+                            results_schema.columns[i].data_type = DataType::BigInt;
+                        }
+                    }
                 }
 
                 // TODO: Order by can contain column that we didn't select.
                 if !order_by.is_empty() {
-                    let order_by_cols = order_by
-                        .iter()
-                        .map(|o| results_schema.iter().position(|r| &r.name == o).unwrap())
-                        .collect::<Vec<_>>();
+                    let mut order_by_cols = Vec::new();
+
+                    for identifier in order_by {
+                        match results_schema.index_of(&identifier) {
+                            Some(index) => order_by_cols.push(index),
+                            None => Err(DbError::Sql(SqlError::Other(format!(
+                                "ordering by columns not present in SELECT is not supported"
+                            ))))?,
+                        }
+                    }
 
                     results.sort_by(|a, b| {
                         for i in &order_by_cols {
@@ -870,8 +940,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and the cloning...
-                    let row = row?;
-                    let (row_id, values) = Self::deserialize_values(row, &schema);
+                    let (row_id, values) = Self::deserialize_values(row?, &schema);
 
                     if !Self::eval_where(&schema, &values, &r#where)? {
                         continue;
@@ -928,23 +997,22 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and then cloning...
-                    let row = row?;
-                    let (row_id, mut values) = Self::deserialize_values(row, &schema);
+                    let (row_id, mut values) = Self::deserialize_values(row?, &schema);
 
                     if !Self::eval_where(&schema, &values, &r#where)? {
                         continue;
                     }
 
                     for (col, expr) in &assignments {
-                        let v = match **expr {
+                        let value = match **expr {
                             Expression::Value(ref v) => v.clone(),
                             _ => Self::resolve_expression(&values, &schema, expr)?,
                         };
 
-                        let p = schema.iter().position(|s| &s.name == col).unwrap();
-
-                        values[p] = v;
-
+                        let index = schema
+                            .index_of(col)
+                            .ok_or(SqlError::InvalidColumn(col.clone()))?;
+                        values[index] = value;
                         updates.push(Self::serialize_values(row_id, &schema, &values));
                     }
                 }
@@ -970,7 +1038,7 @@ mod tests {
 
     use super::{Database, DbError};
     use crate::{
-        database::{mkdb_meta_schema, Header, QueryResolution, MAGIC, MKDB_META_ROOT},
+        database::{mkdb_meta_schema, Header, QueryResolution, Schema, MAGIC, MKDB_META_ROOT},
         paging::{cache::Cache, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
@@ -1032,8 +1100,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1044,12 +1112,12 @@ mod tests {
                         data_type: DataType::Varchar(255),
                         constraint: None
                     }
-                ],
-                vec![
+                ]),
+                results: vec![
                     vec![Value::Number("1".into()), Value::String("John Doe".into())],
                     vec![Value::Number("2".into()), Value::String("Jane Doe".into())],
                 ]
-            )
+            }
         );
 
         Ok(())
@@ -1091,8 +1159,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1108,9 +1176,9 @@ mod tests {
                         data_type: DataType::Varchar(255),
                         constraint: Some(Constraint::Unique),
                     }
-                ],
-                expected
-            )
+                ]),
+                results: expected
+            }
         );
 
         Ok(())
@@ -1129,8 +1197,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1146,8 +1214,8 @@ mod tests {
                         data_type: DataType::Int,
                         constraint: None
                     }
-                ],
-                vec![
+                ]),
+                results: vec![
                     vec![
                         Value::Number("2".into()),
                         Value::String("Jane Doe".into()),
@@ -1159,7 +1227,7 @@ mod tests {
                         Value::Number("24".into())
                     ],
                 ]
-            )
+            }
         );
 
         Ok(())
@@ -1181,9 +1249,9 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                mkdb_meta_schema(),
-                vec![
+            QueryResolution {
+                schema: mkdb_meta_schema(),
+                results: vec![
                     vec![
                         Value::String("table".into()),
                         Value::String("users".into()),
@@ -1206,7 +1274,7 @@ mod tests {
                         Value::String(Parser::new(&t3).parse_statement()?.to_string())
                     ]
                 ]
-            )
+            }
         );
 
         Ok(())
@@ -1227,8 +1295,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1244,9 +1312,9 @@ mod tests {
                         data_type: DataType::Int,
                         constraint: None
                     }
-                ],
-                vec![]
-            )
+                ]),
+                results: vec![]
+            }
         );
 
         Ok(())
@@ -1267,8 +1335,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1284,13 +1352,13 @@ mod tests {
                         data_type: DataType::Int,
                         constraint: None
                     }
-                ],
-                vec![vec![
+                ]),
+                results: vec![vec![
                     Value::Number("1".into()),
                     Value::String("John Doe".into()),
                     Value::Number("18".into())
                 ]]
-            )
+            }
         );
 
         Ok(())
@@ -1311,8 +1379,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1328,8 +1396,8 @@ mod tests {
                         data_type: DataType::Int,
                         constraint: None
                     }
-                ],
-                vec![
+                ]),
+                results: vec![
                     vec![
                         Value::Number("1".into()),
                         Value::String("John Doe".into()),
@@ -1346,7 +1414,7 @@ mod tests {
                         Value::Number("20".into())
                     ]
                 ]
-            )
+            }
         );
 
         Ok(())
@@ -1367,8 +1435,8 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
-                vec![
+            QueryResolution {
+                schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
@@ -1384,8 +1452,8 @@ mod tests {
                         data_type: DataType::Int,
                         constraint: None
                     }
-                ],
-                vec![
+                ]),
+                results: vec![
                     vec![
                         Value::Number("1".into()),
                         Value::String("John Doe".into()),
@@ -1402,7 +1470,7 @@ mod tests {
                         Value::Number("20".into())
                     ]
                 ]
-            )
+            }
         );
 
         Ok(())

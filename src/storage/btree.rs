@@ -1858,12 +1858,12 @@ mod tests {
     use crate::{
         database::{Header, MAGIC},
         paging::{
-            cache::{self, Cache},
+            cache::Cache,
             pager::{PageNumber, Pager},
         },
         storage::{
             btree::Payload,
-            page::{Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
+            page::{Cell, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
         },
     };
 

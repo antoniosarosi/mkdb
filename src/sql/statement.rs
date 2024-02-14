@@ -75,13 +75,13 @@ pub(crate) enum UnaryOperator {
     Minus,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum Constraint {
     PrimaryKey,
     Unique,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum DataType {
     Int,
     UnsignedInt,
@@ -111,7 +111,7 @@ impl PartialOrd for Value {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Column {
     pub name: String,
     pub data_type: DataType,
