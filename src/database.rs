@@ -11,10 +11,7 @@ use std::{
 
 use crate::{
     os::{Disk, HardwareBlockSize},
-    paging::{
-        cache::Cache,
-        pager::{PageNumber, Pager},
-    },
+    paging::pager::{PageNumber, Pager},
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
@@ -50,7 +47,7 @@ pub(crate) struct Header {
 }
 
 pub(crate) struct Database<I> {
-    cache: Cache<I>,
+    pager: Pager<I>,
     row_ids: HashMap<String, u64>,
 }
 
@@ -365,9 +362,9 @@ fn mkdb_meta_schema() -> Schema {
 }
 
 impl<I> Database<I> {
-    fn new(cache: Cache<I>) -> Self {
+    fn new(pager: Pager<I>) -> Self {
         Self {
-            cache,
+            pager,
             row_ids: HashMap::new(),
         }
     }
@@ -405,7 +402,7 @@ impl Database<File> {
             pager.write(MKDB_META_ROOT, root.buffer())?;
         }
 
-        Ok(Database::new(Cache::new(pager)))
+        Ok(Database::new(pager))
     }
 }
 
@@ -420,7 +417,7 @@ fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
 impl<I: Seek + Read + Write> Database<I> {
     fn btree(&mut self, root: PageNumber) -> BTree<'_, I, FixedSizeMemCmp> {
         BTree::new(
-            &mut self.cache,
+            &mut self.pager,
             root,
             DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
             FixedSizeMemCmp::for_type::<RowId>(),
@@ -716,13 +713,8 @@ impl<I: Seek + Read + Write> Database<I> {
         // TODO: SQL injections through the table name?.
         match statement {
             Statement::Create(Create::Table { name, columns }) => {
-                let table_root = Page::new(
-                    self.cache.pager.alloc_page()?,
-                    self.cache.pager.page_size as _,
-                );
-                self.cache
-                    .pager
-                    .write(table_root.number, table_root.buffer())?;
+                let table_root = Page::new(self.pager.alloc_page()?, self.pager.page_size as _);
+                self.pager.write(table_root.number, table_root.buffer())?;
                 let root_page = table_root.number;
 
                 self.exec(&format!(
@@ -1030,7 +1022,7 @@ mod tests {
             mkdb_meta_schema, Header, QueryResolution, Schema, SqlError, TypeError, MAGIC,
             MKDB_META_ROOT,
         },
-        paging::{cache::Cache, pager::Pager},
+        paging::pager::Pager,
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
     };
@@ -1063,7 +1055,7 @@ mod tests {
         let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
         pager.write(MKDB_META_ROOT, root.buffer())?;
 
-        Ok(Database::new(Cache::new(pager)))
+        Ok(Database::new(pager))
     }
 
     #[test]

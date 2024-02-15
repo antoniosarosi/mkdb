@@ -1,4 +1,6 @@
 //! Paging implementation.
 
-pub(crate) mod cache;
+pub(super) mod cache;
+pub(super) mod io;
+
 pub(crate) mod pager;
