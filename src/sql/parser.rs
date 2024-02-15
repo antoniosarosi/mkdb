@@ -15,7 +15,7 @@ const UNARY_ARITHMETIC_OPERATOR_PRECEDENCE: u8 = 50;
 
 /// Parser error kind.
 #[derive(Debug, PartialEq)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     TokenizerError(tokenizer::ErrorKind),
 
     Expected { expected: Token, found: Token },
@@ -30,8 +30,9 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// We need a display value for [`Token`] variants that hold inner data. We
-    /// could also use something like [strum], but it's unnecessary for now.
+    /// We need a display value for [`Token`] variants that hold inner data.
+    ///
+    /// We could also use something like [strum], but it's unnecessary for now.
     ///
     /// [strum]: https://docs.rs/strum/latest/strum/derive.EnumDiscriminants.html
     fn expected_token_string(token: &Token) -> String {
@@ -117,10 +118,12 @@ impl From<TokenizerError> for ParserError {
 
 pub(crate) type ParseResult<T> = Result<T, ParserError>;
 
-/// TDOP (Top-Down Operator Precedence) recursive descent parser. See this
-/// [tutorial] for an introduction to the algorithms used here and see also the
-/// [sqlparser] Github repo for a more complete and robust SQL parser written in
-/// Rust. This one is simply a toy parser implemented for the sake of it.
+/// TDOP (Top-Down Operator Precedence) recursive descent parser.
+///
+/// See this [tutorial] for an introduction to the algorithms used here and see
+/// also the [sqlparser] Github repo for a more complete and robust SQL parser
+/// written in Rust. This one is simply a toy parser implemented for the sake of
+/// it.
 ///
 /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
 /// [sqlparser]: https://github.com/sqlparser-rs/sqlparser-rs
@@ -153,8 +156,9 @@ impl<'i> Parser<'i> {
         }
     }
 
-    /// Parses a single SQL statement in the input string. If the statement
-    /// terminator is not found then it returns [`Err`].
+    /// Parses a single SQL statement in the input string.
+    ///
+    /// If the statement terminator is not found then it returns [`Err`].
     pub fn parse_statement(&mut self) -> ParseResult<Statement> {
         let statement = match self.expect_one_of(&Self::supported_statements())? {
             Keyword::Select => {
@@ -243,8 +247,9 @@ impl<'i> Parser<'i> {
         Ok(statement)
     }
 
-    /// TDOP recursive descent consists of 3 functions that call each other
-    /// recursively:
+    /// Starts the TDOP recursive descent.
+    ///
+    /// TDOP consists of 3 functions that call each other recursively:
     ///
     /// - [`Self::parse_expr`]
     /// - [`Self::parse_prefix`]
@@ -487,6 +492,8 @@ impl<'i> Parser<'i> {
         }
     }
 
+    /// Parses an optional `FROM ... WHERE ...` construct.
+    ///
     /// These statements all have a `FROM` clause and an optional `WHERE`
     /// clause:
     ///
@@ -502,8 +509,9 @@ impl<'i> Parser<'i> {
         Ok((from, r#where))
     }
 
-    /// Parses the `ORDER BY` clause at the end of `SELECT` statements. It only
-    /// works with identifiers (not expressions) for now.
+    /// Parses the `ORDER BY` clause at the end of `SELECT` statements.
+    ///
+    /// It only works with identifiers (not expressions) for now.
     fn parse_optional_order_by(&mut self) -> ParseResult<Vec<String>> {
         if self.consume_optional_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
@@ -520,7 +528,9 @@ impl<'i> Parser<'i> {
     }
 
     /// Automatically fails if the `expected` token is not the next one in the
-    /// stream (after whitespaces). If it is, it will be returned back.
+    /// stream (after whitespaces).
+    ///
+    /// If it is, it will be returned back.
     fn expect_token(&mut self, expected: Token) -> ParseResult<Token> {
         self.next_token().and_then(|token| {
             if token == expected {
@@ -535,7 +545,9 @@ impl<'i> Parser<'i> {
     }
 
     /// Automatically fails if the next token does not match one of the given
-    /// `keywords`. If it does, then the keyword that matched is returned back.
+    /// `keywords`.
+    ///
+    /// If it does, then the keyword that matched is returned back.
     fn expect_one_of<'k, K>(&mut self, keywords: &'k K) -> ParseResult<Keyword>
     where
         &'k K: IntoIterator<Item = &'k Keyword>,
@@ -553,14 +565,18 @@ impl<'i> Parser<'i> {
     }
 
     /// Consumes all the tokens before and including the given `optional`
-    /// keyword. If the keyword is not found, only whitespaces are consumed.
+    /// keyword.
+    ///
+    /// If the keyword is not found, only whitespaces are consumed.
     fn consume_optional_keyword(&mut self, optional: Keyword) -> bool {
         self.consume_optional_token(Token::Keyword(optional))
     }
 
     /// If the next token in the stream matches the given `optional` token, then
-    /// this function consumes the token and returns `true`. Otherwise the token
-    /// will not be consumed and the tokenizer will still be pointing at it.
+    /// this function consumes the token and returns `true`.
+    ///
+    /// Otherwise the token will not be consumed and the tokenizer will still be
+    /// pointing at it.
     fn consume_optional_token(&mut self, optional: Token) -> bool {
         match self.peek_token() {
             Some(Ok(token)) if token == &optional => {
@@ -572,8 +588,10 @@ impl<'i> Parser<'i> {
     }
 
     /// Consumes the next token in the stream only if it matches one of the
-    /// given `keywords`. If so, the matched [`Keyword`] variant is returned.
-    /// Otherwise returns [`Keyword::None`].
+    /// given `keywords`.
+    ///
+    /// If so, the matched [`Keyword`] variant is returned. Otherwise returns
+    /// [`Keyword::None`].
     fn consume_one_of<'k, K>(&mut self, keywords: &'k K) -> Keyword
     where
         &'k K: IntoIterator<Item = &'k Keyword>,
@@ -601,10 +619,12 @@ impl<'i> Parser<'i> {
     }
 
     /// Skips all instances of [`Token::Whitespace`] and returns the next
-    /// relevant [`Token`]. This function doesn't return [`Option`] because
-    /// it's used in all cases to expect some token. If we dont' expect any
-    /// more tokens (for example, after we've found [`Token::SemiColon`] or
-    /// [`Token::Eof`]) then we just won't call this function at all.
+    /// relevant [`Token`].
+    ///
+    /// This function doesn't return [`Option`] because it's used in all cases
+    /// to expect some token. If we dont' expect any more tokens (for example,
+    /// after we've found [`Token::SemiColon`] or [`Token::Eof`]) then we just
+    /// won't call this function at all.
     fn next_token(&mut self) -> ParseResult<Token> {
         self.skip_white_spaces();
         self.next_token_in_stream()
@@ -618,10 +638,11 @@ impl<'i> Parser<'i> {
     }
 
     /// Consumes and returns the next [`Token`] in the stream updating
-    /// [`Self::location`] in the process, removing the need to use
-    /// [`TokenWithLocation`] instances. This method should not be called after
-    /// [`Token::Eof`] has been returned once since it will error with
-    /// [`ErrorKind::UnexpectedEof`].
+    /// [`Self::location`] in the process.
+    ///
+    /// This removes the need to use [`TokenWithLocation`] instances. This
+    /// method should not be called after [`Token::Eof`] has been returned once
+    /// since it will error with [`ErrorKind::UnexpectedEof`].
     fn next_token_in_stream(&mut self) -> ParseResult<Token> {
         match self.tokenizer.peek() {
             None => Err(self.error(ErrorKind::UnexpectedEof)),

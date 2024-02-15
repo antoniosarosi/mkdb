@@ -1,4 +1,6 @@
-//! Disk BTree data structure. See [`BTree`] for details.
+//! Disk BTree data structure implementation.
+//!
+//! See [`BTree`] for details.
 
 use std::{
     cmp::{min, Ordering},
@@ -17,7 +19,7 @@ use crate::paging::pager::{PageNumber, Pager};
 /// binary slices as parameters. For example, suppose we need to compare the
 /// following two slices:
 ///
-/// ```rust
+/// ```no_run
 /// let A = [1, 0, 0, 0];
 /// let B = [2, 0, 0, 0, 0, 0, 0, 0];
 /// ```
@@ -502,8 +504,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         };
 
         self.balance(search.page, parents)?;
-        self.pager.write_dirty_pages()?;
-        self.pager.flush()
+        self.pager.write_dirty_pages()
     }
 
     /// Removes the entry corresponding to the given key if it exists.
@@ -614,7 +615,6 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         self.balance(leaf_node, parents)?;
         self.pager.write_dirty_pages()?;
-        self.pager.flush()?;
 
         Ok(Some(entry))
     }
@@ -1849,11 +1849,14 @@ mod tests {
 
     use super::{BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
-        database::{Header, MAGIC},
-        paging::pager::{PageNumber, Pager},
+        paging::{
+            io::MemBuf,
+            pager::{PageNumber, Pager},
+        },
         storage::{
             btree::Payload,
             page::{Cell, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
+            Header, MAGIC,
         },
     };
 
@@ -1932,34 +1935,25 @@ mod tests {
             let page_size = self.page_size.unwrap_or(optimal_page_size_for(self.order));
             let buf = io::Cursor::new(Vec::new());
 
+            let mut pager = Pager::new(buf, page_size, page_size);
+            pager.init()?;
+
+            let root = Page::new(pager.alloc_page()?, page_size as _);
+            pager.write(root.number, root.buffer())?;
+
             // TODO: Do something about leaking, we shouldn't need that here.
             let mut btree = BTree::new(
-                Box::leak(Box::new(Pager::new(buf, page_size, page_size))),
-                1,
+                Box::leak(Box::new(pager)),
+                root.number,
                 self.balance_siblings_per_side,
                 FixedSizeMemCmp::for_type::<Key>(),
             );
-
-            btree.pager.write_header(Header {
-                magic: MAGIC,
-                page_size: page_size as _,
-                total_pages: 2,
-                first_free_page: 0,
-            })?;
-
-            // Init root.
-            let root = Page::new(btree.root, page_size as _);
-            btree.pager.write(root.number, root.buffer())?;
 
             btree.extend_from_keys(self.keys)?;
 
             Ok(btree)
         }
     }
-
-    /// We use in-memory buffers instead of disk files for testing. This speeds
-    /// up tests as it avoids disk IO and system calls.
-    type MemBuf = io::Cursor<Vec<u8>>;
 
     impl<'c> BTree<'c, MemBuf, FixedSizeMemCmp> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {

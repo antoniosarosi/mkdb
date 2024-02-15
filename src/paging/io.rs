@@ -1,10 +1,82 @@
+//! Block size based IO reading and writing.
+
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use super::pager::PageNumber;
 
+/// Provides a method to force buffered contents to be written to their
+/// destination.
+///
+/// On Unix systems there are two main ways to achieve this: `fflush()` and
+/// `fsync()`. Flushing is already implemented for us but it's not enough to
+/// write contents to disk. See this [StackOverflow question] for details:
+///
+/// [StackOverflow question]: https://stackoverflow.com/questions/2340610/difference-between-fflush-and-fsync
+pub(crate) trait Sync {
+    /// Attempts to persist the data to its destination.
+    ///
+    /// For disk filesystems this should use the necessary syscalls to send
+    /// everything to the hardware.
+    fn sync(&self) -> io::Result<()>;
+}
+
+// Luckily this time we don't have to dive into libc and start doing FFI.
+impl Sync for std::fs::File {
+    fn sync(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// In-memory buffer with the same trait implementations as a normal disk file.
+///
+/// Used mainly for tests, although we could use this to simulate an in-memory
+/// database.
+pub(crate) type MemBuf = io::Cursor<Vec<u8>>;
+
+// Syncing in memory doesn't do anything, but since most of our datastructures
+// are generic over some IO implementation we need this to keep things simple.
+impl Sync for MemBuf {
+    fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Implements reading and writing based on the given block and page sizes.
+///
+/// This is how a file of block size 512 and page size 1024 would look like:
+///
+/// ```text
+/// OFFSET      BLOCKS
+///         +-------------+
+///       0 | +---------+ |
+///         | | BLOCK 0 | |
+///         | +---------+ | PAGE 0
+///     512 | +---------+ |
+///         | | BLOCK 1 | |
+///         | +---------+ |
+///         +-------------+
+///
+///         +-------------+
+///    1024 | +---------+ |
+///         | | BLOCK 2 | |
+///         | +---------+ | PAGE 1
+///    1536 | +---------+ |
+///         | | BLOCK 3 | |
+///         | +---------+ |
+///         +-------------+
+/// ```
+///
+/// This struct is similar to a buffered reader or writer in the sense that it
+/// wraps an IO handle and operates on top of it, but instead of buffering
+/// reads and writes it returns full pages abstracting the blocks.
+///
+/// See [`BlockIo::read`] for more details on how it works.
 pub(super) struct BlockIo<I> {
+    /// Underlying IO resource handle.
     io: I,
+    /// Hardware block size or prefered IO read/write buffer size.
     pub block_size: usize,
+    /// High level page size.
     pub page_size: usize,
 }
 
@@ -19,21 +91,24 @@ impl<I> BlockIo<I> {
 
     /// Some sanity checks for development.
     fn debug_assert_args_are_correct(&self, page_number: PageNumber, buf: &[u8]) {
+        // We should always read and write an entire page.
         debug_assert!(
             buf.len() == self.page_size,
-            "Buffer of incorrect length {} given for page size {}",
+            "buffer of incorrect length {} given for page size {}",
             buf.len(),
             self.page_size
         );
 
         // Used for development/debugging in case we mess up. Don't wanna create
         // giant Gigabyte sized files all of a sudden.
-        debug_assert!(page_number < 1000, "Page number too high: {page_number}");
+        debug_assert!(page_number < 1000, "page number {page_number} too high");
     }
 }
 
 impl<I: Seek + Read> BlockIo<I> {
-    /// Reads the raw bytes of the page in memory without doing anything else.
+    /// Reads the raw bytes of the disk page in memory without doing anything
+    /// else.
+    ///
     /// Simplest case is when [`Self::page_size`] >= [`Self::block_size`]. For
     /// example, suppose `block_size = 512` and `page_size = 1024`:
     ///
@@ -160,8 +235,19 @@ impl<I: Seek + Write> BlockIo<I> {
 }
 
 impl<I: Write> BlockIo<I> {
+    /// Flush buffered contents.
+    ///
+    /// This does not guarantee that the contents reach the filesystem. Use
+    /// [`Self::sync`] after flushing.
     pub fn flush(&mut self) -> io::Result<()> {
         self.io.flush()
+    }
+}
+
+impl<I: Sync> BlockIo<I> {
+    /// See [`Sync`] for details.
+    pub fn sync(&self) -> io::Result<()> {
+        self.io.sync()
     }
 }
 
@@ -178,20 +264,16 @@ mod tests {
         for (page_size, block_size) in sizes {
             let max_pages = 10;
 
-            let buf = io::Cursor::new(Vec::new());
+            let mem_buf = io::Cursor::new(Vec::new());
 
-            let mut io = BlockIo {
-                io: buf,
-                page_size,
-                block_size,
-            };
+            let mut io = BlockIo::new(mem_buf, page_size, block_size);
 
-            for i in 1..=max_pages {
-                let expected = vec![i as u8; page_size];
+            for i in 0..max_pages {
+                let expected = vec![(i + 1) as u8; page_size];
                 let mut buf = vec![0; page_size];
 
-                assert_eq!(io.write(i - 1, &expected)?, page_size);
-                assert_eq!(io.read(i - 1, &mut buf)?, buf.len());
+                assert_eq!(io.write(i, &expected)?, page_size);
+                assert_eq!(io.read(i, &mut buf)?, buf.len());
                 assert_eq!(buf, expected);
             }
         }

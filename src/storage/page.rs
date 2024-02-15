@@ -36,25 +36,25 @@ use crate::paging::pager::PageNumber;
 
 /// Maximum page size is 64 KiB, which is the maximum number that we can
 /// represent using 2 bytes.
-pub const MAX_PAGE_SIZE: u16 = u16::MAX;
+pub(crate) const MAX_PAGE_SIZE: u16 = u16::MAX;
 
 /// Minimum acceptable page size. This should not be used for anything as it
 /// can only store about 8 bytes of payload per page.
-pub const MIN_PAGE_SIZE: u16 =
+pub(crate) const MIN_PAGE_SIZE: u16 =
     (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1)
         & !(CELL_ALIGNMENT as u16 - 1);
 
 /// Size of the [`Page`] header. See [`PageHeader`] for details.
-pub const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
+pub(crate) const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
 
 /// Size of [`CellHeader`].
-pub const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
+pub(crate) const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 
 /// Size of an individual slot (offset pointer).
-pub const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
+pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
 /// See [`Page`] for alignment details.
-pub const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
+pub(crate) const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
@@ -134,7 +134,7 @@ pub(crate) struct PageHeader {
 /// the last 4 bytes of the content point to an overflow page.
 #[derive(Debug, PartialEq, Clone)]
 #[repr(C, align(8))]
-pub struct CellHeader {
+pub(crate) struct CellHeader {
     /// Size of the cell content.
     size: u16,
     /// True if this cell points to an overflow page. Since we need to add
@@ -176,7 +176,7 @@ impl CellHeader {
 /// sibling pages when an overflow or underflow occurs, so instead of hiding the
 /// low level details we provide some API that can be used by upper levels.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Cell {
+pub(crate) struct Cell {
     pub header: CellHeader,
     pub content: Box<[u8]>,
 }
@@ -186,7 +186,7 @@ pub struct Cell {
 /// The cell could be located either in a page that comes from disk or in memory
 /// if the page overflowed.
 #[derive(Debug, PartialEq)]
-pub struct CellRef<'a> {
+pub(crate) struct CellRef<'a> {
     pub header: &'a CellHeader,
     pub content: &'a [u8],
 }
@@ -206,7 +206,7 @@ impl CellRef<'_> {
 }
 
 /// Same as [`CellRef`] but mutable.
-pub struct CellRefMut<'a> {
+pub(crate) struct CellRefMut<'a> {
     pub header: &'a mut CellHeader,
     pub content: &'a mut [u8],
 }
@@ -677,9 +677,10 @@ impl Page {
         }
     }
 
-    /// Attempts to replace the cell at `index` with `new_cell`. It causes the
-    /// page to overflow if it's not possible. After that, this function should
-    /// not be called anymore.
+    /// Attempts to replace the cell at `index` with `new_cell`.
+    ///
+    /// It causes the page to overflow if it's not possible. After that, this
+    /// function should not be called anymore.
     pub fn replace(&mut self, index: SlotId, new_cell: Cell) -> Cell {
         debug_assert!(
             !self.is_overflow(),
@@ -699,8 +700,9 @@ impl Page {
         }
     }
 
-    /// Attempts to insert the given `cell` in this page. There are two possible
-    /// cases:
+    /// Attempts to insert the given `cell` in this page.
+    ///
+    /// There are two possible cases:
     ///
     /// - Case 1: the cell fits in the "free space" between the slot array and
     /// the closest cell. This is the best case scenario since we can just write
@@ -794,7 +796,9 @@ impl Page {
     }
 
     /// Tries to replace the cell pointed by the given slot `index` with the
-    /// `new_cell`. Similar to [`Self::try_insert`] there are 2 main cases:
+    /// `new_cell`.
+    ///
+    /// Similar to [`Self::try_insert`] there are 2 main cases:
     ///
     /// - Case 1: The new cell fits in the same place as the old cell:
     ///
@@ -876,10 +880,11 @@ impl Page {
         Ok(old)
     }
 
-    /// Removes the cell pointed by the given slot `index`. Unlike
-    /// [`Self::try_insert`] and [`Self::try_replace`], this function cannot
-    /// fail. However, it does panic if the given `index` is out of bounds or
-    /// the page is overflow.
+    /// Removes the cell pointed by the given slot `index`.
+    ///
+    /// Unlike [`Self::try_insert`] and [`Self::try_replace`], this function
+    /// cannot fail. However, it does panic if the given `index` is out of
+    /// bounds or the page is overflow.
     pub fn remove(&mut self, index: SlotId) -> Cell {
         debug_assert!(
             !self.is_overflow(),
@@ -908,7 +913,9 @@ impl Page {
         cell
     }
 
-    /// Slides cells towards the right to eliminate fragmentation. For example:
+    /// Slides cells towards the right to eliminate fragmentation.
+    ///
+    /// For example:
     ///
     /// ```text
     ///   HEADER   SLOT ARRAY    FREE SPACE                      CELLS
@@ -968,8 +975,10 @@ impl Page {
     }
 
     /// Works just like [`Vec::drain`]. Removes the specified cells from this
-    /// page and returns an owned version of them. This function does account
-    /// for [`Self::is_overflow`], so it's safe to call on overflow pages.
+    /// page and returns an owned version of them.
+    ///
+    /// This function does account for [`Self::is_overflow`], so it's safe to
+    /// call on overflow pages.
     pub fn drain(&mut self, range: impl RangeBounds<usize>) -> impl Iterator<Item = Cell> + '_ {
         let start = match range.start_bound() {
             Bound::Unbounded => 0,
@@ -1042,6 +1051,12 @@ impl Clone for Page {
         page.buffer_mut().copy_from_slice(self.buffer());
         page.overflow = self.overflow.clone();
         page
+    }
+}
+
+impl AsRef<[u8]> for Page {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer()
     }
 }
 
@@ -1131,7 +1146,6 @@ const OVERFLOW_PAGE_HEADER_SIZE: usize = mem::size_of::<OverflowPageHeder>();
 pub(crate) struct OverflowPage {
     /// Page number.
     pub number: PageNumber,
-
     /// In-memory page buffer.
     buffer: NonNull<[u8]>,
 }

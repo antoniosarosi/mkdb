@@ -53,6 +53,7 @@ pub(crate) enum Expression {
     },
 }
 
+/// Binary operators used in expressions.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum BinaryOperator {
     Eq,
@@ -69,18 +70,21 @@ pub(crate) enum BinaryOperator {
     Or,
 }
 
+/// Unary operators used in expressions.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum UnaryOperator {
     Plus,
     Minus,
 }
 
+/// SQL constraints.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum Constraint {
     PrimaryKey,
     Unique,
 }
 
+/// SQL Data types.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum DataType {
     Int,
@@ -101,6 +105,8 @@ pub(crate) enum DataType {
 // - Using a custom number type
 // It's a toy database anyway, not that anyone is gonna run into integer
 // overflow issues in production :)
+
+/// Resolved values from expressions.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Value {
     Number(i128),
@@ -108,20 +114,23 @@ pub(crate) enum Value {
     Bool(bool),
 }
 
+/// Column definitions from `INSERT` statements.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Column {
     pub name: String,
     pub data_type: DataType,
-    /// TODO: Vec of constraints. Not important for now.
+    // TODO: Vec of constraints. Not important for now.
     pub constraint: Option<Constraint>,
 }
 
+/// `CREATE` statement.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Create {
     Table { name: String, columns: Vec<Column> },
     Database(String),
 }
 
+/// `DROP` statement.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Drop {
     Table(String),

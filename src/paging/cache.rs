@@ -1,4 +1,18 @@
-//! Page read-write cache implementation.
+//! Page cache implementation.
+//!
+//! At this layer there should be no disk operations, cache instances should
+//! only contain an in-memory buffer pool and an eviction policy algorithm.
+//! There is no trait yet for different types of algorithms, but if needed one
+//! can be created easily based on this concrete implementation.
+//!
+//! Another important detail is that in order to comply with the Rust borrow
+//! rules the cache itself should not return references to pages directly.
+//! Instead it should return some owned value that can be used to "index" the
+//! cache and obtain a reference whenever the cache user decides so.
+//!
+//! Doing this saves us from some "can't borrow as mutable more than once" and
+//! "can't borrow as mutable because also borrowed as immutable" errors. See
+//! the [`super::pager::Pager`] code for details.
 
 use std::{
     collections::HashMap,
@@ -6,21 +20,28 @@ use std::{
     ops::{Index, IndexMut},
 };
 
+use super::pager::PageNumber;
+use crate::storage::page::Page;
+
 /// Default value for [`Cache::max_size`].
 const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
 
 /// Minimum allowed cache size.
-const MIN_CACHE_SIZE: usize = 3;
+///
+/// Due to how the [`crate::storage::BTree`] structure works, we need to be able
+/// to store at least 2 pages in the cache because at any given moment one of
+/// the pages could be in "overflow" state, which causes the page to become
+/// unevictable. If the cache can only hold one page and the page cannot be
+/// evicted, then we won't be able to read more pages. See
+/// [`Cache::is_evictable`] for more details on this.
+const MIN_CACHE_SIZE: usize = 2;
 
-use super::pager::PageNumber;
-use crate::storage::page::Page;
-
-/// The buffer pool is made of a list of frames. Each frame holds a parsed page,
-/// a reference bit a dirty bit.
+/// The buffer pool is made of a list of frames. Each frame holds a page, a
+/// reference bit and a dirty bit.
 #[derive(Debug, PartialEq)]
 struct Frame {
     /// In-memory representation of a page.
-    pub page: Page,
+    page: Page,
     /// Reference bit. It's set to 1 every time this frame is accessed.
     reference: bool,
     /// Dirty bit. Set to 1 every time the page is modified.
@@ -32,10 +53,11 @@ struct Frame {
 /// Frames are identified by their index in [`Cache::buffer`].
 type FrameId = usize;
 
-/// Read-Write page cache with clock eviction policy. Pages are loaded into
-/// a buffer pool until the buffer is full, then the clock algorithm kicks in.
-/// Each page is stored in a [`Frame`] inside the buffer pool, which holds
-/// additinal metadata such as reference bit and dirty flag.
+/// Page read cache with clock eviction policy.
+///
+/// Pages are loaded into a buffer pool until the buffer is full, then the clock
+/// algorithm kicks in. Each page is stored in a [`Frame`] inside the buffer
+/// pool, which holds additinal metadata such as reference bit and dirty flag.
 ///
 /// A *page table* keeps track of the frame where each page is stored by mapping
 /// page numbers to frame indexes in a [`HashMap`].
@@ -145,34 +167,17 @@ type FrameId = usize;
 /// ```
 ///
 /// Acquiring mutable references to pages automatically sets their `dirty` flag
-/// to 1 and pushes the frame index to the write queue. Calling
-/// [`Self::flush_write_queue_to_disk`] will persist the changes on disk. Pages
-/// can also be written to disk if they are evicted while being dirty.
+/// to 1, so that the cache client, [`super::pager::Pager`] in this case, can
+/// determine whether an evicted page should be written to disk.
 pub(super) struct Cache {
     /// Buffer pool.
     buffer: Vec<Frame>,
-
     /// Maximum number of pages that can be stored in memory.
     max_size: usize,
-
     /// Page table. Maps page numbers to frame indexes in the buffer pool.
     pages: HashMap<PageNumber, FrameId>,
-
     /// Clock pointer. Keeps cycling around the buffer pool.
     clock: FrameId,
-}
-
-#[derive(Debug, PartialEq)]
-pub(super) struct EvictedPage {
-    pub page: Page,
-    pub dirty: bool,
-}
-
-impl From<Frame> for EvictedPage {
-    fn from(frame: Frame) -> Self {
-        let Frame { page, dirty, .. } = frame;
-        Self { page, dirty }
-    }
 }
 
 impl Frame {
@@ -251,62 +256,13 @@ impl Frame {
     }
 }
 
-impl Cache {
-    /// Creates a new default cache. Max size is set to [`DEFAULT_MAX_CACHE_SIZE`].
-    pub fn new() -> Self {
+impl Default for Cache {
+    fn default() -> Self {
         Self {
             clock: 0,
             max_size: DEFAULT_MAX_CACHE_SIZE,
-            buffer: Vec::new(),
-            pages: HashMap::new(),
-        }
-    }
-
-    /// Sets the value of [`Self::max_size`].
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max_size` < [`MIN_CACHE_SIZE`].
-    pub fn with_max_size(mut self, max_size: usize) -> Self {
-        if max_size < MIN_CACHE_SIZE {
-            panic!("Buffer pool size must be at least {MIN_CACHE_SIZE}");
-        }
-
-        self.max_size = max_size;
-        self
-    }
-
-    /// Mark a page as unevictable. Pinned page checking algorithm is O(n), so
-    /// there should be many pinned pages at the same time.
-    pub fn pin(&mut self, page: PageNumber) -> bool {
-        let Some(frame_id) = self.pages.get(&page) else {
-            return false;
-        };
-
-        self.buffer[*frame_id].pin();
-        true
-    }
-
-    /// Marks the `page` as evictable again.
-    pub fn unpin(&mut self, page: PageNumber) -> bool {
-        let Some(frame_id) = self.pages.get(&page) else {
-            return false;
-        };
-
-        self.buffer[*frame_id].unpin();
-        true
-    }
-
-    /// Sets dirty bit to 1 and pushes frame to write queue.
-    fn mark_dirty_frame(&mut self, frame_id: usize) {
-        self.buffer[frame_id].mark_dirty();
-    }
-
-    /// Cycles the clock.
-    fn tick(&mut self) {
-        self.clock += 1;
-        if self.clock >= self.buffer.len() {
-            self.clock = 0;
+            buffer: Vec::with_capacity(DEFAULT_MAX_CACHE_SIZE),
+            pages: HashMap::with_capacity(DEFAULT_MAX_CACHE_SIZE),
         }
     }
 }
@@ -326,22 +282,47 @@ impl IndexMut<FrameId> for Cache {
 }
 
 impl Cache {
-    /// Returns a read only reference to a page in memory.
+    /// Creates a new default cache. Max size is set to [`DEFAULT_MAX_CACHE_SIZE`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the value of [`Self::max_size`].
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `max_size` < [`MIN_CACHE_SIZE`].
+    pub fn with_max_size(max_size: usize) -> Self {
+        if max_size < MIN_CACHE_SIZE {
+            panic!("Buffer pool size must be at least {MIN_CACHE_SIZE}");
+        }
+
+        Self {
+            clock: 0,
+            max_size,
+            buffer: Vec::with_capacity(max_size),
+            pages: HashMap::with_capacity(max_size),
+        }
+    }
+
+    /// Returns a frame ID that can be used to access the in-memory page.
+    ///
+    /// If the page is not cached or has been invalidated by calling
+    /// [`Self::invalidate`], then this function returns [`None`].
     pub fn get(&mut self, page_number: PageNumber) -> Option<FrameId> {
         self.try_reference_page(page_number)
     }
 
-    /// Returns a mutable reference to a page in memory, automatically adding
-    /// the page to the write queue. Changes might not be saved to disk unless
-    /// [`Self::flush_write_queue_to_disk`] is called.
+    /// Same as [`Self::get`] but marks the page as dirty.
     pub fn get_mut(&mut self, page_number: PageNumber) -> Option<FrameId> {
         self.try_reference_page(page_number)
-            .inspect(|frame_id| self.mark_dirty_frame(*frame_id))
+            .inspect(|frame_id| self.buffer[*frame_id].mark_dirty())
     }
 
-    /// If the given page is cached its reference bit will be set to 1 and the
-    /// frame index where the page is located will be returned. Otherwise
-    /// nothing happens.
+    /// Returns the frame ID of `page_number` and sets if ref bit to 1.
+    ///
+    /// If the page can't be found then nothing happens and [`None`] is
+    /// returned.
     fn try_reference_page(&mut self, page_number: PageNumber) -> Option<usize> {
         self.pages.get(&page_number).map(|frame_id| {
             self.buffer[*frame_id].reference();
@@ -349,51 +330,129 @@ impl Cache {
         })
     }
 
+    /// Loads a page into the buffer pool.
+    ///
+    /// Doesn't matter where the page comes from, it could have been created in
+    /// memory or read from disk. At this level we need an owned version of the
+    /// page.
+    pub fn load(&mut self, page: Page) -> Option<Page> {
+        // Buffer is not full, push the page and return.
+        if self.buffer.len() < self.max_size {
+            self.pages.insert(page.number, self.buffer.len());
+            self.buffer.push(Frame::new_unreferenced(page));
+
+            return None;
+        }
+
+        // Buffer is full, evict some page and load the new one.
+        self.cycle_clock();
+        self.pages.insert(page.number, self.clock);
+
+        let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(page));
+        self.pages.remove(&evict.page.number);
+
+        Some(evict.page)
+    }
+
+    /// Returns `true` if the next page to be evicted is dirty.
+    ///
+    /// Notice that this function **does not actually evict any page**. The
+    /// eviction will take place when [`Self::load`] is called.
+    pub fn must_evict_dirty_page(&mut self) -> bool {
+        if self.buffer.len() < self.max_size {
+            return false;
+        }
+
+        self.cycle_clock();
+        self.buffer[self.clock].is_dirty()
+    }
+
+    /// Cycles the clock until it points to a page that can be safely evicted.
+    ///
+    /// Pages that could not be evicted in the process are unreferenced.
+    fn cycle_clock(&mut self) {
+        let initial_location = self.clock;
+
+        while !self.is_evictable(self.clock) {
+            self.buffer[self.clock].unreference();
+            self.tick();
+
+            // This could end up in an infinite loop in some situations:
+            //
+            // - All pages are pinned.
+            // - Clock unsets references but pages are re-referenced again.
+            //
+            // None of these scenarios should actually happen because callers
+            // should unpin pages when they're done with them and at some point
+            // in time somebody should stop reading and referencing pages so
+            // that at least one can be evicted. The clock can cycle through the
+            // buffer multiple times, that's not a bug per se, it's just slow.
+            #[cfg(debug_assertions)]
+            if self.clock == initial_location {
+                todo!("clock has gone full circle without evicting any page");
+            }
+        }
+    }
+
+    /// Moves the clock to the next frame in the buffer.
+    fn tick(&mut self) {
+        // There are different ways to do wrapping addition. We could use
+        // modulus but a single branch instruction is probably faster, although
+        // there are no benchmarks to prove this and it probably doesn't even
+        // matter in practice. Still, since the clock could be cycling through
+        // a huge buffer multiple times, this should be investigated.
+        self.clock += 1;
+        if self.clock >= self.buffer.len() {
+            self.clock = 0;
+        }
+    }
+
+    /// Returns `true` if the page stored at the given frame can be safely
+    /// evicted.
+    fn is_evictable(&self, frame_id: FrameId) -> bool {
+        let frame = &self.buffer[frame_id];
+
+        // TODO: Use the pin/unpin mechanism in the BTree balance algorithm to
+        // maintain overflow pages in memory. The cache should know as little as
+        // possible about pages. Ideally the cache should be generic, it's just
+        // a replacement algorithm, doesn't matter exaclty "what" is being
+        // replaced.
+        //
+        // Or maybe once we add transactions and stuff we come to the conclusion
+        // that the replacement algorithm should be smart about what pages can
+        // and cannot be replaced based on what the DB is doing, who knows ¯\_(ツ)_/¯
+        !frame.is_referenced() && !frame.is_pinned() && !frame.page.is_overflow()
+    }
+
+    /// Sets the dirty flag of the given page back to 0.
     pub fn mark_clean(&mut self, page_number: PageNumber) {
         if let Some(frame_id) = self.get(page_number) {
             self.buffer[frame_id].mark_clean();
         }
     }
 
-    /// Loads a page into the buffer pool. Doesn't matter where the page comes
-    /// from, it could have been created in memory or read from disk.
-    pub fn load(&mut self, page: Page) -> Option<EvictedPage> {
-        // Buffer is not full, push the page and return.
-        if self.buffer.len() < self.max_size {
-            let frame_id = self.buffer.len();
-            self.pages.insert(page.number, frame_id);
-            self.buffer.push(Frame::new_unreferenced(page));
-
-            return None;
-        }
-
-        // Buffer is full, evict using clock algorithm.
-        while !self.is_evictable(self.clock) {
-            self.buffer[self.clock].unreference();
-            self.tick();
-        }
-
-        self.pages.insert(page.number, self.clock);
-
-        let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(page));
-
-        self.pages.remove(&evict.page.number);
-
-        Some(EvictedPage::from(evict))
+    /// Marks a page as unevictable.
+    ///
+    /// Returns `true` if the page was present and pinned.
+    pub fn pin(&mut self, page: PageNumber) -> bool {
+        self.pages.get(&page).map_or(false, |frame_id| {
+            self.buffer[*frame_id].pin();
+            true
+        })
     }
 
-    /// The eviction policy has some special cases. Pinned pages are never
-    /// evicted and pages that have overflown past the page size cannot be
-    /// evicted safely, because in case they are dirty they cannot be written
-    /// to disk.
-    fn is_evictable(&self, frame_id: FrameId) -> bool {
-        let frame = &self.buffer[frame_id];
-
-        !frame.is_referenced() && !frame.is_pinned()
+    /// Marks the `page` as evictable again.
+    ///
+    /// Returns true if the page was present and upinned.
+    pub fn unpin(&mut self, page: PageNumber) -> bool {
+        self.pages.get(&page).map_or(false, |frame_id| {
+            self.buffer[*frame_id].unpin();
+            true
+        })
     }
 
-    /// Invalidates a cached page. Requesting this page again will force a read
-    /// from disk.
+    /// Invalidates a cached page. Requesting this page again will yield
+    /// [`None`].
     pub fn invalidate(&mut self, page_number: PageNumber) {
         if let Some(frame_id) = self.pages.remove(&page_number) {
             let frame = &mut self.buffer[frame_id];
@@ -405,15 +464,8 @@ impl Cache {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-
     use super::{super::pager::PageNumber, Cache};
-    use crate::{
-        paging::cache::EvictedPage,
-        storage::page::{Cell, Page},
-    };
-
-    type MemBuf = io::Cursor<Vec<u8>>;
+    use crate::storage::page::{Cell, Page};
 
     enum Prefetch {
         AllPages,
@@ -460,31 +512,27 @@ mod tests {
         }
 
         fn build(self) -> (Cache, Vec<Page>) {
-            const PAGE_SIZE: usize = 256;
+            let page_size = 256;
 
-            let pages: Vec<Page> = (0..self.number_of_pages as PageNumber)
-                .map(|i| {
-                    let mut page = Page::new(i, PAGE_SIZE as _);
-                    page.push(Cell::new(vec![
-                        i as u8;
-                        Page::max_payload_size(PAGE_SIZE as u16)
-                            as usize
-                    ]));
-                    page
-                })
-                .collect();
-
-            let mut cache = Cache::new().with_max_size(self.max_size);
-
-            let pages_iter = pages.iter().cloned();
-
-            cache.load_many(match self.prefetch {
-                Prefetch::AllPages => pages_iter.take(self.number_of_pages),
-                Prefetch::UntilBufferIsFull => pages_iter.take(self.max_size),
-                Prefetch::None => pages_iter.take(0),
+            let pages = (0..self.number_of_pages as PageNumber).map(|i| {
+                let mut page = Page::new(i, page_size as _);
+                page.push(Cell::new(vec![
+                    i as u8;
+                    Page::max_payload_size(page_size as u16)
+                        as usize
+                ]));
+                page
             });
 
-            (cache, pages)
+            let mut cache = Cache::with_max_size(self.max_size);
+
+            cache.load_many(match self.prefetch {
+                Prefetch::AllPages => pages.clone().take(self.number_of_pages),
+                Prefetch::UntilBufferIsFull => pages.clone().take(self.max_size),
+                Prefetch::None => pages.clone().take(0),
+            });
+
+            (cache, pages.collect())
         }
     }
 
@@ -585,13 +633,7 @@ mod tests {
         // Should evict page 2 and replace it with page 3.
         let evicted = cache.load(pages[3].clone());
 
-        assert_eq!(
-            evicted,
-            Some(EvictedPage {
-                dirty: false,
-                page: pages[2].clone(),
-            })
-        );
+        assert_eq!(evicted, Some(pages[2].clone()));
 
         assert_eq!(cache.clock, cache.max_size - 1);
 

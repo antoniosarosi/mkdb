@@ -16,7 +16,9 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
     },
-    storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
+    storage::{
+        page::Page, BTree, FixedSizeMemCmp, Header, DEFAULT_BALANCE_SIBLINGS_PER_SIDE, MAGIC,
+    },
 };
 
 /// Database file default page size.
@@ -29,22 +31,9 @@ pub(crate) const MKDB_META: &str = "mkdb_meta";
 /// beginning of the meta-table.
 pub(crate) const MKDB_META_ROOT: PageNumber = 1;
 
-/// Magic number at the beginning of the database file.
-pub(crate) const MAGIC: u32 = 0xB74EE;
-
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
 /// beginning of each tuple.
 type RowId = u64;
-
-/// Database file header. Located at the beginning of the DB file.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub(crate) struct Header {
-    pub magic: u32,
-    pub page_size: u32,
-    pub total_pages: u32,
-    pub first_free_page: PageNumber,
-}
 
 pub(crate) struct Database<I> {
     pager: Pager<I>,
@@ -388,19 +377,16 @@ impl Database<File> {
 
         let mut pager = Pager::new(file, DEFAULT_PAGE_SIZE, block_size);
 
-        // TODO: Recreate the pager if the file exists and the header page size
-        // is different than the default.
-        if pager.read_header()?.magic != MAGIC {
-            pager.write_header(Header {
-                magic: MAGIC,
-                page_size: DEFAULT_PAGE_SIZE as _,
-                total_pages: 2,
-                first_free_page: 0,
-            })?;
+        pager.init()?;
 
-            let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
-            pager.write(MKDB_META_ROOT, root.buffer())?;
-        }
+        assert_eq!(
+            pager.alloc_page()?,
+            MKDB_META_ROOT,
+            "first allocated page is not equal to 1"
+        );
+
+        let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
+        pager.write(MKDB_META_ROOT, root.buffer())?;
 
         Ok(Database::new(pager))
     }
@@ -1022,7 +1008,7 @@ mod tests {
             mkdb_meta_schema, Header, QueryResolution, Schema, SqlError, TypeError, MAGIC,
             MKDB_META_ROOT,
         },
-        paging::pager::Pager,
+        paging::{io::MemBuf, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
         storage::page::Page,
     };
@@ -1038,19 +1024,15 @@ mod tests {
         }
     }
 
-    fn init_database() -> io::Result<Database<io::Cursor<Vec<u8>>>> {
+    fn init_database() -> io::Result<Database<MemBuf>> {
         let mut pager = Pager::new(
             io::Cursor::new(Vec::<u8>::new()),
             DEFAULT_PAGE_SIZE,
             DEFAULT_PAGE_SIZE,
         );
 
-        pager.write_header(Header {
-            magic: MAGIC,
-            page_size: DEFAULT_PAGE_SIZE as _,
-            total_pages: 2,
-            first_free_page: 0,
-        })?;
+        pager.init()?;
+        pager.alloc_page()?;
 
         let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
         pager.write(MKDB_META_ROOT, root.buffer())?;

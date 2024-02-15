@@ -4,7 +4,7 @@ use super::token::{Keyword, Token, Whitespace};
 
 /// Token location.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Location {
+pub(crate) struct Location {
     /// Line number starting at 1.
     pub line: usize,
     /// Column number starting at 1.
@@ -37,8 +37,10 @@ impl TokenWithLocation {
     }
 }
 
-/// Token stream. Wraps a [`Peekable<Chars>`] instance and allows reading the
-/// next character in the stream without consuming it.
+/// Token stream.
+///
+/// Wraps a [`Peekable<Chars>`] instance and allows reading the next character
+/// in the stream without consuming it.
 struct Stream<'i> {
     /// Current location in the stream.
     location: Location,
@@ -152,8 +154,9 @@ impl Display for ErrorKind {
     }
 }
 
-/// If the tokenizer finds an error it means to syntax is not correct. Some
-/// examples are unclosed strings, unclosed operators, etc.
+/// If the tokenizer finds an error it means to syntax is not correct.
+///
+/// Some examples are unclosed strings, unclosed operators, etc.
 #[derive(Debug, PartialEq)]
 pub(super) struct TokenizerError {
     pub kind: ErrorKind,
@@ -177,10 +180,11 @@ pub(super) struct Tokenizer<'i> {
 type TokenResult = Result<Token, TokenizerError>;
 
 impl<'i> Tokenizer<'i> {
-    /// Creates a new tokenizer for the given `input`. The tokenizer won't parse
-    /// anything until [`Tokenizer::next_token`] is called through helper
-    /// functions or iterators. See [`Tokenizer::iter`] and
-    /// [`Tokenizer::tokenize`].
+    /// Creates a new tokenizer for the given `input`.
+    ///
+    /// The tokenizer won't parse anything until [`Tokenizer::next_token`] is
+    /// called through helper functions or iterators. See [`Tokenizer::iter`]
+    /// and [`Tokenizer::tokenize`].
     pub fn new(input: &'i str) -> Self {
         Self {
             stream: Stream::new(input),
@@ -188,24 +192,28 @@ impl<'i> Tokenizer<'i> {
         }
     }
 
-    /// Creates an iterator over [`Self`]. Used mainly to parse tokens as they
-    /// are found instead of waiting for the tokenizer to consume the entire
-    /// input string.
+    /// Creates an iterator over [`Self`].
+    ///
+    /// Used mainly to parse tokens as they are found instead of waiting for the
+    /// tokenizer to consume the entire input string.
     pub fn iter<'t>(&'t mut self) -> Iter<'t, 'i> {
         self.into_iter()
     }
 
     /// Reads the characters in [`Self::stream`] one by one parsing the results
-    /// into [`Token`] variants. If an error is encountered in the process, this
-    /// function returns immediately.
+    /// into [`Token`] variants.
+    ///
+    /// If an error is encountered in the process, this function returns
+    /// immediately.
     pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
         self.iter()
             .map(|result| result.map(TokenWithLocation::token_only))
             .collect()
     }
 
-    /// Returns [`None`] once [`Token::Eof`] has been returned. Useful for
-    /// iterators.
+    /// Returns [`None`] once [`Token::Eof`] has been returned.
+    ///
+    /// Useful for iterators.
     fn optional_next_token_with_location(
         &mut self,
     ) -> Option<Result<TokenWithLocation, TokenizerError>> {
@@ -302,15 +310,15 @@ impl<'i> Tokenizer<'i> {
         }
     }
 
-    /// Consumes one character in the stream and returns an [`Ok(Token)`] result
+    /// Consumes one character in the stream and returns an [`Ok`] result
     /// containing the given [`Token`] variant.
     fn consume(&mut self, token: Token) -> TokenResult {
         self.stream.next();
         Ok(token)
     }
 
-    /// Builds an instance of [`Err(TokenizerError)`] giving it the current
-    /// location of the stream.
+    /// Builds an instance of [`TokenizerError`] wrapped in [`Err`] giving it
+    /// the current location of the stream.
     fn error(&self, kind: ErrorKind) -> TokenResult {
         Err(TokenizerError::new(kind, self.stream.location()))
     }
