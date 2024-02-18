@@ -10,7 +10,7 @@ use std::{
     mem,
 };
 
-use super::page::{Cell, OverflowPage, Page, SlotId};
+use super::page::{Cell, InitEmptyPage, OverflowPage, Page, SlotId};
 use crate::paging::pager::{PageNumber, Pager};
 
 /// [`BTree`] key comparator. Entries are stored in binary, so we need a way to
@@ -1451,13 +1451,16 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Started from the bottom now we're here :)
         let is_root = parents.is_empty();
 
+        // The root is a special case because it can be fully empty.
+        let is_underflow = node.len() == 0 || !is_root && node.is_underflow();
+
         // Nothing to do, the node is balanced.
-        if !node.is_overflow() && !node.is_underflow(is_root) {
+        if !node.is_overflow() && !is_underflow {
             return Ok(());
         }
 
         // Root underflow.
-        if is_root && node.is_underflow(is_root) {
+        if is_root && is_underflow {
             let child_page = node.header().right_child;
 
             if child_page != 0 {
@@ -1471,7 +1474,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Root overflow.
         if is_root && node.is_overflow() {
-            let mut old_root = Page::new(self.pager.alloc_page()?, self.pager.page_size as u16);
+            let mut old_root = Page::init(self.pager.alloc_page()?, self.pager.page_size as u16);
 
             let root = self.pager.get_mut(page)?;
             old_root.append(root);
@@ -1549,7 +1552,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let new_page = Page::new(self.pager.alloc_page()?, self.pager.page_size as _);
+            let new_page = Page::init(self.pager.alloc_page()?, self.pager.page_size as _);
             let parent_index = siblings.last().unwrap().index + 1;
             siblings.push(Sibling::new(new_page.number, parent_index));
             self.pager.load_from_mem(new_page)?;
@@ -1667,10 +1670,10 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut stored_bytes = first_cell_payload_size;
         let mut overflow_pages: Vec<OverflowPage> = Vec::new();
 
-        // TODO: Allocate pages in sequential order to avoid random IO.
+        // TODO: Allocate N pages at once to reduce IO.
         while stored_bytes < payload.len() {
             let mut overflow_page =
-                OverflowPage::new(self.pager.alloc_page()?, self.pager.page_size as _);
+                OverflowPage::init(self.pager.alloc_page()?, self.pager.page_size as _);
 
             let overflow_bytes = min(
                 OverflowPage::usable_space(self.pager.page_size as _) as usize,
@@ -1690,9 +1693,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             stored_bytes += overflow_bytes;
         }
 
-        // TODO: Same as above this should write in sequential order.
         for page in &overflow_pages {
-            self.pager.write(page.number, page.buffer())?;
+            self.pager.write(page.number, page.as_ref())?;
         }
 
         Ok(Cell::new_overflow(
@@ -1708,10 +1710,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         let mut overflow_page = cell.overflow_page();
         while overflow_page != 0 {
-            let mut unused_page = OverflowPage::new(overflow_page, self.pager.page_size as _);
-            self.pager
-                .read(unused_page.number, unused_page.buffer_mut())?;
-            self.pager.free_page(unused_page.number)?;
+            self.pager.free_page(overflow_page)?;
+            let unused_page = self.pager.get_as::<OverflowPage>(overflow_page)?;
             overflow_page = unused_page.header().next;
         }
 
@@ -1733,11 +1733,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             Vec::from(&cell.content[..cell.content.len() - mem::size_of::<PageNumber>()]);
 
         while overflow_page != 0 {
-            let mut page = OverflowPage::new(overflow_page, self.pager.page_size as _);
-            self.pager.read(page.number, page.buffer_mut())?;
-
+            let page = self.pager.get_as::<OverflowPage>(overflow_page)?;
             payload.extend_from_slice(page.payload());
-
             overflow_page = page.header().next;
         }
 
@@ -1855,8 +1852,7 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{Cell, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
-            Header, MAGIC,
+            page::{Cell, InitEmptyPage, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
         },
     };
 
@@ -1896,6 +1892,7 @@ mod tests {
         keys: Vec<Key>,
         order: usize,
         page_size: Option<usize>,
+        root_at_zero: bool,
         balance_siblings_per_side: usize,
     }
 
@@ -1905,6 +1902,7 @@ mod tests {
                 keys: vec![],
                 order: 4,
                 page_size: None,
+                root_at_zero: false,
                 balance_siblings_per_side: DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
             }
         }
@@ -1931,6 +1929,11 @@ mod tests {
             self
         }
 
+        fn root_at_zero(mut self, root_at_zero: bool) -> Self {
+            self.root_at_zero = root_at_zero;
+            self
+        }
+
         fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf, FixedSizeMemCmp>> {
             let page_size = self.page_size.unwrap_or(optimal_page_size_for(self.order));
             let buf = io::Cursor::new(Vec::new());
@@ -1938,13 +1941,15 @@ mod tests {
             let mut pager = Pager::new(buf, page_size, page_size);
             pager.init()?;
 
-            let root = Page::new(pager.alloc_page()?, page_size as _);
-            pager.write(root.number, root.buffer())?;
+            if !self.root_at_zero {
+                let root = pager.alloc_page()?;
+                pager.init_page::<Page>(root)?;
+            }
 
             // TODO: Do something about leaking, we shouldn't need that here.
             let mut btree = BTree::new(
                 Box::leak(Box::new(pager)),
-                root.number,
+                if self.root_at_zero { 0 } else { 1 },
                 self.balance_siblings_per_side,
                 FixedSizeMemCmp::for_type::<Key>(),
             );
@@ -1957,8 +1962,8 @@ mod tests {
 
     impl<'c> BTree<'c, MemBuf, FixedSizeMemCmp> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
-            let mut page = Page::new(root, self.pager.page_size as _);
-            self.pager.read(root, page.buffer_mut())?;
+            let mut page = Page::init(root, self.pager.page_size as _);
+            self.pager.read(root, page.as_mut())?;
 
             let mut node = Node {
                 keys: (0..page.len())

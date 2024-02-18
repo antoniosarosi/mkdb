@@ -21,7 +21,7 @@ use std::{
 };
 
 use super::pager::PageNumber;
-use crate::storage::page::Page;
+use crate::storage::page::MemPage;
 
 /// Default value for [`Cache::max_size`].
 const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
@@ -41,7 +41,7 @@ const MIN_CACHE_SIZE: usize = 2;
 #[derive(Debug, PartialEq)]
 struct Frame {
     /// In-memory representation of a page.
-    page: Page,
+    page: MemPage,
     /// Reference bit. It's set to 1 every time this frame is accessed.
     reference: bool,
     /// Dirty bit. Set to 1 every time the page is modified.
@@ -182,7 +182,7 @@ pub(super) struct Cache {
 
 impl Frame {
     /// Builds a new frame with [`Frame::reference`] set to 0.
-    fn new_unreferenced(page: Page) -> Self {
+    fn new_unreferenced(page: MemPage) -> Self {
         Self {
             page,
             reference: false,
@@ -192,7 +192,7 @@ impl Frame {
     }
 
     /// Builds a new frame with [`Frame::reference`] set to 1.
-    fn new_referenced(page: Page) -> Self {
+    fn new_referenced(page: MemPage) -> Self {
         Self {
             page,
             reference: true,
@@ -268,7 +268,7 @@ impl Default for Cache {
 }
 
 impl Index<FrameId> for Cache {
-    type Output = Page;
+    type Output = MemPage;
 
     fn index(&self, frame_id: FrameId) -> &Self::Output {
         &self.buffer[frame_id].page
@@ -293,9 +293,10 @@ impl Cache {
     ///
     /// This function panics if `max_size` < [`MIN_CACHE_SIZE`].
     pub fn with_max_size(max_size: usize) -> Self {
-        if max_size < MIN_CACHE_SIZE {
-            panic!("Buffer pool size must be at least {MIN_CACHE_SIZE}");
-        }
+        assert!(
+            max_size >= MIN_CACHE_SIZE,
+            "buffer pool size must be at least {MIN_CACHE_SIZE}"
+        );
 
         Self {
             clock: 0,
@@ -303,6 +304,10 @@ impl Cache {
             buffer: Vec::with_capacity(max_size),
             pages: HashMap::with_capacity(max_size),
         }
+    }
+
+    pub fn contains(&self, page_number: PageNumber) -> bool {
+        self.pages.contains_key(&page_number)
     }
 
     /// Returns a frame ID that can be used to access the in-memory page.
@@ -335,10 +340,10 @@ impl Cache {
     /// Doesn't matter where the page comes from, it could have been created in
     /// memory or read from disk. At this level we need an owned version of the
     /// page.
-    pub fn load(&mut self, page: Page) -> Option<Page> {
+    pub fn load(&mut self, page: MemPage) -> Option<MemPage> {
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
-            self.pages.insert(page.number, self.buffer.len());
+            self.pages.insert(page.number(), self.buffer.len());
             self.buffer.push(Frame::new_unreferenced(page));
 
             return None;
@@ -346,10 +351,10 @@ impl Cache {
 
         // Buffer is full, evict some page and load the new one.
         self.cycle_clock();
-        self.pages.insert(page.number, self.clock);
+        self.pages.insert(page.number(), self.clock);
 
         let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(page));
-        self.pages.remove(&evict.page.number);
+        self.pages.remove(&evict.page.number());
 
         Some(evict.page)
     }
@@ -431,6 +436,12 @@ impl Cache {
         }
     }
 
+    pub fn mark_dirty(&mut self, page_number: PageNumber) {
+        if let Some(frame_id) = self.get(page_number) {
+            self.buffer[frame_id].mark_dirty();
+        }
+    }
+
     /// Marks a page as unevictable.
     ///
     /// Returns `true` if the page was present and pinned.
@@ -465,7 +476,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::{super::pager::PageNumber, Cache};
-    use crate::storage::page::{Cell, Page};
+    use crate::storage::page::{Cell, InitEmptyPage, MemPage, Page};
 
     enum Prefetch {
         AllPages,
@@ -511,17 +522,17 @@ mod tests {
             self.prefetch(Prefetch::UntilBufferIsFull)
         }
 
-        fn build(self) -> (Cache, Vec<Page>) {
+        fn build(self) -> (Cache, Vec<MemPage>) {
             let page_size = 256;
 
             let pages = (0..self.number_of_pages as PageNumber).map(|i| {
-                let mut page = Page::new(i, page_size as _);
+                let mut page = Page::init(i, page_size as _);
                 page.push(Cell::new(vec![
                     i as u8;
                     Page::max_payload_size(page_size as u16)
                         as usize
                 ]));
-                page
+                MemPage::Btree(page)
             });
 
             let mut cache = Cache::with_max_size(self.max_size);
@@ -537,9 +548,9 @@ mod tests {
     }
 
     impl Cache {
-        fn load_many<P: IntoIterator<Item = Page>>(&mut self, pages: P) {
+        fn load_many<P: IntoIterator<Item = MemPage>>(&mut self, pages: P) {
             for page in pages {
-                self.load(page);
+                self.load(page.into());
             }
         }
 
@@ -561,7 +572,7 @@ mod tests {
 
         for (i, page) in pages.into_iter().enumerate() {
             assert_eq!(page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number], i);
+            assert_eq!(cache.pages[&page.number()], i);
             assert!(!cache.buffer[i].reference);
         }
     }
@@ -579,7 +590,7 @@ mod tests {
 
         for (i, page) in pages[cache.max_size..].iter().enumerate() {
             assert_eq!(*page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number], i);
+            assert_eq!(cache.pages[&page.number()], i);
         }
     }
 
@@ -592,7 +603,7 @@ mod tests {
             .build();
 
         for (i, page) in pages.into_iter().enumerate() {
-            let index = cache.get(page.number);
+            let index = cache.get(page.number());
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
             assert!(cache.buffer[i].reference);
@@ -609,7 +620,7 @@ mod tests {
             .build();
 
         for (i, page) in pages.into_iter().enumerate() {
-            let index = cache.get_mut(page.number);
+            let index = cache.get_mut(page.number());
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
             assert!(cache.buffer[i].reference);
@@ -627,7 +638,7 @@ mod tests {
 
         // Reference all pages except last one.
         for page in &pages[..cache.max_size - 1] {
-            cache.get(page.number);
+            cache.get(page.number());
         }
 
         // Should evict page 2 and replace it with page 3.
@@ -643,13 +654,13 @@ mod tests {
         );
 
         assert_eq!(
-            cache.pages[&pages[pages.len() - 1].number],
+            cache.pages[&pages[pages.len() - 1].number()],
             cache.max_size - 1
         );
 
         for (i, page) in pages[..cache.max_size - 1].iter().enumerate() {
             assert_eq!(*page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number], i);
+            assert_eq!(cache.pages[&page.number()], i);
         }
     }
 

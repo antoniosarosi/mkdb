@@ -6,17 +6,15 @@
 //! `&mut` to a write queue.
 
 use std::{
+    any::{Any, TypeId},
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
     io::{self, Read, Seek, Write},
-    ptr,
+    mem,
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::{
-    page::{FreePage, Page},
-    Header, MAGIC,
-};
+use crate::storage::page::{DbHeader, FreePage, InitEmptyPage, MemPage, Page, PageZero, MAGIC};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -55,34 +53,12 @@ impl<I: Seek + Read> Pager<I> {
     pub fn read(&mut self, page_number: PageNumber, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read(page_number, buf)
     }
-
-    pub fn read_header(&mut self) -> io::Result<Header> {
-        // TODO: Cache header.
-        let mut buf = vec![0; self.page_size];
-        self.io.read(0, &mut buf)?;
-
-        // SAFETY: Unless somebody manually touched the DB file this should be
-        // safe.
-        unsafe { Ok(ptr::read(buf.as_ptr().cast())) }
-    }
 }
 
 impl<I: Seek + Write> Pager<I> {
     /// Manually write a page to disk.
     pub fn write(&mut self, page_number: PageNumber, buf: &[u8]) -> io::Result<usize> {
         self.io.write(page_number, buf)
-    }
-
-    pub fn write_header(&mut self, header: Header) -> io::Result<()> {
-        // TODO: Cache header.
-        let mut buf = Vec::with_capacity(self.page_size);
-        buf.resize(self.page_size, 0);
-
-        // SAFETY: Buffer has enough space, page_size should always be greater
-        // than size_of<Header>()
-        unsafe { ptr::write(buf.as_mut_ptr().cast(), header) };
-
-        self.io.write(0, &buf).map(|_| ())
     }
 
     /// Writes all the pages present in the dirty queue and marks them as clean.
@@ -98,7 +74,7 @@ impl<I: Seek + Write> Pager<I> {
             // unwrapping should be safe here.
             let index = self.cache.get(page_number).unwrap();
             let page = &self.cache[index];
-            self.io.write(page_number, page.buffer())?;
+            self.io.write(page_number, page.as_ref())?;
             self.cache.mark_clean(page_number);
             self.dirty_pages.remove(&page_number);
         }
@@ -126,70 +102,231 @@ impl<I: super::io::Sync> Pager<I> {
 }
 
 impl<I: Seek + Read + Write> Pager<I> {
+    /// Initialize the database file.
     pub fn init(&mut self) -> io::Result<()> {
-        // TODO: Recreate the pager if the file exists and the header page size
-        // is different than the default.
-        if self.read_header()?.magic != MAGIC {
-            self.write_header(Header {
-                magic: MAGIC,
-                page_size: self.page_size as _,
-                total_pages: 1,
-                free_pages: 0,
-                first_free_page: 0,
-                last_free_page: 0,
-            })?;
+        // We'll manually read the magic number.
+        let io = self.io.as_raw();
+        io.rewind()?;
+
+        let mut buf = [0; std::mem::size_of::<u32>()];
+        io.read(&mut buf)?;
+
+        let magic = u32::from_ne_bytes(buf);
+
+        // Magic number is written in the file, we'll assume that it is already
+        // initialized.
+        if magic == MAGIC {
+            return Ok(());
         }
+
+        // Magic number is written but using the opposite endianness. We could
+        // techincally make this work by calling `.to_le()` or `.to_be()`
+        // everywhere or using a custom `LittleEndian<I>(I)` type, which would
+        // be a no-op if the endianness of the machine is correct. But instead
+        // we could just implement some functionality for dumping the SQL
+        // insert statements just like MySQL or any other database does.
+        if magic.swap_bytes() == MAGIC {
+            panic!("the database file has been created using a different endianness than the one used by this machine");
+        }
+
+        // Initialize page zero.
+        let page_zero = PageZero::init(0, self.page_size as _);
+        self.write(0, page_zero.as_ref())?;
 
         Ok(())
     }
 
-    /// Returns a read-only reference to a page.
+    /// Returns the cache index of the given `page_number`.
     ///
-    /// Best case scenario is when the page is already cached in memory. Worst
-    /// case scenario is when we have to evict a dirty page in order to load
-    /// the new one, which requires at least two IO operations.
-    pub fn get(&mut self, page_number: PageNumber) -> io::Result<&Page> {
+    /// This function doesn't fail if the page is not cached, it will load the
+    /// page from disk instead. So Best case scenario is when the page is
+    /// already cached in memory. Worst case scenario is when we have to evict a
+    /// dirty page in order to load the new one, which requires at least two IO
+    /// operations, but possibly more since we flush the entire write queue at
+    /// that point. Evicting a clean page doesn't require IO.
+    fn lookup<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<usize> {
         if let Some(index) = self.cache.get(page_number) {
-            return Ok(&self.cache[index]);
+            return Ok(index);
         }
 
-        self.load_from_disk(page_number)?;
-        let index = self.cache.get(page_number).unwrap();
-        Ok(&self.cache[index])
+        self.load_from_disk::<P>(page_number)?;
+
+        // Unwrapping is safe because we've just loaded the page into cache.
+        Ok(self.cache.get(page_number).unwrap())
     }
 
-    /// Same as [`Self::get`] but marks the page as dirty and sends it to a
-    /// write queue.
+    /// Returns a page as a concrete type.
     ///
-    /// This function should not be used unless the page is actually about to
-    /// be modified, since otherwise the page will be written to disk
-    /// unnecessarily at some point.
-    pub fn get_mut(&mut self, page_number: PageNumber) -> io::Result<&mut Page> {
+    /// # Panics
+    ///
+    /// Panics if the requested type is not the actual type of the page at
+    /// runtime. There's no way to recover from that as it would be a bug.
+    ///
+    /// # Implementation Notes
+    ///
+    /// We have a rare situation where we need to store multiple types of pages
+    /// in the cache but at the same time we know the exact type of each page
+    /// we're gonna use at compile time. `dyn Trait` doesn't cut it because we
+    /// don't need a VTable for anything at all and it also introduces an extra
+    /// level of indirection since we have to box it.
+    ///
+    /// We're currently using [`Any`] to downcast to to the concrete type at
+    /// runtime, which is definitely not "elegant" or "good practice", but it
+    /// works and it doesn't require a lot of duplicated code or macros.
+    ///
+    /// We've managed to keep this project free of dependencies so far, so we're
+    /// not gonna introduce one just for this feature, but we could use
+    /// [`enum_dispatch`](https://docs.rs/enum_dispatch/) which basically
+    /// automates what we're doing here using [`TryFrom`] for each enum member.
+    ///
+    /// Implementing [`TryFrom`] manually requires two impls per member, one for
+    /// `&P` and another one for `&mut P`, and possibly a third one for `P`
+    /// which we might use in tests. So for now `downcast_ref` is good enough to
+    /// reduce boilerplate.
+    pub fn get_as<P: Any + 'static + Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<&P> {
+        let index = self.lookup::<P>(page_number)?;
+
+        let downcast = <dyn Any>::downcast_ref(match &self.cache[index] {
+            MemPage::Btree(page) => page,
+            MemPage::Overflow(overflow_page) => overflow_page,
+            MemPage::Zero(page_zero) => {
+                if TypeId::of::<P>() == TypeId::of::<Page>() {
+                    page_zero.as_btree_page()
+                } else {
+                    page_zero
+                }
+            }
+        });
+
+        Ok(downcast.expect("page type error"))
+    }
+
+    /// Sames as [`Self::get_as`] but returns a mutable reference.
+    pub fn get_mut_as<P: Any + 'static + Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<&mut P> {
         self.dirty_pages.insert(page_number);
 
-        if let Some(index) = self.cache.get_mut(page_number) {
-            return Ok(&mut self.cache[index]);
-        }
+        let index = self.lookup::<P>(page_number)?;
 
-        self.load_from_disk(page_number)?;
-        let index = self.cache.get_mut(page_number).unwrap();
-        Ok(&mut self.cache[index])
+        let downcast = <dyn Any>::downcast_mut(match &mut self.cache[index] {
+            MemPage::Btree(page) => page,
+            MemPage::Overflow(overflow_page) => overflow_page,
+            MemPage::Zero(page_zero) => {
+                if TypeId::of::<P>() == TypeId::of::<Page>() {
+                    page_zero.as_btree_page_mut()
+                } else {
+                    page_zero
+                }
+            }
+        });
+
+        Ok(downcast.expect("page type error"))
     }
 
-    /// Loads a page from disk into the cache.
-    fn load_from_disk(&mut self, page_number: PageNumber) -> io::Result<()> {
-        let mut page = Page::new(page_number, self.page_size as _);
-        self.io.read(page_number, page.buffer_mut())?;
-        self.load_from_mem(page)
+    /// Returns a read-only reference to a BTree page.
+    ///
+    /// BTree page are the ones used most frequently, so we'll consider this
+    /// function the default of [`Self::get_as`].
+    pub fn get(&mut self, page_number: PageNumber) -> io::Result<&Page> {
+        self.get_as(page_number)
     }
 
-    /// Loads a page created in memory into the cache.
-    pub fn load_from_mem(&mut self, page: Page) -> io::Result<()> {
+    /// Default return type for [`Self::get_mut_as`].
+    pub fn get_mut(&mut self, page_number: PageNumber) -> io::Result<&mut Page> {
+        self.get_mut_as(page_number)
+    }
+
+    /// Loads the given page into the cache buffer.
+    ///
+    /// If the cache evicts a dirty page we use the opportunity to write all
+    /// the dirty pages that we currenlty track. This doesn't mean that the
+    /// dirty pages will be written to disk, they might be buffered by the
+    /// underlying OS until [`Self::sync`] is called.
+    fn load_page_into_cache(&mut self, page: impl Into<MemPage>) -> io::Result<()> {
         if self.cache.must_evict_dirty_page() {
             self.write_dirty_pages()?;
         }
 
-        self.cache.load(page);
+        self.cache.load(page.into());
+
+        Ok(())
+    }
+
+    /// Loads a page from disk into the cache.
+    ///
+    /// The page is not marked dirty, it will not be written back to disk
+    /// unless [`Self::get_mut_as`] is called.
+    fn load_from_disk<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<()> {
+        let mut page = P::init(page_number, self.page_size as _);
+        self.io.read(page_number, page.as_mut())?;
+        self.load_page_into_cache(page)
+    }
+
+    /// Loads a page created in memory into the cache.
+    ///
+    /// Doing so automatically marks the page as dirty, since it's gonna have
+    /// to be written to disk at some point.
+    pub fn load_from_mem(&mut self, page: impl Into<MemPage>) -> io::Result<()> {
+        let page: MemPage = page.into();
+        let page_number = page.number();
+
+        self.load_page_into_cache(page)?;
+        self.cache.mark_dirty(page_number);
+
+        Ok(())
+    }
+
+    pub fn init_page<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<()> {
+        self.replace_page(page_number, P::init(page_number, self.page_size as _))
+    }
+
+    /// Returns a copy of the DB header.
+    ///
+    /// Since the header is small it's gonna be faster to copy it once, modify
+    /// it and then write it back instead of accessing it through the cache
+    /// system, which requires making sure that the borrow rules are met and
+    /// other details.
+    fn read_header(&mut self) -> io::Result<DbHeader> {
+        self.get_as::<PageZero>(0).map(PageZero::header).copied()
+    }
+
+    /// Writes the header back to page zero. See [`Self::read_header`].
+    fn write_header(&mut self, header: DbHeader) -> io::Result<()> {
+        *self.get_mut_as::<PageZero>(0)?.header_mut() = header;
+        Ok(())
+    }
+
+    /// Replaces the page at `page_number` with the given page.
+    ///
+    /// If the page to replace is already cached, then this is almost a no-op
+    /// as we only have to assign the value. If the page is on disk then we
+    /// load the replacement into the cache (evicting another page if necessary)
+    /// and mark it as dirty, and at some point in the future it will be written
+    /// to disk.
+    fn replace_page<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+        with: P,
+    ) -> io::Result<()> {
+        if let Some(index) = self.cache.get(page_number) {
+            self.cache[index] = with.into();
+        } else {
+            self.load_from_mem(with)?;
+        }
 
         Ok(())
     }
@@ -205,8 +342,7 @@ impl<I: Seek + Read + Write> Pager<I> {
             page
         } else {
             // Otherwise use one of the free pages.
-            let mut page = FreePage::new(header.first_free_page, self.page_size as _);
-            self.io.read(page.number, page.buffer_mut())?;
+            let page = self.get_as::<FreePage>(header.last_free_page)?;
             header.first_free_page = page.header().next;
             header.free_pages -= 1;
             page.number
@@ -222,10 +358,13 @@ impl<I: Seek + Read + Write> Pager<I> {
     }
 
     /// Adds the given page to the free list.
+    ///
+    /// Important: do not use the page after calling this function, since it
+    /// will be replaced by a free page and all the data will be lost. Consider
+    /// that a "use after free" bug.
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
         // Initialize last free page.
-        let new_last_free = FreePage::new(page_number, self.page_size as _);
-        self.io.write(page_number, new_last_free.buffer())?;
+        self.init_page::<FreePage>(page_number)?;
 
         let mut header = self.read_header()?;
 
@@ -234,11 +373,8 @@ impl<I: Seek + Read + Write> Pager<I> {
             header.first_free_page = page_number;
         } else {
             // Grab the last free and make it point to the new last free.
-            let mut last_free = FreePage::new(header.last_free_page, self.page_size as _);
-            self.io.read(last_free.number, last_free.buffer_mut())?;
-
+            let last_free = self.get_mut_as::<FreePage>(page_number)?;
             last_free.header_mut().next = page_number;
-            self.io.write(last_free.number, last_free.buffer())?;
         }
 
         header.last_free_page = page_number;
@@ -255,7 +391,7 @@ mod tests {
     use super::Pager;
     use crate::{
         paging::io::MemBuf,
-        storage::page::{Cell, Page},
+        storage::page::{Cell, InitEmptyPage, Page},
     };
 
     fn init_pager() -> io::Result<Pager<MemBuf>> {
@@ -309,13 +445,14 @@ mod tests {
         let mut pager = init_pager()?;
 
         for i in 1..=10 {
-            let mut page = Page::new(pager.alloc_page()?, pager.page_size as _);
+            let mut page = Page::init(pager.alloc_page()?, pager.page_size as _);
             page.push(Cell::new(vec![
                 i;
                 Page::max_payload_size(pager.page_size as _)
                     as usize
             ]));
-            pager.write(page.number, page.buffer())?;
+
+            pager.write(page.number, page.as_ref())?;
         }
 
         let update_pages = [5, 7, 9];
@@ -329,7 +466,7 @@ mod tests {
         pager.sync()?;
 
         for i in 1..=10 {
-            let mut expected = Page::new(i, pager.page_size as _);
+            let mut expected = Page::init(i, pager.page_size as _);
             expected.push(Cell::new(vec![
                 if update_pages.contains(&i) {
                     10 + i as u8
@@ -340,8 +477,8 @@ mod tests {
                     as usize
             ]));
 
-            let mut page = Page::new(i, pager.page_size as _);
-            pager.read(page.number, page.buffer_mut())?;
+            let mut page = Page::init(i, pager.page_size as _);
+            pager.read(page.number, page.as_mut())?;
 
             assert_eq!(page, expected);
         }

@@ -1,38 +1,93 @@
-//! Slotted page implementation tuned for index organized storage.
+//! Implementations of different disk page types.
 //!
-//! Initially this was going to be a generic slotted page implementation that
-//! would serve as a building block for both index organized storage (like
-//! SQLite) and tuple oriented storage (like Postgres), but the idea has been
-//! dropped in favor of simplicity.
+//! Currently there are 3 types of pages:
 //!
-//! The main difference is that when using index organized storage we never
-//! point to slot indexes from outside the page, so there's no need to attempt
-//! to maintain their current position for as long as possible. This [commit]
-//! contains the last version that used to do so. Another benefit of the current
-//! aproach is that BTree nodes and disk pages are the same thing, because
-//! everything is stored in a BTree, so we need less generics, less types and
-//! less code. Take a look at the [btree.c] file from SQLite 2.X.X for the
-//! inspiration.
+//! - [`PageZero`]
+//! - [`Page`]
+//! - [`OverflowPage`]
 //!
-//! Check these lectures for some background on slotted pages and data storage:
+//! The most important type of page is [`Page`] (that's why it's called
+//! literally "Page"), which is used for BTree nodes. [`PageZero`] is a special
+//! subtype of [`Page`] which holds additional metadata about the database file.
+//! [`OverflowPage`] is a page that is used when variable size data exceeds the
+//! maximum amount of bytes that can be stored in a single page.
+//! [`OverflowPage`] instances are also reused as free pages, because they use
+//! the same headers.
 //!
-//! - [F2023 #03 - Database Storage Part 1 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=DJ5u5HrbcMk)
-//! - [F2023 #04 - Database Storage Part 2 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=Ra50bFHkeM8)
+//! Each database is stored in a single file, and the data structures in this
+//! module operate on pages of such file. The DB file looks roughly like this:
 //!
-//! [commit]: https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs
-//! [btree.c]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c
+//! ```text
+//! +--------------------------+ <----+
+//! |       File Metadata      |      |
+//! +--------------------------+      |
+//! | +----------------------+ |      |
+//! | | Btree Page 0 Header  | |      | PAGE 0     struct PageZero
+//! | +----------------------+ |      |
+//! | | Btree page 0 Content | |      |
+//! | +----------------------+ |      |
+//! +--------------------------+ <----+
+//! | +----------------------+ |      |
+//! | | Btree Page 1 Header  | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      | PAGE 1       struct Page
+//! | | Btree page 1 Content | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      |
+//! +--------------------------+ <----+
+//! | +----------------------+ |      |
+//! | | Btree Page 2 Header  | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      | PAGE 2       struct Page
+//! | | Btree page 2 Content | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      |
+//! +--------------------------+ <----+
+//! | +----------------------+ |      |
+//! | | Overflow Page Header | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      | PAGE 3     struct OverflowPage
+//! | |   Overflow Content   | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      |
+//! +--------------------------+ <----+
+//! | +----------------------+ |      |
+//! | |    Fee Page Header   | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      | PAGE 4  struct OverflowPage (AKA FreePage)
+//! | |        UNUSED        | |      |
+//! | |                      | |      |
+//! | +----------------------+ |      |
+//! +--------------------------+ <----+
+//!             ...
+//! ```
+//!
+//! Pages link to other pages using their [`PageNumber`], which is just a 32 bit
+//! offset that can be used to jump from the beginning of the file to a
+//! concrete page.
+//!
+//! All the datastructures in this module offer APIs to operate on a single
+//! page. For multi-page operations see the [`super::btree`] module.
 
 use std::{
     alloc::{self, Allocator, Layout},
     cmp::Ordering,
     collections::BinaryHeap,
     fmt::Debug,
-    iter, mem,
+    iter,
+    marker::PhantomData,
+    mem::{self, ManuallyDrop},
     ops::{Bound, RangeBounds},
     ptr::NonNull,
 };
 
 use crate::paging::pager::PageNumber;
+
+/// Magic number at the beginning of the database file.
+///
+/// `0xB74EE` is supposed to stand for "BTree" and also serves as endianess
+/// check, since the big endian and little endian representations are different.
+pub(crate) const MAGIC: u32 = 0xB74EE;
 
 /// Maximum page size is 64 KiB, which is the maximum number that we can
 /// represent using 2 bytes.
@@ -54,11 +109,233 @@ pub(crate) const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
 /// See [`Page`] for alignment details.
-pub(crate) const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>() as _;
+pub(crate) const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>();
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
 pub(crate) type SlotId = u16;
+
+/// In-memory binary buffer split into header and content.
+///
+/// This struct is the basic building block for all the pages and contains a
+/// single memory buffer that looks like this:
+///
+/// ```text
+/// +----- Buffer address
+/// |
+/// |        +----- Content offset  (Buffer address + size of header)
+/// |        |
+/// V        V
+/// +--------+--------------------------+
+/// | HEADER |         CONTENT          |
+/// +--------+--------------------------+
+/// ```
+///
+/// The struct provides methods for directly reading or writing both the header
+/// and the content. The size in bytes of the header is determined by the
+/// generic type `H` using [`mem::size_of`].
+#[derive(Debug)]
+pub(crate) struct BufferWithHeader<H> {
+    marker: PhantomData<H>,
+    pointer: NonNull<[u8]>,
+}
+
+impl<H> BufferWithHeader<H> {
+    #[cfg(debug_assertions)]
+    fn debug_assert_size_is_valid(size: u16) {
+        debug_assert!(
+            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
+            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+        );
+
+        debug_assert!(
+            size as usize > mem::size_of::<H>(),
+            "the buffer only has space for the header, which makes the content pointer invalid"
+        );
+    }
+
+    /// Allocates a new buffer setting all the bytes to 0.
+    ///
+    /// If all the fields in the header should be set to 0 then this is good
+    /// enough, otherwise use [`Self::new`] and pass the header manually.
+    pub fn alloc(size: u16) -> Self {
+        #[cfg(debug_assertions)]
+        Self::debug_assert_size_is_valid(size);
+
+        // TODO: We can probably handle the alloc error by rolling back the
+        // database and returning an error to the client.
+        let pointer = alloc::Global
+            .allocate_zeroed(alloc::Layout::from_size_align(size as _, CELL_ALIGNMENT).unwrap())
+            .expect("could not allocate page buffer");
+
+        Self {
+            pointer,
+            marker: PhantomData,
+        }
+    }
+
+    /// Allocates a new buffer writing the given header at the beginning.
+    pub fn new(size: u16, header: H) -> Self {
+        let mut buffer = Self::alloc(size);
+        *buffer.header_mut() = header;
+
+        buffer
+    }
+
+    /// Sames as [`Self::new`] but does not allocate, it uses the given wrapper
+    /// instead.
+    ///
+    /// # Safety
+    ///
+    /// This function is marked as unsafe because the caller must make two
+    /// guarantees to prevent use after free bugs:
+    ///
+    /// 1. The wrapped buffer is never used after the parent buffer is dropped.
+    /// 2. The wrapped buffer is never dropped itself.
+    ///
+    /// Ensuring such behaviours should make this safe. See the implementation
+    /// of [`Drop`] for [`BufferWithHeader`] for more details.
+    pub unsafe fn new_in<W>(wrapper: &mut BufferWithHeader<W>, header: H) -> Self {
+        let pointer = wrapper.content_non_null();
+
+        #[cfg(debug_assertions)]
+        Self::debug_assert_size_is_valid(pointer.len() as _);
+
+        let mut buffer = Self {
+            marker: PhantomData,
+            pointer,
+        };
+
+        *buffer.header_mut() = header;
+
+        buffer
+    }
+
+    /// Number of bytes that can be used to store content.
+    ///
+    /// ```text
+    ///                 usable_space()
+    ///          +--------------------------+
+    ///          |                          |
+    ///          V                          V
+    /// +--------+--------------------------+
+    /// | HEADER |         CONTENT          |
+    /// +--------+--------------------------+
+    /// ```
+    pub fn usable_space(page_size: u16) -> u16 {
+        page_size - mem::size_of::<H>() as u16
+    }
+
+    /// Full size of the buffer in bytes.
+    ///
+    /// ```text
+    ///                size()
+    /// +-----------------------------------+
+    /// |                                   |
+    /// V                                   V
+    /// +--------+--------------------------+
+    /// | HEADER |         CONTENT          |
+    /// +--------+--------------------------+
+    /// ```
+    pub fn size(&self) -> u16 {
+        self.pointer.len() as _
+    }
+
+    /// Returns a read-only reference to the header.
+    pub fn header(&self) -> &H {
+        // SAFETY: The underlying [`NonNull`] pointer should always be valid and
+        // aligned since we allocate it ourselves or obtain it from another
+        // buffer that has already been allocated when using [`Self::new_in`].
+        // Unless we manually build an instance of this struct giving it an
+        // incorrect pointer this should be safe.
+        unsafe { self.pointer.cast().as_ref() }
+    }
+
+    /// Returns a mutable reference to the header.
+    pub fn header_mut(&mut self) -> &mut H {
+        // SAFETY: Same as [`Self::header`].
+        unsafe { self.pointer.cast().as_mut() }
+    }
+
+    /// Returns a pointer to the content of this buffer.
+    fn content_non_null(&self) -> NonNull<[u8]> {
+        // SAFETY: Pretty much the same as [`Self::header`], if the assertions
+        // in [`Self::debug_assert_size_is_valid`] were met then the content
+        // pointer should always be valid.
+        unsafe {
+            NonNull::slice_from_raw_parts(
+                self.pointer.byte_add(mem::size_of::<H>()).cast::<u8>(),
+                Self::usable_space(self.pointer.len() as u16) as usize,
+            )
+        }
+    }
+
+    /// Returns a read-only reference to the content part of this buffer.
+    pub fn content(&self) -> &[u8] {
+        // SAFETY: Same as [`Self::content_non_null`].
+        unsafe { self.content_non_null().as_ref() }
+    }
+
+    /// Returns a mutable reference to the content part of this buffer.
+    pub fn content_mut(&mut self) -> &mut [u8] {
+        // SAFETY: Same as [`Self::content_non_null`].
+        unsafe { self.content_non_null().as_mut() }
+    }
+}
+
+impl<H> AsRef<[u8]> for BufferWithHeader<H> {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: We allocate the pointer so we now it's valid and well
+        // aligned.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl<H> AsMut<[u8]> for BufferWithHeader<H> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: Same as `as_ref`.
+        unsafe { self.pointer.as_mut() }
+    }
+}
+
+impl<H> PartialEq for BufferWithHeader<H> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref().eq(other.as_ref())
+    }
+}
+
+impl<H> Clone for BufferWithHeader<H> {
+    fn clone(&self) -> Self {
+        let mut buffer = Self::alloc(self.size());
+        buffer.as_mut().copy_from_slice(self.as_ref());
+
+        buffer
+    }
+}
+
+impl<H> Drop for BufferWithHeader<H> {
+    fn drop(&mut self) {
+        // NOTE: See [`Self::new_in`]. It is possible to have buffers contained
+        // within other buffers, in which case this code should not run. We
+        // could add a guard to each buffer, something like `if self.is_wrapped`
+        // but as of right now there is only one case of wrapped buffer (page
+        // zero, which contains two headers). So we'll just leave it as is and
+        // delegate the responsibilities to the caller (which unfortunatley
+        // happens to be the same person who wrote this...)
+        unsafe {
+            alloc::Global.deallocate(
+                self.pointer.cast(),
+                alloc::Layout::from_size_align(self.pointer.len(), CELL_ALIGNMENT).unwrap(),
+            )
+        }
+    }
+}
+
+/// A trait similar to [`Default`] but for initializing empty pages in memory.
+pub(crate) trait InitEmptyPage {
+    /// Initializes an empty page of the given size.
+    fn init(number: PageNumber, size: u16) -> Self;
+}
 
 /// Slotted page header.
 ///
@@ -244,6 +521,8 @@ impl Cell {
         }
     }
 
+    /// Creates a new overflow cell by extending the `payload` buffer with the
+    /// `overflow_page` number.
     pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Self {
         payload.extend_from_slice(&overflow_page.to_le_bytes());
 
@@ -395,9 +674,30 @@ impl Ord for OverflowCell {
 /// The remaining slot IDs do not change. This is useful for deleting tuples
 /// and delaying index updates as much as possible if using tuple oriented
 /// storage, which we are not doing, so you'll never see NULL slots.
-/// Check this [commit](https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs)
-/// for the initial implementation which used to manage both null and non-null
-/// slot indexes.
+///
+/// # Null Slots
+///
+/// Initially this was going to be a generic slotted page implementation that
+/// would serve as a building block for both index organized storage (like
+/// SQLite) and tuple oriented storage (like Postgres), but the idea has been
+/// dropped in favor of simplicity.
+///
+/// The main difference is that when using index organized storage we never
+/// point to slot indexes from outside the page, so there's no need to attempt
+/// to maintain their current position for as long as possible. This [commit]
+/// contains the last version that used to do so. Another benefit of the current
+/// aproach is that BTree nodes and disk pages are the same thing, because
+/// everything is stored in a BTree, so we need less generics, less types and
+/// less code. Take a look at the [btree.c] file from SQLite 2.X.X for the
+/// inspiration.
+///
+/// Check these lectures for some background on slotted pages and data storage:
+///
+/// - [F2023 #03 - Database Storage Part 1 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=DJ5u5HrbcMk)
+/// - [F2023 #04 - Database Storage Part 2 (CMU Intro to Database Systems)](https://www.youtube.com/watch?v=Ra50bFHkeM8)
+///
+/// [commit]: https://github.com/antoniosarosi/mkdb/blob/3011003170f02d337f62cdd9f5af0f3b63786144/src/paging/page.rs
+/// [btree.c]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c
 ///
 /// # Alignment
 ///
@@ -418,34 +718,28 @@ impl Ord for OverflowCell {
 /// algorithm will move all the cells out of the page and reorganize them across
 /// siblings. The only method that needs to work correctly is [`Page::drain`] as
 /// that's the one used to move the cells out.
+#[derive(Clone)]
 pub(crate) struct Page {
     /// Page number on disk.
     pub number: PageNumber,
     /// Fixed size in-memory buffer that contains the data read from disk.
-    buffer: NonNull<[u8]>,
+    buffer: BufferWithHeader<PageHeader>,
     /// Overflow list.
     overflow: BinaryHeap<OverflowCell>,
 }
 
-impl Page {
-    /// Allocates a new page in memory.
-    pub fn new(number: PageNumber, size: u16) -> Self {
-        let buffer = alloc::Global
-            .allocate_zeroed(Self::layout(size))
-            .expect("could not allocate page");
-
-        // SAFETY: If allocation didn't fail then the layout is guaranteed to
-        // fit the page header plus some payload. We can cast and write the
-        // header safely.
-        unsafe {
-            buffer.cast().write(PageHeader {
+impl InitEmptyPage for Page {
+    fn init(number: PageNumber, size: u16) -> Self {
+        let buffer = BufferWithHeader::new(
+            size,
+            PageHeader {
                 num_slots: 0,
                 last_used_offset: size,
                 free_space: Self::usable_space(size),
                 right_child: 0,
                 padding: 0,
-            });
-        }
+            },
+        );
 
         Self {
             number,
@@ -453,10 +747,35 @@ impl Page {
             overflow: BinaryHeap::new(),
         }
     }
+}
 
+// TODO: Technically two pages could have the exact same content but different
+// internal structure due to calls to defragment or different insertion order.
+// However figuring out if the cells are actually equal probably requires an
+// O(n^2) algorithm. This is good enough for tests anyway, as the BTree always
+// inserts data in the same order.
+impl PartialEq for Page {
+    fn eq(&self, other: &Self) -> bool {
+        self.number == other.number && self.buffer == other.buffer
+    }
+}
+
+impl AsRef<[u8]> for Page {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for Page {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut()
+    }
+}
+
+impl Page {
     /// Amount of space that can be used in a page to store [`Cell`] instances.
     pub fn usable_space(page_size: u16) -> u16 {
-        page_size - PAGE_HEADER_SIZE
+        BufferWithHeader::<PageHeader>::usable_space(page_size)
     }
 
     /// The maximum size that the payload of a single cell can take on the page.
@@ -479,22 +798,9 @@ impl Page {
         max_size
     }
 
-    /// Memory layout of the page.
-    pub fn layout(page_size: u16) -> Layout {
-        assert!(
-            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size),
-            "page size out of acceptable bounds"
-        );
-
-        // SAFETY:
-        // - `CELL_ALIGNMENT` is a non-zero power of two.
-        // - `page_size` is u16 so it cannot overflow isize.
-        unsafe { Layout::from_size_align_unchecked(page_size as usize, CELL_ALIGNMENT) }
-    }
-
     /// Size in bytes of the page.
     pub fn size(&self) -> u16 {
-        self.buffer.len() as _
+        self.buffer.size()
     }
 
     /// Number of cells in the page.
@@ -502,52 +808,33 @@ impl Page {
         self.header().num_slots + self.overflow.len() as u16
     }
 
-    /// In-memory page buffer.
-    pub fn buffer(&self) -> &[u8] {
-        // SAFETY: We allocated the pointer so we know it's valid.
-        unsafe { self.buffer.as_ref() }
-    }
-
-    /// Same as [`Self::buffer`] but readable.
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
-        // SAFETY: Same as [`Self::buffer`].
-        unsafe { self.buffer.as_mut() }
-    }
-
     /// Reference to the page header.
     pub fn header(&self) -> &PageHeader {
-        // SAFETY: The pointer is valid and we store the header at the beginning
-        // of the page, so we can safely cast.
-        unsafe { self.buffer.cast().as_ref() }
+        self.buffer.header()
     }
 
     /// Mutable reference to the page header.
     pub fn header_mut(&mut self) -> &mut PageHeader {
-        // SAFETY: Same as [`Self::header`].
-        unsafe { self.buffer.cast().as_mut() }
+        self.buffer.header_mut()
     }
 
     /// Pointer to the slot array.
     fn slot_array_non_null(&self) -> NonNull<[u16]> {
-        // SAFETY: The slotted array is located right after the header and
-        // `num_slots` records the exact size of the slotted array.
-        unsafe {
-            NonNull::slice_from_raw_parts(
-                self.buffer.byte_add(PAGE_HEADER_SIZE as _).cast(),
-                self.header().num_slots as _,
-            )
-        }
+        NonNull::slice_from_raw_parts(
+            self.buffer.content_non_null().cast(),
+            self.header().num_slots as _,
+        )
     }
 
     // Slotted array as a slice.
     fn slot_array(&self) -> &[u16] {
-        // SAFETY: See [`Self::slot_array_non_null`].
+        // SAFETY: See [`BufferWithHeader::content_non_null`].
         unsafe { self.slot_array_non_null().as_ref() }
     }
 
     // Slotted array as a mutable slice.
     fn slot_array_mut(&mut self) -> &mut [u16] {
-        // SAFETY: See [`Self::slot_array_non_null`].
+        // SAFETY: See [`BufferWithHeader::content_non_null`].
         unsafe { self.slot_array_non_null().as_mut() }
     }
 
@@ -559,7 +846,7 @@ impl Page {
     /// the offset is valid within the function, so the caller is responsible
     /// for that.
     unsafe fn cell_header_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
-        self.buffer.byte_add(offset as _).cast()
+        self.buffer.pointer.byte_add(offset as _).cast()
     }
 
     /// Returns a pointer to the [`CellHeader`] pointer by the given slot.
@@ -629,9 +916,12 @@ impl Page {
     }
 
     /// Returns `true` if this page is underflow.
-    pub fn is_underflow(&self, is_root: bool) -> bool {
-        self.len() == 0
-            || !is_root && self.header().free_space > Self::usable_space(self.size()) / 2
+    ///
+    /// An ordinary page is in "underflow" condition when less than half of
+    /// its usable space is occupied. Special cases must be handled at other
+    /// layers.
+    pub fn is_underflow(&self) -> bool {
+        self.header().free_space > Self::usable_space(self.size()) / 2
     }
 
     /// Returns `true` if this page is overflow.
@@ -955,6 +1245,11 @@ impl Page {
         let mut destination_offset = self.size();
 
         while let Some((offset, i)) = offsets.pop() {
+            // SAFETY: Calling [`Self::cell_header_at_offset`] is safe here
+            // because we obtained all the offsets from the slot array, which
+            // should always be in a valid state. If that holds true, then
+            // casting the dereferencing the cell pointer should be safe as
+            // well.
             unsafe {
                 let cell = self.cell_header_at_offset(offset);
                 let size = cell.as_ref().total_size();
@@ -963,6 +1258,7 @@ impl Page {
 
                 cell.cast::<u8>().copy_to(
                     self.buffer
+                        .pointer
                         .byte_add(destination_offset as usize)
                         .cast::<u8>(),
                     size as usize,
@@ -1029,37 +1325,6 @@ impl Page {
     }
 }
 
-impl Drop for Page {
-    fn drop(&mut self) {
-        unsafe {
-            alloc::Global.deallocate(self.buffer.cast(), Self::layout(self.buffer.len() as _))
-        }
-    }
-}
-
-impl PartialEq for Page {
-    fn eq(&self, other: &Self) -> bool {
-        self.number == other.number
-            && self.buffer.len() == other.buffer.len()
-            && self.buffer().eq(other.buffer())
-    }
-}
-
-impl Clone for Page {
-    fn clone(&self) -> Self {
-        let mut page = Page::new(self.number, self.buffer.len() as _);
-        page.buffer_mut().copy_from_slice(self.buffer());
-        page.overflow = self.overflow.clone();
-        page
-    }
-}
-
-impl AsRef<[u8]> for Page {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer()
-    }
-}
-
 impl Debug for Page {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Page")
@@ -1091,15 +1356,13 @@ impl Debug for Page {
 /// Header of an overflow page.
 #[derive(Debug)]
 #[repr(C)]
-pub(crate) struct OverflowPageHeder {
+pub(crate) struct OverflowPageHeader {
     /// Next overflow page.
     pub next: PageNumber,
     /// Number of bytes stored in this page. Not to be confused with the page
     /// size.
     pub num_bytes: u16,
 }
-
-const OVERFLOW_PAGE_HEADER_SIZE: usize = mem::size_of::<OverflowPageHeder>();
 
 /// Cell overflow page.
 ///
@@ -1143,77 +1406,240 @@ const OVERFLOW_PAGE_HEADER_SIZE: usize = mem::size_of::<OverflowPageHeder>();
 ///
 /// When a [`CellHeader::is_overflow`] equals `true` then the last 4 bytes of
 /// the [`Cell`] payload point to the first overflow page.
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) struct OverflowPage {
     /// Page number.
     pub number: PageNumber,
     /// In-memory page buffer.
-    buffer: NonNull<[u8]>,
+    buffer: BufferWithHeader<OverflowPageHeader>,
 }
 
 /// We can reuse the overflow page to represent free pages since we only need
 /// a linked list of pages.
 pub(crate) type FreePage = OverflowPage;
 
-impl OverflowPage {
-    pub fn new(number: PageNumber, size: u16) -> Self {
-        let buffer = alloc::Global
-            .allocate_zeroed(Self::layout(size))
-            .expect("could not allocate page");
-
-        Self { number, buffer }
-    }
-
-    fn layout(size: u16) -> Layout {
-        Layout::from_size_align(size as usize, mem::align_of::<OverflowPageHeder>()).unwrap()
-    }
-
-    pub fn usable_space(page_size: u16) -> u16 {
-        page_size - OVERFLOW_PAGE_HEADER_SIZE as u16
-    }
-
-    pub fn header(&self) -> &OverflowPageHeder {
-        unsafe { self.buffer.cast().as_ref() }
-    }
-
-    pub fn header_mut(&mut self) -> &mut OverflowPageHeder {
-        unsafe { self.buffer.cast().as_mut() }
-    }
-
-    fn content_non_null(&self) -> NonNull<[u8]> {
-        unsafe {
-            NonNull::slice_from_raw_parts(
-                self.buffer.byte_add(OVERFLOW_PAGE_HEADER_SIZE).cast::<u8>(),
-                Self::usable_space(self.buffer.len() as u16) as usize,
-            )
+impl InitEmptyPage for OverflowPage {
+    fn init(number: PageNumber, size: u16) -> Self {
+        Self {
+            number,
+            buffer: BufferWithHeader::alloc(size),
         }
-    }
-
-    pub fn content(&self) -> &[u8] {
-        unsafe { self.content_non_null().as_ref() }
-    }
-
-    pub fn content_mut(&mut self) -> &mut [u8] {
-        unsafe { self.content_non_null().as_mut() }
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        &self.content()[..self.header().num_bytes as usize]
-    }
-
-    pub fn buffer(&self) -> &[u8] {
-        unsafe { self.buffer.as_ref() }
-    }
-
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
-        unsafe { self.buffer.as_mut() }
     }
 }
 
-impl Drop for OverflowPage {
-    fn drop(&mut self) {
-        unsafe {
-            alloc::Global.deallocate(self.buffer.cast(), Self::layout(self.buffer.len() as u16))
+impl AsRef<[u8]> for OverflowPage {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for OverflowPage {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut()
+    }
+}
+
+impl OverflowPage {
+    /// Total space that can be used for overflow payloads.
+    pub fn usable_space(page_size: u16) -> u16 {
+        BufferWithHeader::<OverflowPageHeader>::usable_space(page_size)
+    }
+
+    /// Returns a reference to the header.
+    pub fn header(&self) -> &OverflowPageHeader {
+        self.buffer.header()
+    }
+
+    /// Returns a mutable reference to the header.
+    pub fn header_mut(&mut self) -> &mut OverflowPageHeader {
+        self.buffer.header_mut()
+    }
+
+    /// Returns a mutable reference to the entire content buffer.
+    pub fn content_mut(&mut self) -> &mut [u8] {
+        self.buffer.content_mut()
+    }
+
+    /// Returns a read-only reference to the payload (not the entire content).
+    pub fn payload(&self) -> &[u8] {
+        &self.buffer.content()[..self.header().num_bytes as usize]
+    }
+}
+
+/// Database file header.
+///
+/// This is located at the beginning of the DB file and is used by the pager to
+/// keep track of free pages and other metadata.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, align(8))]
+pub(crate) struct DbHeader {
+    /// Magic number at the beginning of the file.
+    pub magic: u32,
+    /// Page size used for this DB file.
+    pub page_size: u32,
+    /// Number of pages in the file (both free and used).
+    pub total_pages: u32,
+    /// Number of free pages.
+    pub free_pages: u32,
+    /// First free page in the freelist.
+    pub first_free_page: PageNumber,
+    /// Last free page in the freelist.
+    pub last_free_page: PageNumber,
+}
+
+/// The first page of the DB file (offset 0) is a special case since it contains
+/// an additional header with metadata.
+///
+/// As such, this page has less usable space for [`Cell`] instances. Note that
+/// the BTree balancing algorithm should always operate on pages of the same
+/// size, but since root nodes are special cases this particular page doesn't
+/// introduce any bugs. The alternative would be to use an entire page to store
+/// just the [`DbHeader`], which doesn't make much sense if we peek a reasonable
+/// page size of 4096 or above.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct PageZero {
+    /// Page buffer.
+    buffer: BufferWithHeader<DbHeader>,
+    /// Inner BTree slotted page. Marked as manually drop to ensure the safety
+    /// conditions of [`BufferWithHeader::new_in`].
+    page: ManuallyDrop<Page>,
+}
+
+impl InitEmptyPage for PageZero {
+    fn init(number: PageNumber, size: u16) -> Self {
+        let mut buffer = BufferWithHeader::new(
+            size,
+            DbHeader {
+                magic: MAGIC,
+                page_size: size as _,
+                total_pages: 1,
+                free_pages: 0,
+                first_free_page: 0,
+                last_free_page: 0,
+            },
+        );
+
+        // SAFETY: `new_in` requires two guarantees which we meet as follows:
+        //
+        // 1. There is no way to use the wrapped buffer after the main one is
+        // dropped because we own both of them and they're gonna live as long
+        // as this struct.
+        //
+        // 2. The wrapped buffer can never be dropped because we're using
+        // ManuallyDrop to store the Page instance.
+        let page_buffer = unsafe {
+            BufferWithHeader::<PageHeader>::new_in(
+                &mut buffer,
+                PageHeader {
+                    num_slots: 0,
+                    last_used_offset: size - mem::size_of::<DbHeader>() as u16,
+                    free_space: Page::usable_space(size),
+                    right_child: 0,
+                    padding: 0,
+                },
+            )
+        };
+
+        let page = ManuallyDrop::new(Page {
+            number,
+            buffer: page_buffer,
+            overflow: BinaryHeap::new(),
+        });
+
+        Self { buffer, page }
+    }
+}
+
+impl PageZero {
+    /// Read-only reference to the database file header.
+    pub fn header(&self) -> &DbHeader {
+        self.buffer.header()
+    }
+
+    /// Mutable reference to the database file header.
+    pub fn header_mut(&mut self) -> &mut DbHeader {
+        self.buffer.header_mut()
+    }
+
+    /// Read-only references to the contained slotted page.
+    pub fn as_btree_page(&self) -> &Page {
+        &self.page
+    }
+
+    /// Mutable reference to the inner slotted page.
+    pub fn as_btree_page_mut(&mut self) -> &mut Page {
+        &mut self.page
+    }
+}
+
+impl AsRef<[u8]> for PageZero {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for PageZero {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut()
+    }
+}
+
+/// Serves as a wrapper to hold multiple types of pages.
+///
+/// See [`crate::paging::pager::Pager::get_as`] for details as to why we need
+/// this.
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) enum MemPage {
+    Zero(PageZero),
+    Overflow(OverflowPage),
+    Btree(Page),
+}
+
+impl MemPage {
+    /// Returns the disk page number.
+    pub fn number(&self) -> PageNumber {
+        match self {
+            Self::Zero(_) => 0,
+            Self::Overflow(page) => page.number,
+            Self::Btree(page) => page.number,
         }
+    }
+
+    /// Returns `true` if the page is in overflow state.
+    pub fn is_overflow(&self) -> bool {
+        match self {
+            Self::Btree(page) => page.is_overflow(),
+            Self::Zero(page_zero) => page_zero.as_btree_page().is_overflow(),
+            _ => false,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MemPage {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Zero(page) => page.as_ref(),
+            Self::Overflow(page) => page.as_ref(),
+            Self::Btree(page) => page.as_ref(),
+        }
+    }
+}
+
+impl Into<MemPage> for Page {
+    fn into(self) -> MemPage {
+        MemPage::Btree(self)
+    }
+}
+
+impl Into<MemPage> for OverflowPage {
+    fn into(self) -> MemPage {
+        MemPage::Overflow(self)
+    }
+}
+
+impl Into<MemPage> for PageZero {
+    fn into(self) -> MemPage {
+        MemPage::Zero(self)
     }
 }
 
@@ -1257,7 +1683,7 @@ mod tests {
         }
 
         fn build(self) -> (Page, Vec<Cell>) {
-            let mut page = Page::new(0, self.size);
+            let mut page = Page::init(0, self.size);
             page.push_all(self.cells.clone());
 
             (page, self.cells)

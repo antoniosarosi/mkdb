@@ -29,6 +29,13 @@ fn main() -> io::Result<()> {
         let conn = stream.peer_addr().unwrap().to_string();
         println!("Connection from {}", conn);
 
+        let prompt = "mkdb> ";
+
+        stream.write(
+            format!("Welcome to the MKDB 'SHELL' (not really a shell). Type SQL statements below\n\n{prompt}")
+                .as_bytes(),
+        )?;
+
         let mut statement = String::new();
 
         let exit_command = "quit";
@@ -56,7 +63,7 @@ fn main() -> io::Result<()> {
 
                     Err(e) => stream.write(e.to_string().as_bytes()),
                 };
-                stream.write("\n".as_bytes()).unwrap();
+                stream.write(format!("\n{prompt}").as_bytes()).unwrap();
                 statement = String::new();
             }
         }

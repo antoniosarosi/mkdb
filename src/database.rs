@@ -17,7 +17,8 @@ use crate::{
         Statement, UnaryOperator, Value,
     },
     storage::{
-        page::Page, BTree, FixedSizeMemCmp, Header, DEFAULT_BALANCE_SIBLINGS_PER_SIDE, MAGIC,
+        page::{InitEmptyPage, Page},
+        BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
     },
 };
 
@@ -29,7 +30,7 @@ pub(crate) const MKDB_META: &str = "mkdb_meta";
 
 /// Root page of the meta-table. Page 0 holds the DB header, page 1 holds the
 /// beginning of the meta-table.
-pub(crate) const MKDB_META_ROOT: PageNumber = 1;
+pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
 /// beginning of each tuple.
@@ -379,15 +380,6 @@ impl Database<File> {
 
         pager.init()?;
 
-        assert_eq!(
-            pager.alloc_page()?,
-            MKDB_META_ROOT,
-            "first allocated page is not equal to 1"
-        );
-
-        let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
-        pager.write(MKDB_META_ROOT, root.buffer())?;
-
         Ok(Database::new(pager))
     }
 }
@@ -699,9 +691,8 @@ impl<I: Seek + Read + Write> Database<I> {
         // TODO: SQL injections through the table name?.
         match statement {
             Statement::Create(Create::Table { name, columns }) => {
-                let table_root = Page::new(self.pager.alloc_page()?, self.pager.page_size as _);
-                self.pager.write(table_root.number, table_root.buffer())?;
-                let root_page = table_root.number;
+                let root_page = self.pager.alloc_page()?;
+                self.pager.init_page::<Page>(root_page)?;
 
                 self.exec(&format!(
                     r#"
@@ -1005,12 +996,11 @@ mod tests {
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
         database::{
-            mkdb_meta_schema, Header, QueryResolution, Schema, SqlError, TypeError, MAGIC,
-            MKDB_META_ROOT,
+            mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError, MKDB_META_ROOT,
         },
         paging::{io::MemBuf, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
-        storage::page::Page,
+        storage::page::{InitEmptyPage, Page},
     };
 
     impl PartialEq for DbError {
@@ -1032,10 +1022,6 @@ mod tests {
         );
 
         pager.init()?;
-        pager.alloc_page()?;
-
-        let root = Page::new(MKDB_META_ROOT, DEFAULT_PAGE_SIZE as _);
-        pager.write(MKDB_META_ROOT, root.buffer())?;
 
         Ok(Database::new(pager))
     }
@@ -1056,7 +1042,7 @@ mod tests {
                 vec![vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
-                    Value::Number(2),
+                    Value::Number(1),
                     Value::String("users".into()),
                     Value::String(Parser::new(sql).parse_statement()?.to_string())
                 ]]
@@ -1471,21 +1457,21 @@ mod tests {
                     vec![
                         Value::String("table".into()),
                         Value::String("users".into()),
-                        Value::Number(2),
+                        Value::Number(1),
                         Value::String("users".into()),
                         Value::String(Parser::new(&t1).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("tasks".into()),
-                        Value::Number(3),
+                        Value::Number(2),
                         Value::String("tasks".into()),
                         Value::String(Parser::new(&t2).parse_statement()?.to_string())
                     ],
                     vec![
                         Value::String("table".into()),
                         Value::String("products".into()),
-                        Value::Number(4),
+                        Value::Number(3),
                         Value::String("products".into()),
                         Value::String(Parser::new(&t3).parse_statement()?.to_string())
                     ]
