@@ -991,7 +991,10 @@ impl<I: Seek + Read + Write> Database<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{
+        collections::{HashMap, HashSet},
+        io,
+    };
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
@@ -1478,6 +1481,56 @@ mod tests {
                 ]
             }
         );
+
+        Ok(())
+    }
+
+    /// Used mostly to test the possibilities of a BTree rooted at page zero,
+    /// since that's a special case.
+    #[test]
+    fn create_many_tables() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let mut table_names = Vec::new();
+
+        let schema = "(id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255))";
+
+        for i in 1..=100 {
+            let name = format!("table_{i:03}");
+            db.exec(&format!("CREATE TABLE {name} {schema};"))?;
+
+            table_names.push(name);
+        }
+
+        let query = db.exec("SELECT * FROM mkdb_meta ORDER BY table_name;")?;
+
+        let mut roots = HashMap::new();
+
+        for (i, name) in table_names.into_iter().enumerate() {
+            let root = match query.get(i, "root").unwrap() {
+                Value::Number(root) => *root,
+                other => panic!("root is not a page number: {other:?}"),
+            };
+
+            if let Err(root_used_by) = roots.try_insert(root, name.clone()) {
+                panic!("root {root} used for both table {root_used_by} and {name}");
+            }
+
+            assert_eq!(
+                query.results[i],
+                vec![
+                    Value::String("table".into()),
+                    Value::String(name.clone()),
+                    Value::Number(root),
+                    Value::String(name.clone()),
+                    Value::String(
+                        Parser::new(&format!("CREATE TABLE {name} {schema};"))
+                            .parse_statement()?
+                            .to_string()
+                    ),
+                ]
+            );
+        }
 
         Ok(())
     }

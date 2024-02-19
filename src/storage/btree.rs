@@ -503,8 +503,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             Err(index) => node.insert(index, new_cell),
         };
 
-        self.balance(search.page, parents)?;
-        self.pager.write_dirty_pages()
+        self.balance(search.page, &mut parents)
     }
 
     /// Removes the entry corresponding to the given key if it exists.
@@ -609,12 +608,25 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// API and calls [`Self::balance`] at the end.
     pub fn remove(&mut self, entry: &[u8]) -> io::Result<Option<Box<[u8]>>> {
         let mut parents = Vec::new();
-        let Some((entry, leaf_node)) = self.remove_entry(entry, &mut parents)? else {
+        let Some((entry, leaf_node, internal_node)) = self.remove_entry(entry, &mut parents)?
+        else {
             return Ok(None);
         };
 
-        self.balance(leaf_node, parents)?;
-        self.pager.write_dirty_pages()?;
+        self.balance(leaf_node, &mut parents)?;
+
+        // Since data is variable size it could happen that we peek a large
+        // substitute from a leaf node to replace a small key in an internal
+        // node, leaving the leaf node balanced and the internal node overflow.
+        if let Some(node) = internal_node {
+            // This algorithm is O(n) but the height of the tree grows
+            // logarithmically so there shoudn't be that many elements to search
+            // here.
+            if let Some(index) = parents.iter().position(|n| n == &node) {
+                parents.drain(index..);
+                self.balance(node, &mut parents)?;
+            }
+        }
 
         Ok(Some(entry))
     }
@@ -629,7 +641,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         &mut self,
         entry: &[u8],
         parents: &mut Vec<PageNumber>,
-    ) -> io::Result<Option<(Box<[u8]>, PageNumber)>> {
+    ) -> io::Result<Option<(Box<[u8]>, PageNumber, Option<PageNumber>)>> {
         let search = self.search(self.root, entry, parents)?;
         let node = self.pager.get(search.page)?;
 
@@ -643,7 +655,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Leaf node is the simplest case, remove key and pop off the stack.
         if node.is_leaf() {
             let cell = self.pager.get_mut(search.page)?.remove(index);
-            return Ok(Some((cell.content, search.page)));
+            return Ok(Some((cell.content, search.page, None)));
         }
 
         // Root or internal nodes require additional work. We need to find a
@@ -669,7 +681,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         substitute.header.left_child = node.child(index);
         let entry = node.replace(index, substitute);
 
-        Ok(Some((entry.content, leaf_node)))
+        Ok(Some((entry.content, leaf_node, Some(node.number))))
     }
 
     /// Traverses the tree all the way down to the leaf nodes, following the
@@ -1445,7 +1457,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// this process, we would execute step 2 discussed at the beginning of
     /// this doc comment. With all this information in mind, you can now attempt
     /// to understand the source code.
-    fn balance(&mut self, mut page: PageNumber, mut parents: Vec<PageNumber>) -> io::Result<()> {
+    fn balance(&mut self, mut page: PageNumber, parents: &mut Vec<PageNumber>) -> io::Result<()> {
         let node = self.pager.get(page)?;
 
         // Started from the bottom now we're here :)
@@ -1465,8 +1477,13 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
             if child_page != 0 {
                 let mut child_node = self.pager.get(child_page)?.clone();
-                self.pager.get_mut(page)?.append(&mut child_node);
-                self.pager.free_page(child_page)?;
+                let root = self.pager.get(page)?;
+
+                // Account for page zero having less space than the rest of pages.
+                if root.can_consume_without_overflow(&child_node) {
+                    self.pager.get_mut(page)?.append(&mut child_node);
+                    self.pager.free_page(child_page)?;
+                }
             }
 
             return Ok(());
@@ -1492,7 +1509,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut siblings = self.load_siblings(page, parent_page)?;
 
         let mut cells = VecDeque::new();
-        let divider_idx = siblings[0].index;
+        let mut divider_idx = siblings[0].index;
 
         // Make copies of cells in order.
         for (i, sibling) in siblings.iter().enumerate() {
@@ -1577,6 +1594,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
                 self.pager
                     .get_mut(parent_page)?
                     .insert(siblings[i].index, divider);
+                divider_idx += 1;
             }
         }
 
@@ -1658,22 +1676,31 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             .collect())
     }
 
+    /// Allocates a cell that can fit the entire given `payload`.
+    ///
+    /// Overflow pages are used if necessary. See [`OverflowPage`] for details.
     fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Cell> {
-        let max_payload_size = Page::max_payload_size(self.pager.page_size as _) as usize;
+        let max_payload_size = Page::ideal_max_payload_size(self.pager.page_size as _) as usize;
 
+        // No overflow needed.
         if payload.len() <= max_payload_size {
             return Ok(Cell::new(payload));
         }
 
+        // Store payload in chunks, link overflow pages and return the cell.
         let first_cell_payload_size = max_payload_size - mem::size_of::<PageNumber>();
+        let mut next_overflow_page = self.pager.alloc_page()?;
+
+        let cell = Cell::new_overflow(
+            Vec::from(&payload[..first_cell_payload_size]),
+            next_overflow_page,
+        );
 
         let mut stored_bytes = first_cell_payload_size;
-        let mut overflow_pages: Vec<OverflowPage> = Vec::new();
 
-        // TODO: Allocate N pages at once to reduce IO.
-        while stored_bytes < payload.len() {
+        loop {
             let mut overflow_page =
-                OverflowPage::init(self.pager.alloc_page()?, self.pager.page_size as _);
+                OverflowPage::init(next_overflow_page, self.pager.page_size as _);
 
             let overflow_bytes = min(
                 OverflowPage::usable_space(self.pager.page_size as _) as usize,
@@ -1685,39 +1712,45 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
             overflow_page.header_mut().num_bytes = overflow_bytes as _;
 
-            if let Some(previous) = overflow_pages.last_mut() {
-                previous.header_mut().next = overflow_page.number;
+            stored_bytes += overflow_bytes;
+
+            if stored_bytes >= payload.len() {
+                self.pager.load_from_mem(overflow_page)?;
+                break;
             }
 
-            overflow_pages.push(overflow_page);
-            stored_bytes += overflow_bytes;
+            next_overflow_page = self.pager.alloc_page()?;
+            overflow_page.header_mut().next = next_overflow_page;
+            self.pager.load_from_mem(overflow_page)?;
         }
 
-        for page in &overflow_pages {
-            self.pager.write(page.number, page.as_ref())?;
-        }
-
-        Ok(Cell::new_overflow(
-            Vec::from(&payload[..first_cell_payload_size]),
-            overflow_pages[0].number,
-        ))
+        Ok(cell)
     }
 
+    /// Frees the pages occupied by the given `cell`.
+    ///
+    /// Pretty much a no-op if the cell is not "overflow".
     fn free_cell(&mut self, cell: Cell) -> io::Result<()> {
         if !cell.header.is_overflow {
             return Ok(());
         }
 
         let mut overflow_page = cell.overflow_page();
+
         while overflow_page != 0 {
-            self.pager.free_page(overflow_page)?;
             let unused_page = self.pager.get_as::<OverflowPage>(overflow_page)?;
-            overflow_page = unused_page.header().next;
+            let next = unused_page.header().next;
+            self.pager.free_page(overflow_page)?;
+            overflow_page = next;
         }
 
         Ok(())
     }
 
+    /// Joins a split payload back into one contiguous memory region.
+    ///
+    /// If the cell at the given slot is not "overflow" then this simply returns
+    /// a reference to its content.
     fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Payload> {
         // TODO: Check if we can circumvent Rust borrowing rules to make stuff
         // like this cleaner.
@@ -1741,31 +1774,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         Ok(Payload::Reassembled(payload.into()))
     }
 
-    // fn iter_cell_overflow(
-    //     &mut self,
-    //     mut overflow_page: PageNumber,
-    // ) -> impl Iterator<Item = io::Result<OverflowPage>> + '_ {
-    //     std::iter::from_fn(move || {
-    //         if overflow_page == 0 {
-    //             return None;
-    //         }
-
-    //         let mut page = OverflowPage::new(overflow_page, self.cache.page_size as _);
-
-    //         match self.cache.read(overflow_page, page.buffer_mut()) {
-    //             Ok(_) => {
-    //                 overflow_page = page.header().next;
-    //                 Some(Ok(page))
-    //             }
-    //             Err(e) => {
-    //                 overflow_page = 0;
-    //                 Some(Err(e))
-    //             }
-    //         }
-    //     })
-    // }
-
-    // Testing/Debugging only.
+    #[cfg(debug_assertions)]
     fn read_into_mem(&mut self, root: PageNumber, buf: &mut Vec<Page>) -> io::Result<()> {
         for page in self.pager.get(root)?.iter_children().collect::<Vec<_>>() {
             self.read_into_mem(page, buf)?;
@@ -1777,7 +1786,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         Ok(())
     }
 
-    // Testing/Debugging only.
+    #[cfg(debug_assertions)]
     pub fn json(&mut self) -> io::Result<String> {
         let mut nodes = Vec::new();
         self.read_into_mem(0, &mut nodes)?;
@@ -1798,7 +1807,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         Ok(string)
     }
 
-    // Testing/Debugging only.
+    #[cfg(debug_assertions)]
     fn node_json(&mut self, page: &Page) -> io::Result<String> {
         let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
 
@@ -1842,7 +1851,11 @@ mod tests {
     //! examples. Remember that `order` means the maximum number of children in
     //! a BTree that stores fixed size keys.
 
-    use std::{io, mem};
+    use std::{
+        alloc::Layout,
+        io::{self, Write},
+        mem,
+    };
 
     use super::{BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
@@ -1852,7 +1865,10 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{Cell, InitEmptyPage, Page, CELL_ALIGNMENT, PAGE_HEADER_SIZE},
+            page::{
+                Cell, InitEmptyPage, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE,
+                SLOT_SIZE,
+            },
         },
     };
 
@@ -1860,14 +1876,14 @@ mod tests {
     /// actual [`BTree`] structure. See tests below for examples.
     #[derive(Debug, PartialEq)]
     struct Node {
-        keys: Vec<u32>,
+        keys: Vec<Key>,
         children: Vec<Self>,
     }
 
     impl Node {
         /// Leaf nodes have no children. This method saves us some unecessary
         /// typing and makes the tree structure more readable.
-        fn leaf(keys: impl IntoIterator<Item = u32>) -> Self {
+        fn leaf(keys: impl IntoIterator<Item = Key>) -> Self {
             Self {
                 keys: keys.into_iter().collect(),
                 children: Vec::new(),
@@ -1876,7 +1892,7 @@ mod tests {
     }
 
     /// Fixed size key used for most of the tests.
-    type Key = u32;
+    type Key = u64;
 
     /// Serialize into big endian and use [`FixedSizeMemCmp`] for comparisons.
     fn serialize_key(key: Key) -> [u8; mem::size_of::<Key>()] {
@@ -1935,7 +1951,9 @@ mod tests {
         }
 
         fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf, FixedSizeMemCmp>> {
-            let page_size = self.page_size.unwrap_or(optimal_page_size_for(self.order));
+            let page_size = self
+                .page_size
+                .unwrap_or(optimal_page_size_for_order(self.order));
             let buf = io::Cursor::new(Vec::new());
 
             let mut pager = Pager::new(buf, page_size, page_size);
@@ -1962,8 +1980,7 @@ mod tests {
 
     impl<'c> BTree<'c, MemBuf, FixedSizeMemCmp> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
-            let mut page = Page::init(root, self.pager.page_size as _);
-            self.pager.read(root, page.as_mut())?;
+            let page = self.pager.get(root)?;
 
             let mut node = Node {
                 keys: (0..page.len())
@@ -1972,7 +1989,9 @@ mod tests {
                 children: vec![],
             };
 
-            for page in page.iter_children() {
+            let children = page.iter_children().collect::<Vec<_>>();
+
+            for page in children {
                 node.children.push(self.into_test_nodes(page)?);
             }
 
@@ -2001,7 +2020,7 @@ mod tests {
 
         fn try_remove_all_keys(
             &mut self,
-            keys: impl IntoIterator<Item = u32>,
+            keys: impl IntoIterator<Item = Key>,
         ) -> io::Result<Vec<Option<Box<[u8]>>>> {
             keys.into_iter()
                 .map(|key| self.remove(&serialize_key(key)))
@@ -2009,14 +2028,31 @@ mod tests {
         }
     }
 
-    fn optimal_page_size_for(order: usize) -> usize {
-        let key_size = Cell::new(vec![0; mem::size_of::<u32>()]).storage_size();
-        let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
-
-        std::alloc::Layout::from_size_align(total_space_needed as usize, CELL_ALIGNMENT)
+    fn align_upwards(size: usize, alignment: usize) -> usize {
+        Layout::from_size_align(size, alignment)
             .unwrap()
             .pad_to_align()
             .size() as _
+    }
+
+    /// Computes the page size needed to store `order - 1` keys of type [`Key`]
+    /// in one page.
+    fn optimal_page_size_for_order(order: usize) -> usize {
+        let key_size = Cell::new(vec![0; mem::size_of::<Key>()]).storage_size();
+        let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
+
+        align_upwards(total_space_needed as _, CELL_ALIGNMENT)
+    }
+
+    /// Computes the page size needed to store cells of at least `max` size.
+    fn optimal_page_size_for_max_payload(max: usize) -> usize {
+        let one_max_cell_size =
+            CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, CELL_ALIGNMENT) as u16;
+
+        // TODO: Hardcoded 4. Make it configurable.
+        let total_size = PAGE_HEADER_SIZE + one_max_cell_size * 4;
+
+        align_upwards(total_size as usize, CELL_ALIGNMENT)
     }
 
     impl<'c> TryFrom<BTree<'c, MemBuf, FixedSizeMemCmp>> for Node {
@@ -3262,8 +3298,7 @@ mod tests {
 
         for (i, size) in payload_sizes.iter().flatten().enumerate() {
             let mut entry = vec![0; *size];
-            let key = i as u32 + 1;
-            entry[..4].copy_from_slice(&key.to_be_bytes());
+            entry[..mem::size_of::<Key>()].copy_from_slice(&serialize_key(i as Key + 1));
             btree.insert(entry)?;
         }
 
@@ -3307,6 +3342,245 @@ mod tests {
         assert_eq!(
             btree.get(&large_key)?,
             Some(Payload::Reassembled(large_key.into_boxed_slice()))
+        );
+
+        Ok(())
+    }
+
+    /// Some obscure edge case when deleting. See the source of
+    /// [`BTree::remove`].
+    ///
+    /// ```text
+    ///                                                                                                                      Remove 6,9 and then double the size of 5 and 8
+    ///                                                                                                                                            |
+    ///                                                                                                                                            V
+    ///                                                                                                                                          +----+
+    ///                                                                           +--------------------------------------------------------------| 49 |-----------------------------------------------------+
+    ///                                                                          /                                                               +----+                                                      \
+    ///                                                                         /                                                                                                                             \
+    ///                                                              +------------------+                                                                                                               +-------------+
+    ///            +-------------------------------------------------| 7,14,21,28,35,42 |-------------------------------------------+                                +----------------------------------| 56,63,70,74 |--------------------+
+    ///           /                                                  +------------------+                                            \                              /                                   +-------------+                     \
+    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                    \                            /                                        /  |  \                          \
+    ///         /                  /                      +----------------+   |   +------------+                 \                    \                          /                            +-----------+   |   +------------+             \
+    ///        /                  /                      /                     |                 \                 \                    \                        /                            /                |                 \             \
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    /// | 1,2,3,4,5,6 |  | 8,9,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |  | 43,44,45,46,47,48 |    | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    ///
+    ///                                                                                                                       Remove 7. The internal node should rebalance.
+    ///                                                                                                                                            |
+    ///                                                                                                                                            V
+    ///                                                                                                                                          +----+
+    ///                                                                           +--------------------------------------------------------------| 49 |-----------------------------------------------------+
+    ///                                                                          /                                                               +----+                                                      \
+    ///                                                                         /                                                                                                                             \
+    ///                                                              +------------------+                                                                                                               +-------------+
+    ///            +-------------------------------------------------| 7,14,21,28,35,42 |-------------------------------------------+                                +----------------------------------| 56,63,70,74 |--------------------+
+    ///           /                                                  +------------------+                                            \                              /                                   +-------------+                     \
+    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                    \                            /                                        /  |  \                          \
+    ///         /                  /                      +----------------+   |   +------------+                 \                    \                          /                            +-----------+   |   +------------+             \
+    ///        /                  /                      /                     |                 \                 \                    \                        /                            /                |                 \             \
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    /// | 1,2,3,4,5XX |  | 8XX,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |  | 43,44,45,46,47,48 |    | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    ///
+    ///                                                                                                                   FINAL RESULT
+    ///                                                                                                                        |
+    ///                                                                                                                        V
+    ///                                                                                                                      +----+
+    ///                                                                           +------------------------------------------| 42 |-------------------------------------------------+
+    ///                                                                          /                                           +----+                                                  \
+    ///                                                                         /                                                                                                     \
+    ///                                                              +------------------+                                                                                       +----------------+
+    ///            +-------------------------------------------------| 5XX,14,21,28,35  |                                                    +----------------------------------| 49,56,63,70,74 |----------------------------------------+
+    ///           /                                                  +------------------+                                                   /                                   +----------------+                                         \
+    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                         /                                        /  |  \    \-------------------------------+            \
+    ///         /                  /                      +----------------+   |   +------------+                 \                       /                            +-----------+   |   +------------+                       \             \
+    ///        /                  /                      /                     |                 \                 \                     /                            /                |                 \                       \             \
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+    +-------------------+  +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    /// | 1,2,3,4     |  | 8XX,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |    | 43,44,45,46,47,48 |  | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
+    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+    +-------------------+  +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    /// ```
+    #[test]
+    fn delete_leaving_leaf_balanced_and_internal_unbalanced() -> io::Result<()> {
+        let mut btree = BTree::builder()
+            .page_size(optimal_page_size_for_max_payload(16))
+            .keys(1..=77)
+            .try_build()?;
+
+        btree.remove_key(6)?;
+        btree.remove_key(9)?;
+
+        let double_size_of_key = |k| -> Vec<u8> {
+            let mut large_key = serialize_key(k).to_vec();
+            large_key.append(&mut serialize_key(0).to_vec());
+            large_key
+        };
+
+        btree.insert(double_size_of_key(5))?;
+        btree.insert(double_size_of_key(8))?;
+
+        btree.remove_key(7)?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![42],
+                children: vec![
+                    Node {
+                        keys: vec![5, 14, 21, 28, 35],
+                        children: vec![
+                            Node::leaf([1, 2, 3, 4]),
+                            Node::leaf([8, 10, 11, 12, 13]),
+                            Node::leaf([15, 16, 17, 18, 19, 20]),
+                            Node::leaf([22, 23, 24, 25, 26, 27]),
+                            Node::leaf([29, 30, 31, 32, 33, 34]),
+                            Node::leaf([36, 37, 38, 39, 40, 41]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![49, 56, 63, 70, 74],
+                        children: vec![
+                            Node::leaf([43, 44, 45, 46, 47, 48]),
+                            Node::leaf([50, 51, 52, 53, 54, 55]),
+                            Node::leaf([57, 58, 59, 60, 61, 62]),
+                            Node::leaf([64, 65, 66, 67, 68, 69]),
+                            Node::leaf([71, 72, 73]),
+                            Node::leaf([75, 76, 77]),
+                        ]
+                    }
+                ]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Page zero has less space than the rest of pages and does some weird
+    /// things but it still keeps the BTree in a correct state. Sometimes the
+    /// root stays empty because it becomes "overflow", then it is moved into
+    /// a new page of greater size that is not "overflow" anymore, so there's
+    /// no split, which means there's no divider key.
+    ///
+    /// But the BTree still works because if there's no divider then the
+    /// binary search fails with index 0, and the child 0 is whichever comes
+    /// beneath the root.
+    ///
+    /// When the root child finally splits the root starts collecting dividers
+    /// making the tree look normal, but this cycle can repeat itself.
+    ///
+    /// This test is the same as [`basic_insertion`] but with the root set at
+    /// page 0. In this case, every node can fit 3 keys except the root, which
+    /// can only fit 2 keys.
+    ///
+    /// Due to the "empty root not empty root cycle", the tree ends up like
+    /// this:
+    ///
+    /// ```text
+    ///                 +--------+
+    ///                 |        | Empty Root
+    ///                 +--------+
+    ///                     |
+    ///                 +--------+
+    ///         +-------| 4,8,12 |--------+
+    ///       /         +--------+         \
+    ///     /           /        \          \
+    /// +-------+  +-------+  +---------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    /// +-------+  +-------+  +---------+  +----------+
+    /// ```
+    #[test]
+    fn page_zero_root_basic_insertion() -> io::Result<()> {
+        let btree = BTree::builder()
+            .root_at_zero(true)
+            .keys(1..=15)
+            .try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![],
+                children: vec![Node {
+                    keys: vec![4, 8, 12],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10, 11]),
+                        Node::leaf([13, 14, 15]),
+                    ]
+                }]
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Right after [`page_zero_root_basic_insertion`] this is what should
+    /// happen:
+    ///
+    /// ```text
+    ///                           +--------+
+    ///                   +-------|   11   |-------+
+    ///                  /        +--------+        \
+    ///                 /                            \
+    ///            +-------+                     +--------+
+    ///       +----|  4,8  |----+                |   14   |
+    ///      /     +-------+     \               +--------+
+    ///     /          |          \               /      \
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    /// +-------+  +-------+  +-------+     +-------+  +-------+
+    /// ```
+    ///
+    /// As you can see the tree behaves normally again. The test case is the
+    /// same as [`propagate_split_to_root`].
+    #[test]
+    fn page_zero_insert_divider_in_empty_root() -> io::Result<()> {
+        let btree = BTree::builder()
+            .root_at_zero(true)
+            .keys(1..=16)
+            .try_build()?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![11],
+                children: vec![
+                    Node {
+                        keys: vec![4, 8],
+                        children: vec![
+                            Node::leaf([1, 2, 3]),
+                            Node::leaf([5, 6, 7]),
+                            Node::leaf([9, 10]),
+                        ]
+                    },
+                    Node {
+                        keys: vec![14],
+                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                    }
+                ]
+            },
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_zero_merge_all_nodes() -> io::Result<()> {
+        let mut btree = BTree::builder()
+            .root_at_zero(true)
+            .keys(1..=16)
+            .try_build()?;
+
+        btree.try_remove_all_keys(2..=16)?;
+
+        assert_eq!(
+            Node::try_from(btree)?,
+            Node {
+                keys: vec![1],
+                children: vec![]
+            },
         );
 
         Ok(())

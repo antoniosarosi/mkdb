@@ -8,13 +8,15 @@
 use std::{
     any::{Any, TypeId},
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet},
     io::{self, Read, Seek, Write},
     mem,
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{DbHeader, FreePage, InitEmptyPage, MemPage, Page, PageZero, MAGIC};
+use crate::storage::page::{
+    DbHeader, FreePage, InitEmptyPage, MemPage, OverflowPage, Page, PageZero, MAGIC,
+};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -152,7 +154,13 @@ impl<I: Seek + Read + Write> Pager<I> {
             return Ok(index);
         }
 
-        self.load_from_disk::<P>(page_number)?;
+        // We always know the type of page zero. See [`Self::get_as`] for
+        // details on page types.
+        if page_number == 0 {
+            self.load_from_disk::<PageZero>(page_number)?;
+        } else {
+            self.load_from_disk::<P>(page_number)?;
+        }
 
         // Unwrapping is safe because we've just loaded the page into cache.
         Ok(self.cache.get(page_number).unwrap())
@@ -204,6 +212,26 @@ impl<I: Seek + Read + Write> Pager<I> {
             }
         });
 
+        if cfg!(debug_assertions) {
+            let types = HashMap::from([
+                (TypeId::of::<Page>(), "Page"),
+                (TypeId::of::<PageZero>(), "PageZero"),
+                (TypeId::of::<OverflowPage>(), "OverflowPage"),
+            ]);
+
+            if !types.contains_key(&TypeId::of::<P>()) {
+                panic!("get_as() called with invalid generic type");
+            }
+
+            if downcast.is_none() {
+                panic!(
+                    "attempt to read page {page_number} of type {:?} as type {}",
+                    &self.cache[index],
+                    types.get(&TypeId::of::<P>()).unwrap()
+                );
+            }
+        }
+
         Ok(downcast.expect("page type error"))
     }
 
@@ -215,6 +243,13 @@ impl<I: Seek + Read + Write> Pager<I> {
         self.dirty_pages.insert(page_number);
 
         let index = self.lookup::<P>(page_number)?;
+
+        // It's easier to verify the type using read-only references. We'll just
+        // call get_as until we find some better solution to deal with page
+        // types.
+        if cfg!(debug_assertions) {
+            self.get_as::<P>(page_number)?;
+        }
 
         let downcast = <dyn Any>::downcast_mut(match &mut self.cache[index] {
             MemPage::Btree(page) => page,
@@ -448,7 +483,7 @@ mod tests {
             let mut page = Page::init(pager.alloc_page()?, pager.page_size as _);
             page.push(Cell::new(vec![
                 i;
-                Page::max_payload_size(pager.page_size as _)
+                Page::ideal_max_payload_size(pager.page_size as _)
                     as usize
             ]));
 
@@ -473,7 +508,7 @@ mod tests {
                 } else {
                     i as u8
                 };
-                Page::max_payload_size(pager.page_size as _)
+                Page::ideal_max_payload_size(pager.page_size as _)
                     as usize
             ]));
 

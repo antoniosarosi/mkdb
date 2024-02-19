@@ -93,14 +93,34 @@ pub(crate) const MAGIC: u32 = 0xB74EE;
 /// represent using 2 bytes.
 pub(crate) const MAX_PAGE_SIZE: u16 = u16::MAX;
 
-/// Minimum acceptable page size. This should not be used for anything as it
-/// can only store about 8 bytes of payload per page.
-pub(crate) const MIN_PAGE_SIZE: u16 =
+/// Minimum acceptable page size.
+///
+/// When in debug mode the minimum value of the page size is calculated so that
+/// a normal [`Page`] instance can store at least one valid [`Cell`], which is
+/// an aligned cell that can fit [`CELL_ALIGNMENT`] bytes.
+///
+/// In numbers, at the moment of writing this the page header is 12 bytes, a
+/// slot pointer is 2 bytes, and the cell header is 8 bytes. This gives us a
+/// total of 22 bytes of metadata for one single payload.
+///
+/// [`CELL_ALIGNMENT`] is 8 bytes, so we'll consider that to be the minimum
+/// payload. Essentially what we do is add 8 bytes to 22 bytes, giving us 30
+/// bytes, and then we align upwards to 32 bytes. So the minimum page size in
+/// debug mode can store only 8 bytes worth of data, but we allow this because
+/// most tests use really small page sizes for simplicity.
+///
+/// In release mode we'll consider the minimum size to be 512 bytes.
+pub(crate) const MIN_PAGE_SIZE: u16 = if cfg!(debug_assertions) {
     (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1)
-        & !(CELL_ALIGNMENT as u16 - 1);
+        & !(CELL_ALIGNMENT as u16 - 1)
+} else {
+    512
+};
 
 /// Size of the [`Page`] header. See [`PageHeader`] for details.
 pub(crate) const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
+
+pub(crate) const DB_HEADER_SIZE: u16 = mem::size_of::<DbHeader>() as _;
 
 /// Size of [`CellHeader`].
 pub(crate) const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
@@ -141,26 +161,19 @@ pub(crate) struct BufferWithHeader<H> {
 }
 
 impl<H> BufferWithHeader<H> {
-    #[cfg(debug_assertions)]
-    fn debug_assert_size_is_valid(size: u16) {
-        debug_assert!(
-            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
-            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
-        );
-
-        debug_assert!(
-            size as usize > mem::size_of::<H>(),
-            "the buffer only has space for the header, which makes the content pointer invalid"
-        );
-    }
-
     /// Allocates a new buffer setting all the bytes to 0.
     ///
     /// If all the fields in the header should be set to 0 then this is good
     /// enough, otherwise use [`Self::new`] and pass the header manually.
     pub fn alloc(size: u16) -> Self {
-        #[cfg(debug_assertions)]
-        Self::debug_assert_size_is_valid(size);
+        debug_assert!(
+            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
+            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+        );
+        debug_assert!(
+            size as usize > mem::size_of::<H>(),
+            "allocated buffer only has space for the header, which makes the content pointer invalid"
+        );
 
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
@@ -198,8 +211,10 @@ impl<H> BufferWithHeader<H> {
     pub unsafe fn new_in<W>(wrapper: &mut BufferWithHeader<W>, header: H) -> Self {
         let pointer = wrapper.content_non_null();
 
-        #[cfg(debug_assertions)]
-        Self::debug_assert_size_is_valid(pointer.len() as _);
+        debug_assert!(
+            pointer.len() > mem::size_of::<H>(),
+            "wrapped buffer only has space for the header, which makes the content pointer invalid"
+        );
 
         let mut buffer = Self {
             marker: PhantomData,
@@ -778,24 +793,40 @@ impl Page {
         BufferWithHeader::<PageHeader>::usable_space(page_size)
     }
 
-    /// The maximum size that the payload of a single cell can take on the page.
+    /// The maximum payload size that can be stored in the given usable space.
     ///
     /// It's calculated by substracting the cell header size and the slot
-    /// pointer size from one fourth of the usable space and then aligning the
-    /// result downwards to [`CELL_ALIGNMENT`].
-    pub fn max_payload_size(page_size: u16) -> u16 {
+    /// pointer size from the usable space and then aligning the result
+    /// downwards to [`CELL_ALIGNMENT`]. This makes sure that at least one cell
+    /// can successfuly fit in the given space.
+    fn max_payload_size_in(usable_space: u16) -> u16 {
+        (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1)
+    }
+
+    /// The maximum size that the payload of a single cell "should" take on
+    /// the page.
+    ///
+    /// We hardcoded the number 4 here so that the BTree can always store at
+    /// least 4 cells in every page, but this should probably be configurable.
+    pub fn ideal_max_payload_size(page_size: u16) -> u16 {
         let usable_space = Self::usable_space(page_size);
 
-        let max_size =
-            (usable_space / 4 - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1);
+        let max_size = Self::max_payload_size_in(usable_space / 4);
 
         // When the page size is too small we can't fit 4 keys. This is mostly
         // for tests, since we use small page sizes for simplicity.
+        #[cfg(debug_assertions)]
         if max_size == 0 {
-            return (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1);
+            return Self::max_payload_size_in(usable_space);
         }
 
         max_size
+    }
+
+    /// Similar to [`Self::ideal_max_payload_size`] but allows a cell to occupy
+    /// as much as possible. See [`Self::insert`] for more details.
+    fn max_allowed_payload_size(&self) -> u16 {
+        Self::max_payload_size_in(self.size())
     }
 
     /// Size in bytes of the page.
@@ -929,13 +960,20 @@ impl Page {
         !self.overflow.is_empty()
     }
 
+    pub fn can_consume_without_overflow(&self, other: &Self) -> bool {
+        if other.is_overflow() {
+            return false;
+        }
+
+        let used_bytes = Self::usable_space(other.size()) - other.header().free_space;
+
+        self.header().free_space >= used_bytes
+    }
+
     /// Just like [`Vec::append`], this function removes all the cells in
     /// `other` and adds them to `self`.
     pub fn append(&mut self, other: &mut Self) {
-        for cell in other.drain(..) {
-            self.push(cell);
-        }
-
+        other.drain(..).for_each(|cell| self.push(cell));
         self.header_mut().right_child = other.header().right_child;
     }
 
@@ -951,11 +989,20 @@ impl Page {
 
     /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Cell) {
+        // NOTE: there's an edge case here that can happen due to [`PageZero`]
+        // having less total space than the rest of pages. Since page zero is a
+        // root node, at some point the BTree can move a cell from its children
+        // into the page zero root that cannot actually fit in page zero. This
+        // can only happen if the page size is really small, otherwise
+        // [`Self::ideal_max_payload_size`] divides the usable space in 4
+        // buckets and even if [`PageZero`] has less total space it should be
+        // able to fit at least one of those buckets. As long as that's true
+        // then the balance algorithm will take care of the rest.
         debug_assert!(
-            cell.content.len() <= Self::max_payload_size(self.size()) as usize,
-            "attempt to store payload of size {} when max payload size is {}",
+            cell.content.len() <= self.max_allowed_payload_size() as usize,
+            "attempt to store payload of size {} when max allowed payload size is {}",
             cell.content.len(),
-            Self::max_payload_size(self.size())
+            self.max_allowed_payload_size()
         );
 
         if self.is_overflow() {
@@ -981,11 +1028,14 @@ impl Page {
             Ok(old_cell) => old_cell,
 
             Err(new_cell) => {
+                let old_cell = self.remove(index);
+
                 self.overflow.push(OverflowCell {
                     cell: new_cell,
                     index,
                 });
-                self.remove(index)
+
+                old_cell
             }
         }
     }
@@ -1069,15 +1119,15 @@ impl Page {
         self.header_mut().last_used_offset = offset;
         self.header_mut().free_space -= total_size;
 
+        // Add new slot.
+        self.header_mut().num_slots += 1;
+
         // If the index is not the last one, shift slots to the right.
         if index < self.header().num_slots {
             let end = self.header().num_slots as usize - 1;
             self.slot_array_mut()
                 .copy_within(index as usize..end, index as usize + 1);
         }
-
-        // Add new slot.
-        self.header_mut().num_slots += 1;
 
         // Set offset.
         self.slot_array_mut()[index as usize] = offset;
@@ -1339,10 +1389,11 @@ impl Debug for Page {
                     let offset = self.slot_array()[slot as usize];
                     list.entry_with(|f| {
                         f.debug_struct("Cell")
-                            .field("header", &cell.header)
                             .field("start", &offset)
                             .field("end", &(offset + cell.header.total_size()))
                             .field("size", &cell.header.size)
+                            .field("header", &cell.header)
+                            .field("content", &cell.content)
                             .finish()
                     });
                 });
@@ -1533,7 +1584,7 @@ impl InitEmptyPage for PageZero {
                 PageHeader {
                     num_slots: 0,
                     last_used_offset: size - mem::size_of::<DbHeader>() as u16,
-                    free_space: Page::usable_space(size),
+                    free_space: Page::usable_space(size - mem::size_of::<DbHeader>() as u16),
                     right_child: 0,
                     padding: 0,
                 },

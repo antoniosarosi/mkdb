@@ -1,6 +1,7 @@
 #![feature(non_null_convenience)]
 #![feature(debug_closure_helpers)]
 #![feature(allocator_api)]
+#![feature(map_try_insert)]
 
 mod database;
 mod os;
