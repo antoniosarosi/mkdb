@@ -88,9 +88,8 @@ use crate::paging::pager::PageNumber;
 /// check, since the big endian and little endian representations are different.
 pub(crate) const MAGIC: u32 = 0xB74EE;
 
-/// Maximum page size is 64 KiB, which is the maximum number that we can
-/// represent using 2 bytes.
-pub(crate) const MAX_PAGE_SIZE: u16 = u16::MAX;
+/// Maximum page size is 64 KiB.
+pub(crate) const MAX_PAGE_SIZE: usize = 64 * 1024;
 
 /// Minimum acceptable page size.
 ///
@@ -109,9 +108,9 @@ pub(crate) const MAX_PAGE_SIZE: u16 = u16::MAX;
 /// most tests use really small page sizes for simplicity.
 ///
 /// In release mode we'll consider the minimum size to be 512 bytes.
-pub(crate) const MIN_PAGE_SIZE: u16 = if cfg!(debug_assertions) {
-    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1)
-        & !(CELL_ALIGNMENT as u16 - 1)
+pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(debug_assertions) {
+    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1) as usize
+        & !(CELL_ALIGNMENT - 1)
 } else {
     512
 };
@@ -119,6 +118,7 @@ pub(crate) const MIN_PAGE_SIZE: u16 = if cfg!(debug_assertions) {
 /// Size of the [`Page`] header. See [`PageHeader`] for details.
 pub(crate) const PAGE_HEADER_SIZE: u16 = mem::size_of::<PageHeader>() as _;
 
+/// Size of the database file header.
 pub(crate) const DB_HEADER_SIZE: u16 = mem::size_of::<DbHeader>() as _;
 
 /// Size of [`CellHeader`].
@@ -177,7 +177,7 @@ impl<H> BufferWithHeader<H> {
     unsafe fn content_of(buffer: NonNull<[u8]>) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(
             buffer.byte_add(mem::size_of::<H>()).cast::<u8>(),
-            Self::usable_space(buffer.len() as u16) as usize,
+            Self::usable_space(buffer.len()) as usize,
         )
     }
 
@@ -193,7 +193,7 @@ impl<H> BufferWithHeader<H> {
     ///
     /// If all the fields in the header should be set to 0 then this is good
     /// enough, otherwise use [`Self::new`] and pass the header manually.
-    pub fn alloc(size: u16) -> Self {
+    pub fn alloc(size: usize) -> Self {
         debug_assert!(
             (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
             "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
@@ -221,7 +221,7 @@ impl<H> BufferWithHeader<H> {
     }
 
     /// Allocates a new buffer writing the given header at the beginning.
-    pub fn new(size: u16, header: H) -> Self {
+    pub fn new(size: usize, header: H) -> Self {
         let mut buffer = Self::alloc(size);
         *buffer.header_mut() = header;
 
@@ -273,8 +273,8 @@ impl<H> BufferWithHeader<H> {
     /// | HEADER |         CONTENT          |
     /// +--------+--------------------------+
     /// ```
-    pub fn usable_space(page_size: u16) -> u16 {
-        page_size - mem::size_of::<H>() as u16
+    pub fn usable_space(page_size: usize) -> u16 {
+        (page_size - mem::size_of::<H>()) as u16
     }
 
     /// Full size of the buffer in bytes.
@@ -288,8 +288,8 @@ impl<H> BufferWithHeader<H> {
     /// | HEADER |         CONTENT          |
     /// +--------+--------------------------+
     /// ```
-    pub fn size(&self) -> u16 {
-        self.size as _
+    pub fn size(&self) -> usize {
+        self.size
     }
 
     /// Returns a read-only reference to the header.
@@ -378,7 +378,7 @@ impl<H> Drop for BufferWithHeader<H> {
 /// A trait similar to [`Default`] but for initializing empty pages in memory.
 pub(crate) trait InitEmptyPage {
     /// Initializes an empty page of the given size.
-    fn init(number: PageNumber, size: u16) -> Self;
+    fn init(number: PageNumber, size: usize) -> Self;
 }
 
 /// Slotted page header.
@@ -773,12 +773,12 @@ pub(crate) struct Page {
 }
 
 impl InitEmptyPage for Page {
-    fn init(number: PageNumber, size: u16) -> Self {
+    fn init(number: PageNumber, size: usize) -> Self {
         let buffer = BufferWithHeader::new(
             size,
             PageHeader {
                 num_slots: 0,
-                last_used_offset: size,
+                last_used_offset: size as u16,
                 free_space: Self::usable_space(size),
                 right_child: 0,
                 padding: 0,
@@ -818,7 +818,7 @@ impl AsMut<[u8]> for Page {
 
 impl Page {
     /// Amount of space that can be used in a page to store [`Cell`] instances.
-    pub fn usable_space(page_size: u16) -> u16 {
+    pub fn usable_space(page_size: usize) -> u16 {
         BufferWithHeader::<PageHeader>::usable_space(page_size)
     }
 
@@ -837,7 +837,7 @@ impl Page {
     ///
     /// We hardcoded the number 4 here so that the BTree can always store at
     /// least 4 cells in every page, but this should probably be configurable.
-    pub fn ideal_max_payload_size(page_size: u16) -> u16 {
+    pub fn ideal_max_payload_size(page_size: usize) -> u16 {
         let usable_space = Self::usable_space(page_size);
 
         let max_size = Self::max_payload_size_in(usable_space / 4);
@@ -855,11 +855,11 @@ impl Page {
     /// Similar to [`Self::ideal_max_payload_size`] but allows a cell to occupy
     /// as much as possible. See [`Self::insert`] for more details.
     fn max_allowed_payload_size(&self) -> u16 {
-        Self::max_payload_size_in(self.size())
+        Self::max_payload_size_in(Self::usable_space(self.size()))
     }
 
     /// Size in bytes of the page.
-    pub fn size(&self) -> u16 {
+    pub fn size(&self) -> usize {
         self.buffer.size()
     }
 
@@ -1322,22 +1322,19 @@ impl Page {
             // well.
             unsafe {
                 let cell = self.cell_header_at_offset(offset);
-                let size = cell.as_ref().total_size();
+                let size = cell.as_ref().total_size() as usize;
 
                 destination_offset -= size;
 
                 cell.cast::<u8>().copy_to(
-                    self.buffer
-                        .header
-                        .byte_add(destination_offset as usize)
-                        .cast::<u8>(),
-                    size as usize,
+                    self.buffer.header.byte_add(destination_offset).cast::<u8>(),
+                    size,
                 );
             }
-            self.slot_array_mut()[i] = destination_offset;
+            self.slot_array_mut()[i] = destination_offset as u16;
         }
 
-        self.header_mut().last_used_offset = destination_offset;
+        self.header_mut().last_used_offset = destination_offset as u16;
     }
 
     /// Works just like [`Vec::drain`]. Removes the specified cells from this
@@ -1490,7 +1487,7 @@ pub(crate) struct OverflowPage {
 pub(crate) type FreePage = OverflowPage;
 
 impl InitEmptyPage for OverflowPage {
-    fn init(number: PageNumber, size: u16) -> Self {
+    fn init(number: PageNumber, size: usize) -> Self {
         Self {
             number,
             buffer: BufferWithHeader::alloc(size),
@@ -1512,7 +1509,7 @@ impl AsMut<[u8]> for OverflowPage {
 
 impl OverflowPage {
     /// Total space that can be used for overflow payloads.
-    pub fn usable_space(page_size: u16) -> u16 {
+    pub fn usable_space(page_size: usize) -> u16 {
         BufferWithHeader::<OverflowPageHeader>::usable_space(page_size)
     }
 
@@ -1577,7 +1574,7 @@ pub(crate) struct PageZero {
 }
 
 impl InitEmptyPage for PageZero {
-    fn init(number: PageNumber, size: u16) -> Self {
+    fn init(number: PageNumber, size: usize) -> Self {
         let mut buffer = BufferWithHeader::new(
             size,
             DbHeader {
@@ -1603,8 +1600,8 @@ impl InitEmptyPage for PageZero {
                 &mut buffer,
                 PageHeader {
                     num_slots: 0,
-                    last_used_offset: size - mem::size_of::<DbHeader>() as u16,
-                    free_space: Page::usable_space(size - mem::size_of::<DbHeader>() as u16),
+                    last_used_offset: (size - mem::size_of::<DbHeader>()) as u16,
+                    free_space: Page::usable_space(size - mem::size_of::<DbHeader>()),
                     right_child: 0,
                     padding: 0,
                 },
@@ -1731,7 +1728,7 @@ mod tests {
     }
 
     struct Builder {
-        size: u16,
+        size: usize,
         cells: Vec<Cell>,
     }
 
@@ -1743,7 +1740,7 @@ mod tests {
             }
         }
 
-        fn size(mut self, size: u16) -> Self {
+        fn size(mut self, size: usize) -> Self {
             self.size = size;
             self
         }
@@ -1780,8 +1777,8 @@ mod tests {
     fn compare_consecutive_offsets(page: &Page, cells: &Vec<Cell>) {
         let mut expected_offset = page.size();
         for (i, cell) in cells.iter().enumerate() {
-            expected_offset -= cell.total_size();
-            assert_eq!(page.slot_array()[i], expected_offset);
+            expected_offset -= cell.total_size() as usize;
+            assert_eq!(page.slot_array()[i], expected_offset as u16);
             assert_eq!(page.cell(i as u16), cell);
         }
     }
@@ -1799,7 +1796,7 @@ mod tests {
         const CONTENT_SIZE: usize = 24;
 
         let mut buf = BufferWithHeader::new(
-            (mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE) as u16,
+            mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE,
             OverflowPageHeader {
                 next: 0,
                 num_bytes: 0,
@@ -1933,15 +1930,15 @@ mod tests {
 
         let new_cell = Cell::new(vec![4; 96]);
 
-        let expected_offset =
-            page.size() - cells.iter().map(Cell::total_size).sum::<u16>() - new_cell.total_size();
+        let expected_offset = page.size()
+            - (cells.iter().map(Cell::total_size).sum::<u16>() + new_cell.total_size()) as usize;
 
         cells[0] = new_cell.clone();
 
         page.replace(0, new_cell);
 
         assert_eq!(page.header().num_slots, 2);
-        assert_eq!(page.slot_array()[0], expected_offset);
+        assert_eq!(page.slot_array()[0], expected_offset as u16);
         compare_cells(&page, &cells);
     }
 

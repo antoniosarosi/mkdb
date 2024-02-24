@@ -131,7 +131,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         }
 
         // Initialize page zero.
-        let page_zero = PageZero::init(0, self.page_size as _);
+        let page_zero = PageZero::init(0, self.page_size);
         self.write(0, page_zero.as_ref())?;
 
         Ok(())
@@ -302,7 +302,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        let mut page = P::init(page_number, self.page_size as _);
+        let mut page = P::init(page_number, self.page_size);
         self.io.read(page_number, page.as_mut())?;
         self.load_page_into_cache(page)
     }
@@ -325,7 +325,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        self.replace_page(page_number, P::init(page_number, self.page_size as _))
+        self.replace_page(page_number, P::init(page_number, self.page_size))
     }
 
     /// Returns a copy of the DB header.
@@ -479,10 +479,10 @@ mod tests {
         let mut pager = init_pager()?;
 
         for i in 1..=10 {
-            let mut page = Page::init(pager.alloc_page()?, pager.page_size as _);
+            let mut page = Page::init(pager.alloc_page()?, pager.page_size);
             page.push(Cell::new(vec![
                 i;
-                Page::ideal_max_payload_size(pager.page_size as _)
+                Page::ideal_max_payload_size(pager.page_size)
                     as usize
             ]));
 
@@ -500,18 +500,18 @@ mod tests {
         pager.sync()?;
 
         for i in 1..=10 {
-            let mut expected = Page::init(i, pager.page_size as _);
+            let mut expected = Page::init(i, pager.page_size);
             expected.push(Cell::new(vec![
                 if update_pages.contains(&i) {
                     10 + i as u8
                 } else {
                     i as u8
                 };
-                Page::ideal_max_payload_size(pager.page_size as _)
+                Page::ideal_max_payload_size(pager.page_size)
                     as usize
             ]));
 
-            let mut page = Page::init(i, pager.page_size as _);
+            let mut page = Page::init(i, pager.page_size);
             pager.read(page.number, page.as_mut())?;
 
             assert_eq!(page, expected);

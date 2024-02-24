@@ -526,10 +526,10 @@ mod tests {
             let page_size = 256;
 
             let pages = (0..self.number_of_pages as PageNumber).map(|i| {
-                let mut page = Page::init(i, page_size as _);
+                let mut page = Page::init(i, page_size);
                 page.push(Cell::new(vec![
                     i as u8;
-                    Page::ideal_max_payload_size(page_size as u16)
+                    Page::ideal_max_payload_size(page_size)
                         as usize
                 ]));
                 MemPage::Btree(page)

@@ -1491,7 +1491,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Root overflow.
         if is_root && node.is_overflow() {
-            let mut old_root = Page::init(self.pager.alloc_page()?, self.pager.page_size as u16);
+            let mut old_root = Page::init(self.pager.alloc_page()?, self.pager.page_size);
 
             let root = self.pager.get_mut(page)?;
             old_root.append(root);
@@ -1521,7 +1521,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             }
         }
 
-        let usable_space = Page::usable_space(self.pager.page_size as _);
+        let usable_space = Page::usable_space(self.pager.page_size);
 
         let mut total_size_in_each_page = vec![0];
         let mut number_of_cells_per_page = vec![0];
@@ -1569,7 +1569,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let new_page = Page::init(self.pager.alloc_page()?, self.pager.page_size as _);
+            let new_page = Page::init(self.pager.alloc_page()?, self.pager.page_size);
             let parent_index = siblings.last().unwrap().index + 1;
             siblings.push(Sibling::new(new_page.number, parent_index));
             self.pager.load_from_mem(new_page)?;
@@ -1680,7 +1680,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     ///
     /// Overflow pages are used if necessary. See [`OverflowPage`] for details.
     fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Cell> {
-        let max_payload_size = Page::ideal_max_payload_size(self.pager.page_size as _) as usize;
+        let max_payload_size = Page::ideal_max_payload_size(self.pager.page_size) as usize;
 
         // No overflow needed.
         if payload.len() <= max_payload_size {
@@ -1699,11 +1699,10 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut stored_bytes = first_cell_payload_size;
 
         loop {
-            let mut overflow_page =
-                OverflowPage::init(next_overflow_page, self.pager.page_size as _);
+            let mut overflow_page = OverflowPage::init(next_overflow_page, self.pager.page_size);
 
             let overflow_bytes = min(
-                OverflowPage::usable_space(self.pager.page_size as _) as usize,
+                OverflowPage::usable_space(self.pager.page_size) as usize,
                 payload[stored_bytes..].len(),
             );
 
