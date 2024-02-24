@@ -2,17 +2,15 @@
 //!
 //! Currently there are 3 types of pages:
 //!
-//! - [`PageZero`]
-//! - [`Page`]
-//! - [`OverflowPage`]
+//! - [`Page`]: Used for BTree nodes. This is the most common type of page,
+//! that's why it's called literally "Page".
 //!
-//! The most important type of page is [`Page`] (that's why it's called
-//! literally "Page"), which is used for BTree nodes. [`PageZero`] is a special
-//! subtype of [`Page`] which holds additional metadata about the database file.
-//! [`OverflowPage`] is a page that is used when variable size data exceeds the
-//! maximum amount of bytes that can be stored in a single page.
-//! [`OverflowPage`] instances are also reused as free pages, because they use
-//! the same headers.
+//! - [`PageZero`]: Special subtype of [`Page`] which holds additional metadata
+//! about the database file.
+//!
+//! - [`OverflowPage`]: Used when variable size data exceeds the maximum amount
+//! of bytes that can be stored in a single page. [`OverflowPage`] instances are
+//! also reused as free pages, because they use the same headers.
 //!
 //! Each database is stored in a single file, and the data structures in this
 //! module operate on pages of such file. The DB file looks roughly like this:
@@ -105,7 +103,8 @@ pub(crate) const MAX_PAGE_SIZE: usize = 64 * 1024;
 /// payload. Essentially what we do is add 8 bytes to 22 bytes, giving us 30
 /// bytes, and then we align upwards to 32 bytes. So the minimum page size in
 /// debug mode can store only 8 bytes worth of data, but we allow this because
-/// most tests use really small page sizes for simplicity.
+/// most tests use really small page sizes for simplicity and because it's
+/// easier to debug.
 ///
 /// In release mode we'll consider the minimum size to be 512 bytes.
 pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(debug_assertions) {
@@ -408,16 +407,46 @@ pub(crate) struct PageHeader {
     /// Length of the slot array.
     num_slots: u16,
 
-    /// Offset of the last cell.
-    last_used_offset: u16,
-
-    /// Add padding manually to avoid uninitialized bytes since the [`PartialEq`]
-    /// implementation for [`Page`] relies on comparing the memory buffers. Rust
-    /// does not make any guarantees about the values of padding bytes. See
-    /// here:
+    /// Offset of the last inserted cell.
     ///
-    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
-    padding: u16,
+    /// ```text
+    ///                         last_used_offset
+    ///                               |
+    ///                               V
+    /// +--------+-------+------------+------+-----+------+
+    /// | HEADER | SLOTS | FREE SPACE | CELL | DEL | CELL |
+    /// +--------+-------+------------+------+-----+------+
+    /// ```
+    ///
+    /// For empty pages with no cells, this value is equal to the page size:
+    ///
+    /// ```text
+    ///                                             last_used_offset
+    ///                                                   |
+    ///                                                   V
+    /// +--------+----------------------------------------+
+    /// | HEADER |              EMPTY PAGE                |
+    /// +--------+----------------------------------------+
+    /// ```
+    ///
+    /// This makes it so that there is no distinction between empty pages and
+    /// pages with cells, we can always substract the size of a cell from
+    /// `last_used_offset` to obtain the next `last_used_offset`.
+    ///
+    /// Note that this value is of type [`u32`] even though a [`Cell`] can never
+    /// have an offset greater than [`u16::MAX`]. However, [`u16::MAX`] is equal
+    /// to 65535 (2^16 - 1) while [`MAX_PAGE_SIZE`] is 65536 (2^16), so the
+    /// trick mentioned above to reduce the algorithm to one single case would
+    /// not work if we stored this value in [`u16`], we'd have to use if
+    /// statements when inserting cells to account for 64 KiB pages.
+    ///
+    /// Storing this as [`u16`] would require 2 bytes of padding to align the
+    /// [`PageNumber`] below anyway, so we might as well use those bytes for
+    /// something.
+    ///
+    /// This has its own problems though, having to deal with `u16` and `u32`
+    /// arithmetic requires a bunch of casts. So... TODO.
+    last_used_offset: u32,
 
     /// Last child of this page.
     pub right_child: PageNumber,
@@ -458,13 +487,24 @@ pub(crate) struct PageHeader {
 pub(crate) struct CellHeader {
     /// Size of the cell content.
     size: u16,
-    /// True if this cell points to an overflow page. Since we need to add
+
+    /// True if this cell points to an overflow page.
+    ///
+    /// Since we need to add
     /// padding to align the fields of this struct anyway, we're not wasting
     /// space here.
     pub is_overflow: bool,
-    /// See [`PageHeader::padding`] for details.
+
+    /// Add padding manually to avoid uninitialized bytes.
+    ///
+    /// The [`PartialEq`] implementation for [`Page`] relies on comparing the
+    /// memory buffers, but Rust does not make any guarantees about the values
+    /// of padding bytes. See here:
+    ///
+    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
     padding: u8,
-    /// ID of the BTree page that contains values less than this cell.
+
+    /// Page number of the BTree page that contains values less than this cell.
     pub left_child: PageNumber,
 }
 
@@ -778,10 +818,9 @@ impl InitEmptyPage for Page {
             size,
             PageHeader {
                 num_slots: 0,
-                last_used_offset: size as u16,
+                last_used_offset: size as _,
                 free_space: Self::usable_space(size),
                 right_child: 0,
-                padding: 0,
             },
         );
 
@@ -818,6 +857,10 @@ impl AsMut<[u8]> for Page {
 
 impl Page {
     /// Amount of space that can be used in a page to store [`Cell`] instances.
+    ///
+    /// Since [`MAX_PAGE_SIZE`] is 64 KiB, the usable space should be a value
+    /// less than [`u16::MAX`] unless the header of the page is zero sized,
+    /// which doesn't make much sense anyway.
     pub fn usable_space(page_size: usize) -> u16 {
         BufferWithHeader::<PageHeader>::usable_space(page_size)
     }
@@ -1099,10 +1142,10 @@ impl Page {
     /// There is no free list, we don't search for deleted blocks that can fit
     /// the new cell.
     fn try_insert(&mut self, index: SlotId, cell: Cell) -> Result<SlotId, Cell> {
-        let total_size = cell.storage_size();
+        let cell_storage_size = cell.storage_size();
 
         // There's no way we can fit the cell in this page.
-        if self.header().free_space < total_size {
+        if self.header().free_space < cell_storage_size {
             return Err(cell);
         }
 
@@ -1111,15 +1154,17 @@ impl Page {
             let end = self.header().last_used_offset;
             let start = PAGE_HEADER_SIZE + self.header().num_slots * SLOT_SIZE;
 
-            end - start
+            // This value fits in u16 even if the page is 64 KiB.
+            (end - start as u32) as u16
         };
 
         // We can fit the new cell but we have to defragment the page first.
-        if available_space < total_size {
+        if available_space < cell_storage_size {
             self.defragment();
         }
 
-        let offset = self.header().last_used_offset - cell.total_size();
+        // Same as above, this offset always fits in u16.
+        let offset = self.header().last_used_offset - cell.total_size() as u32;
 
         // Write new cell.
         // SAFETY: `last_used_offset` keeps track of where the last cell was
@@ -1127,7 +1172,7 @@ impl Page {
         // `last_used_offset` we get a valid pointer within the page where we
         // write the new cell.
         unsafe {
-            let header = self.cell_header_at_offset(offset);
+            let header = self.cell_header_at_offset(offset as u16);
             header.write(cell.header);
 
             CellHeader::content_of(header)
@@ -1137,7 +1182,7 @@ impl Page {
 
         // Update header.
         self.header_mut().last_used_offset = offset;
-        self.header_mut().free_space -= total_size;
+        self.header_mut().free_space -= cell_storage_size;
 
         // Add new slot.
         self.header_mut().num_slots += 1;
@@ -1150,7 +1195,7 @@ impl Page {
         }
 
         // Set offset.
-        self.slot_array_mut()[index as usize] = offset;
+        self.slot_array_mut()[index as usize] = offset as u16;
 
         Ok(index)
     }
@@ -1334,7 +1379,7 @@ impl Page {
             self.slot_array_mut()[i] = destination_offset as u16;
         }
 
-        self.header_mut().last_used_offset = destination_offset as u16;
+        self.header_mut().last_used_offset = destination_offset as u32;
     }
 
     /// Works just like [`Vec::drain`]. Removes the specified cells from this
@@ -1600,10 +1645,9 @@ impl InitEmptyPage for PageZero {
                 &mut buffer,
                 PageHeader {
                     num_slots: 0,
-                    last_used_offset: (size - mem::size_of::<DbHeader>()) as u16,
+                    last_used_offset: (size - mem::size_of::<DbHeader>()) as _,
                     free_space: Page::usable_space(size - mem::size_of::<DbHeader>()),
                     right_child: 0,
-                    padding: 0,
                 },
             )
         };
