@@ -3,10 +3,9 @@
 //! See [`BTree`] for details.
 
 use std::{
-    cmp::{min, Ordering},
-    collections::VecDeque,
-    io,
-    io::{Read, Seek, Write},
+    cmp::{min, Ordering, Reverse},
+    collections::{BinaryHeap, VecDeque},
+    io::{self, Read, Seek, Write},
     mem,
 };
 
@@ -1509,7 +1508,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut siblings = self.load_siblings(page, parent_page)?;
 
         let mut cells = VecDeque::new();
-        let mut divider_idx = siblings[0].index;
+        let divider_idx = siblings[0].index;
 
         // Make copies of cells in order.
         for (i, sibling) in siblings.iter().enumerate() {
@@ -1580,6 +1579,14 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             self.pager.free_page(siblings.pop().unwrap().page)?;
         }
 
+        // Put pages in ascending order to favor sequential IO where possible.
+        for (i, page) in BinaryHeap::from_iter(siblings.iter().map(|s| Reverse(s.page)))
+            .iter()
+            .enumerate()
+        {
+            siblings[i].page = page.0;
+        }
+
         // Begin redistribution.
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
             let page = self.pager.get_mut(siblings[i].page)?;
@@ -1594,7 +1601,6 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
                 self.pager
                     .get_mut(parent_page)?
                     .insert(siblings[i].index, divider);
-                divider_idx += 1;
             }
         }
 
@@ -1611,7 +1617,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         } else {
             self.pager
                 .get_mut(parent_page)?
-                .cell_mut(divider_idx)
+                .cell_mut(last_sibling.index)
                 .header
                 .left_child = last_sibling.page;
         }
