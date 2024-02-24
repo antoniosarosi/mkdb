@@ -10,7 +10,6 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     io::{self, Read, Seek, Write},
-    mem,
 };
 
 use super::{cache::Cache, io::BlockIo};

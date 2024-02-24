@@ -1840,12 +1840,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
 #[cfg(test)]
 mod tests {
-    //! BTree testing module. Most of the tests use fixed size 32 bit keys
+    //! BTree testing module. Most of the tests use fixed size 64 bit keys
     //! to easily test whether the BTree balancing algorithm does the correct
     //! thing in each situation. To easily compare the state of the [`BTree`]
     //! structure with something human readable we use [`Node`] instances, which
     //! allow us to define a tree as if we used some JSON-like syntax. There's
-    //! also a [`Builder`] struct that can be used to insert many 32 bit keys at
+    //! also a [`Builder`] struct that can be used to insert many 64 bit keys at
     //! once into the tree and also tune parameters such as
     //! [`BTree::balance_siblings_per_side`]. See the tests for more details and
     //! examples. Remember that `order` means the maximum number of children in
@@ -1853,7 +1853,7 @@ mod tests {
 
     use std::{
         alloc::Layout,
-        io::{self, Write},
+        io::{self},
         mem,
     };
 
@@ -1865,10 +1865,7 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{
-                Cell, InitEmptyPage, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE,
-                SLOT_SIZE,
-            },
+            page::{Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
         },
     };
 

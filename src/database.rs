@@ -16,10 +16,7 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
     },
-    storage::{
-        page::{InitEmptyPage, Page},
-        BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
-    },
+    storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
 };
 
 /// Database file default page size.
@@ -991,19 +988,14 @@ impl<I: Seek + Read + Write> Database<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, HashSet},
-        io,
-    };
+    use std::{collections::HashMap, io};
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        database::{
-            mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError, MKDB_META_ROOT,
-        },
+        database::{mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError},
         paging::{io::MemBuf, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
-        storage::page::{InitEmptyPage, Page},
+        storage::page::InitEmptyPage,
     };
 
     impl PartialEq for DbError {

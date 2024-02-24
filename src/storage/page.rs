@@ -75,7 +75,6 @@ use std::{
     collections::BinaryHeap,
     fmt::Debug,
     iter,
-    marker::PhantomData,
     mem::{self, ManuallyDrop},
     ops::{Bound, RangeBounds},
     ptr::NonNull,
@@ -154,13 +153,42 @@ pub(crate) type SlotId = u16;
 /// The struct provides methods for directly reading or writing both the header
 /// and the content. The size in bytes of the header is determined by the
 /// generic type `H` using [`mem::size_of`].
+///
+/// References to the entire memory buffer (including both the header and the
+/// content) can be obtained using [`AsRef::as_ref`] and [`AsMut::as_mut`].
 #[derive(Debug)]
 pub(crate) struct BufferWithHeader<H> {
-    marker: PhantomData<H>,
-    pointer: NonNull<[u8]>,
+    /// Pointer to the header located at the beginning of the buffer.
+    header: NonNull<H>,
+    /// Pointer to the content located right after the header.
+    content: NonNull<[u8]>,
+    /// Total size of the buffer (size of header + size of content).
+    size: usize,
 }
 
 impl<H> BufferWithHeader<H> {
+    /// Calculates the content address of the given buffer and returns a pointer
+    /// to it.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that the buffer has enough size to contain at least
+    /// `mem::size_of::<H>() + 1` bytes.
+    unsafe fn content_of(buffer: NonNull<[u8]>) -> NonNull<[u8]> {
+        NonNull::slice_from_raw_parts(
+            buffer.byte_add(mem::size_of::<H>()).cast::<u8>(),
+            Self::usable_space(buffer.len() as u16) as usize,
+        )
+    }
+
+    /// Returns a pointer to the in-memory buffer.
+    ///
+    /// This is needed for reading and writing pages to/from disk using
+    /// [`AsRef`] and [`AsMut`].
+    fn pointer(&self) -> NonNull<[u8]> {
+        NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
+    }
+
     /// Allocates a new buffer setting all the bytes to 0.
     ///
     /// If all the fields in the header should be set to 0 then this is good
@@ -177,13 +205,18 @@ impl<H> BufferWithHeader<H> {
 
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
-        let pointer = alloc::Global
+        let buffer = alloc::Global
             .allocate_zeroed(alloc::Layout::from_size_align(size as _, CELL_ALIGNMENT).unwrap())
             .expect("could not allocate page buffer");
 
+        // SAFETY: If the assertions above were met then the content pointer
+        // should always be valid.
+        let content = unsafe { Self::content_of(buffer) };
+
         Self {
-            pointer,
-            marker: PhantomData,
+            header: buffer.cast(),
+            content,
+            size: buffer.len(),
         }
     }
 
@@ -209,16 +242,19 @@ impl<H> BufferWithHeader<H> {
     /// Ensuring such behaviours should make this safe. See the implementation
     /// of [`Drop`] for [`BufferWithHeader`] for more details.
     pub unsafe fn new_in<W>(wrapper: &mut BufferWithHeader<W>, header: H) -> Self {
-        let pointer = wrapper.content_non_null();
+        let buffer = wrapper.content_non_null();
 
         debug_assert!(
-            pointer.len() > mem::size_of::<H>(),
+            buffer.len() > mem::size_of::<H>(),
             "wrapped buffer only has space for the header, which makes the content pointer invalid"
         );
 
+        let content = unsafe { Self::content_of(buffer) };
+
         let mut buffer = Self {
-            marker: PhantomData,
-            pointer,
+            header: buffer.cast(),
+            content,
+            size: buffer.len(),
         };
 
         *buffer.header_mut() = header;
@@ -253,7 +289,7 @@ impl<H> BufferWithHeader<H> {
     /// +--------+--------------------------+
     /// ```
     pub fn size(&self) -> u16 {
-        self.pointer.len() as _
+        self.size as _
     }
 
     /// Returns a read-only reference to the header.
@@ -263,53 +299,46 @@ impl<H> BufferWithHeader<H> {
         // buffer that has already been allocated when using [`Self::new_in`].
         // Unless we manually build an instance of this struct giving it an
         // incorrect pointer this should be safe.
-        unsafe { self.pointer.cast().as_ref() }
+        unsafe { self.header.as_ref() }
     }
 
     /// Returns a mutable reference to the header.
     pub fn header_mut(&mut self) -> &mut H {
         // SAFETY: Same as [`Self::header`].
-        unsafe { self.pointer.cast().as_mut() }
+        unsafe { self.header.as_mut() }
     }
 
     /// Returns a pointer to the content of this buffer.
     fn content_non_null(&self) -> NonNull<[u8]> {
-        // SAFETY: Pretty much the same as [`Self::header`], if the assertions
-        // in [`Self::debug_assert_size_is_valid`] were met then the content
-        // pointer should always be valid.
-        unsafe {
-            NonNull::slice_from_raw_parts(
-                self.pointer.byte_add(mem::size_of::<H>()).cast::<u8>(),
-                Self::usable_space(self.pointer.len() as u16) as usize,
-            )
-        }
+        self.content
     }
 
     /// Returns a read-only reference to the content part of this buffer.
     pub fn content(&self) -> &[u8] {
-        // SAFETY: Same as [`Self::content_non_null`].
+        // SAFETY: The assertions in [`Self::alloc`] verify that the content
+        // pointer is valid.
         unsafe { self.content_non_null().as_ref() }
     }
 
     /// Returns a mutable reference to the content part of this buffer.
     pub fn content_mut(&mut self) -> &mut [u8] {
-        // SAFETY: Same as [`Self::content_non_null`].
+        // SAFETY: Same as [`Self::content`].
         unsafe { self.content_non_null().as_mut() }
     }
 }
 
 impl<H> AsRef<[u8]> for BufferWithHeader<H> {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: We allocate the pointer so we now it's valid and well
-        // aligned.
-        unsafe { self.pointer.as_ref() }
+        // SAFETY: We allocate the buffer so we know the pointer is valid and
+        // well aligned.
+        unsafe { self.pointer().as_ref() }
     }
 }
 
 impl<H> AsMut<[u8]> for BufferWithHeader<H> {
     fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: Same as `as_ref`.
-        unsafe { self.pointer.as_mut() }
+        // SAFETY: Same as [`AsRef::as_ref`].
+        unsafe { self.pointer().as_mut() }
     }
 }
 
@@ -339,8 +368,8 @@ impl<H> Drop for BufferWithHeader<H> {
         // happens to be the same person who wrote this...)
         unsafe {
             alloc::Global.deallocate(
-                self.pointer.cast(),
-                alloc::Layout::from_size_align(self.pointer.len(), CELL_ALIGNMENT).unwrap(),
+                self.header.cast(),
+                alloc::Layout::from_size_align(self.size, CELL_ALIGNMENT).unwrap(),
             )
         }
     }
@@ -877,7 +906,7 @@ impl Page {
     /// the offset is valid within the function, so the caller is responsible
     /// for that.
     unsafe fn cell_header_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
-        self.buffer.pointer.byte_add(offset as _).cast()
+        self.buffer.header.byte_add(offset as _).cast()
     }
 
     /// Returns a pointer to the [`CellHeader`] pointer by the given slot.
@@ -989,15 +1018,6 @@ impl Page {
 
     /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Cell) {
-        // NOTE: there's an edge case here that can happen due to [`PageZero`]
-        // having less total space than the rest of pages. Since page zero is a
-        // root node, at some point the BTree can move a cell from its children
-        // into the page zero root that cannot actually fit in page zero. This
-        // can only happen if the page size is really small, otherwise
-        // [`Self::ideal_max_payload_size`] divides the usable space in 4
-        // buckets and even if [`PageZero`] has less total space it should be
-        // able to fit at least one of those buckets. As long as that's true
-        // then the balance algorithm will take care of the rest.
         debug_assert!(
             cell.content.len() <= self.max_allowed_payload_size() as usize,
             "attempt to store payload of size {} when max allowed payload size is {}",
@@ -1308,7 +1328,7 @@ impl Page {
 
                 cell.cast::<u8>().copy_to(
                     self.buffer
-                        .pointer
+                        .header
                         .byte_add(destination_offset as usize)
                         .cast::<u8>(),
                     size as usize,
@@ -1772,6 +1792,25 @@ mod tests {
         for (i, cell) in cells.iter().enumerate() {
             assert_eq!(page.cell(i as _), cell);
         }
+    }
+
+    #[test]
+    fn buffer_with_header() {
+        const CONTENT_SIZE: usize = 24;
+
+        let mut buf = BufferWithHeader::new(
+            (mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE) as u16,
+            OverflowPageHeader {
+                next: 0,
+                num_bytes: 0,
+            },
+        );
+
+        buf.header_mut().num_bytes = CONTENT_SIZE as u16;
+        buf.content_mut().fill(8);
+
+        assert_eq!(buf.header().num_bytes, CONTENT_SIZE as u16);
+        assert_eq!(buf.content(), &[8; CONTENT_SIZE]);
     }
 
     // Some important notes to keep in mind before you read the code below:
