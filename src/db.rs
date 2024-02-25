@@ -19,7 +19,7 @@ use crate::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
     },
-    storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
+    storage::{page::Page, BTree, BytesCmp, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
     vm,
 };
 
@@ -29,8 +29,9 @@ pub(crate) const DEFAULT_PAGE_SIZE: usize = 4096;
 /// Name of the meta-table used to keep track of other tables.
 pub(crate) const MKDB_META: &str = "mkdb_meta";
 
-/// Root page of the meta-table. Page 0 holds the DB header, page 1 holds the
-/// beginning of the meta-table.
+/// Root page of the meta-table.
+///
+/// Page 0 holds the DB header, page 1 holds the beginning of the meta-table.
 pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
@@ -88,6 +89,7 @@ pub(crate) enum SqlError {
     InvalidColumn(String),
     ColumnValueCountMismatch,
     MissingColumns,
+    MultiplePrimaryKeys,
     TypeError(TypeError),
     Expected {
         expected: ExpectedExpression,
@@ -102,6 +104,7 @@ impl Display for SqlError {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
             Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
             Self::ColumnValueCountMismatch => f.write_str("number of columns doesn't match values"),
+            Self::MultiplePrimaryKeys => f.write_str("only one primary key per table is allowed"),
             Self::MissingColumns => {
                 f.write_str("default values are not supported, all columns must be specified")
             }
@@ -200,6 +203,20 @@ impl Schema {
         self.index.insert(column.name.to_owned(), self.len());
         self.columns.push(column);
     }
+
+    pub fn prepend_row_id(&mut self) {
+        debug_assert!(self.columns[0].name != "row_id");
+
+        let col = Column {
+            name: String::from("row_id"),
+            data_type: DataType::UnsignedBigInt,
+            constraint: None,
+        };
+
+        self.columns.insert(0, col);
+        self.index.values_mut().for_each(|idx| *idx += 1);
+        self.index.insert(String::from("row_id"), 0);
+    }
 }
 
 impl From<Vec<Column>> for Schema {
@@ -230,7 +247,7 @@ impl QueryResolution {
         self.results.is_empty()
     }
 
-    pub fn as_ascii_table(&self) -> String {
+    pub fn to_ascii_table(&self) -> String {
         // Initialize width of each column to the length of the table headers.
         let mut widths: Vec<usize> = self
             .schema
@@ -393,6 +410,141 @@ fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
+struct StringCmp {
+    schema: Schema,
+}
+
+impl BytesCmp for StringCmp {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        let a = deserialize_values(a, &self.schema);
+        let b = deserialize_values(b, &self.schema);
+        match (&a[0], &b[0]) {
+            (Value::String(a), Value::String(b)) => a.cmp(&b),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn serialize_values(schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
+    macro_rules! serialize_big_endian {
+        ($num:expr, $int:ty) => {
+            TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()
+        };
+    }
+
+    debug_assert_eq!(
+        schema.len(),
+        values.len(),
+        "length of schema and values must be the same"
+    );
+
+    let mut buf = Vec::new();
+
+    // TODO: Alignment.
+    for (col, val) in schema.columns.iter().zip(values) {
+        match (&col.data_type, val) {
+            (DataType::Varchar(max), Value::String(string)) => {
+                let length = string.len().to_le_bytes();
+
+                // TODO: Strings longer than 65535 chars are not handled.
+                let n_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
+
+                buf.extend_from_slice(&length[..n_bytes]);
+                buf.extend_from_slice(string.as_bytes());
+            }
+
+            (DataType::Int, Value::Number(num)) => {
+                buf.extend_from_slice(&serialize_big_endian!(num, i32));
+            }
+
+            (DataType::UnsignedInt, Value::Number(num)) => {
+                buf.extend_from_slice(&serialize_big_endian!(num, u32));
+            }
+
+            (DataType::BigInt, Value::Number(num)) => {
+                buf.extend_from_slice(&serialize_big_endian!(num, i64));
+            }
+
+            (DataType::UnsignedBigInt, Value::Number(num)) => {
+                buf.extend_from_slice(&serialize_big_endian!(num, u64));
+            }
+
+            (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
+
+            _ => unreachable!("attempt to serialize {val} into {}", col.data_type),
+        }
+    }
+
+    buf
+}
+
+fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
+    let mut values = Vec::new();
+    let mut index = 0;
+
+    macro_rules! deserialize_big_endian {
+        ($buf:expr, $index:expr, $int:ty) => {
+            <$int>::from_be_bytes(
+                $buf[index..index + mem::size_of::<$int>()]
+                    .try_into()
+                    .unwrap(),
+            )
+            .into()
+        };
+    }
+
+    // TODO: Alignment.
+    for column in &schema.columns {
+        match column.data_type {
+            DataType::Varchar(max) => {
+                let length = if max <= u8::MAX as usize {
+                    let len = buf[index];
+                    index += 1;
+                    len as usize
+                } else {
+                    let len: usize =
+                        u16::from_le_bytes(buf[index..index + 2].try_into().unwrap()).into();
+                    index += 2;
+                    len
+                };
+
+                // TODO: Check if we should use from_ut8_lossy() or from_utf8()
+                values.push(Value::String(
+                    String::from_utf8_lossy(&buf[index..(index + length)]).to_string(),
+                ));
+                index += length;
+            }
+
+            DataType::Int => {
+                values.push(Value::Number(deserialize_big_endian!(buf, index, i32)));
+                index += mem::size_of::<i32>();
+            }
+
+            DataType::UnsignedInt => {
+                values.push(Value::Number(deserialize_big_endian!(buf, index, u32)));
+                index += mem::size_of::<u32>();
+            }
+
+            DataType::BigInt => {
+                values.push(Value::Number(deserialize_big_endian!(buf, index, i64)));
+                index += mem::size_of::<i64>();
+            }
+
+            DataType::UnsignedBigInt => {
+                values.push(Value::Number(deserialize_big_endian!(buf, index, u64)));
+                index += mem::size_of::<u64>();
+            }
+
+            DataType::Bool => {
+                values.push(Value::Bool(if buf[index] == 0 { false } else { true }));
+                index += mem::size_of::<bool>();
+            }
+        }
+    }
+
+    values
+}
+
 impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
     fn btree(&mut self, root: PageNumber) -> BTree<'_, I, FixedSizeMemCmp> {
         BTree::new(
@@ -403,123 +555,20 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         )
     }
 
-    fn serialize_values(row_id: RowId, schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
-        let mut buf = Vec::from(serialize_row_id(row_id));
-
-        macro_rules! serialize_little_endian {
-            ($num:expr, $int:ty) => {
-                TryInto::<$int>::try_into(*$num).unwrap().to_le_bytes()
-            };
-        }
-
-        // TODO: Alignment.
-        for (col, val) in schema.columns.iter().zip(values) {
-            match (&col.data_type, val) {
-                (DataType::Varchar(max), Value::String(string)) => {
-                    let length = string.len().to_le_bytes();
-
-                    // TODO: Strings longer than 65535 chars are not handled.
-                    let n_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
-
-                    buf.extend_from_slice(&length[..n_bytes]);
-                    buf.extend_from_slice(string.as_bytes());
-                }
-
-                (DataType::Int, Value::Number(num)) => {
-                    buf.extend_from_slice(&serialize_little_endian!(num, i32));
-                }
-
-                (DataType::UnsignedInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&serialize_little_endian!(num, u32));
-                }
-
-                (DataType::BigInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&serialize_little_endian!(num, i64));
-                }
-
-                (DataType::UnsignedBigInt, Value::Number(num)) => {
-                    buf.extend_from_slice(&serialize_little_endian!(num, u64));
-                }
-
-                (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
-
-                _ => unreachable!("attempt to serialize {val} into {}", col.data_type),
-            }
-        }
-
-        buf
-    }
-
-    fn deserialize_values(buf: Box<[u8]>, schema: &Schema) -> (RowId, Vec<Value>) {
-        let mut values = Vec::new();
-        let row_id = deserialize_row_id(&buf);
-        let mut index = mem::size_of::<RowId>();
-
-        macro_rules! deserialize_little_endian {
-            ($buf:expr, $index:expr, $int:ty) => {
-                <$int>::from_le_bytes(
-                    $buf[index..index + mem::size_of::<$int>()]
-                        .try_into()
-                        .unwrap(),
-                )
-                .into()
-            };
-        }
-
-        // TODO: Alignment.
-        for column in &schema.columns {
-            match column.data_type {
-                DataType::Varchar(max) => {
-                    let length = if max <= u8::MAX as usize {
-                        let len = buf[index];
-                        index += 1;
-                        len as usize
-                    } else {
-                        let len: usize = deserialize_little_endian!(buf, index, u16);
-                        index += 2;
-                        len
-                    };
-
-                    // TODO: Check if we should use from_ut8_lossy() or from_utf8()
-                    values.push(Value::String(
-                        String::from_utf8_lossy(&buf[index..(index + length)]).to_string(),
-                    ));
-                    index += length;
-                }
-
-                DataType::Int => {
-                    values.push(Value::Number(deserialize_little_endian!(buf, index, i32)));
-                    index += mem::size_of::<i32>();
-                }
-
-                DataType::UnsignedInt => {
-                    values.push(Value::Number(deserialize_little_endian!(buf, index, u32)));
-                    index += mem::size_of::<u32>();
-                }
-
-                DataType::BigInt => {
-                    values.push(Value::Number(deserialize_little_endian!(buf, index, i64)));
-                    index += mem::size_of::<i64>();
-                }
-
-                DataType::UnsignedBigInt => {
-                    values.push(Value::Number(deserialize_little_endian!(buf, index, u64)));
-                    index += mem::size_of::<u64>();
-                }
-
-                DataType::Bool => {
-                    values.push(Value::Bool(if buf[index] == 0 { false } else { true }));
-                    index += mem::size_of::<bool>();
-                }
-            }
-        }
-
-        (row_id, values)
+    fn index_btree<C: BytesCmp>(&mut self, root: PageNumber, cmp: C) -> BTree<'_, I, C> {
+        BTree::new(
+            &mut self.pager,
+            root,
+            DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
+            cmp,
+        )
     }
 
     fn table_metadata(&mut self, table: &String) -> Result<(Schema, PageNumber), DbError> {
         if table == MKDB_META {
-            return Ok((mkdb_meta_schema(), MKDB_META_ROOT));
+            let mut schema = mkdb_meta_schema();
+            schema.prepend_row_id();
+            return Ok((schema, MKDB_META_ROOT));
         }
 
         let query = self.exec(&format!(
@@ -533,7 +582,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         // TODO: Find some way to avoid parsing SQL every time. Probably a
         // hash map of table name -> schema, we wouldn't even need to update it
         // as we don't support ALTER table statements.
-        let schema = match query.get(0, "sql") {
+        let mut schema = match query.get(0, "sql") {
             Some(Value::String(sql)) => match Parser::new(&sql).parse_statement()? {
                 Statement::Create(Create::Table { columns, .. }) => Schema::from(columns),
                 _ => unreachable!(),
@@ -546,11 +595,13 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             _ => unreachable!(),
         };
 
+        schema.prepend_row_id();
+
         Ok((schema, root))
     }
 
-    fn next_row_id(&mut self, table: String, root: PageNumber) -> io::Result<RowId> {
-        if let Some(row_id) = self.row_ids.get_mut(&table) {
+    fn next_row_id(&mut self, table: &str, root: PageNumber) -> io::Result<RowId> {
+        if let Some(row_id) = self.row_ids.get_mut(table) {
             *row_id += 1;
             return Ok(*row_id);
         }
@@ -564,7 +615,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             1
         };
 
-        self.row_ids.insert(table, row_id);
+        self.row_ids.insert(String::from(table), row_id);
         Ok(row_id)
     }
 
@@ -586,6 +637,18 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 let root_page = self.pager.alloc_page()?;
                 self.pager.init_disk_page::<Page>(root_page)?;
 
+                let mut maybe_primary_key = None;
+
+                for col in &columns {
+                    if let Some(Constraint::PrimaryKey) = col.constraint {
+                        if maybe_primary_key.is_some() {
+                            return Err(DbError::Sql(SqlError::MultiplePrimaryKeys));
+                        } else {
+                            maybe_primary_key = Some(col.name.clone());
+                        }
+                    }
+                }
+
                 self.exec(&format!(
                     r#"
                         INSERT INTO {MKDB_META} (type, name, root, table_name, sql)
@@ -594,6 +657,47 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                     sql = Statement::Create(Create::Table {
                         name: name.clone(),
                         columns,
+                    })
+                ))?;
+
+                if let Some(primary_key) = maybe_primary_key {
+                    self.exec(&format!(
+                        "CREATE INDEX {name}_pk_index ON {name}({primary_key});"
+                    ))?;
+                }
+
+                QueryResolution::empty()
+            }
+
+            Statement::Create(Create::Index {
+                name,
+                table,
+                column,
+            }) => {
+                let query = self.exec(&format!(
+                    "SELECT name FROM {MKDB_META} WHERE name = '{table}';"
+                ))?;
+
+                if query.is_empty() {
+                    return Err(DbError::Sql(SqlError::InvalidTable(table)));
+                }
+
+                if query.is_empty() {
+                    return Err(DbError::Sql(SqlError::InvalidTable(table)));
+                }
+
+                let root_page = self.pager.alloc_page()?;
+                self.pager.init_disk_page::<Page>(root_page)?;
+
+                self.exec(&format!(
+                    r#"
+                        INSERT INTO {MKDB_META} (type, name, root, table_name, sql)
+                        VALUES ("index", "{name}", {root_page}, "{table}", '{sql}');
+                    "#,
+                    sql = Statement::Create(Create::Index {
+                        name: name.clone(),
+                        table: table.clone(),
+                        column
                     })
                 ))?;
 
@@ -617,11 +721,12 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                     }
                 }
 
-                if schema.len() != columns.len() {
+                // -1 because row_id
+                if schema.len() - 1 != columns.len() {
                     return Err(DbError::Sql(SqlError::MissingColumns));
                 }
 
-                let mut resolved_values = vec![Value::Bool(false); values.len()];
+                let mut resolved_values = vec![Value::Bool(false); schema.len()];
 
                 for (col, expr) in columns.iter().zip(values) {
                     let value = match vm::resolve_expression(&Vec::new(), &Schema::empty(), &expr) {
@@ -657,11 +762,78 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                     }
                 }
 
-                let row_id = self.next_row_id(into, root)?;
+                let row_id = self.next_row_id(&into, root)?;
+                resolved_values[0] = Value::Number(row_id.into());
 
                 let mut btree = self.btree(root);
 
-                btree.insert(Self::serialize_values(row_id, &schema, &resolved_values))?;
+                btree.insert(serialize_values(&schema, &resolved_values))?;
+
+                // Update all indexes
+                let query = self.exec(&format!(
+                    "SELECT root, sql FROM {MKDB_META} WHERE table_name = '{into}' AND type = 'index';",
+                ))?;
+
+                // TODO: Instead of panicking with "unreachable" in situtations
+                // like this, return a "Corrupt" error or something similar.
+                for i in 0..query.results.len() {
+                    let root = match query.get(i, "root") {
+                        Some(Value::Number(root)) => *root as u32,
+                        _ => unreachable!(),
+                    };
+
+                    let sql = match query.get(i, "sql") {
+                        Some(Value::String(sql)) => Parser::new(sql).parse_statement()?,
+                        _ => unreachable!(),
+                    };
+
+                    let Statement::Create(Create::Index {
+                        name,
+                        table,
+                        column,
+                    }) = sql
+                    else {
+                        unreachable!();
+                    };
+
+                    let col_idx = schema.index_of(&column).unwrap();
+
+                    let key = resolved_values.get(col_idx).unwrap().clone();
+
+                    let tuple = vec![key, Value::Number(row_id.into())];
+
+                    let index_schema = Schema::new(vec![
+                        schema.columns[col_idx].clone(),
+                        Column {
+                            name: "row_id".into(),
+                            data_type: DataType::UnsignedInt,
+                            constraint: None,
+                        },
+                    ]);
+
+                    match &index_schema.columns[0].data_type {
+                        DataType::Varchar(_) => {
+                            let mut btree = self.index_btree(
+                                root,
+                                StringCmp {
+                                    schema: Schema::new(vec![index_schema.columns[0].clone()]),
+                                },
+                            );
+
+                            btree.insert(serialize_values(&index_schema, &tuple))?;
+                        }
+                        DataType::Int | DataType::UnsignedInt => {
+                            let mut btree = self.index_btree(root, FixedSizeMemCmp(4));
+                            btree.insert(serialize_values(&index_schema, &tuple))?;
+                        }
+
+                        DataType::BigInt | DataType::UnsignedBigInt => {
+                            let mut btree = self.index_btree(root, FixedSizeMemCmp(8));
+                            btree.insert(serialize_values(&index_schema, &tuple))?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
 
                 QueryResolution::empty()
             }
@@ -681,7 +853,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                     let mut resolved_wildcards = Vec::new();
                     for expr in columns {
                         if let &Expression::Wildcard = &expr {
-                            for col in &schema.columns {
+                            for col in &schema.columns[1..] {
                                 resolved_wildcards
                                     .push(Expression::Identifier(col.name.to_owned()));
                             }
@@ -717,7 +889,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 let mut btree = self.btree(root);
 
                 for row in btree.iter() {
-                    let (_, values) = Self::deserialize_values(row?, &schema);
+                    let values = deserialize_values(&row?, &schema);
 
                     if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
@@ -788,13 +960,16 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and the cloning...
-                    let (row_id, values) = Self::deserialize_values(row?, &schema);
+                    let values = deserialize_values(&row?, &schema);
 
                     if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
                     }
 
-                    row_ids.push(row_id);
+                    match values[0] {
+                        Value::Number(row_id) => row_ids.push(row_id as RowId),
+                        _ => unreachable!(),
+                    };
                 }
 
                 // TODO: Second mutable borrow occurs here?
@@ -845,7 +1020,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
                 for row in btree.iter() {
                     // TODO: Deserialize only needed values instead of all and then cloning...
-                    let (row_id, mut values) = Self::deserialize_values(row?, &schema);
+                    let mut values = deserialize_values(&row?, &schema);
 
                     if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
@@ -861,7 +1036,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                             .index_of(col)
                             .ok_or(SqlError::InvalidColumn(col.clone()))?;
                         values[index] = value;
-                        updates.push(Self::serialize_values(row_id, &schema, &values));
+                        updates.push(serialize_values(&schema, &values));
                     }
                 }
 
@@ -893,9 +1068,9 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        database::{mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError},
         paging::{io::MemBuf, pager::Pager},
-        sql::{Column, Constraint, DataType, Parser, Value},
+        sql::{self, Column, Constraint, DataType, Parser, Value},
     };
 
     impl PartialEq for DbError {
@@ -934,13 +1109,26 @@ mod tests {
             query,
             QueryResolution::new(
                 mkdb_meta_schema(),
-                vec![vec![
-                    Value::String("table".into()),
-                    Value::String("users".into()),
-                    Value::Number(1),
-                    Value::String("users".into()),
-                    Value::String(Parser::new(sql).parse_statement()?.to_string())
-                ]]
+                vec![
+                    vec![
+                        Value::String("table".into()),
+                        Value::String("users".into()),
+                        Value::Number(1),
+                        Value::String("users".into()),
+                        Value::String(Parser::new(sql).parse_statement()?.to_string())
+                    ],
+                    vec![
+                        Value::String("index".into()),
+                        Value::String("users_pk_index".into()),
+                        Value::Number(2),
+                        Value::String("users".into()),
+                        Value::String(
+                            Parser::new("CREATE INDEX users_pk_index ON users(id);")
+                                .parse_statement()?
+                                .to_string()
+                        )
+                    ]
+                ]
             )
         );
 
@@ -1335,8 +1523,13 @@ mod tests {
         let mut db = init_database()?;
 
         let t1 = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
+        let i1 = "CREATE INDEX users_pk_index ON users(id);";
+
         let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
+        let i2 = "CREATE INDEX tasks_pk_index ON tasks(id);";
+
         let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
+        let i3 = "CREATE INDEX products_pk_index ON products(id);";
 
         db.exec(t1)?;
         db.exec(t2)?;
@@ -1357,19 +1550,40 @@ mod tests {
                         Value::String(Parser::new(&t1).parse_statement()?.to_string())
                     ],
                     vec![
+                        Value::String("index".into()),
+                        Value::String("users_pk_index".into()),
+                        Value::Number(2),
+                        Value::String("users".into()),
+                        Value::String(Parser::new(i1).parse_statement()?.to_string())
+                    ],
+                    vec![
                         Value::String("table".into()),
                         Value::String("tasks".into()),
-                        Value::Number(2),
+                        Value::Number(3),
                         Value::String("tasks".into()),
                         Value::String(Parser::new(&t2).parse_statement()?.to_string())
                     ],
                     vec![
+                        Value::String("index".into()),
+                        Value::String("tasks_pk_index".into()),
+                        Value::Number(4),
+                        Value::String("tasks".into()),
+                        Value::String(Parser::new(i2).parse_statement()?.to_string())
+                    ],
+                    vec![
                         Value::String("table".into()),
                         Value::String("products".into()),
-                        Value::Number(3),
+                        Value::Number(5),
                         Value::String("products".into()),
                         Value::String(Parser::new(&t3).parse_statement()?.to_string())
-                    ]
+                    ],
+                    vec![
+                        Value::String("index".into()),
+                        Value::String("products_pk_index".into()),
+                        Value::Number(6),
+                        Value::String("products".into()),
+                        Value::String(Parser::new(i3).parse_statement()?.to_string())
+                    ],
                 ]
             }
         );
@@ -1383,45 +1597,54 @@ mod tests {
     fn create_many_tables() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        let mut table_names = Vec::new();
+        let mut expected = Vec::new();
 
         let schema = "(id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255))";
 
         for i in 1..=100 {
-            let name = format!("table_{i:03}");
-            db.exec(&format!("CREATE TABLE {name} {schema};"))?;
+            let table_name = format!("table_{i:03}");
+            let index_name = format!("{table_name}_pk_index");
 
-            table_names.push(name);
+            let table_sql = format!("CREATE TABLE {table_name} {schema};");
+            let index_sql = format!("CREATE INDEX {index_name} ON {table_name}(id);");
+
+            db.exec(&table_sql)?;
+
+            expected.push(vec![
+                Value::String("table".into()),
+                Value::String(table_name.clone()),
+                Value::Number(0),
+                Value::String(table_name.clone()),
+                Value::String(Parser::new(&table_sql).parse_statement()?.to_string()),
+            ]);
+
+            expected.push(vec![
+                Value::String("index".into()),
+                Value::String(index_name),
+                Value::Number(0),
+                Value::String(table_name),
+                Value::String(Parser::new(&index_sql).parse_statement()?.to_string()),
+            ]);
         }
 
-        let query = db.exec("SELECT * FROM mkdb_meta ORDER BY table_name;")?;
+        let query = db.exec("SELECT * FROM mkdb_meta ORDER BY table_name, name;")?;
 
         let mut roots = HashMap::new();
 
-        for (i, name) in table_names.into_iter().enumerate() {
+        for (i, mut tuple) in expected.into_iter().enumerate() {
             let root = match query.get(i, "root").unwrap() {
                 Value::Number(root) => *root,
                 other => panic!("root is not a page number: {other:?}"),
             };
 
+            let name = tuple[1].clone();
+            tuple[2] = Value::Number(root);
+
             if let Err(root_used_by) = roots.try_insert(root, name.clone()) {
-                panic!("root {root} used for both table {root_used_by} and {name}");
+                panic!("root {root} used for both {root_used_by} and {name}");
             }
 
-            assert_eq!(
-                query.results[i],
-                vec![
-                    Value::String("table".into()),
-                    Value::String(name.clone()),
-                    Value::Number(root),
-                    Value::String(name.clone()),
-                    Value::String(
-                        Parser::new(&format!("CREATE TABLE {name} {schema};"))
-                            .parse_statement()?
-                            .to_string()
-                    ),
-                ]
-            );
+            assert_eq!(query.results[i], tuple);
         }
 
         Ok(())

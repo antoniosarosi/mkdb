@@ -126,8 +126,16 @@ pub(crate) struct Column {
 /// `CREATE` statement.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Create {
-    Table { name: String, columns: Vec<Column> },
     Database(String),
+    Table {
+        name: String,
+        columns: Vec<Column>,
+    },
+    Index {
+        name: String,
+        table: String,
+        column: String,
+    },
 }
 
 /// `DROP` statement.
@@ -261,6 +269,14 @@ impl Display for Statement {
 
                 Create::Database(name) => {
                     write!(f, "CREATE DATABASE {name}")?;
+                }
+
+                Create::Index {
+                    name,
+                    table,
+                    column,
+                } => {
+                    write!(f, "CREATE INDEX {name} ON {table}({column})")?;
                 }
             },
 

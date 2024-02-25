@@ -178,7 +178,9 @@ impl<'i> Parser<'i> {
             }
 
             Keyword::Create => {
-                let keyword = self.expect_one_of(&[Keyword::Database, Keyword::Table])?;
+                let keyword =
+                    self.expect_one_of(&[Keyword::Database, Keyword::Table, Keyword::Index])?;
+
                 let identifier = self.parse_identifier()?;
 
                 Statement::Create(match keyword {
@@ -188,6 +190,21 @@ impl<'i> Parser<'i> {
                         name: identifier,
                         columns: self.parse_column_definitions()?,
                     },
+
+                    Keyword::Index => {
+                        self.expect_keyword(Keyword::On)?;
+                        let table = self.parse_identifier()?;
+
+                        self.expect_token(Token::LeftParen)?;
+                        let column = self.parse_identifier()?;
+                        self.expect_token(Token::RightParen)?;
+
+                        Create::Index {
+                            name: identifier,
+                            table,
+                            column,
+                        }
+                    }
 
                     _ => unreachable!(),
                 })

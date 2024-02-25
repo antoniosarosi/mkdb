@@ -41,7 +41,7 @@ pub(crate) trait BytesCmp {
 /// This is more useful than it seems at first glance because if we store keys
 /// at the beginning of the binary buffer in big endian format, then this is
 /// all we need to successfuly determine the [`Ordering`].
-pub(crate) struct FixedSizeMemCmp(usize);
+pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {
     pub fn for_type<T>() -> Self {

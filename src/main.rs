@@ -3,7 +3,7 @@
 #![feature(allocator_api)]
 #![feature(map_try_insert)]
 
-mod database;
+mod db;
 mod os;
 mod paging;
 mod sql;
@@ -16,7 +16,7 @@ use std::{
     net::TcpListener,
 };
 
-use crate::database::Database;
+use crate::db::Database;
 
 fn main() -> io::Result<()> {
     let file = env::args().nth(1).expect("database file not provided");
@@ -58,7 +58,7 @@ fn main() -> io::Result<()> {
                 let _ = match db.exec(&statement) {
                     Ok(result) => {
                         if !result.is_empty() {
-                            stream.write(result.as_ascii_table().as_bytes())
+                            stream.write(result.to_ascii_table().as_bytes())
                         } else {
                             stream.write("OK".as_bytes())
                         }

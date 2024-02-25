@@ -8,7 +8,7 @@
 use std::mem;
 
 use crate::{
-    database::{Schema, SqlError, TypeError},
+    db::{Schema, SqlError, TypeError},
     sql::{BinaryOperator, DataType, Expression, UnaryOperator, Value},
 };
 
@@ -17,7 +17,7 @@ use crate::{
 /// If the expression cannot be resolved then this function returns a
 /// [`SqlError`] variant.
 pub(crate) fn resolve_expression(
-    values: &Vec<Value>,
+    tuple: &Vec<Value>,
     schema: &Schema,
     expr: &Expression,
 ) -> Result<Value, SqlError> {
@@ -25,12 +25,12 @@ pub(crate) fn resolve_expression(
         Expression::Value(value) => Ok(value.clone()),
 
         Expression::Identifier(ident) => match schema.index_of(&ident) {
-            Some(index) => Ok(values[index].clone()),
+            Some(index) => Ok(tuple[index].clone()),
             None => Err(SqlError::InvalidColumn(ident.clone())),
         },
 
         Expression::UnaryOperation { operator, expr } => {
-            match resolve_expression(values, schema, expr)? {
+            match resolve_expression(tuple, schema, expr)? {
                 Value::Number(mut num) => {
                     if let UnaryOperator::Minus = operator {
                         num = -num;
@@ -51,8 +51,8 @@ pub(crate) fn resolve_expression(
             operator,
             right,
         } => {
-            let left = resolve_expression(values, schema, &left)?;
-            let right = resolve_expression(values, schema, &right)?;
+            let left = resolve_expression(tuple, schema, &left)?;
+            let right = resolve_expression(tuple, schema, &right)?;
 
             let mismatched_types = SqlError::TypeError(TypeError::CannotApplyBinary {
                 left: left.clone(),
@@ -110,14 +110,14 @@ pub(crate) fn resolve_expression(
 /// evaluates to true.
 pub(crate) fn eval_where(
     schema: &Schema,
-    values: &Vec<Value>,
+    tuple: &Vec<Value>,
     r#where: &Option<Expression>,
 ) -> Result<bool, SqlError> {
     let Some(expr) = r#where else {
         return Ok(true);
     };
 
-    match resolve_expression(&values, &schema, &expr)? {
+    match resolve_expression(&tuple, &schema, &expr)? {
         Value::Bool(b) => Ok(b),
 
         other => Err(SqlError::TypeError(TypeError::ExpectedType {

@@ -382,6 +382,8 @@ impl<'i> Tokenizer<'i> {
             "FALSE" => Keyword::False,
             "ORDER" => Keyword::Order,
             "BY" => Keyword::By,
+            "INDEX" => Keyword::Index,
+            "ON" => Keyword::On,
             _ => Keyword::None,
         };
 

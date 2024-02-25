@@ -56,6 +56,8 @@ pub(crate) enum Keyword {
     False,
     Order,
     By,
+    Index,
+    On,
     /// Not a keyword, used for convenience. See [`super::tokenizer::Tokenizer`].
     None,
 }
@@ -139,6 +141,8 @@ impl Display for Keyword {
             Self::False => "FALSE",
             Self::Order => "ORDER",
             Self::By => "BY",
+            Self::Index => "INDEX",
+            Self::On => "ON",
             Self::None => "_",
         })
     }
