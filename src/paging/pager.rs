@@ -105,18 +105,19 @@ impl<I: super::io::Sync> Pager<I> {
 impl<I: Seek + Read + Write> Pager<I> {
     /// Initialize the database file.
     pub fn init(&mut self) -> io::Result<()> {
-        // We'll manually read the magic number.
-        let io = self.io.as_raw();
-        io.rewind()?;
-
-        let mut buf = [0; std::mem::size_of::<u32>()];
-        io.read(&mut buf)?;
-
-        let magic = u32::from_ne_bytes(buf);
+        // Manually read one block without involving the cache system, because
+        // if the DB file already exists we might have to set the page size to
+        // that defined in the file.
+        let (magic, page_size) = {
+            let mut page_zero = PageZero::init(0, self.block_size);
+            self.read(0, page_zero.as_mut())?;
+            (page_zero.header().magic, page_zero.header().page_size)
+        };
 
         // Magic number is written in the file, we'll assume that it is already
         // initialized.
         if magic == MAGIC {
+            self.page_size = page_size as usize;
             return Ok(());
         }
 

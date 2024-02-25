@@ -89,10 +89,6 @@ impl<I> BlockIo<I> {
         }
     }
 
-    pub fn as_raw(&mut self) -> &mut I {
-        &mut self.io
-    }
-
     /// Some sanity checks for development.
     fn debug_assert_args_are_correct(&self, page_number: PageNumber, buf: &[u8]) {
         // We should always read and write an entire page.
