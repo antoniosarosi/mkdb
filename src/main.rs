@@ -34,7 +34,7 @@ fn main() -> io::Result<()> {
         let prompt = "mkdb> ";
 
         stream.write(
-            format!("Welcome to the MKDB 'SHELL' (not really a shell). Type SQL statements below\n\n{prompt}")
+            format!("Welcome to the MKDB 'shell' (not really a shell). Type SQL statements below or 'quit' to exit the program.\n\n{prompt}")
                 .as_bytes(),
         )?;
 
@@ -50,6 +50,7 @@ fn main() -> io::Result<()> {
                 && &statement[statement.len() - exit_command.len()..] == exit_command
             {
                 println!("Close {conn} connection");
+                stream.write("Closing connection\n".as_bytes())?;
                 break;
             }
 

@@ -11,7 +11,10 @@ use std::{
 
 use crate::{
     os::{Disk, HardwareBlockSize},
-    paging::pager::{PageNumber, Pager},
+    paging::{
+        self,
+        pager::{PageNumber, Pager},
+    },
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
@@ -390,7 +393,7 @@ fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
-impl<I: Seek + Read + Write> Database<I> {
+impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
     fn btree(&mut self, root: PageNumber) -> BTree<'_, I, FixedSizeMemCmp> {
         BTree::new(
             &mut self.pager,
@@ -578,7 +581,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections through the table name?.
-        match statement {
+        let query_resolution = match statement {
             Statement::Create(Create::Table { name, columns }) => {
                 let root_page = self.pager.alloc_page()?;
                 self.pager.init_disk_page::<Page>(root_page)?;
@@ -594,7 +597,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     })
                 ))?;
 
-                Ok(QueryResolution::empty())
+                QueryResolution::empty()
             }
 
             Statement::Insert {
@@ -660,7 +663,7 @@ impl<I: Seek + Read + Write> Database<I> {
 
                 btree.insert(Self::serialize_values(row_id, &schema, &resolved_values))?;
 
-                Ok(QueryResolution::empty())
+                QueryResolution::empty()
             }
 
             Statement::Select {
@@ -772,7 +775,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     })
                 }
 
-                Ok(QueryResolution::new(results_schema, results))
+                QueryResolution::new(results_schema, results)
             }
 
             Statement::Delete { from, r#where } => {
@@ -801,7 +804,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     btree.remove(&serialize_row_id(row_id))?;
                 }
 
-                Ok(QueryResolution::empty())
+                QueryResolution::empty()
             }
 
             Statement::Update {
@@ -869,11 +872,18 @@ impl<I: Seek + Read + Write> Database<I> {
                     btree.insert(update)?;
                 }
 
-                Ok(QueryResolution::empty())
+                QueryResolution::empty()
             }
 
             _ => todo!("rest of SQL statements"),
-        }
+        };
+
+        // TODO: Transactions.
+        self.pager.write_dirty_pages()?;
+        self.pager.flush()?;
+        self.pager.sync()?;
+
+        Ok(query_resolution)
     }
 }
 

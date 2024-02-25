@@ -116,7 +116,7 @@ impl<I: super::io::Sync> Pager<I> {
     /// Ensure writes reach their destination.
     ///
     /// See [`super::io::Sync`] for details.
-    fn sync(&self) -> io::Result<()> {
+    pub fn sync(&self) -> io::Result<()> {
         self.io.sync()
     }
 }
