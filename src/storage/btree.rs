@@ -372,6 +372,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         self.search(next_node, entry, parents)
     }
 
+    /// Binary search with support for overflow data.
+    ///
     /// Returns an [`Ok`] result containing the index where `entry` was found or
     /// an [`Err`] result containing the index where `entry` should have been
     /// found if present.
@@ -387,13 +389,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
             let overflow_buf: Box<[u8]>;
 
-            // TODO: This condition is probably not enough to check if we
-            // actually need to reassemble or not. If the given entry has the
-            // same length as the cell content and they match, we probably have
-            // to reassemble and check again. One example could be long strings
-            // such as "abcdefg" vs "abcd". If we don't have the entire string
-            // we can't tell for sure if they're equal.
-            let payload = if cell.header.is_overflow && entry.len() > cell.content.len() {
+            // TODO: Figure out if we actually need to reassemble the payload.
+            // We could ask the comparator through the [`BytesCmp`] trait if
+            // it needs the entire buffer or not. When comparing strings for
+            // example, "a" is always less than "abcdefg", so there's no point
+            // in reassembling the entire string.
+            let payload = if cell.header.is_overflow {
                 match self.reassemble_payload(page, mid)? {
                     Payload::Reassembled(buf) => overflow_buf = buf,
                     _ => unreachable!(),
@@ -1845,16 +1846,17 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
 #[cfg(test)]
 mod tests {
-    //! BTree testing module. Most of the tests use fixed size 64 bit keys
-    //! to easily test whether the BTree balancing algorithm does the correct
-    //! thing in each situation. To easily compare the state of the [`BTree`]
-    //! structure with something human readable we use [`Node`] instances, which
-    //! allow us to define a tree as if we used some JSON-like syntax. There's
-    //! also a [`Builder`] struct that can be used to insert many 64 bit keys at
-    //! once into the tree and also tune parameters such as
-    //! [`BTree::balance_siblings_per_side`]. See the tests for more details and
-    //! examples. Remember that `order` means the maximum number of children in
-    //! a BTree that stores fixed size keys.
+    //! BTree testing framework.
+    //!
+    //! Most of the tests use fixed size 64 bit keys to easily test whether the
+    //! BTree balancing algorithm does the correct thing in each situation. To
+    //! easily compare the state of the [`BTree`] structure with something human
+    //! readable we use [`Node`] instances, which allow us to define a tree as
+    //! if we used some JSON-like syntax. There's also a [`Builder`] struct that
+    //! can be used to insert many 64 bit keys at once into the tree and also
+    //! tune parameters such as [`BTree::balance_siblings_per_side`]. See the
+    //! tests for more details and examples. Remember that `order` means the
+    //! maximum number of children in a BTree that stores fixed size keys.
 
     use std::{
         alloc::Layout,
@@ -2034,7 +2036,7 @@ mod tests {
         Layout::from_size_align(size, alignment)
             .unwrap()
             .pad_to_align()
-            .size() as _
+            .size()
     }
 
     /// Computes the page size needed to store `order - 1` keys of type [`Key`]

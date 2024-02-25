@@ -389,7 +389,7 @@ impl Database<File> {
         let metadata = file.metadata()?;
 
         if !metadata.is_file() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "Not a file"));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file"));
         }
 
         let block_size = Disk::from(&path).block_size()?;
