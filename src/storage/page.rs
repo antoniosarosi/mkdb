@@ -452,6 +452,18 @@ pub(crate) struct PageHeader {
     pub right_child: PageNumber,
 }
 
+impl PageHeader {
+    /// Initializes a new header for empty pages.
+    fn new(size: usize) -> Self {
+        Self {
+            num_slots: 0,
+            last_used_offset: size as _,
+            free_space: Page::usable_space(size),
+            right_child: 0,
+        }
+    }
+}
+
 /// Cell header located at the beginning of each cell.
 ///
 /// The header stores the size of the cell without including its own size and it
@@ -814,15 +826,7 @@ pub(crate) struct Page {
 
 impl InitEmptyPage for Page {
     fn init(number: PageNumber, size: usize) -> Self {
-        let buffer = BufferWithHeader::new(
-            size,
-            PageHeader {
-                num_slots: 0,
-                last_used_offset: size as _,
-                free_space: Self::usable_space(size),
-                right_child: 0,
-            },
-        );
+        let buffer = BufferWithHeader::new(size, PageHeader::new(size));
 
         Self {
             number,
@@ -1643,12 +1647,7 @@ impl InitEmptyPage for PageZero {
         let page_buffer = unsafe {
             BufferWithHeader::<PageHeader>::new_in(
                 &mut buffer,
-                PageHeader {
-                    num_slots: 0,
-                    last_used_offset: (size - mem::size_of::<DbHeader>()) as _,
-                    free_space: Page::usable_space(size - mem::size_of::<DbHeader>()),
-                    right_child: 0,
-                },
+                PageHeader::new(size - mem::size_of::<DbHeader>()),
             )
         };
 
@@ -1737,21 +1736,21 @@ impl AsRef<[u8]> for MemPage {
     }
 }
 
-impl Into<MemPage> for Page {
-    fn into(self) -> MemPage {
-        MemPage::Btree(self)
+impl From<Page> for MemPage {
+    fn from(page: Page) -> MemPage {
+        MemPage::Btree(page)
     }
 }
 
-impl Into<MemPage> for OverflowPage {
-    fn into(self) -> MemPage {
-        MemPage::Overflow(self)
+impl From<OverflowPage> for MemPage {
+    fn from(page: OverflowPage) -> MemPage {
+        MemPage::Overflow(page)
     }
 }
 
-impl Into<MemPage> for PageZero {
-    fn into(self) -> MemPage {
-        MemPage::Zero(self)
+impl From<PageZero> for MemPage {
+    fn from(page: PageZero) -> MemPage {
+        MemPage::Zero(page)
     }
 }
 
