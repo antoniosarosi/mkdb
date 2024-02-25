@@ -6,16 +6,14 @@
 //! `&mut` to a write queue.
 
 use std::{
-    any::{Any, TypeId},
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashSet},
+    fmt::Debug,
     io::{self, Read, Seek, Write},
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{
-    DbHeader, FreePage, InitEmptyPage, MemPage, OverflowPage, Page, PageZero, MAGIC,
-};
+use crate::storage::page::{DbHeader, FreePage, InitEmptyPage, MemPage, Page, PageZero, MAGIC};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -181,89 +179,54 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// don't need a VTable for anything at all and it also introduces an extra
     /// level of indirection since we have to box it.
     ///
-    /// We're currently using [`Any`] to downcast to to the concrete type at
-    /// runtime, which is definitely not "elegant" or "good practice", but it
-    /// works and it doesn't require a lot of duplicated code or macros.
+    /// Two different "manual" solutions have been tried:
+    ///
+    /// 1. The current solution based on an enum and [`TryFrom`]. Works pretty
+    /// well and doesn't require much magic, the only downside is that it needs
+    /// a lot of duplicated code to implement [`TryFrom`] for both `&P` and
+    /// `&mut P` and for every enum variant. Basically two identical `impl`
+    /// blocks for each variant, see the [`TryFrom`] impls below [`MemPage`].
+    ///
+    /// 2. The previous solution was using [`std::any::Any`] to downcast to the
+    /// the concrete type at runtime, which is definitely not "elegant" or
+    /// "good practice", but it works and it doesn't require so much duplicated
+    /// code or macros. It does introduce some boilerplate if we want to know
+    /// which type conversion failed though. Here's the last [commit] that used
+    /// to do so.
+    ///
+    /// [commit]: https://github.com/antoniosarosi/mkdb/blob/master/src/paging/pager.rs#L197-L236
     ///
     /// We've managed to keep this project free of dependencies so far, so we're
     /// not gonna introduce one just for this feature, but we could use
     /// [`enum_dispatch`](https://docs.rs/enum_dispatch/) which basically
-    /// automates what we're doing here using [`TryFrom`] for each enum member.
-    ///
-    /// Implementing [`TryFrom`] manually requires two impls per member, one for
-    /// `&P` and another one for `&mut P`, and possibly a third one for `P`
-    /// which we might use in tests. So for now `downcast_ref` is good enough to
-    /// reduce boilerplate.
-    pub fn get_as<P: Any + 'static + Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
-        &mut self,
-        page_number: PageNumber,
-    ) -> io::Result<&P> {
+    /// automates what we're doing here by implementing [`TryFrom`] for each
+    /// enum member using macros (didn't actually test if it works in our case
+    /// since we need a specific lifetime).
+    pub fn get_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&P>
+    where
+        P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>,
+        &'p P: TryFrom<&'p MemPage>,
+        <&'p P as TryFrom<&'p MemPage>>::Error: Debug,
+    {
         let index = self.lookup::<P>(page_number)?;
+        let mem_page = &self.cache[index];
 
-        let downcast = <dyn Any>::downcast_ref(match &self.cache[index] {
-            MemPage::Btree(page) => page,
-            MemPage::Overflow(overflow_page) => overflow_page,
-            MemPage::Zero(page_zero) => {
-                if TypeId::of::<P>() == TypeId::of::<Page>() {
-                    page_zero.as_btree_page()
-                } else {
-                    page_zero
-                }
-            }
-        });
-
-        if cfg!(debug_assertions) {
-            let types = HashMap::from([
-                (TypeId::of::<Page>(), "Page"),
-                (TypeId::of::<PageZero>(), "PageZero"),
-                (TypeId::of::<OverflowPage>(), "OverflowPage"),
-            ]);
-
-            if !types.contains_key(&TypeId::of::<P>()) {
-                panic!("get_as() called with invalid generic type");
-            }
-
-            if downcast.is_none() {
-                panic!(
-                    "attempt to read page {page_number} of type {:?} as type {}",
-                    &self.cache[index],
-                    types.get(&TypeId::of::<P>()).unwrap()
-                );
-            }
-        }
-
-        Ok(downcast.expect("page type error"))
+        Ok(mem_page.try_into().expect("page type conversion error"))
     }
 
     /// Sames as [`Self::get_as`] but returns a mutable reference.
-    pub fn get_mut_as<P: Any + 'static + Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
-        &mut self,
-        page_number: PageNumber,
-    ) -> io::Result<&mut P> {
+    pub fn get_mut_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&mut P>
+    where
+        P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>,
+        &'p mut P: TryFrom<&'p mut MemPage>,
+        <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
+    {
         self.dirty_pages.insert(page_number);
 
         let index = self.lookup::<P>(page_number)?;
+        let mem_page = &mut self.cache[index];
 
-        // It's easier to verify the type using read-only references. We'll just
-        // call get_as until we find some better solution to deal with page
-        // types.
-        if cfg!(debug_assertions) {
-            self.get_as::<P>(page_number)?;
-        }
-
-        let downcast = <dyn Any>::downcast_mut(match &mut self.cache[index] {
-            MemPage::Btree(page) => page,
-            MemPage::Overflow(overflow_page) => overflow_page,
-            MemPage::Zero(page_zero) => {
-                if TypeId::of::<P>() == TypeId::of::<Page>() {
-                    page_zero.as_btree_page_mut()
-                } else {
-                    page_zero
-                }
-            }
-        });
-
-        Ok(downcast.expect("page type error"))
+        Ok(mem_page.try_into().expect("page type conversion error"))
     }
 
     /// Returns a read-only reference to a BTree page.
@@ -271,12 +234,12 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// BTree page are the ones used most frequently, so we'll consider this
     /// function the default of [`Self::get_as`].
     pub fn get(&mut self, page_number: PageNumber) -> io::Result<&Page> {
-        self.get_as(page_number)
+        self.get_as::<Page>(page_number)
     }
 
     /// Default return type for [`Self::get_mut_as`].
     pub fn get_mut(&mut self, page_number: PageNumber) -> io::Result<&mut Page> {
-        self.get_mut_as(page_number)
+        self.get_mut_as::<Page>(page_number)
     }
 
     /// Loads the given page into the cache buffer.

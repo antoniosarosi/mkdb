@@ -1,5 +1,4 @@
 //! This module contains code that interprets SQL [`Expression`] instances.
-//! instances.
 //!
 //! TODO: we should make a real "virtual machine" like the one in
 //! [SQLite 2](https://www.sqlite.org/vdbe.html) or an "executor" with JIT and

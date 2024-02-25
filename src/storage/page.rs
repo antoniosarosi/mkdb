@@ -1754,6 +1754,79 @@ impl From<PageZero> for MemPage {
     }
 }
 
+/// WARNING: Verbose duplicated code ahead :(
+/// See [`crate::paging::pager::Pager::get_as`] for details.
+/// We should probably use a macro to generate this but there are only 3 types
+/// of pages for now so it's not that bad.
+
+impl<'p> TryFrom<&'p MemPage> for &'p Page {
+    type Error = String;
+
+    fn try_from(mem_page: &'p MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Btree(page) => Ok(page),
+            MemPage::Zero(page_zero) => Ok(page_zero.as_btree_page()),
+            other => Err(format!("attempt to convert {other:?} into Page")),
+        }
+    }
+}
+
+impl<'p> TryFrom<&'p mut MemPage> for &'p mut Page {
+    type Error = String;
+
+    fn try_from(mem_page: &'p mut MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Btree(page) => Ok(page),
+            MemPage::Zero(page_zero) => Ok(page_zero.as_btree_page_mut()),
+            other => Err(format!("attempt to convert {other:?} into Page")),
+        }
+    }
+}
+
+impl<'p> TryFrom<&'p MemPage> for &'p PageZero {
+    type Error = String;
+
+    fn try_from(mem_page: &'p MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Zero(page_zero) => Ok(page_zero),
+            other => Err(format!("attempt to convert {other:?} into PageZero")),
+        }
+    }
+}
+
+impl<'p> TryFrom<&'p mut MemPage> for &'p mut PageZero {
+    type Error = String;
+
+    fn try_from(mem_page: &'p mut MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Zero(page_zero) => Ok(page_zero),
+            other => Err(format!("attempt to convert {other:?} into PageZero")),
+        }
+    }
+}
+
+impl<'p> TryFrom<&'p MemPage> for &'p OverflowPage {
+    type Error = String;
+
+    fn try_from(mem_page: &'p MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Overflow(page) => Ok(page),
+            other => Err(format!("attempt to convert {other:?} into OverflowPage")),
+        }
+    }
+}
+
+impl<'p> TryFrom<&'p mut MemPage> for &'p mut OverflowPage {
+    type Error = String;
+
+    fn try_from(mem_page: &'p mut MemPage) -> Result<Self, Self::Error> {
+        match mem_page {
+            MemPage::Overflow(page) => Ok(page),
+            other => Err(format!("attempt to convert {other:?} into OverflowPage")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
