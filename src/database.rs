@@ -17,6 +17,7 @@ use crate::{
         Statement, UnaryOperator, Value,
     },
     storage::{page::Page, BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE},
+    vm,
 };
 
 /// Database file default page size.
@@ -399,115 +400,6 @@ impl<I: Seek + Read + Write> Database<I> {
         )
     }
 
-    fn resolve_expression(
-        values: &Vec<Value>,
-        schema: &Schema,
-        expr: &Expression,
-    ) -> Result<Value, SqlError> {
-        match expr {
-            Expression::Value(value) => Ok(value.clone()),
-
-            Expression::Identifier(ident) => match schema.index_of(&ident) {
-                Some(index) => Ok(values[index].clone()),
-                None => Err(SqlError::InvalidColumn(ident.clone())),
-            },
-
-            Expression::UnaryOperation { operator, expr } => {
-                match Self::resolve_expression(values, schema, expr)? {
-                    Value::Number(mut num) => {
-                        if let UnaryOperator::Minus = operator {
-                            num = -num;
-                        }
-
-                        Ok(Value::Number(num))
-                    }
-
-                    value => Err(SqlError::TypeError(TypeError::CannotApplyUnary {
-                        operator: *operator,
-                        value,
-                    })),
-                }
-            }
-
-            Expression::BinaryOperation {
-                left,
-                operator,
-                right,
-            } => {
-                let left = Self::resolve_expression(values, schema, &left)?;
-                let right = Self::resolve_expression(values, schema, &right)?;
-
-                let mismatched_types = SqlError::TypeError(TypeError::CannotApplyBinary {
-                    left: left.clone(),
-                    operator: *operator,
-                    right: right.clone(),
-                });
-
-                if mem::discriminant(&left) != mem::discriminant(&right) {
-                    return Err(mismatched_types);
-                }
-
-                Ok(match operator {
-                    BinaryOperator::Eq => Value::Bool(left == right),
-                    BinaryOperator::Neq => Value::Bool(left != right),
-                    BinaryOperator::Lt => Value::Bool(left < right),
-                    BinaryOperator::LtEq => Value::Bool(left <= right),
-                    BinaryOperator::Gt => Value::Bool(left > right),
-                    BinaryOperator::GtEq => Value::Bool(left >= right),
-
-                    logical @ (BinaryOperator::And | BinaryOperator::Or) => {
-                        let (Value::Bool(left), Value::Bool(right)) = (left, right) else {
-                            return Err(mismatched_types);
-                        };
-
-                        match logical {
-                            BinaryOperator::And => Value::Bool(left && right),
-                            BinaryOperator::Or => Value::Bool(left || right),
-                            _ => unreachable!(),
-                        }
-                    }
-
-                    arithmetic => {
-                        let (Value::Number(left), Value::Number(right)) = (left, right) else {
-                            return Err(mismatched_types);
-                        };
-
-                        Value::Number(match arithmetic {
-                            BinaryOperator::Plus => left + right,
-                            BinaryOperator::Minus => left - right,
-                            BinaryOperator::Mul => left * right,
-                            BinaryOperator::Div => left / right,
-                            _ => unreachable!(),
-                        })
-                    }
-                })
-            }
-
-            Expression::Wildcard => {
-                unreachable!("wildcards should be resolved into identifiers at this point")
-            }
-        }
-    }
-
-    fn eval_where(
-        schema: &Schema,
-        values: &Vec<Value>,
-        r#where: &Option<Expression>,
-    ) -> Result<bool, SqlError> {
-        let Some(expr) = r#where else {
-            return Ok(true);
-        };
-
-        match Self::resolve_expression(&values, &schema, &expr)? {
-            Value::Bool(b) => Ok(b),
-
-            other => Err(SqlError::TypeError(TypeError::ExpectedType {
-                expected: DataType::Bool,
-                found: other,
-            })),
-        }
-    }
-
     fn serialize_values(row_id: RowId, schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
         let mut buf = Vec::from(serialize_row_id(row_id));
 
@@ -729,8 +621,7 @@ impl<I: Seek + Read + Write> Database<I> {
                 let mut resolved_values = vec![Value::Bool(false); values.len()];
 
                 for (col, expr) in columns.iter().zip(values) {
-                    let value = match Self::resolve_expression(&Vec::new(), &Schema::empty(), &expr)
-                    {
+                    let value = match vm::resolve_expression(&Vec::new(), &Schema::empty(), &expr) {
                         Ok(value) => value,
 
                         Err(SqlError::InvalidColumn(_col)) => {
@@ -825,14 +716,14 @@ impl<I: Seek + Read + Write> Database<I> {
                 for row in btree.iter() {
                     let (_, values) = Self::deserialize_values(row?, &schema);
 
-                    if !Self::eval_where(&schema, &values, &r#where)? {
+                    if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
                     }
 
                     let mut result = Vec::new();
 
                     for expr in &columns {
-                        result.push(Self::resolve_expression(&values, &schema, expr)?);
+                        result.push(vm::resolve_expression(&values, &schema, expr)?);
                     }
 
                     results.push(result);
@@ -896,7 +787,7 @@ impl<I: Seek + Read + Write> Database<I> {
                     // TODO: Deserialize only needed values instead of all and the cloning...
                     let (row_id, values) = Self::deserialize_values(row?, &schema);
 
-                    if !Self::eval_where(&schema, &values, &r#where)? {
+                    if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
                     }
 
@@ -953,14 +844,14 @@ impl<I: Seek + Read + Write> Database<I> {
                     // TODO: Deserialize only needed values instead of all and then cloning...
                     let (row_id, mut values) = Self::deserialize_values(row?, &schema);
 
-                    if !Self::eval_where(&schema, &values, &r#where)? {
+                    if !vm::eval_where(&schema, &values, &r#where)? {
                         continue;
                     }
 
                     for (col, expr) in &assignments {
                         let value = match **expr {
                             Expression::Value(ref v) => v.clone(),
-                            _ => Self::resolve_expression(&values, &schema, expr)?,
+                            _ => vm::resolve_expression(&values, &schema, expr)?,
                         };
 
                         let index = schema
@@ -995,7 +886,6 @@ mod tests {
         database::{mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError},
         paging::{io::MemBuf, pager::Pager},
         sql::{Column, Constraint, DataType, Parser, Value},
-        storage::page::InitEmptyPage,
     };
 
     impl PartialEq for DbError {

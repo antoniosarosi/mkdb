@@ -8,6 +8,7 @@ mod os;
 mod paging;
 mod sql;
 mod storage;
+mod vm;
 
 use std::{
     env,
