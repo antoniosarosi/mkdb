@@ -306,10 +306,6 @@ impl Cache {
         }
     }
 
-    pub fn contains(&self, page_number: PageNumber) -> bool {
-        self.pages.contains_key(&page_number)
-    }
-
     /// Returns a frame ID that can be used to access the in-memory page.
     ///
     /// If the page is not cached or has been invalidated by calling
@@ -340,7 +336,29 @@ impl Cache {
     /// Doesn't matter where the page comes from, it could have been created in
     /// memory or read from disk. At this level we need an owned version of the
     /// page.
+    ///
+    /// There are 3 possible cases:
+    ///
+    /// 1. We're trying to load a page that already exists in the cache. We'll
+    /// assume this is a new version of the page and replace the old one, since
+    /// pages are uniquelly identified by their [`PageNumber`] and we shouldn't
+    /// have the same number multiple times in the cache.
+    ///
+    /// 2. The cache buffer is not full yet, so we can load pages without
+    /// evicting anything.
+    ///
+    /// 3. We must evict a page in order to load a new one. The evicted page is
+    /// returned to the caller.
+    ///
+    /// In any case, there is no IO at the cache level, all of this is done in
+    /// memory. IO is controlled mostly by the [`super::pager`] module.
     pub fn load(&mut self, page: MemPage) -> Option<MemPage> {
+        // Already cached, drop the previous page and replace it with the new one.
+        if let Some(index) = self.pages.get(&page.number()) {
+            self.buffer[*index].page = page;
+            return None;
+        }
+
         // Buffer is not full, push the page and return.
         if self.buffer.len() < self.max_size {
             self.pages.insert(page.number(), self.buffer.len());
@@ -377,6 +395,7 @@ impl Cache {
     /// Pages that could not be evicted in the process are unreferenced.
     fn cycle_clock(&mut self) {
         let initial_location = self.clock;
+        let mut rounds = 0;
 
         while !self.is_evictable(self.clock) {
             self.buffer[self.clock].unreference();
@@ -393,8 +412,14 @@ impl Cache {
             // that at least one can be evicted. The clock can cycle through the
             // buffer multiple times, that's not a bug per se, it's just slow.
             #[cfg(debug_assertions)]
-            if self.clock == initial_location {
-                todo!("clock has gone full circle without evicting any page");
+            {
+                if rounds == 1 {
+                    todo!("clock has gone full circle without evicting any page");
+                }
+
+                if self.clock == initial_location {
+                    rounds += 1;
+                }
             }
         }
     }
@@ -429,16 +454,17 @@ impl Cache {
         !frame.is_referenced() && !frame.is_pinned() && !frame.page.is_overflow()
     }
 
+    /// Manually marks the page as dirty.
+    pub fn mark_dirty(&mut self, page_number: PageNumber) {
+        if let Some(frame_id) = self.get(page_number) {
+            self.buffer[frame_id].mark_dirty();
+        }
+    }
+
     /// Sets the dirty flag of the given page back to 0.
     pub fn mark_clean(&mut self, page_number: PageNumber) {
         if let Some(frame_id) = self.get(page_number) {
             self.buffer[frame_id].mark_clean();
-        }
-    }
-
-    pub fn mark_dirty(&mut self, page_number: PageNumber) {
-        if let Some(frame_id) = self.get(page_number) {
-            self.buffer[frame_id].mark_dirty();
         }
     }
 

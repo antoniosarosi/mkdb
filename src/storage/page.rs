@@ -1036,6 +1036,8 @@ impl Page {
         !self.overflow.is_empty()
     }
 
+    /// Returns `true` if [`Self::append`] can be called on `other` without
+    /// causig `self` to overflow.
     pub fn can_consume_without_overflow(&self, other: &Self) -> bool {
         if other.is_overflow() {
             return false;

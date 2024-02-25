@@ -581,7 +581,7 @@ impl<I: Seek + Read + Write> Database<I> {
         match statement {
             Statement::Create(Create::Table { name, columns }) => {
                 let root_page = self.pager.alloc_page()?;
-                self.pager.init_page::<Page>(root_page)?;
+                self.pager.init_disk_page::<Page>(root_page)?;
 
                 self.exec(&format!(
                     r#"

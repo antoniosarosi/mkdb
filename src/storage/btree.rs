@@ -1963,7 +1963,7 @@ mod tests {
 
             if !self.root_at_zero {
                 let root = pager.alloc_page()?;
-                pager.init_page::<Page>(root)?;
+                pager.init_disk_page::<Page>(root)?;
             }
 
             // TODO: Do something about leaking, we shouldn't need that here.

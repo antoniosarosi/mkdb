@@ -33,9 +33,11 @@ pub(crate) struct Pager<I> {
 }
 
 impl<I> Pager<I> {
-    /// Creates a new pager on top of `io`. `block_size` should evenly divide
-    /// `page_size` or viceversa. Ideally, both should be powers of 2, but it's
-    /// convinient to support any size for testing.
+    /// Creates a new pager on top of `io`.
+    ///
+    /// `block_size` should evenly divide `page_size` or viceversa. Ideally,
+    /// both should be powers of 2, but it's convinient to support any size for
+    /// testing.
     pub fn new(io: I, page_size: usize, block_size: usize) -> Self {
         Self {
             io: BlockIo::new(io, page_size, block_size),
@@ -44,6 +46,25 @@ impl<I> Pager<I> {
             cache: Cache::new(),
             dirty_pages: HashSet::new(),
         }
+    }
+
+    /// Same as [`Self::new`] but allows a custom cache instance.
+    pub fn with_cache(io: I, page_size: usize, block_size: usize, cache: Cache) -> Self {
+        Self {
+            io: BlockIo::new(io, page_size, block_size),
+            block_size,
+            page_size,
+            cache,
+            dirty_pages: HashSet::new(),
+        }
+    }
+}
+
+impl<I> Pager<I> {
+    /// Appends the given page to the write queue.
+    fn push_to_write_queue(&mut self, page_number: PageNumber) {
+        self.cache.mark_dirty(page_number);
+        self.dirty_pages.insert(page_number);
     }
 }
 
@@ -144,6 +165,8 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// dirty page in order to load the new one, which requires at least two IO
     /// operations, but possibly more since we flush the entire write queue at
     /// that point. Evicting a clean page doesn't require IO.
+    ///
+    /// Note that this function does not mark the page as dirty.
     fn lookup<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
@@ -215,15 +238,18 @@ impl<I: Seek + Read + Write> Pager<I> {
     }
 
     /// Sames as [`Self::get_as`] but returns a mutable reference.
+    ///
+    /// This function also marks the page as dirty and adds it to the write
+    /// queue.
     pub fn get_mut_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&mut P>
     where
         P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>,
         &'p mut P: TryFrom<&'p mut MemPage>,
         <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
     {
-        self.dirty_pages.insert(page_number);
-
         let index = self.lookup::<P>(page_number)?;
+        self.push_to_write_queue(page_number);
+
         let mem_page = &mut self.cache[index];
 
         Ok(mem_page.try_into().expect("page type conversion error"))
@@ -280,16 +306,22 @@ impl<I: Seek + Read + Write> Pager<I> {
         let page_number = page.number();
 
         self.load_page_into_cache(page)?;
-        self.cache.mark_dirty(page_number);
+        self.push_to_write_queue(page_number);
 
         Ok(())
     }
 
-    pub fn init_page<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+    /// Initializes the contents of a disk page.
+    ///
+    /// This does not immediately write to disk as it would be inefficient.
+    /// Instead, the initialization goes through the cache system. The page
+    /// is initialized in memory, cached and pushed to the write queue.
+    /// Eventually, the page will be written to disk.
+    pub fn init_disk_page<P: Into<MemPage> + InitEmptyPage>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        self.replace_page(page_number, P::init(page_number, self.page_size))
+        self.load_from_mem(P::init(page_number, self.page_size))
     }
 
     /// Returns a copy of the DB header.
@@ -305,27 +337,6 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// Writes the header back to page zero. See [`Self::read_header`].
     fn write_header(&mut self, header: DbHeader) -> io::Result<()> {
         *self.get_mut_as::<PageZero>(0)?.header_mut() = header;
-        Ok(())
-    }
-
-    /// Replaces the page at `page_number` with the given page.
-    ///
-    /// If the page to replace is already cached, then this is almost a no-op
-    /// as we only have to assign the value. If the page is on disk then we
-    /// load the replacement into the cache (evicting another page if necessary)
-    /// and mark it as dirty, and at some point in the future it will be written
-    /// to disk.
-    fn replace_page<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
-        &mut self,
-        page_number: PageNumber,
-        with: P,
-    ) -> io::Result<()> {
-        if let Some(index) = self.cache.get(page_number) {
-            self.cache[index] = with.into();
-        } else {
-            self.load_from_mem(with)?;
-        }
-
         Ok(())
     }
 
@@ -357,12 +368,12 @@ impl<I: Seek + Read + Write> Pager<I> {
 
     /// Adds the given page to the free list.
     ///
-    /// Important: do not use the page after calling this function, since it
+    /// **Important**: do not use the page after calling this function, since it
     /// will be replaced by a free page and all the data will be lost. Consider
     /// that a "use after free" bug.
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
         // Initialize last free page.
-        self.init_page::<FreePage>(page_number)?;
+        self.load_from_mem(FreePage::init(page_number, self.page_size))?;
 
         let mut header = self.read_header()?;
 
@@ -388,15 +399,19 @@ mod tests {
 
     use super::Pager;
     use crate::{
-        paging::io::MemBuf,
-        storage::page::{Cell, InitEmptyPage, Page},
+        paging::{cache::Cache, io::MemBuf},
+        storage::page::{Cell, InitEmptyPage, OverflowPage, Page},
     };
 
-    fn init_pager() -> io::Result<Pager<MemBuf>> {
-        let mut pager = Pager::new(io::Cursor::new(Vec::new()), 256, 256);
+    fn init_pager_with_cache(cache: Cache) -> io::Result<Pager<MemBuf>> {
+        let mut pager = Pager::with_cache(io::Cursor::new(Vec::new()), 256, 256, cache);
         pager.init()?;
 
         Ok(pager)
+    }
+
+    fn init_pager() -> io::Result<Pager<MemBuf>> {
+        init_pager_with_cache(Cache::default())
     }
 
     #[test]
@@ -479,6 +494,36 @@ mod tests {
             pager.read(page.number, page.as_mut())?;
 
             assert_eq!(page, expected);
+        }
+
+        assert!(!pager.cache.must_evict_dirty_page());
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_pages_when_dirty_page_is_evicted() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
+
+        for i in 1..=3 {
+            let mut page = OverflowPage::init(i, pager.page_size);
+            page.content_mut().fill(i as u8);
+            pager.load_from_mem(page)?;
+        }
+
+        let mut causes_evict = OverflowPage::init(4, pager.page_size);
+        causes_evict.content_mut().fill(4);
+
+        pager.load_from_mem(causes_evict)?;
+
+        for i in 1..=3 {
+            let mut page = OverflowPage::init(i, pager.page_size);
+            pager.read(i, page.as_mut())?;
+
+            let mut expected = OverflowPage::init(i, pager.page_size);
+            expected.content_mut().fill(i as u8);
+
+            assert_eq!(expected, page);
         }
 
         assert!(!pager.cache.must_evict_dirty_page());
