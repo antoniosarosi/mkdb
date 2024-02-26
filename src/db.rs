@@ -31,8 +31,6 @@ pub(crate) const DEFAULT_PAGE_SIZE: usize = 4096;
 pub(crate) const MKDB_META: &str = "mkdb_meta";
 
 /// Root page of the meta-table.
-///
-/// Page 0 holds the DB header, page 1 holds the beginning of the meta-table.
 pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
@@ -207,13 +205,17 @@ impl From<SqlError> for DbError {
     }
 }
 
+/// Table schema.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Schema {
+    /// Column definitions.
     pub columns: Vec<Column>,
+    /// Quick index to find column defs based on their name.
     pub index: HashMap<String, usize>,
 }
 
 impl Schema {
+    /// Create a new schema with the given column definitions.
     pub fn new(columns: Vec<Column>) -> Self {
         let index = columns
             .iter()
@@ -224,23 +226,28 @@ impl Schema {
         Self { columns, index }
     }
 
+    /// Creates an empty schema with no columns.
     pub fn empty() -> Self {
         Self::new(vec![])
     }
 
+    /// Returns the index in [`Self::columns`] of `col`.
     pub fn index_of(&self, col: &str) -> Option<usize> {
         self.index.get(col).copied()
     }
 
+    /// Number of columns in this schema.
     pub fn len(&self) -> usize {
         self.columns.len()
     }
 
+    /// Appends a new column to the end of the schema.
     pub fn push(&mut self, column: Column) {
         self.index.insert(column.name.to_owned(), self.len());
         self.columns.push(column);
     }
 
+    /// Prepends the special "row_id" column at the beginning of the schema.
     pub fn prepend_row_id(&mut self) {
         debug_assert!(self.columns[0].name != "row_id");
 
@@ -1477,12 +1484,12 @@ mod tests {
                         constraint: Some(Constraint::PrimaryKey),
                     },
                     Column {
-                        name: "(price) / (10)".into(),
+                        name: "price / 10".into(),
                         data_type: DataType::BigInt,
                         constraint: None
                     },
                     Column {
-                        name: "(discount) * (100)".into(),
+                        name: "discount * 100".into(),
                         data_type: DataType::BigInt,
                         constraint: None
                     }

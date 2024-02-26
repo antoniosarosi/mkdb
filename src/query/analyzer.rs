@@ -244,6 +244,8 @@ fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<GenericDataT
             }
         }
 
+        Expression::Nested(expr) => analyze_expression(schema, expr)?,
+
         Expression::Wildcard => {
             unreachable!("analyze_expression() shouldn't come across wildcards")
         }

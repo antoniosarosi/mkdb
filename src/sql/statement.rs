@@ -51,6 +51,8 @@ pub(crate) enum Expression {
         operator: UnaryOperator,
         expr: Box<Self>,
     },
+
+    Nested(Box<Self>),
 }
 
 /// Binary operators used in expressions.
@@ -262,11 +264,12 @@ impl Display for Expression {
                 operator,
                 right,
             } => {
-                write!(f, "({left}) {operator} ({right})")
+                write!(f, "{left} {operator} {right}")
             }
             Self::UnaryOperation { operator, expr } => {
-                write!(f, "{operator}({expr})")
+                write!(f, "{operator}{expr}")
             }
+            Self::Nested(expr) => write!(f, "({expr})"),
         }
     }
 }

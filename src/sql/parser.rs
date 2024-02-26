@@ -277,7 +277,7 @@ impl<'i> Parser<'i> {
     /// works.
     ///
     /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
-    fn parse_expression(&mut self) -> ParseResult<Expression> {
+    pub(crate) fn parse_expression(&mut self) -> ParseResult<Expression> {
         self.parse_expr(0)
     }
 
@@ -319,7 +319,7 @@ impl<'i> Parser<'i> {
             Token::LeftParen => {
                 let expr = self.parse_expression()?;
                 self.expect_token(Token::RightParen)?;
-                Ok(expr)
+                Ok(Expression::Nested(Box::new(expr)))
             }
 
             unexpected => Err(self.error(ErrorKind::ExpectedOneOf {
@@ -852,11 +852,13 @@ mod tests {
                         right: Box::new(Expression::BinaryOperation {
                             left: Box::new(Expression::Value(Value::Number(10))),
                             operator: BinaryOperator::Plus,
-                            right: Box::new(Expression::BinaryOperation {
-                                left: Box::new(Expression::Value(Value::Number(2))),
-                                operator: BinaryOperator::Mul,
-                                right: Box::new(Expression::Value(Value::Number(20))),
-                            })
+                            right: Box::new(Expression::Nested(Box::new(
+                                Expression::BinaryOperation {
+                                    left: Box::new(Expression::Value(Value::Number(2))),
+                                    operator: BinaryOperator::Mul,
+                                    right: Box::new(Expression::Value(Value::Number(20))),
+                                }
+                            )))
                         }),
                     })
                 }),
@@ -1129,25 +1131,33 @@ mod tests {
                     left: Box::new(Expression::Value(Value::Number(10))),
                     operator: BinaryOperator::Minus,
                     right: Box::new(Expression::BinaryOperation {
-                        left: Box::new(Expression::BinaryOperation {
+                        left: Box::new(Expression::Nested(Box::new(Expression::BinaryOperation {
                             left: Box::new(Expression::Value(Value::Number(20))),
                             operator: BinaryOperator::Plus,
                             right: Box::new(Expression::Value(Value::Number(50))),
-                        }),
+                        }))),
                         operator: BinaryOperator::Div,
-                        right: Box::new(Expression::BinaryOperation {
-                            left: Box::new(Expression::Value(Value::Number(2))),
-                            operator: BinaryOperator::Mul,
-                            right: Box::new(Expression::BinaryOperation {
-                                left: Box::new(Expression::Value(Value::Number(4))),
-                                operator: BinaryOperator::Plus,
-                                right: Box::new(Expression::BinaryOperation {
-                                    left: Box::new(Expression::Value(Value::Number(1))),
-                                    operator: BinaryOperator::Minus,
-                                    right: Box::new(Expression::Value(Value::Number(1))),
-                                })
-                            })
-                        })
+                        right: Box::new(Expression::Nested(Box::new(
+                            Expression::BinaryOperation {
+                                left: Box::new(Expression::Value(Value::Number(2))),
+                                operator: BinaryOperator::Mul,
+                                right: Box::new(Expression::Nested(Box::new(
+                                    Expression::BinaryOperation {
+                                        left: Box::new(Expression::Value(Value::Number(4))),
+                                        operator: BinaryOperator::Plus,
+                                        right: Box::new(Expression::Nested(Box::new(
+                                            Expression::BinaryOperation {
+                                                left: Box::new(Expression::Value(Value::Number(1))),
+                                                operator: BinaryOperator::Minus,
+                                                right: Box::new(Expression::Value(Value::Number(
+                                                    1
+                                                ))),
+                                            }
+                                        )))
+                                    }
+                                )))
+                            }
+                        )))
                     })
                 })
             })
@@ -1198,7 +1208,7 @@ mod tests {
                 operator: BinaryOperator::Mul,
                 right: Box::new(Expression::UnaryOperation {
                     operator: UnaryOperator::Minus,
-                    expr: Box::new(Expression::BinaryOperation {
+                    expr: Box::new(Expression::Nested(Box::new(Expression::BinaryOperation {
                         left: Box::new(Expression::Value(Value::Number(2))),
                         operator: BinaryOperator::Plus,
                         right: Box::new(Expression::BinaryOperation {
@@ -1206,7 +1216,7 @@ mod tests {
                             operator: BinaryOperator::Mul,
                             right: Box::new(Expression::Value(Value::Number(2))),
                         })
-                    })
+                    })))
                 })
             })
         )
