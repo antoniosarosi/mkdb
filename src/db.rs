@@ -15,7 +15,7 @@ use crate::{
         self,
         pager::{PageNumber, Pager},
     },
-    query::analyzer::analyze,
+    query::{analyzer::analyze, optimizer::optimize},
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
@@ -112,7 +112,7 @@ impl Display for ExpectedExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Identifier => "identifier",
-            Self::Value => "raw value",
+            Self::Value => "literal value",
             Self::Assignment => "assignment",
         })
     }
@@ -672,9 +672,10 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             todo!("handle multiple statements at once");
         }
 
-        let statement = statements.remove(0);
+        let mut statement = statements.remove(0);
 
         analyze(&statement, self)?;
+        optimize(&mut statement);
 
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections through the table name?.
