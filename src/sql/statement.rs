@@ -9,7 +9,7 @@ pub(crate) enum Statement {
         columns: Vec<Expression>,
         from: String,
         r#where: Option<Expression>,
-        order_by: Vec<String>,
+        order_by: Vec<Expression>,
     },
 
     Delete {
@@ -19,7 +19,7 @@ pub(crate) enum Statement {
 
     Update {
         table: String,
-        columns: Vec<Expression>,
+        columns: Vec<Assignment>,
         r#where: Option<Expression>,
     },
 
@@ -33,7 +33,7 @@ pub(crate) enum Statement {
 }
 
 /// Expressions used in select, update, delete and insert statements.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Expression {
     Identifier(String),
 
@@ -112,6 +112,12 @@ pub(crate) enum Value {
     Number(i128),
     String(String),
     Bool(bool),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct Assignment {
+    pub identifier: String,
+    pub value: Expression,
 }
 
 /// Column definitions from `INSERT` statements.
@@ -211,6 +217,12 @@ impl Display for Column {
     }
 }
 
+impl Display for Assignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} = {}", self.identifier, self.value)
+    }
+}
+
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -242,17 +254,17 @@ impl Display for UnaryOperator {
 impl Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expression::Identifier(ident) => f.write_str(ident),
-            Expression::Value(value) => write!(f, "{value}"),
-            Expression::Wildcard => f.write_char('*'),
-            Expression::BinaryOperation {
+            Self::Identifier(ident) => f.write_str(ident),
+            Self::Value(value) => write!(f, "{value}"),
+            Self::Wildcard => f.write_char('*'),
+            Self::BinaryOperation {
                 left,
                 operator,
                 right,
             } => {
                 write!(f, "({left}) {operator} ({right})")
             }
-            Expression::UnaryOperation { operator, expr } => {
+            Self::UnaryOperation { operator, expr } => {
                 write!(f, "{operator}({expr})")
             }
         }

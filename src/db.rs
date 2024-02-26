@@ -15,6 +15,7 @@ use crate::{
         self,
         pager::{PageNumber, Pager},
     },
+    query::analyzer::analyze,
     sql::{
         BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
         Statement, UnaryOperator, Value,
@@ -49,6 +50,36 @@ pub(crate) struct QueryResolution {
     results: Vec<Vec<Value>>,
 }
 
+/// Generic data types without SQL details such as `UNSIGNED` or `VARCHAR(max)`.
+///
+/// Basically the variants of [`Value`] but without inner data.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) enum GenericDataType {
+    Bool,
+    String,
+    Number,
+}
+
+impl Display for GenericDataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bool => "boolean",
+            Self::Number => "number",
+            Self::String => "string",
+        })
+    }
+}
+
+impl From<DataType> for GenericDataType {
+    fn from(data_type: DataType) -> Self {
+        match data_type {
+            DataType::Varchar(_) => GenericDataType::String,
+            DataType::Bool => GenericDataType::Bool,
+            _ => GenericDataType::Number,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum TypeError {
     CannotApplyUnary {
@@ -56,14 +87,20 @@ pub(crate) enum TypeError {
         value: Value,
     },
     CannotApplyBinary {
-        left: Value,
+        left: Expression,
         operator: BinaryOperator,
-        right: Value,
+        right: Expression,
     },
     ExpectedType {
-        expected: DataType,
-        found: Value,
+        expected: GenericDataType,
+        found: Expression,
     },
+}
+
+impl From<TypeError> for SqlError {
+    fn from(type_error: TypeError) -> Self {
+        SqlError::TypeError(type_error)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -564,7 +601,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         )
     }
 
-    fn table_metadata(&mut self, table: &String) -> Result<(Schema, PageNumber), DbError> {
+    pub fn table_metadata(&mut self, table: &String) -> Result<(Schema, PageNumber), DbError> {
         if table == MKDB_META {
             let mut schema = mkdb_meta_schema();
             schema.prepend_row_id();
@@ -630,6 +667,8 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
         let statement = statements.remove(0);
 
+        analyze(&statement, self)?;
+
         // TODO: Parse and execute statements one by one.
         // TODO: SQL injections through the table name?.
         let query_resolution = match statement {
@@ -674,18 +713,6 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 table,
                 column,
             }) => {
-                let query = self.exec(&format!(
-                    "SELECT name FROM {MKDB_META} WHERE name = '{table}';"
-                ))?;
-
-                if query.is_empty() {
-                    return Err(DbError::Sql(SqlError::InvalidTable(table)));
-                }
-
-                if query.is_empty() {
-                    return Err(DbError::Sql(SqlError::InvalidTable(table)));
-                }
-
                 let root_page = self.pager.alloc_page()?;
                 self.pager.init_disk_page::<Page>(root_page)?;
 
@@ -710,21 +737,6 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 values,
             } => {
                 let (schema, root) = self.table_metadata(&into)?;
-
-                if columns.len() != values.len() {
-                    return Err(DbError::Sql(SqlError::ColumnValueCountMismatch));
-                }
-
-                for col in &columns {
-                    if !schema.index.contains_key(col) {
-                        return Err(DbError::Sql(SqlError::InvalidColumn(col.to_owned())));
-                    }
-                }
-
-                // -1 because row_id
-                if schema.len() - 1 != columns.len() {
-                    return Err(DbError::Sql(SqlError::MissingColumns));
-                }
 
                 let mut resolved_values = vec![Value::Bool(false); schema.len()];
 
@@ -751,11 +763,11 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                         | (_, Value::Number(_)) => {
                             resolved_values[schema.index_of(col).unwrap()] = value;
                         }
-                        (expected, _) => {
+                        (data_type, _) => {
                             return Err(DbError::Sql(SqlError::TypeError(
                                 TypeError::ExpectedType {
-                                    expected,
-                                    found: value,
+                                    expected: GenericDataType::from(data_type),
+                                    found: Expression::Value(value),
                                 },
                             )))
                         }
@@ -901,7 +913,13 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                         result.push(vm::resolve_expression(&values, &schema, expr)?);
                     }
 
-                    results.push(result);
+                    let mut order_by_vals = Vec::new();
+
+                    for expr in &order_by {
+                        order_by_vals.push(vm::resolve_expression(&values, &schema, expr)?);
+                    }
+
+                    results.push((result, order_by_vals));
                 }
 
                 // We already set the default of unknown types as bools, if
@@ -910,7 +928,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 // of results for anything now anyway.
                 if !results.is_empty() {
                     for i in unknown_types {
-                        if let Value::Number(_) = &results[0][i] {
+                        if let Value::Number(_) = &results[0].0[i] {
                             results_schema.columns[i].data_type = DataType::BigInt;
                         }
                     }
@@ -918,20 +936,9 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
                 // TODO: Order by can contain column that we didn't select.
                 if !order_by.is_empty() {
-                    let mut order_by_cols = Vec::new();
-
-                    for identifier in order_by {
-                        match results_schema.index_of(&identifier) {
-                            Some(index) => order_by_cols.push(index),
-                            None => Err(DbError::Sql(SqlError::Other(format!(
-                                "ordering by columns not present in SELECT is not supported"
-                            ))))?,
-                        }
-                    }
-
-                    results.sort_by(|a, b| {
-                        for i in &order_by_cols {
-                            let cmp = match (&a[*i], &b[*i]) {
+                    results.sort_by(|(_, a), (_, b)| {
+                        for (a, b) in a.iter().zip(b) {
+                            let cmp = match (a, b) {
                                 (Value::Number(a), Value::Number(b)) => a.cmp(b),
                                 (Value::String(a), Value::String(b)) => a.cmp(b),
                                 (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
@@ -947,7 +954,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                     })
                 }
 
-                QueryResolution::new(results_schema, results)
+                QueryResolution::new(results_schema, results.into_iter().map(|r| r.0).collect())
             }
 
             Statement::Delete { from, r#where } => {
@@ -989,31 +996,6 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             } => {
                 let (schema, root) = self.table_metadata(&table)?;
 
-                let mut assignments = Vec::new();
-
-                for col in columns {
-                    let Expression::BinaryOperation {
-                        left,
-                        operator: BinaryOperator::Eq,
-                        right,
-                    } = col
-                    else {
-                        return Err(DbError::Sql(SqlError::Expected {
-                            expected: ExpectedExpression::Assignment,
-                            found: col,
-                        }));
-                    };
-
-                    let Expression::Identifier(ident) = *left else {
-                        return Err(DbError::Sql(SqlError::Expected {
-                            expected: ExpectedExpression::Identifier,
-                            found: *left,
-                        }));
-                    };
-
-                    assignments.push((ident, right));
-                }
-
                 let mut btree = self.btree(root);
 
                 let mut updates = Vec::new();
@@ -1026,15 +1008,12 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                         continue;
                     }
 
-                    for (col, expr) in &assignments {
-                        let value = match **expr {
-                            Expression::Value(ref v) => v.clone(),
-                            _ => vm::resolve_expression(&values, &schema, expr)?,
-                        };
-
+                    for assignment in &columns {
+                        let value = vm::resolve_expression(&values, &schema, &assignment.value)?;
                         let index = schema
-                            .index_of(col)
-                            .ok_or(SqlError::InvalidColumn(col.clone()))?;
+                            .index_of(&assignment.identifier)
+                            .ok_or(SqlError::InvalidColumn(assignment.identifier.clone()))?;
+
                         values[index] = value;
                         updates.push(serialize_values(&schema, &values));
                     }
@@ -1068,9 +1047,9 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, QueryResolution, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, GenericDataType, QueryResolution, Schema, SqlError, TypeError},
         paging::{io::MemBuf, pager::Pager},
-        sql::{self, Column, Constraint, DataType, Parser, Value},
+        sql::{self, Column, Constraint, DataType, Expression, Parser, Value},
     };
 
     impl PartialEq for DbError {
@@ -1916,8 +1895,8 @@ mod tests {
         assert_eq!(
             db.exec("INSERT INTO users(id, name) VALUES ('String', 10);"),
             Err(DbError::Sql(SqlError::TypeError(TypeError::ExpectedType {
-                expected: DataType::Int,
-                found: Value::String("String".into())
+                expected: GenericDataType::Number,
+                found: Expression::Value(Value::String("String".into()))
             })))
         );
 

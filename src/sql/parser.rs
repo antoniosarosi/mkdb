@@ -3,8 +3,8 @@ use std::fmt::Display;
 
 use super::{
     statement::{
-        BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression, Statement,
-        UnaryOperator, Value,
+        Assignment, BinaryOperator, Column, Constraint, Create, DataType, Drop, Expression,
+        Statement, UnaryOperator, Value,
     },
     token::{Keyword, Token},
     tokenizer::{self, Location, TokenWithLocation, Tokenizer, TokenizerError},
@@ -214,7 +214,7 @@ impl<'i> Parser<'i> {
                 let table = self.parse_identifier()?;
                 self.expect_keyword(Keyword::Set)?;
 
-                let columns = self.parse_comma_separated_expressions()?;
+                let columns = self.parse_comma_separated(Self::parse_assignment, false)?;
                 let r#where = self.parse_optional_where()?;
 
                 Statement::Update {
@@ -443,6 +443,15 @@ impl<'i> Parser<'i> {
         })
     }
 
+    /// Parses an assignment like the ones used in `UPDATE` statements.
+    fn parse_assignment(&mut self) -> ParseResult<Assignment> {
+        let identifier = self.parse_identifier()?;
+        self.expect_token(Token::Eq)?;
+        let value = self.parse_expression()?;
+
+        Ok(Assignment { identifier, value })
+    }
+
     /// Parses the next identifier in the stream or fails if it's not an
     /// identifier.
     fn parse_identifier(&mut self) -> ParseResult<String> {
@@ -529,10 +538,10 @@ impl<'i> Parser<'i> {
     /// Parses the `ORDER BY` clause at the end of `SELECT` statements.
     ///
     /// It only works with identifiers (not expressions) for now.
-    fn parse_optional_order_by(&mut self) -> ParseResult<Vec<String>> {
+    fn parse_optional_order_by(&mut self) -> ParseResult<Vec<Expression>> {
         if self.consume_optional_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
-            self.parse_identifier_list(false)
+            self.parse_comma_separated_expressions()
         } else {
             Ok(Vec::new())
         }
@@ -738,6 +747,7 @@ impl<'i> Parser<'i> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::statement::Assignment;
 
     #[test]
     fn parse_simple_select() {
@@ -868,7 +878,7 @@ mod tests {
                 ],
                 from: "users".into(),
                 r#where: None,
-                order_by: vec!["email".into()]
+                order_by: vec![Expression::Identifier("email".into())]
             })
         )
     }
@@ -926,10 +936,9 @@ mod tests {
             Parser::new(sql).parse_statement(),
             Ok(Statement::Update {
                 table: "users".into(),
-                columns: vec![Expression::BinaryOperation {
-                    left: Box::new(Expression::Identifier("is_admin".into())),
-                    operator: BinaryOperator::Eq,
-                    right: Box::new(Expression::Value(Value::Number(1))),
+                columns: vec![Assignment {
+                    identifier: "is_admin".into(),
+                    value: Expression::Value(Value::Number(1)),
                 }],
                 r#where: None,
             })
@@ -949,24 +958,21 @@ mod tests {
             Ok(Statement::Update {
                 table: "products".into(),
                 columns: vec![
-                    Expression::BinaryOperation {
-                        left: Box::new(Expression::Identifier("price".into())),
-                        operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::BinaryOperation {
+                    Assignment {
+                        identifier: "price".into(),
+                        value: Expression::BinaryOperation {
                             left: Box::new(Expression::Identifier("price".into())),
                             operator: BinaryOperator::Minus,
                             right: Box::new(Expression::Value(Value::Number(10))),
-                        }),
+                        }
                     },
-                    Expression::BinaryOperation {
-                        left: Box::new(Expression::Identifier("discount".into())),
-                        operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number(15))),
+                    Assignment {
+                        identifier: "discount".into(),
+                        value: Expression::Value(Value::Number(15))
                     },
-                    Expression::BinaryOperation {
-                        left: Box::new(Expression::Identifier("stock".into())),
-                        operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number(10))),
+                    Assignment {
+                        identifier: "stock".into(),
+                        value: Expression::Value(Value::Number(10))
                     }
                 ],
                 r#where: Some(Expression::BinaryOperation {
@@ -1060,10 +1066,9 @@ mod tests {
                 Statement::Drop(Drop::Table("test".into())),
                 Statement::Update {
                     table: "users".into(),
-                    columns: vec![Expression::BinaryOperation {
-                        left: Box::new(Expression::Identifier("is_admin".into())),
-                        operator: BinaryOperator::Eq,
-                        right: Box::new(Expression::Value(Value::Number(1))),
+                    columns: vec![Assignment {
+                        identifier: "is_admin".into(),
+                        value: Expression::Value(Value::Number(1)),
                     }],
                     r#where: None,
                 },

@@ -1,14 +1,19 @@
-//! This module contains code that interprets SQL [`Expression`] instances.
+//! This module contains code that interprets SQL [`Statement`] instances.
 //!
 //! TODO: we should make a real "virtual machine" like the one in
-//! [SQLite 2](https://www.sqlite.org/vdbe.html) or an "executor" with JIT and
+//! [SQLite 2](https://www.sqlite.org/vdbe.html) or an executor with JIT and
 //! stuff like Postgres or something similar instead of interpreting the raw
-//! [`Expression`] trees. But this is good enough for now.
+//! [`Statement`] trees. But this is good enough for now.
+
+// mod analyzer;
+// mod executor;
+// mod expression;
+// mod optimizer;
 
 use std::mem;
 
 use crate::{
-    db::{Schema, SqlError, TypeError},
+    db::{GenericDataType, Schema, SqlError, TypeError},
     sql::{BinaryOperator, DataType, Expression, UnaryOperator, Value},
 };
 
@@ -55,9 +60,9 @@ pub(crate) fn resolve_expression(
             let right = resolve_expression(tuple, schema, &right)?;
 
             let mismatched_types = SqlError::TypeError(TypeError::CannotApplyBinary {
-                left: left.clone(),
+                left: Expression::Value(left.clone()),
                 operator: *operator,
-                right: right.clone(),
+                right: Expression::Value(right.clone()),
             });
 
             if mem::discriminant(&left) != mem::discriminant(&right) {
@@ -121,8 +126,8 @@ pub(crate) fn eval_where(
         Value::Bool(b) => Ok(b),
 
         other => Err(SqlError::TypeError(TypeError::ExpectedType {
-            expected: DataType::Bool,
-            found: other,
+            expected: GenericDataType::Bool,
+            found: Expression::Value(other),
         })),
     }
 }
