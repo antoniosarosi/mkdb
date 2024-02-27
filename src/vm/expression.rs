@@ -2,7 +2,7 @@ use std::mem;
 
 use crate::{
     db::{GenericDataType, Schema, SqlError, TypeError},
-    sql::{BinaryOperator, DataType, Expression, UnaryOperator, Value},
+    sql::{BinaryOperator, Expression, UnaryOperator, Value},
 };
 
 /// Reduces an [`Expression`] instance to a concrete [`Value`] if possible.

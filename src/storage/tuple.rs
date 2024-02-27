@@ -1,12 +1,19 @@
-fn deserialize_row_id(buf: &[u8]) -> RowId {
+use std::mem;
+
+use crate::{
+    db::{RowId, Schema},
+    sql::{DataType, Value},
+};
+
+pub(crate) fn deserialize_row_id(buf: &[u8]) -> RowId {
     RowId::from_be_bytes(buf[..mem::size_of::<RowId>()].try_into().unwrap())
 }
 
-fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
+pub(crate) fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
-fn serialize_values(schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
+pub(crate) fn serialize_values(schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
     macro_rules! serialize_big_endian {
         ($num:expr, $int:ty) => {
             TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()
@@ -59,7 +66,7 @@ fn serialize_values(schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
     buf
 }
 
-fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
+pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
     let mut values = Vec::new();
     let mut index = 0;
 

@@ -7,6 +7,6 @@ mod tokenizer;
 
 pub(crate) use parser::{ParseResult, Parser, ParserError};
 pub(crate) use statement::{
-    Assignment, BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement,
-    UnaryOperator, Value,
+    BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement, UnaryOperator,
+    Value,
 };
