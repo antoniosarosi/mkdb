@@ -133,6 +133,15 @@ fn simplfy(expression: &mut Expression) {
                     mem::swap(left, right);
                 }
 
+                // Swap expressions like 6 + x to make them work with the case above.
+                (
+                    literal @ Expression::Value(_),
+                    BinaryOperator::Plus,
+                    variable @ Expression::Identifier(_),
+                ) => {
+                    mem::swap(variable, literal);
+                }
+
                 // Resolve these expressions to "x":
                 // 1 * x
                 // x * 1
@@ -279,9 +288,25 @@ mod tests {
     }
 
     #[test]
-    fn simplify_binary() -> ParseResult<()> {
+    fn simplify_addition() -> ParseResult<()> {
         assert_optimize_expr(Opt {
             raw_input: "x + 2 + 4 + 6",
+            optimized: "x + 12",
+        })
+    }
+
+    #[test]
+    fn simplify_addition_reverse_order() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "1 + 2 + 3 + x",
+            optimized: "x + 6",
+        })
+    }
+
+    #[test]
+    fn simplify_addition_on_both_sides() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "1 + 2 + 3 + x + 3 + 2 + 1",
             optimized: "x + 12",
         })
     }
