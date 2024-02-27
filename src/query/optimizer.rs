@@ -7,7 +7,7 @@ use std::mem;
 
 use crate::{
     db::Schema,
-    sql::{BinaryOperator, Expression, Statement, Value},
+    sql::{BinaryOperator, Expression, Statement, UnaryOperator, Value},
     vm,
 };
 
@@ -19,8 +19,12 @@ pub(crate) fn optimize(statement: &mut Statement) {
         }
 
         Statement::Select {
-            r#where, order_by, ..
+            columns,
+            r#where,
+            order_by,
+            ..
         } => {
+            simplify_all(columns.iter_mut());
             simplfy_where(r#where);
             simplify_all(order_by.iter_mut());
         }
@@ -111,7 +115,7 @@ fn simplfy(expression: &mut Expression) {
             simplfy(right.as_mut());
 
             match (left.as_mut(), operator, right.as_mut()) {
-                // Attempt to simplify expressions like `x + 2 + 4`.
+                // Attempt to simplify expressions like `x + 2 + 4` into `x + 6`.
                 (
                     Expression::BinaryOperation {
                         left: variable,
@@ -132,19 +136,67 @@ fn simplfy(expression: &mut Expression) {
                     *right.as_mut() = resolved_value;
                 }
 
-                // Resolve `x * 1` or `1 * x` or `x / 1` to `x`.
+                // Resolve these expressions to "x":
+                // 1 * x
+                // x * 1
+                // x / 1
+                // x + 0
+                // x - 0
+                // 0 + x
                 (
                     Expression::Value(Value::Number(1)),
                     BinaryOperator::Mul,
-                    ident @ Expression::Identifier(_),
+                    variable @ Expression::Identifier(_),
                 )
                 | (
-                    ident @ Expression::Identifier(_),
+                    variable @ Expression::Identifier(_),
                     BinaryOperator::Mul | BinaryOperator::Div,
                     Expression::Value(Value::Number(1)),
+                )
+                | (
+                    variable @ Expression::Identifier(_),
+                    BinaryOperator::Plus | BinaryOperator::Minus,
+                    Expression::Value(Value::Number(0)),
+                )
+                | (
+                    Expression::Value(Value::Number(0)),
+                    BinaryOperator::Plus,
+                    variable @ Expression::Identifier(_),
                 ) => {
-                    *expression = mem::replace(ident, Expression::Wildcard);
+                    *expression = mem::replace(variable, Expression::Wildcard);
                 }
+
+                // Resolve these expressions to 0:
+                // 0 * x
+                // 0 / x
+                // x * 0
+                (
+                    zero @ Expression::Value(Value::Number(0)),
+                    BinaryOperator::Mul | BinaryOperator::Div,
+                    Expression::Identifier(_),
+                )
+                | (
+                    Expression::Identifier(_),
+                    BinaryOperator::Mul,
+                    zero @ Expression::Value(Value::Number(0)),
+                ) => {
+                    *expression = mem::replace(zero, Expression::Wildcard);
+                }
+
+                // Resolve binary operation `0 - x` to unary `-x`.
+                (
+                    Expression::Value(Value::Number(0)),
+                    BinaryOperator::Minus,
+                    Expression::Identifier(_),
+                ) => match mem::replace(expression, Expression::Wildcard) {
+                    Expression::BinaryOperation { right, .. } => {
+                        *expression = Expression::UnaryOperation {
+                            operator: UnaryOperator::Minus,
+                            expr: right,
+                        }
+                    }
+                    _ => unreachable!(),
+                },
 
                 // Expression with literal values.
                 (Expression::Value(_), _op, Expression::Value(_)) => {
@@ -189,16 +241,116 @@ fn resolve_literal_expression(expression: &Expression) -> Expression {
 mod tests {
     use crate::{
         query::optimizer::{optimize, simplfy},
-        sql::{Assignment, BinaryOperator, Expression, ParseResult, Parser, Statement, Value},
+        sql::{BinaryOperator, Expression, ParseResult, Parser, Statement, Value},
     };
 
-    #[test]
-    fn simplify_unary() -> ParseResult<()> {
-        let mut expr = Parser::new("x + -(2+2+2)").parse_expression()?;
+    struct Opt<'e> {
+        raw_input: &'e str,
+        optimized: &'e str,
+    }
+
+    fn assert_optimize_expr(opt: Opt) -> ParseResult<()> {
+        assert_eq!(
+            simplify_expr(opt.raw_input)?,
+            Parser::new(opt.optimized).parse_expression()?
+        );
+
+        Ok(())
+    }
+
+    fn assert_optimize_sql(opt: Opt) -> ParseResult<()> {
+        assert_eq!(
+            optimize_sql(opt.raw_input)?,
+            Parser::new(opt.optimized).parse_statement()?
+        );
+
+        Ok(())
+    }
+
+    fn simplify_expr(expr: &str) -> ParseResult<Expression> {
+        let mut expr = Parser::new(expr).parse_expression()?;
         simplfy(&mut expr);
 
+        Ok(expr)
+    }
+
+    fn optimize_sql(sql: &str) -> ParseResult<Statement> {
+        let mut statement = Parser::new(sql).parse_statement()?;
+        optimize(&mut statement);
+
+        Ok(statement)
+    }
+
+    #[test]
+    fn simplify_binary() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x + 2 + 4 + 6",
+            optimized: "x + 12",
+        })
+    }
+
+    #[test]
+    fn simplify_multiply_by_one() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x * (3 - 2)",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn simplify_multiply_by_one_in_other_direction() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "(2 - 1) * x",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn simplify_divide_by_one() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x / (10 - 9)",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn simplify_add_zero() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x + (10 - 10)",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn simplify_substract_zero() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x - ((6 - 4) - 2)",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn simplify_multiply_by_zero() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x + x * (2-2)",
+            optimized: "x",
+        })
+    }
+
+    #[test]
+    fn dont_alter_expression_if_cant_simplify() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "x * 2 + 6",
+            optimized: "x * 2 + 6",
+        })
+    }
+
+    /// This one's done manually because if we run the parser on `x + -6` or
+    /// `x - 6` we won't get the same result that the optimizer produces.
+    #[test]
+    fn simplify_unary() -> ParseResult<()> {
         assert_eq!(
-            expr,
+            simplify_expr("x + -(2+2+2)")?,
             Expression::BinaryOperation {
                 left: Box::new(Expression::Identifier("x".into())),
                 operator: BinaryOperator::Plus,
@@ -210,70 +362,42 @@ mod tests {
     }
 
     #[test]
-    fn simplify_binary() -> ParseResult<()> {
-        let mut expr = Parser::new("x + 2 + 4 + 6").parse_expression()?;
-        simplfy(&mut expr);
-
-        assert_eq!(
-            expr,
-            Expression::BinaryOperation {
-                left: Box::new(Expression::Identifier("x".into())),
-                operator: BinaryOperator::Plus,
-                right: Box::new(Expression::Value(Value::Number(12))),
-            }
-        );
-
-        Ok(())
+    fn simplify_zero_minus_var() -> ParseResult<()> {
+        assert_optimize_expr(Opt {
+            raw_input: "(2-2) - x",
+            optimized: "-x",
+        })
     }
 
     #[test]
-    fn simplify_multiply_by_one() -> ParseResult<()> {
-        let mut expr = Parser::new("x * (3 - 2)").parse_expression()?;
-        simplfy(&mut expr);
-
-        assert_eq!(expr, Expression::Identifier("x".into()));
-
-        Ok(())
+    fn optimize_update() -> ParseResult<()> {
+        assert_optimize_sql(Opt {
+            raw_input: "UPDATE products SET price = price + 2 + 2 WHERE discount < 2 * 10;",
+            optimized: "UPDATE products SET price = price + 4 WHERE discount < 20;",
+        })
     }
 
     #[test]
-    fn dont_alter_expression_if_cant_simplify() -> ParseResult<()> {
-        let mut expr = Parser::new("x * 2 + 6").parse_expression()?;
-        let expected = expr.clone();
-
-        simplfy(&mut expr);
-
-        assert_eq!(expr, expected);
-
-        Ok(())
+    fn optimize_select() -> ParseResult<()> {
+        assert_optimize_sql(Opt {
+            raw_input: "SELECT x * 1, 2 + (2 + 2), y FROM some_table WHERE x < 5 -(-5) ORDER BY x + (y * (9-8));",
+            optimized: "SELECT x, 6, y FROM some_table WHERE x < 10 ORDER BY x + y;",
+        })
     }
 
     #[test]
-    fn optimize_sql_statement() -> ParseResult<()> {
-        let sql = "UPDATE products SET price = price + 2 + 2 WHERE discount < 2 * 10;";
-        let mut statement = Parser::new(sql).parse_statement()?;
-        optimize(&mut statement);
+    fn optimize_insert() -> ParseResult<()> {
+        assert_optimize_sql(Opt {
+            raw_input: "INSERT INTO some_table (a,b,c) VALUES (2+2, 2*(2*10), -(-5)-5);",
+            optimized: "INSERT INTO some_table (a,b,c) VALUES (4, 40, 0);",
+        })
+    }
 
-        assert_eq!(
-            statement,
-            Statement::Update {
-                table: "products".into(),
-                columns: vec![Assignment {
-                    identifier: "price".into(),
-                    value: Expression::BinaryOperation {
-                        left: Box::new(Expression::Identifier("price".into())),
-                        operator: BinaryOperator::Plus,
-                        right: Box::new(Expression::Value(Value::Number(4))),
-                    }
-                }],
-                r#where: Some(Expression::BinaryOperation {
-                    left: Box::new(Expression::Identifier("discount".into())),
-                    operator: BinaryOperator::Lt,
-                    right: Box::new(Expression::Value(Value::Number(20)))
-                })
-            }
-        );
-
-        Ok(())
+    #[test]
+    fn optimize_delete() -> ParseResult<()> {
+        assert_optimize_sql(Opt {
+            raw_input: "DELETE FROM t WHERE x >= y * (2 - 2) AND x != (10+10);",
+            optimized: "DELETE FROM t WHERE x >= 0 AND x != 20;",
+        })
     }
 }
