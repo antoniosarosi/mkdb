@@ -127,13 +127,10 @@ fn simplfy(expression: &mut Expression) {
                 ) if matches!(center_value.as_ref(), Expression::Value(_)) => {
                     // Swap "x" with 4.
                     mem::swap(variable.as_mut(), right_value);
-
                     // Compute 4 + 2.
-                    let resolved_value = resolve_literal_expression(&left);
-
-                    // Set the expression to x + 6.
-                    mem::swap(left.as_mut(), right_value);
-                    *right.as_mut() = resolved_value;
+                    *left.as_mut() = resolve_literal_expression(&left);
+                    // Swap 6 + x to make it x + 6
+                    mem::swap(left, right);
                 }
 
                 // Resolve these expressions to "x":
@@ -372,7 +369,7 @@ mod tests {
     #[test]
     fn optimize_update() -> ParseResult<()> {
         assert_optimize_sql(Opt {
-            raw_input: "UPDATE products SET price = price + 2 + 2 WHERE discount < 2 * 10;",
+            raw_input: "UPDATE products SET price = price + 2+2 WHERE discount < 2*10;",
             optimized: "UPDATE products SET price = price + 4 WHERE discount < 20;",
         })
     }
