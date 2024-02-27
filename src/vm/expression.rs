@@ -1,7 +1,7 @@
 use std::mem;
 
 use crate::{
-    db::{Schema, SqlError, TypeError},
+    db::{GenericDataType, Schema, SqlError, TypeError},
     sql::{BinaryOperator, DataType, Expression, UnaryOperator, Value},
 };
 
@@ -47,14 +47,16 @@ pub(crate) fn resolve_expression(
             let left = resolve_expression(tuple, schema, &left)?;
             let right = resolve_expression(tuple, schema, &right)?;
 
-            let mismatched_types = SqlError::TypeError(TypeError::CannotApplyBinary {
-                left: left.clone(),
-                operator: *operator,
-                right: right.clone(),
-            });
+            let mismatched_types = || {
+                SqlError::TypeError(TypeError::CannotApplyBinary {
+                    left: Expression::Value(left.clone()),
+                    operator: *operator,
+                    right: Expression::Value(right.clone()),
+                })
+            };
 
             if mem::discriminant(&left) != mem::discriminant(&right) {
-                return Err(mismatched_types);
+                return Err(mismatched_types());
             }
 
             Ok(match operator {
@@ -66,20 +68,20 @@ pub(crate) fn resolve_expression(
                 BinaryOperator::GtEq => Value::Bool(left >= right),
 
                 logical @ (BinaryOperator::And | BinaryOperator::Or) => {
-                    let (Value::Bool(left), Value::Bool(right)) = (left, right) else {
-                        return Err(mismatched_types);
+                    let (Value::Bool(left), Value::Bool(right)) = (&left, &right) else {
+                        return Err(mismatched_types());
                     };
 
                     match logical {
-                        BinaryOperator::And => Value::Bool(left && right),
-                        BinaryOperator::Or => Value::Bool(left || right),
+                        BinaryOperator::And => Value::Bool(*left && *right),
+                        BinaryOperator::Or => Value::Bool(*left || *right),
                         _ => unreachable!(),
                     }
                 }
 
                 arithmetic => {
-                    let (Value::Number(left), Value::Number(right)) = (left, right) else {
-                        return Err(mismatched_types);
+                    let (Value::Number(left), Value::Number(right)) = (&left, &right) else {
+                        return Err(mismatched_types());
                     };
 
                     Value::Number(match arithmetic {
@@ -92,6 +94,8 @@ pub(crate) fn resolve_expression(
                 }
             })
         }
+
+        Expression::Nested(expr) => resolve_expression(tuple, schema, expr),
 
         Expression::Wildcard => {
             unreachable!("wildcards should be resolved into identifiers at this point")
@@ -114,8 +118,8 @@ pub(crate) fn eval_where(
         Value::Bool(b) => Ok(b),
 
         other => Err(SqlError::TypeError(TypeError::ExpectedType {
-            expected: DataType::Bool,
-            found: other,
+            expected: GenericDataType::Bool,
+            found: Expression::Value(other),
         })),
     }
 }

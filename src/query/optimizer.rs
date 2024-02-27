@@ -55,10 +55,11 @@ fn simplify_all<'e>(expressions: impl Iterator<Item = &'e mut Expression>) {
 /// Takes an expression and reduces its number of operations.
 ///
 /// For now, the only thing this function does is resolve literal expressions
-/// like `x + 2 + 4 + 6` which is equivalent to `x + 12`. Ideally we should be
-/// able to simplify expressions like `2*x + 2*y` into `2*(x+y)` using common
-/// factors, but doing so seems to require a "computer algebra system" which
-/// doesn't sound precisely easy to implement.
+/// like `x + 2 + 4 + 6` which is equivalent to `x + 12` or apply basic rules
+/// such as `x * 0 = 0`. Ideally we should be able to simplify expressions like
+/// `2*x + 2*y` into `2*(x+y)` using common factors, but doing so seems to
+/// require a "computer algebra system" which doesn't sound precisely easy to
+/// implement.
 ///
 /// # Implementation Notes
 ///
@@ -115,31 +116,9 @@ fn simplfy(expression: &mut Expression) {
             simplfy(right.as_mut());
 
             match (left.as_mut(), operator, right.as_mut()) {
-                // Attempt to simplify expressions like `x + 2 + 4` into `x + 6`.
-                (
-                    Expression::BinaryOperation {
-                        left: variable,
-                        operator: BinaryOperator::Plus,
-                        right: center_value,
-                    },
-                    BinaryOperator::Plus,
-                    right_value @ Expression::Value(_),
-                ) if matches!(center_value.as_ref(), Expression::Value(_)) => {
-                    // Swap "x" with 4.
-                    mem::swap(variable.as_mut(), right_value);
-                    // Compute 4 + 2.
-                    *left.as_mut() = resolve_literal_expression(&left);
-                    // Swap 6 + x to make it x + 6
-                    mem::swap(left, right);
-                }
-
-                // Swap expressions like 6 + x to make them work with the case above.
-                (
-                    literal @ Expression::Value(_),
-                    BinaryOperator::Plus,
-                    variable @ Expression::Identifier(_),
-                ) => {
-                    mem::swap(variable, literal);
+                // Resolve expression with literal values to a single value.
+                (Expression::Value(_), _op, Expression::Value(_)) => {
+                    *expression = resolve_literal_expression(&expression);
                 }
 
                 // Resolve these expressions to "x":
@@ -204,9 +183,32 @@ fn simplfy(expression: &mut Expression) {
                     _ => unreachable!(),
                 },
 
-                // Expression with literal values.
-                (Expression::Value(_), _op, Expression::Value(_)) => {
-                    *expression = resolve_literal_expression(&expression);
+                // Attempt to simplify expressions like `x + 2 + 4` into `x + 6`.
+                (
+                    Expression::BinaryOperation {
+                        left: variable,
+                        operator: BinaryOperator::Plus,
+                        right: center_value,
+                    },
+                    BinaryOperator::Plus,
+                    right_value @ Expression::Value(_),
+                ) if matches!(center_value.as_ref(), Expression::Value(_)) => {
+                    // Swap "x" with 4.
+                    mem::swap(variable.as_mut(), right_value);
+                    // Compute 4 + 2.
+                    *left.as_mut() = resolve_literal_expression(&left);
+                    // Swap 6 + x to make it x + 6
+                    mem::swap(left, right);
+                }
+
+                // Turn expressions like `6 + x` into `x + 6` to make them work
+                // with the case above.
+                (
+                    literal @ Expression::Value(_),
+                    BinaryOperator::Plus,
+                    variable @ Expression::Identifier(_),
+                ) => {
+                    mem::swap(variable, literal);
                 }
 
                 _other => {}
