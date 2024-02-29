@@ -33,7 +33,7 @@ impl Sync for std::fs::File {
 /// database.
 pub(crate) type MemBuf = io::Cursor<Vec<u8>>;
 
-// Syncing in memory doesn't do anything, but since most of our datastructures
+// Syncing in memory doesn't do anything, but since most of our data structures
 // are generic over some IO implementation we need this to keep things simple.
 impl Sync for MemBuf {
     fn sync(&self) -> io::Result<()> {

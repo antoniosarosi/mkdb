@@ -1,16 +1,41 @@
 //! Implementations of different disk page types.
 //!
-//! Currently there are 3 types of pages:
+//! # Page Types
+//!
+//! Currently there are 3 types of disk pages:
 //!
 //! - [`Page`]: Used for BTree nodes. This is the most common type of page,
-//! that's why it's called literally "Page".
+//! that's why it's called literally "Page". It is also the most complex type
+//! of page because it's a slotted page that stores [`Cell`] instances instead
+//! of just raw bytes.
 //!
 //! - [`PageZero`]: Special subtype of [`Page`] which holds additional metadata
-//! about the database file.
+//! about the database file. As such, it contains less usable space than a
+//! normal BTree [`Page`], which introduces some edge cases that have to be
+//! addressed at [`super::btree`].
 //!
 //! - [`OverflowPage`]: Used when variable size data exceeds the maximum amount
-//! of bytes that can be stored in a single page. [`OverflowPage`] instances are
-//! also reused as free pages, because they use the same headers.
+//! of bytes allowed in a single page. [`OverflowPage`] instances are also
+//! reused as free pages because they both share the same headers, that's the
+//! purpose of the [`FreePage`] type alias.
+//!
+//! # Other Data Structures
+//!
+//! The cache buffer needs to be able to store all kinds of pages, but we know
+//! the exact type of page that we need at compile time, so there's no need for
+//! dynamic dispatch and traits. Instead, we group all the pages into the
+//! [`MemPage`] enum and store that in the cache. Then we use [`TryFrom`] to
+//! extract the type we need.
+//!
+//! There's another important data structure in this module that serves as the
+//! basic building block for any kind of page, which is [`BufferWithHeader`].
+//! Since all pages have a header followed by some content, we might as well try
+//! to reuse some of the code. Right now we're doing so with the [Newtype]
+//! pattern which introduces some boilerplate but it's not too bad.
+//!
+//! [Newtype]: https://rust-unofficial.github.io/patterns/patterns/behavioural/newtype.html
+//!
+//! # The Database File
 //!
 //! Each database is stored in a single file, and the data structures in this
 //! module operate on pages of such file. The DB file looks roughly like this:
@@ -20,7 +45,7 @@
 //! |       File Metadata      |      |
 //! +--------------------------+      |
 //! | +----------------------+ |      |
-//! | | Btree Page 0 Header  | |      | PAGE 0     struct PageZero
+//! | | Btree Page 0 Header  | |      | PAGE 0    struct PageZero
 //! | +----------------------+ |      |
 //! | | Btree page 0 Content | |      |
 //! | +----------------------+ |      |
@@ -28,7 +53,7 @@
 //! | +----------------------+ |      |
 //! | | Btree Page 1 Header  | |      |
 //! | |                      | |      |
-//! | +----------------------+ |      | PAGE 1       struct Page
+//! | +----------------------+ |      | PAGE 1    struct Page
 //! | | Btree page 1 Content | |      |
 //! | |                      | |      |
 //! | +----------------------+ |      |
@@ -36,7 +61,7 @@
 //! | +----------------------+ |      |
 //! | | Btree Page 2 Header  | |      |
 //! | |                      | |      |
-//! | +----------------------+ |      | PAGE 2       struct Page
+//! | +----------------------+ |      | PAGE 2    struct Page
 //! | | Btree page 2 Content | |      |
 //! | |                      | |      |
 //! | +----------------------+ |      |
@@ -44,7 +69,7 @@
 //! | +----------------------+ |      |
 //! | | Overflow Page Header | |      |
 //! | |                      | |      |
-//! | +----------------------+ |      | PAGE 3     struct OverflowPage
+//! | +----------------------+ |      | PAGE 3    struct OverflowPage
 //! | |   Overflow Content   | |      |
 //! | |                      | |      |
 //! | +----------------------+ |      |
@@ -52,7 +77,7 @@
 //! | +----------------------+ |      |
 //! | |    Fee Page Header   | |      |
 //! | |                      | |      |
-//! | +----------------------+ |      | PAGE 4  struct OverflowPage (AKA FreePage)
+//! | +----------------------+ |      | PAGE 4    struct OverflowPage (AKA FreePage)
 //! | |        UNUSED        | |      |
 //! | |                      | |      |
 //! | +----------------------+ |      |
@@ -62,10 +87,32 @@
 //!
 //! Pages link to other pages using their [`PageNumber`], which is just a 32 bit
 //! offset that can be used to jump from the beginning of the file to a
-//! concrete page.
+//! concrete page. As an exception, pointing to page 0 is the same as saying
+//! "NULL" or "None", since nobody can point to page 0. BTree pages do not point
+//! to their parents, and even if page 0 itself is used as a BTree page it only
+//! points downwards to its children, so nobody ever should point to page 0.
 //!
-//! All the datastructures in this module offer APIs to operate on a single
-//! page. For multi-page operations see the [`super::btree`] module.
+//! All the data structures in this module offer higher level APIs to operate on
+//! a single page. For operations involving multiples pages at the same time see
+//! the [`super::btree`] module.
+//!
+//! # Module Structure Notes
+//!
+//! TODO: This module could be split into something like this:
+//!
+//! ```text
+//! |-- page/
+//!     |-- buffer.rs
+//!     |-- mem.rs
+//!     |-- mod.rs
+//!     |-- overflow.rs
+//!     |-- slotted.rs
+//!     |-- zero.rs
+//! ```
+//!
+//! But for now we're trying to maintain two levels of nesting in this project
+//! to prevent it from becoming complicated to navigate. At the moment there's
+//! only one directory per subsystem so it's pretty clear where everything is.
 
 use std::{
     alloc::{self, Allocator, Layout},
@@ -87,19 +134,19 @@ use crate::paging::pager::PageNumber;
 pub(crate) const MAGIC: u32 = 0xB74EE;
 
 /// Maximum page size is 64 KiB.
-pub(crate) const MAX_PAGE_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_PAGE_SIZE: usize = 64 << 10;
 
 /// Minimum acceptable page size.
 ///
 /// When in debug mode the minimum value of the page size is calculated so that
 /// a normal [`Page`] instance can store at least one valid [`Cell`], which is
-/// an aligned cell that can fit [`CELL_ALIGNMENT`] bytes.
+/// an aligned cell that can fit [`MEM_ALIGNMENT`] bytes.
 ///
 /// In numbers, at the moment of writing this the page header is 12 bytes, a
 /// slot pointer is 2 bytes, and the cell header is 8 bytes. This gives us a
 /// total of 22 bytes of metadata for one single payload.
 ///
-/// [`CELL_ALIGNMENT`] is 8 bytes, so we'll consider that to be the minimum
+/// [`MEM_ALIGNMENT`] is 8 bytes, so we'll consider that to be the minimum
 /// payload. Essentially what we do is add 8 bytes to 22 bytes, giving us 30
 /// bytes, and then we align upwards to 32 bytes. So the minimum page size in
 /// debug mode can store only 8 bytes worth of data, but we allow this because
@@ -108,8 +155,8 @@ pub(crate) const MAX_PAGE_SIZE: usize = 64 * 1024;
 ///
 /// In release mode we'll consider the minimum size to be 512 bytes.
 pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(debug_assertions) {
-    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1) as usize
-        & !(CELL_ALIGNMENT - 1)
+    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * MEM_ALIGNMENT as u16 - 1) as usize
+        & !(MEM_ALIGNMENT - 1)
 } else {
     512
 };
@@ -127,7 +174,7 @@ pub(crate) const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
 /// See [`Page`] for alignment details.
-pub(crate) const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>();
+pub(crate) const MEM_ALIGNMENT: usize = mem::align_of::<CellHeader>();
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
@@ -156,13 +203,16 @@ pub(crate) type SlotId = u16;
 /// References to the entire memory buffer (including both the header and the
 /// content) can be obtained using [`AsRef::as_ref`] and [`AsMut::as_mut`].
 #[derive(Debug)]
-pub(crate) struct BufferWithHeader<H> {
+struct BufferWithHeader<H> {
     /// Pointer to the header located at the beginning of the buffer.
     header: NonNull<H>,
     /// Pointer to the content located right after the header.
     content: NonNull<[u8]>,
     /// Total size of the buffer (size of header + size of content).
     size: usize,
+    /// `true` if this buffer is contained within another larger buffer.
+    #[cfg(debug_assertions)]
+    is_wrapped: bool,
 }
 
 impl<H> BufferWithHeader<H> {
@@ -174,6 +224,11 @@ impl<H> BufferWithHeader<H> {
     /// Caller must ensure that the buffer has enough size to contain at least
     /// `mem::size_of::<H>() + 1` bytes.
     unsafe fn content_of(buffer: NonNull<[u8]>) -> NonNull<[u8]> {
+        debug_assert!(
+            buffer.len() > mem::size_of::<H>(),
+            "attempt to read the content of a BufferWithHeader<H> that cannot fit any content"
+        );
+
         NonNull::slice_from_raw_parts(
             buffer.byte_add(mem::size_of::<H>()).cast::<u8>(),
             Self::usable_space(buffer.len()) as usize,
@@ -205,7 +260,7 @@ impl<H> BufferWithHeader<H> {
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
         let buffer = alloc::Global
-            .allocate_zeroed(alloc::Layout::from_size_align(size as _, CELL_ALIGNMENT).unwrap())
+            .allocate_zeroed(alloc::Layout::from_size_align(size as _, MEM_ALIGNMENT).unwrap())
             .expect("could not allocate page buffer");
 
         // SAFETY: If the assertions above were met then the content pointer
@@ -216,6 +271,8 @@ impl<H> BufferWithHeader<H> {
             header: buffer.cast(),
             content,
             size: buffer.len(),
+            #[cfg(debug_assertions)]
+            is_wrapped: false,
         }
     }
 
@@ -254,6 +311,8 @@ impl<H> BufferWithHeader<H> {
             header: buffer.cast(),
             content,
             size: buffer.len(),
+            #[cfg(debug_assertions)]
+            is_wrapped: true,
         };
 
         *buffer.header_mut() = header;
@@ -358,17 +417,20 @@ impl<H> Clone for BufferWithHeader<H> {
 
 impl<H> Drop for BufferWithHeader<H> {
     fn drop(&mut self) {
-        // NOTE: See [`Self::new_in`]. It is possible to have buffers contained
-        // within other buffers, in which case this code should not run. We
-        // could add a guard to each buffer, something like `if self.is_wrapped`
-        // but as of right now there is only one case of wrapped buffer (page
-        // zero, which contains two headers). So we'll just leave it as is and
-        // delegate the responsibilities to the caller (which unfortunatley
-        // happens to be the same person who wrote this...)
+        // We could determine dynamically at runtime whether we need to drop or
+        // not by removing the debug_assertions condition and replacing the
+        // panic with an early return. But since cells are going to be "dropped"
+        // many times when the BTree rebalances it's better if we enforce this
+        // behaviour at compile time.
+        #[cfg(debug_assertions)]
+        if self.is_wrapped {
+            panic!("attempt to drop wrapped buffer, use mem::ManuallyDrop<T> or mem::forget()");
+        }
+
         unsafe {
             alloc::Global.deallocate(
                 self.header.cast(),
-                alloc::Layout::from_size_align(self.size, CELL_ALIGNMENT).unwrap(),
+                alloc::Layout::from_size_align(self.size, MEM_ALIGNMENT).unwrap(),
             )
         }
     }
@@ -644,7 +706,7 @@ impl Cell {
 
     /// See [`Page`] for details.
     pub fn aligned_size_of(data: &[u8]) -> u16 {
-        Layout::from_size_align(data.len(), CELL_ALIGNMENT)
+        Layout::from_size_align(data.len(), MEM_ALIGNMENT)
             .unwrap()
             .pad_to_align()
             .size() as _
@@ -876,7 +938,7 @@ impl Page {
     /// downwards to [`CELL_ALIGNMENT`]. This makes sure that at least one cell
     /// can successfuly fit in the given space.
     fn max_payload_size_in(usable_space: u16) -> u16 {
-        (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1)
+        (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(MEM_ALIGNMENT as u16 - 1)
     }
 
     /// The maximum size that the payload of a single cell "should" take on

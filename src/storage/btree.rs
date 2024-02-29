@@ -114,7 +114,7 @@ impl<'s> AsRef<[u8]> for Payload<'s> {
 ///
 /// # About BTrees
 ///
-/// BTrees are a family of tree datastructures that always maintain their
+/// BTrees are a family of tree data structures that always maintain their
 /// balance. Unlike binary trees, which can be turned into a linked list by
 /// inserting keys in sequential order like this:
 ///
@@ -923,7 +923,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    /// 
+    ///
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1872,7 +1872,7 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
+            page::{Cell, Page, MEM_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
         },
     };
 
@@ -2045,18 +2045,18 @@ mod tests {
         let key_size = Cell::new(vec![0; mem::size_of::<Key>()]).storage_size();
         let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
 
-        align_upwards(total_space_needed as _, CELL_ALIGNMENT)
+        align_upwards(total_space_needed as _, MEM_ALIGNMENT)
     }
 
     /// Computes the page size needed to store cells of at least `max` size.
     fn optimal_page_size_for_max_payload(max: usize) -> usize {
         let one_max_cell_size =
-            CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, CELL_ALIGNMENT) as u16;
+            CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, MEM_ALIGNMENT) as u16;
 
         // TODO: Hardcoded 4. Make it configurable.
         let total_size = PAGE_HEADER_SIZE + one_max_cell_size * 4;
 
-        align_upwards(total_size as usize, CELL_ALIGNMENT)
+        align_upwards(total_size as usize, MEM_ALIGNMENT)
     }
 
     impl<'c> TryFrom<BTree<'c, MemBuf, FixedSizeMemCmp>> for Node {
