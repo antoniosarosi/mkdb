@@ -122,7 +122,7 @@ use std::{
     iter,
     mem::{self, ManuallyDrop},
     ops::{Bound, RangeBounds},
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 use crate::paging::pager::PageNumber;
@@ -243,17 +243,26 @@ impl<H> BufferWithHeader<H> {
         NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
     }
 
+    /// Consumes `self` and returns a pointer to the underlying memory buffer.
+    ///
+    /// The buffer must be dropped by the caller after this function returns.
+    pub fn into_non_null(self) -> NonNull<[u8]> {
+        ManuallyDrop::new(self).pointer()
+    }
+
     /// Allocates a new buffer setting all the bytes to 0.
     ///
     /// If all the fields in the header should be set to 0 then this is good
     /// enough, otherwise use [`Self::new`] and pass the header manually.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size <= mem::size_of::<H>()`. In other words, the buffer must
+    /// be able to fit an entire header plus at least one byte. Otherwise
+    /// accessing the content is undefined behaviour.
     pub fn alloc(size: usize) -> Self {
-        debug_assert!(
-            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
-            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
-        );
-        debug_assert!(
-            size as usize > mem::size_of::<H>(),
+        assert!(
+            size > mem::size_of::<H>(),
             "allocated buffer only has space for the header, which makes the content pointer invalid"
         );
 
@@ -263,8 +272,7 @@ impl<H> BufferWithHeader<H> {
             .allocate_zeroed(alloc::Layout::from_size_align(size as _, MEM_ALIGNMENT).unwrap())
             .expect("could not allocate page buffer");
 
-        // SAFETY: If the assertions above were met then the content pointer
-        // should always be valid.
+        // SAFETY: We checked if the pointer is valid in the assertion above.
         let content = unsafe { Self::content_of(buffer) };
 
         Self {
@@ -284,12 +292,27 @@ impl<H> BufferWithHeader<H> {
         buffer
     }
 
+    /// Same as [`Self::new`] but checks that the page size is within bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the page size is less than [`MIN_PAGE_SIZE`] or greater than
+    /// [`MAX_PAGE_SIZE`].
+    pub fn for_page(size: usize, header: H) -> Self {
+        assert!(
+            (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
+            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+        );
+
+        Self::new(size, header)
+    }
+
     /// Sames as [`Self::new`] but does not allocate, it uses the given wrapper
     /// instead.
     ///
     /// # Safety
     ///
-    /// This function is marked as unsafe because the caller must make two
+    /// This function is marked as unsafe because the caller must make three
     /// guarantees to prevent use after free bugs:
     ///
     /// 1. The wrapped buffer is never used after the parent buffer is dropped.
@@ -297,10 +320,16 @@ impl<H> BufferWithHeader<H> {
     ///
     /// Ensuring such behaviours should make this safe. See the implementation
     /// of [`Drop`] for [`BufferWithHeader`] for more details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the content part of the wrapper can't fit the header plus at
+    /// least one byte. We can't recover from such error anyway, so we'll just
+    /// terminate the program instead of forcing the caller to check the size.
     pub unsafe fn new_in<W>(wrapper: &mut BufferWithHeader<W>, header: H) -> Self {
         let buffer = wrapper.content_non_null();
 
-        debug_assert!(
+        assert!(
             buffer.len() > mem::size_of::<H>(),
             "wrapped buffer only has space for the header, which makes the content pointer invalid"
         );
@@ -437,7 +466,7 @@ impl<H> Drop for BufferWithHeader<H> {
 }
 
 /// A trait similar to [`Default`] but for initializing empty pages in memory.
-pub(crate) trait InitEmptyPage {
+pub(crate) trait InitPage {
     /// Initializes an empty page of the given size.
     fn init(number: PageNumber, size: usize) -> Self;
 }
@@ -556,7 +585,7 @@ impl PageHeader {
 /// of 4 keys per page. If a cell needs to hold more data than we can fit in a
 /// single page, then we'll set [`CellHeader::is_overflow`] to `true` and make
 /// the last 4 bytes of the content point to an overflow page.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(C, align(8))]
 pub(crate) struct CellHeader {
     /// Size of the cell content.
@@ -582,51 +611,149 @@ pub(crate) struct CellHeader {
     pub left_child: PageNumber,
 }
 
-impl CellHeader {
-    /// Total size of the cell including the header.
-    fn total_size(&self) -> u16 {
-        CELL_HEADER_SIZE + self.size
-    }
-
-    /// Total size of the cell including the header and the slot array pointer
-    /// needed to store the offset.
-    pub fn storage_size(&self) -> u16 {
-        self.total_size() + SLOT_SIZE
-    }
-
-    /// Returns a pointer to the content of the given cell header.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee that the given pointer is valid and points to a
-    /// cell within the page.
-    unsafe fn content_of(header: NonNull<Self>) -> NonNull<[u8]> {
-        NonNull::slice_from_raw_parts(header.add(1).cast(), header.as_ref().size as _)
-    }
-}
-
-/// Owned version of a cell.
+/// A cell is a structure that stores a single BTree entry.
 ///
-/// The [`crate::storage::BTree`] structure reorders cells around different
-/// sibling pages when an overflow or underflow occurs, so instead of hiding the
-/// low level details we provide some API that can be used by upper levels.
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct Cell {
-    pub header: CellHeader,
-    pub content: Box<[u8]>,
-}
-
-/// Read-only reference to a cell.
+/// Each cell stores the binary entry (AKA payload or key) and a pointer to the
+/// BTree node that contains cells with keys smaller than that stored in the
+/// cell itself.
 ///
-/// The cell could be located either in a page that comes from disk or in memory
-/// if the page overflowed.
+/// The [`super::BTree`] structure reorders cells around different sibling pages
+/// when an overflow or underflow occurs, so instead of hiding the low level
+/// details we provide some API that can be used by upper levels.
+///
+/// # About DSTs
+///
+/// Note that this struct is a DST (Dynamically Sized Type), which is hard to
+/// construct in Rust and is considered a "half-baked feature" (as of march 2024
+/// at least, check the [nomicon]). Not that half-baked features are a problem,
+/// we're using nightly and `#![feature()]` everywhere to see the latest and
+/// greatest of Rust, but it would be nice to have a standard way of building
+/// DSTs.
+///
+/// [nomicon]: https://web.archive.org/web/20240222131917/https://doc.rust-lang.org/nomicon/exotic-sizes.html
+///
+/// The reason we're using this instead of anything else is because we need to
+/// take both references and mutable references to cells and we also need owned
+/// cells. Without DSTs we would need to define 3 types and implement the exact
+/// same methods for all of them. Here's the last [commit] with multiple types
+/// before the refactor.
+///
+/// [commit]: https://github.com/antoniosarosi/mkdb/blob/73e806fab193d79a41c9946bb7a0cbfba372e619/src/storage/page.rs#L608-L714
+///
+/// The DST approach reduces boilerplate but makes it harder to construct the
+/// type at runtime. See [`Page::cell_at_offset`] and [`Cell::new`] for details.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CellRef<'a> {
-    pub header: &'a CellHeader,
-    pub content: &'a [u8],
+pub(crate) struct Cell {
+    /// Cell header.
+    pub header: CellHeader,
+    /// Cell content. If [`CellHeader::is_overflow`] is true then the last 4
+    /// bytes of this array should point to an overflow page.
+    pub content: [u8],
 }
 
-impl CellRef<'_> {
+impl Clone for Box<Cell> {
+    fn clone(&self) -> Self {
+        let mut cloned = Cell::new(Vec::from(&self.content));
+        cloned.header = self.header;
+        cloned
+    }
+}
+
+impl PartialEq<Box<Cell>> for Cell {
+    fn eq(&self, other: &Box<Cell>) -> bool {
+        self.header == other.header && &self.content == &other.content
+    }
+}
+
+impl Cell {
+    /// Creates a new cell allocated in memory.
+    pub fn new(mut payload: Vec<u8>) -> Box<Self> {
+        let size = Self::aligned_size_of(&payload);
+        // Add padding.
+        payload.resize(size as _, 0);
+
+        let mut buf = BufferWithHeader::<CellHeader>::new(
+            (size + CELL_HEADER_SIZE) as usize,
+            CellHeader {
+                size,
+                left_child: 0,
+                is_overflow: false,
+                padding: 0,
+            },
+        );
+
+        buf.content_mut().copy_from_slice(&payload);
+
+        // This is the DST hard part. In theory, all we need to build the DST
+        // is a fat pointer, which is basically a two-tuple in the form of
+        // (address, size). Note that "size" in this context is not the same
+        // thing as the pointer length. The "size" here refers to the number
+        // of elements that the DST stores in its dynamic part. If we allocate
+        // 100 bytes but the DST stores 80 bytes because the first 20 correspond
+        // to the header, then the size of the DST is 80, not 100.
+        //
+        // It's a bit counterintuitive because you'd think the size of the DST
+        // should be the total length of the pointer, but it's not the case. The
+        // size is only used for correctly indexing the dynamic part within its
+        // bounds. Everything else is known at compile time.
+        //
+        // The other tricky part is that we have to create a "fake" slice and
+        // then cast it to our DST. And then the other tricky part is that this
+        // code is probably buggy because we're boxing our DST pointer, and in
+        // order to do so "safely" we should meet the [`Box`] memory layout
+        // requirements. See here:
+        //
+        // <https://doc.rust-lang.org/std/boxed/index.html#memory-layout>
+        //
+        // [`Box`] uses [`Layout::for_value`] to obtain the memory layout, but
+        // we can't do that because we don't have the value yet, we need to
+        // build it first.
+        //
+        // Miri doesn't complain about any of this and the allocator doesn't
+        // panic, so we probably do meet the layout requirements. The alignment
+        // is not a problem because [`BufferWithHeader`] forces allocations to
+        // be 8-aligned, and then the size of the allocation shouldn't be a
+        // problem either because we're adding padding manually. So when [`Box`]
+        // calls [`Layout::for_value`] to drop the allocation it probably
+        // obtains the exact same layout that [`BufferWithHeader`] uses for
+        // allocations.
+        //
+        // We could probably use our own smart pointer that knows the exact
+        // layout needed to deallocate instead of [`Box`], but this works for
+        // now. See other similar examples in the Rust playground:
+        //
+        // Example 1: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=ce193d6fdcd9477463071cfa53d329b8>
+        // Example 2: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=fd082276db55c278b3a37b4380ca912a>
+        //
+        // The second one comes from this Reddit discussion:
+        // <https://www.reddit.com/r/rust/comments/mq3kqe/is_this_the_best_way_to_do_custom_dsts_unsized/>
+        //
+        // And the first one is a simplified version of the second one that I
+        // wrote.
+        //
+        // Another important note that you should remember when reading this
+        // codebase is that I don't know what I'm doing, so don't trust me on
+        // this one, if it seg faults it seg faults :)
+        unsafe {
+            Box::from_raw(ptr::slice_from_raw_parts(
+                buf.into_non_null().cast::<u8>().as_ptr(),
+                payload.len(),
+            ) as *mut Cell)
+        }
+    }
+
+    /// Creates a new overflow cell by extending the `payload` buffer with the
+    /// `overflow_page` number.
+    pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Box<Self> {
+        payload.extend_from_slice(&overflow_page.to_le_bytes());
+
+        let mut cell = Self::new(payload);
+        cell.header.is_overflow = true;
+
+        cell
+    }
+
+    /// Returns the first overflow page of this cell.
     pub fn overflow_page(&self) -> PageNumber {
         if !self.header.is_overflow {
             return 0;
@@ -638,70 +765,16 @@ impl CellRef<'_> {
                 .expect("failed parsing overflow page number"),
         )
     }
-}
 
-/// Same as [`CellRef`] but mutable.
-pub(crate) struct CellRefMut<'a> {
-    pub header: &'a mut CellHeader,
-    pub content: &'a mut [u8],
-}
-
-impl<'a> From<&'a Cell> for CellRef<'a> {
-    fn from(cell: &'a Cell) -> Self {
-        Self {
-            header: &cell.header,
-            content: &cell.content,
-        }
-    }
-}
-
-impl PartialEq<&Cell> for CellRef<'_> {
-    fn eq(&self, other: &&Cell) -> bool {
-        self.header.eq(&other.header) && self.content.eq(other.content.as_ref())
-    }
-}
-
-impl Cell {
-    /// Creates a new cell allocated in memory.
-    pub fn new(mut payload: Vec<u8>) -> Self {
-        let size = Self::aligned_size_of(&payload);
-        // Add padding.
-        payload.resize(size as _, 0);
-
-        Self {
-            header: CellHeader {
-                size,
-                left_child: 0,
-                is_overflow: false,
-                padding: 0,
-            },
-            content: payload.into_boxed_slice(),
-        }
-    }
-
-    /// Creates a new overflow cell by extending the `payload` buffer with the
-    /// `overflow_page` number.
-    pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Self {
-        payload.extend_from_slice(&overflow_page.to_le_bytes());
-
-        let mut cell = Self::new(payload);
-        cell.header.is_overflow = true;
-
-        cell
-    }
-
-    /// Shorthand for [`CellHeader::total_size`].
+    /// Total size of the cell including the header.
     pub fn total_size(&self) -> u16 {
-        self.header.total_size()
+        CELL_HEADER_SIZE + self.header.size
     }
 
-    /// Shorthand for [`CellHeader::storage_size`].
+    /// Total size of the cell including the header and the slot array pointer
+    /// needed to store the offset.
     pub fn storage_size(&self) -> u16 {
-        self.header.storage_size()
-    }
-
-    pub fn overflow_page(&self) -> PageNumber {
-        CellRef::from(self).overflow_page()
+        self.total_size() + SLOT_SIZE
     }
 
     /// See [`Page`] for details.
@@ -709,7 +782,7 @@ impl Cell {
         Layout::from_size_align(data.len(), MEM_ALIGNMENT)
             .unwrap()
             .pad_to_align()
-            .size() as _
+            .size() as u16
     }
 }
 
@@ -718,7 +791,7 @@ impl Cell {
 #[derive(Debug, Clone)]
 struct OverflowCell {
     /// Owned cell.
-    cell: Cell,
+    cell: Box<Cell>,
     /// Index in the slot array where the cell should have been inserted.
     index: SlotId,
 }
@@ -886,9 +959,9 @@ pub(crate) struct Page {
     overflow: BinaryHeap<OverflowCell>,
 }
 
-impl InitEmptyPage for Page {
+impl InitPage for Page {
     fn init(number: PageNumber, size: usize) -> Self {
-        let buffer = BufferWithHeader::new(size, PageHeader::new(size));
+        let buffer = BufferWithHeader::for_page(size, PageHeader::new(size));
 
         Self {
             number,
@@ -991,7 +1064,7 @@ impl Page {
     fn slot_array_non_null(&self) -> NonNull<[u16]> {
         NonNull::slice_from_raw_parts(
             self.buffer.content_non_null().cast(),
-            self.header().num_slots as _,
+            self.header().num_slots as usize,
         )
     }
 
@@ -1011,61 +1084,57 @@ impl Page {
     ///
     /// # Safety
     ///
-    /// This is the only function marked as `unsafe` because we can't guarantee
-    /// the offset is valid within the function, so the caller is responsible
-    /// for that.
+    /// This function is marked as `unsafe` because we can't guarantee the
+    /// offset is valid within the function, so the caller is responsible for
+    /// that.
     unsafe fn cell_header_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
-        self.buffer.header.byte_add(offset as _).cast()
+        self.buffer.header.byte_add(offset as usize).cast()
     }
 
-    /// Returns a pointer to the [`CellHeader`] pointer by the given slot.
-    fn cell_header_at_slot_index(&self, index: SlotId) -> NonNull<CellHeader> {
+    /// Returns a pointer to the [`Cell`] located at the given offset.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::cell_header_at_offset`].
+    unsafe fn cell_at_offset(&self, offset: u16) -> NonNull<Cell> {
+        let header = self.cell_header_at_offset(offset);
+        let size = header.as_ref().size as usize;
+
+        // See the giant comment in [`Cell::new`] for the "DST construction"
+        // explanation.
+        let cell = ptr::slice_from_raw_parts(header.cast::<u8>().as_ptr(), size) as *mut Cell;
+
+        NonNull::new_unchecked(cell)
+    }
+
+    /// Returns a pointer to the [`Cell`] located at the given slot.
+    fn cell_at_slot(&self, index: SlotId) -> NonNull<Cell> {
         // SAFETY: The slot array always stores valid offsets within the page
-        // that point to actual cells.
-        unsafe { self.cell_header_at_offset(self.slot_array()[index as usize]) }
+        // that point to actual initialized cells.
+        unsafe { self.cell_at_offset(self.slot_array()[index as usize]) }
     }
 
     /// Read-only reference to a cell.
-    pub fn cell(&self, index: SlotId) -> CellRef {
-        let header = self.cell_header_at_slot_index(index);
-        // SAFETY: The slot array stores a correct offset to a cell. Once we
-        // have the pointer to the cell, we know the header and content are
-        // contiguous, so we can take the two references.
-        unsafe {
-            CellRef {
-                header: header.as_ref(),
-                content: CellHeader::content_of(header).as_ref(),
-            }
-        }
+    pub fn cell<'p>(&'p self, index: SlotId) -> &'p Cell {
+        let cell = self.cell_at_slot(index);
+        // SAFETY: Same as [`Self::cell_at_offset`].
+        unsafe { cell.as_ref() }
     }
 
     /// Mutable reference to a cell.
-    pub fn cell_mut(&mut self, index: SlotId) -> CellRefMut {
-        let mut header = self.cell_header_at_slot_index(index);
-        // SAFETY: This one is not as easy as getting a [`CellRef`] because we
-        // can't get a mutable reference to the header and _then_ a mutable
-        // reference to the content, since in order to know how long the content
-        // is we have to borrow the header as immutable to read the `size`
-        // property. Since we can't borrow as mutable and immutable at the same
-        // time we'll just flip the order. Grab the content first and then the
-        // header.
-        unsafe {
-            CellRefMut {
-                content: CellHeader::content_of(header).as_mut(),
-                header: header.as_mut(),
-            }
-        }
+    pub fn cell_mut<'p>(&'p mut self, index: SlotId) -> &'p mut Cell {
+        let mut cell = self.cell_at_slot(index);
+        // SAFETY: Same as [`Self::cell_at_offset`].
+        unsafe { cell.as_mut() }
     }
 
     /// Returns an owned cell by cloning it.
-    pub fn owned_cell(&self, index: SlotId) -> Cell {
-        let header = self.cell_header_at_slot_index(index);
-        unsafe {
-            Cell {
-                header: header.read(),
-                content: Vec::from(CellHeader::content_of(header).as_ref()).into(),
-            }
-        }
+    pub fn owned_cell(&self, index: SlotId) -> Box<Cell> {
+        let cell = self.cell(index);
+        let mut boxed = Cell::new(Vec::from(&cell.content));
+        boxed.header = cell.header;
+
+        boxed
     }
 
     /// Returns the child at the given `index`.
@@ -1098,8 +1167,8 @@ impl Page {
         !self.overflow.is_empty()
     }
 
-    /// Returns `true` if [`Self::append`] can be called on `other` without
-    /// causig `self` to overflow.
+    /// Returns `true` if [`Self::append`] can be called with `other` as a
+    /// parameter without causig `self` to overflow.
     pub fn can_consume_without_overflow(&self, other: &Self) -> bool {
         if other.is_overflow() {
             return false;
@@ -1123,12 +1192,12 @@ impl Page {
     }
 
     /// Adds `cell` to this page, possibly overflowing the page.
-    pub fn push(&mut self, cell: Cell) {
+    pub fn push(&mut self, cell: Box<Cell>) {
         self.insert(self.len(), cell);
     }
 
     /// Inserts the `cell` at `index`, possibly overflowing.
-    pub fn insert(&mut self, index: SlotId, cell: Cell) {
+    pub fn insert(&mut self, index: SlotId, cell: Box<Cell>) {
         debug_assert!(
             cell.content.len() <= self.max_allowed_payload_size() as usize,
             "attempt to store payload of size {} when max allowed payload size is {}",
@@ -1149,7 +1218,7 @@ impl Page {
     ///
     /// It causes the page to overflow if it's not possible. After that, this
     /// function should not be called anymore.
-    pub fn replace(&mut self, index: SlotId, new_cell: Cell) -> Cell {
+    pub fn replace(&mut self, index: SlotId, new_cell: Box<Cell>) -> Box<Cell> {
         debug_assert!(
             !self.is_overflow(),
             "overflow cells are not replaced so replace() should not run on overflow pages"
@@ -1209,7 +1278,7 @@ impl Page {
     ///
     /// There is no free list, we don't search for deleted blocks that can fit
     /// the new cell.
-    fn try_insert(&mut self, index: SlotId, cell: Cell) -> Result<SlotId, Cell> {
+    fn try_insert(&mut self, index: SlotId, cell: Box<Cell>) -> Result<SlotId, Box<Cell>> {
         let cell_storage_size = cell.storage_size();
 
         // There's no way we can fit the cell in this page.
@@ -1243,9 +1312,10 @@ impl Page {
             let header = self.cell_header_at_offset(offset as u16);
             header.write(cell.header);
 
-            CellHeader::content_of(header)
-                .as_mut()
-                .copy_from_slice(&cell.content);
+            let mut content =
+                NonNull::slice_from_raw_parts(header.add(1).cast(), cell.header.size as _);
+
+            content.as_mut().copy_from_slice(&cell.content);
         }
 
         // Update header.
@@ -1314,12 +1384,12 @@ impl Page {
     ///                                   using all the available free space
     ///                                   including the deleted cell
     /// ```
-    fn try_replace(&mut self, index: SlotId, new_cell: Cell) -> Result<Cell, Cell> {
+    fn try_replace(&mut self, index: SlotId, new_cell: Box<Cell>) -> Result<Box<Cell>, Box<Cell>> {
         let old_cell = self.cell(index);
 
         // There's no way we can fit the new cell in this page, even if we
         // remove the one that has to be replaced.
-        if self.header().free_space + old_cell.header.total_size() < new_cell.total_size() {
+        if self.header().free_space + old_cell.total_size() < new_cell.total_size() {
             return Err(new_cell);
         }
 
@@ -1336,7 +1406,7 @@ impl Page {
             // Overwrite the contents of the old cell.
             let old_cell = self.cell_mut(index);
             old_cell.content[..new_cell.content.len()].copy_from_slice(&new_cell.content);
-            *old_cell.header = new_cell.header;
+            old_cell.header = new_cell.header;
 
             self.header_mut().free_space += free_bytes;
 
@@ -1358,7 +1428,7 @@ impl Page {
     /// Unlike [`Self::try_insert`] and [`Self::try_replace`], this function
     /// cannot fail. However, it does panic if the given `index` is out of
     /// bounds or the page is overflow.
-    pub fn remove(&mut self, index: SlotId) -> Cell {
+    pub fn remove(&mut self, index: SlotId) -> Box<Cell> {
         debug_assert!(
             !self.is_overflow(),
             "remove() does not handle overflow indexes"
@@ -1428,13 +1498,12 @@ impl Page {
         let mut destination_offset = self.size();
 
         while let Some((offset, i)) = offsets.pop() {
-            // SAFETY: Calling [`Self::cell_header_at_offset`] is safe here
-            // because we obtained all the offsets from the slot array, which
-            // should always be in a valid state. If that holds true, then
-            // casting the dereferencing the cell pointer should be safe as
-            // well.
+            // SAFETY: Calling [`Self::cell_at_offset`] is safe here because we
+            // obtained all the offsets from the slot array, which should always
+            // be in a valid state. If that holds true, then casting the
+            // dereferencing the cell pointer should be safe as well.
             unsafe {
-                let cell = self.cell_header_at_offset(offset);
+                let cell = self.cell_at_offset(offset);
                 let size = cell.as_ref().total_size() as usize;
 
                 destination_offset -= size;
@@ -1455,7 +1524,10 @@ impl Page {
     ///
     /// This function does account for [`Self::is_overflow`], so it's safe to
     /// call on overflow pages.
-    pub fn drain(&mut self, range: impl RangeBounds<usize>) -> impl Iterator<Item = Cell> + '_ {
+    pub fn drain(
+        &mut self,
+        range: impl RangeBounds<usize>,
+    ) -> impl Iterator<Item = Box<Cell>> + '_ {
         let start = match range.start_bound() {
             Bound::Unbounded => 0,
             Bound::Excluded(i) => i + 1,
@@ -1492,7 +1564,7 @@ impl Page {
             } else {
                 // Now compute gained space and shift slots towards the left.
                 self.header_mut().free_space += (start..slot_index)
-                    .map(|slot| self.cell(slot as _).header.storage_size())
+                    .map(|slot| self.cell(slot as _).storage_size())
                     .sum::<u16>();
 
                 self.slot_array_mut().copy_within(slot_index.., start);
@@ -1520,10 +1592,10 @@ impl Debug for Page {
                     list.entry_with(|f| {
                         f.debug_struct("Cell")
                             .field("start", &offset)
-                            .field("end", &(offset + cell.header.total_size()))
+                            .field("end", &(offset + cell.total_size()))
                             .field("size", &cell.header.size)
                             .field("header", &cell.header)
-                            .field("content", &cell.content)
+                            .field("content", &&cell.content)
                             .finish()
                     });
                 });
@@ -1599,7 +1671,7 @@ pub(crate) struct OverflowPage {
 /// a linked list of pages.
 pub(crate) type FreePage = OverflowPage;
 
-impl InitEmptyPage for OverflowPage {
+impl InitPage for OverflowPage {
     fn init(number: PageNumber, size: usize) -> Self {
         Self {
             number,
@@ -1686,9 +1758,9 @@ pub(crate) struct PageZero {
     page: ManuallyDrop<Page>,
 }
 
-impl InitEmptyPage for PageZero {
+impl InitPage for PageZero {
     fn init(number: PageNumber, size: usize) -> Self {
-        let mut buffer = BufferWithHeader::new(
+        let mut buffer = BufferWithHeader::for_page(
             size,
             DbHeader {
                 magic: MAGIC,
@@ -1895,7 +1967,7 @@ impl<'p> TryFrom<&'p mut MemPage> for &'p mut OverflowPage {
 mod tests {
     use super::*;
 
-    fn variable_size_cells(sizes: &[usize]) -> Vec<Cell> {
+    fn variable_size_cells(sizes: &[usize]) -> Vec<Box<Cell>> {
         sizes
             .iter()
             .enumerate()
@@ -1903,13 +1975,13 @@ mod tests {
             .collect()
     }
 
-    fn fixed_size_cells(size: usize, amount: usize) -> Vec<Cell> {
+    fn fixed_size_cells(size: usize, amount: usize) -> Vec<Box<Cell>> {
         variable_size_cells(&vec![size; amount])
     }
 
     struct Builder {
         size: usize,
-        cells: Vec<Cell>,
+        cells: Vec<Box<Cell>>,
     }
 
     impl Builder {
@@ -1925,12 +1997,12 @@ mod tests {
             self
         }
 
-        fn cells(mut self, cells: Vec<Cell>) -> Self {
+        fn cells(mut self, cells: Vec<Box<Cell>>) -> Self {
             self.cells = cells;
             self
         }
 
-        fn build(self) -> (Page, Vec<Cell>) {
+        fn build(self) -> (Page, Vec<Box<Cell>>) {
             let mut page = Page::init(0, self.size);
             page.push_all(self.cells.clone());
 
@@ -1939,7 +2011,7 @@ mod tests {
     }
 
     impl Page {
-        fn push_all(&mut self, cells: Vec<Cell>) {
+        fn push_all(&mut self, cells: Vec<Box<Cell>>) {
             cells.into_iter().for_each(|cell| self.push(cell));
         }
 
@@ -1954,7 +2026,7 @@ mod tests {
     ///
     /// * `cells` - List of cells that have been inserted in the page
     /// (in order). Necessary for checking data corruption.
-    fn compare_consecutive_offsets(page: &Page, cells: &Vec<Cell>) {
+    fn compare_consecutive_offsets(page: &Page, cells: &Vec<Box<Cell>>) {
         let mut expected_offset = page.size();
         for (i, cell) in cells.iter().enumerate() {
             expected_offset -= cell.total_size() as usize;
@@ -1965,7 +2037,7 @@ mod tests {
 
     /// Same as [`compare_consecutive_offsets`] but only checks the cell values,
     /// not the offsets.
-    fn compare_cells(page: &Page, cells: &Vec<Cell>) {
+    fn compare_cells(page: &Page, cells: &Vec<Box<Cell>>) {
         for (i, cell) in cells.iter().enumerate() {
             assert_eq!(page.cell(i as _), cell);
         }
@@ -2111,7 +2183,8 @@ mod tests {
         let new_cell = Cell::new(vec![4; 96]);
 
         let expected_offset = page.size()
-            - (cells.iter().map(Cell::total_size).sum::<u16>() + new_cell.total_size()) as usize;
+            - (cells.iter().map(|cell| cell.total_size()).sum::<u16>() + new_cell.total_size())
+                as usize;
 
         cells[0] = new_cell.clone();
 

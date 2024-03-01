@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{DbHeader, FreePage, InitEmptyPage, MemPage, Page, PageZero, MAGIC};
+use crate::storage::page::{DbHeader, FreePage, InitPage, MemPage, Page, PageZero, MAGIC};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -167,7 +167,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// that point. Evicting a clean page doesn't require IO.
     ///
     /// Note that this function does not mark the page as dirty.
-    fn lookup<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+    fn lookup<P: Into<MemPage> + InitPage + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<usize> {
@@ -227,7 +227,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// since we need a specific lifetime).
     pub fn get_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&P>
     where
-        P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>,
+        P: Into<MemPage> + InitPage + AsMut<[u8]>,
         &'p P: TryFrom<&'p MemPage>,
         <&'p P as TryFrom<&'p MemPage>>::Error: Debug,
     {
@@ -243,7 +243,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// queue.
     pub fn get_mut_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&mut P>
     where
-        P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>,
+        P: Into<MemPage> + InitPage + AsMut<[u8]>,
         &'p mut P: TryFrom<&'p mut MemPage>,
         <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
     {
@@ -288,7 +288,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     ///
     /// The page is not marked dirty, it will not be written back to disk
     /// unless [`Self::get_mut_as`] is called.
-    fn load_from_disk<P: Into<MemPage> + InitEmptyPage + AsMut<[u8]>>(
+    fn load_from_disk<P: Into<MemPage> + InitPage + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
@@ -317,7 +317,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// Instead, the initialization goes through the cache system. The page
     /// is initialized in memory, cached and pushed to the write queue.
     /// Eventually, the page will be written to disk.
-    pub fn init_disk_page<P: Into<MemPage> + InitEmptyPage>(
+    pub fn init_disk_page<P: Into<MemPage> + InitPage>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
@@ -400,7 +400,7 @@ mod tests {
     use super::Pager;
     use crate::{
         paging::{cache::Cache, io::MemBuf},
-        storage::page::{Cell, InitEmptyPage, OverflowPage, Page},
+        storage::page::{Cell, InitPage, OverflowPage, Page},
     };
 
     fn init_pager_with_cache(cache: Cache) -> io::Result<Pager<MemBuf>> {

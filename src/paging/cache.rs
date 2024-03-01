@@ -502,7 +502,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::{super::pager::PageNumber, Cache};
-    use crate::storage::page::{Cell, InitEmptyPage, MemPage, Page};
+    use crate::storage::page::{Cell, InitPage, MemPage, Page};
 
     enum Prefetch {
         AllPages,

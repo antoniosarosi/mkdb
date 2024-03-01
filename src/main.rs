@@ -2,6 +2,7 @@
 #![feature(debug_closure_helpers)]
 #![feature(allocator_api)]
 #![feature(map_try_insert)]
+#![feature(vec_into_raw_parts)]
 
 mod db;
 mod os;

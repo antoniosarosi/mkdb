@@ -9,7 +9,7 @@ use std::{
     mem,
 };
 
-use super::page::{Cell, InitEmptyPage, OverflowPage, Page, SlotId};
+use super::page::{Cell, InitPage, OverflowPage, Page, SlotId};
 use crate::paging::pager::{PageNumber, Pager};
 
 /// [`BTree`] key comparator. Entries are stored in binary, so we need a way to
@@ -103,8 +103,8 @@ pub(crate) enum Payload<'s> {
 impl<'s> AsRef<[u8]> for Payload<'s> {
     fn as_ref(&self) -> &[u8] {
         match self {
-            Self::PageRef(r) => r,
-            Self::Reassembled(payload) => &payload,
+            Self::PageRef(reference) => reference,
+            Self::Reassembled(boxed) => &boxed,
         }
     }
 }
@@ -401,7 +401,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
                 }
                 &overflow_buf
             } else {
-                cell.content
+                &cell.content
             };
 
             match self.comparator.bytes_cmp(payload, entry) {
@@ -606,7 +606,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// handled by [`Self::balance`]. See also [`Self::remove_entry`] for the
     /// actual deletion code, this function is a wrapper that provides a public
     /// API and calls [`Self::balance`] at the end.
-    pub fn remove(&mut self, entry: &[u8]) -> io::Result<Option<Box<[u8]>>> {
+    pub fn remove(&mut self, entry: &[u8]) -> io::Result<Option<Box<Cell>>> {
         let mut parents = Vec::new();
         let Some((entry, leaf_node, internal_node)) = self.remove_entry(entry, &mut parents)?
         else {
@@ -641,7 +641,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         &mut self,
         entry: &[u8],
         parents: &mut Vec<PageNumber>,
-    ) -> io::Result<Option<(Box<[u8]>, PageNumber, Option<PageNumber>)>> {
+    ) -> io::Result<Option<(Box<Cell>, PageNumber, Option<PageNumber>)>> {
         let search = self.search(self.root, entry, parents)?;
         let node = self.pager.get(search.page)?;
 
@@ -655,7 +655,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Leaf node is the simplest case, remove key and pop off the stack.
         if node.is_leaf() {
             let cell = self.pager.get_mut(search.page)?.remove(index);
-            return Ok(Some((cell.content, search.page, None)));
+            return Ok(Some((cell, search.page, None)));
         }
 
         // Root or internal nodes require additional work. We need to find a
@@ -681,7 +681,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         substitute.header.left_child = node.child(index);
         let entry = node.replace(index, substitute);
 
-        Ok(Some((entry.content, leaf_node, Some(node.number))))
+        Ok(Some((entry, leaf_node, Some(node.number))))
     }
 
     /// Traverses the tree all the way down to the leaf nodes, following the
@@ -923,7 +923,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    ///
+    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1686,7 +1686,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Allocates a cell that can fit the entire given `payload`.
     ///
     /// Overflow pages are used if necessary. See [`OverflowPage`] for details.
-    fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Cell> {
+    fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Box<Cell>> {
         let max_payload_size = Page::ideal_max_payload_size(self.pager.page_size) as usize;
 
         // No overflow needed.
@@ -1736,7 +1736,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Frees the pages occupied by the given `cell`.
     ///
     /// Pretty much a no-op if the cell is not "overflow".
-    fn free_cell(&mut self, cell: Cell) -> io::Result<()> {
+    fn free_cell(&mut self, cell: Box<Cell>) -> io::Result<()> {
         if !cell.header.is_overflow {
             return Ok(());
         }
@@ -1762,7 +1762,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // like this cleaner.
         if !self.pager.get(page)?.cell(slot).header.is_overflow {
             let cell = self.pager.get(page)?.cell(slot);
-            return Ok(Payload::PageRef(cell.content));
+            return Ok(Payload::PageRef(&cell.content));
         }
 
         let cell = self.pager.get(page)?.cell(slot);
@@ -1818,12 +1818,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
 
         if page.len() >= 1 {
-            let key = page.cell(0).content;
+            let key = &page.cell(0).content;
             string.push_str(&format!("{:?}", key));
 
             for i in 1..page.len() {
                 string.push(',');
-                string.push_str(&format!("{:?}", page.cell(i).content));
+                string.push_str(&format!("{:?}", &page.cell(i).content));
             }
         }
 
@@ -1872,7 +1872,7 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{Cell, Page, MEM_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
+            page::{Cell, Page, CELL_HEADER_SIZE, MEM_ALIGNMENT, PAGE_HEADER_SIZE, SLOT_SIZE},
         },
     };
 
@@ -1988,7 +1988,7 @@ mod tests {
 
             let mut node = Node {
                 keys: (0..page.len())
-                    .map(|i| deserialize_key(page.cell(i).content))
+                    .map(|i| deserialize_key(&page.cell(i).content))
                     .collect(),
                 children: vec![],
             };
@@ -2010,7 +2010,7 @@ mod tests {
             self.insert(Vec::from(serialize_key(key)))
         }
 
-        fn remove_key(&mut self, key: Key) -> io::Result<Option<Box<[u8]>>> {
+        fn remove_key(&mut self, key: Key) -> io::Result<Option<Box<Cell>>> {
             self.remove(&serialize_key(key))
         }
 
@@ -2025,7 +2025,7 @@ mod tests {
         fn try_remove_all_keys(
             &mut self,
             keys: impl IntoIterator<Item = Key>,
-        ) -> io::Result<Vec<Option<Box<[u8]>>>> {
+        ) -> io::Result<Vec<Option<Box<Cell>>>> {
             keys.into_iter()
                 .map(|key| self.remove(&serialize_key(key)))
                 .collect()
