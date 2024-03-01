@@ -499,18 +499,22 @@ pub(crate) struct PageHeader {
     /// Length of the slot array.
     num_slots: u16,
 
-    /// Offset of the last inserted cell.
+    /// Offset of the last inserted cell counting from the start of the content.
     ///
     /// ```text
-    ///                         last_used_offset
-    ///                               |
-    ///                               V
+    ///     count start        last_used_offset
+    ///          |                    |
+    ///          V                    V
     /// +--------+-------+------------+------+-----+------+
     /// | HEADER | SLOTS | FREE SPACE | CELL | DEL | CELL |
     /// +--------+-------+------------+------+-----+------+
+    ///          ^                                        ^
+    ///          |                                        |
+    ///          +-----------------------------------------
+    ///                         Page Content
     /// ```
     ///
-    /// For empty pages with no cells, this value is equal to the page size:
+    /// For empty pages with no cells, this value is equal to the content size:
     ///
     /// ```text
     ///                                             last_used_offset
@@ -519,26 +523,35 @@ pub(crate) struct PageHeader {
     /// +--------+----------------------------------------+
     /// | HEADER |              EMPTY PAGE                |
     /// +--------+----------------------------------------+
+    ///          ^                                        ^
+    ///          |                                        |
+    ///          +-----------------------------------------
+    ///                        Page Content
     /// ```
     ///
     /// This makes it so that there is no distinction between empty pages and
     /// pages with cells, we can always substract the size of a cell from
     /// `last_used_offset` to obtain the next `last_used_offset`.
     ///
-    /// Note that this value is of type [`u32`] even though a [`Cell`] can never
-    /// have an offset greater than [`u16::MAX`]. However, [`u16::MAX`] is equal
-    /// to 65535 (2^16 - 1) while [`MAX_PAGE_SIZE`] is 65536 (2^16), so the
-    /// trick mentioned above to reduce the algorithm to one single case would
-    /// not work if we stored this value in [`u16`], we'd have to use if
-    /// statements when inserting cells to account for 64 KiB pages.
+    /// The reason we start counting from the beginning of the content instead
+    /// of the header is because [`MAX_PAGE_SIZE`] equals 65536 (2^16) while
+    /// [`u16::MAX`] is equal to 65535 (2^16 - 1) so the trick mentioned above
+    /// to reduce the algorithm to one single case would not work with 64 KiB
+    /// pages.
     ///
-    /// Storing this as [`u16`] would require 2 bytes of padding to align the
-    /// [`PageNumber`] below anyway, so we might as well use those bytes for
-    /// something.
+    /// We could store this as [`u32`] but that introduces its own problems
+    /// since doing arithmetic with [`u16`], [`u32`] and [`usize`] requires a
+    /// bunch of casts everywhere.
+    last_used_offset: u16,
+
+    /// Add padding manually to avoid uninitialized bytes.
     ///
-    /// This has its own problems though, having to deal with `u16` and `u32`
-    /// arithmetic requires a bunch of casts. So... TODO.
-    last_used_offset: u32,
+    /// The [`PartialEq`] implementation for [`Page`] relies on comparing the
+    /// memory buffers, but Rust does not make any guarantees about the values
+    /// of padding bytes. See here:
+    ///
+    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
+    padding: u16,
 
     /// Last child of this page.
     pub right_child: PageNumber,
@@ -549,9 +562,10 @@ impl PageHeader {
     fn new(size: usize) -> Self {
         Self {
             num_slots: 0,
-            last_used_offset: size as _,
+            last_used_offset: (size - PAGE_HEADER_SIZE as usize) as u16,
             free_space: Page::usable_space(size),
             right_child: 0,
+            padding: 0,
         }
     }
 }
@@ -1089,7 +1103,7 @@ impl Page {
     /// offset is valid within the function, so the caller is responsible for
     /// that.
     unsafe fn cell_header_at_offset(&self, offset: u16) -> NonNull<CellHeader> {
-        self.buffer.header.byte_add(offset as usize).cast()
+        self.buffer.content.byte_add(offset as usize).cast()
     }
 
     /// Returns a pointer to the [`Cell`] located at the given offset.
@@ -1290,10 +1304,8 @@ impl Page {
         // Space between the end of the slot array and the closest cell.
         let available_space = {
             let end = self.header().last_used_offset;
-            let start = PAGE_HEADER_SIZE + self.header().num_slots * SLOT_SIZE;
-
-            // This value fits in u16 even if the page is 64 KiB.
-            (end - start as u32) as u16
+            let start = self.header().num_slots * SLOT_SIZE;
+            end - start
         };
 
         // We can fit the new cell but we have to defragment the page first.
@@ -1301,8 +1313,7 @@ impl Page {
             self.defragment();
         }
 
-        // Same as above, this offset always fits in u16.
-        let offset = self.header().last_used_offset - cell.total_size() as u32;
+        let offset = self.header().last_used_offset - cell.total_size();
 
         // Write new cell.
         // SAFETY: `last_used_offset` keeps track of where the last cell was
@@ -1310,7 +1321,7 @@ impl Page {
         // `last_used_offset` we get a valid pointer within the page where we
         // write the new cell.
         unsafe {
-            let header = self.cell_header_at_offset(offset as u16);
+            let header = self.cell_header_at_offset(offset);
             header.write(cell.header);
 
             let mut content =
@@ -1334,7 +1345,7 @@ impl Page {
         }
 
         // Set offset.
-        self.slot_array_mut()[index as usize] = offset as u16;
+        self.slot_array_mut()[index as usize] = offset;
 
         Ok(index)
     }
@@ -1496,7 +1507,7 @@ impl Page {
                 .map(|(i, offset)| (*offset, i)),
         );
 
-        let mut destination_offset = self.size();
+        let mut destination_offset = self.size() - PAGE_HEADER_SIZE as usize;
 
         while let Some((offset, i)) = offsets.pop() {
             // SAFETY: Calling [`Self::cell_at_offset`] is safe here because we
@@ -1510,14 +1521,17 @@ impl Page {
                 destination_offset -= size;
 
                 cell.cast::<u8>().copy_to(
-                    self.buffer.header.byte_add(destination_offset).cast::<u8>(),
+                    self.buffer
+                        .content
+                        .byte_add(destination_offset)
+                        .cast::<u8>(),
                     size,
                 );
             }
             self.slot_array_mut()[i] = destination_offset as u16;
         }
 
-        self.header_mut().last_used_offset = destination_offset as u32;
+        self.header_mut().last_used_offset = destination_offset as u16;
     }
 
     /// Works just like [`Vec::drain`]. Removes the specified cells from this
@@ -2028,7 +2042,7 @@ mod tests {
     /// * `cells` - List of cells that have been inserted in the page
     /// (in order). Necessary for checking data corruption.
     fn compare_consecutive_offsets(page: &Page, cells: &Vec<Box<Cell>>) {
-        let mut expected_offset = page.size();
+        let mut expected_offset = page.size() - PAGE_HEADER_SIZE as usize;
         for (i, cell) in cells.iter().enumerate() {
             expected_offset -= cell.total_size() as usize;
             assert_eq!(page.slot_array()[i], expected_offset as u16);
@@ -2184,6 +2198,7 @@ mod tests {
         let new_cell = Cell::new(vec![4; 96]);
 
         let expected_offset = page.size()
+            - PAGE_HEADER_SIZE as usize
             - (cells.iter().map(|cell| cell.total_size()).sum::<u16>() + new_cell.total_size())
                 as usize;
 
