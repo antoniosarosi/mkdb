@@ -539,9 +539,12 @@ pub(crate) struct PageHeader {
     /// to reduce the algorithm to one single case would not work with 64 KiB
     /// pages.
     ///
-    /// We could store this as [`u32`] but that introduces its own problems
-    /// since doing arithmetic with [`u16`], [`u32`] and [`usize`] requires a
-    /// bunch of casts everywhere.
+    /// We could store this as [`u32`] and remove the padding below but that
+    /// introduces its own problems since doing arithmetic with [`u16`], [`u32`]
+    /// and [`usize`] requires a bunch of casts everywhere. Here's the last
+    /// commit where `last_used_offset` was [`u32`]:
+    ///
+    /// <https://github.com/antoniosarosi/mkdb/blob/7f4819dec0b1bc310d72e95e4af6858beb7b00f6/src/storage/page.rs#L502-L541>
     last_used_offset: u16,
 
     /// Add padding manually to avoid uninitialized bytes.
@@ -668,9 +671,22 @@ pub(crate) struct Cell {
 
 impl Clone for Box<Cell> {
     fn clone(&self) -> Self {
-        let mut cloned = Cell::new(Vec::from(&self.content));
-        cloned.header = self.header;
-        cloned
+        let cloned = alloc::Global
+            .allocate(Layout::for_value(self.as_ref()))
+            .expect("alloc error")
+            .cast::<u8>();
+
+        // SAFETY: See [`Cell::new`].
+        unsafe {
+            cloned.copy_from_nonoverlapping(
+                NonNull::new_unchecked(self.as_ref() as *const Cell as *mut u8),
+                self.total_size() as usize,
+            );
+
+            Box::from_raw(
+                ptr::slice_from_raw_parts(cloned.as_ptr(), self.header.size as usize) as *mut Cell,
+            )
+        }
     }
 }
 
