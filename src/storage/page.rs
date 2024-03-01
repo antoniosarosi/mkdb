@@ -173,7 +173,8 @@ pub(crate) const CELL_HEADER_SIZE: u16 = mem::size_of::<CellHeader>() as _;
 /// Size of an individual slot (offset pointer).
 pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
-/// See [`Page`] for alignment details.
+/// See the "Alignment" section of the [`Page`] documentation for alignment
+/// details.
 pub(crate) const MEM_ALIGNMENT: usize = mem::align_of::<CellHeader>();
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
@@ -301,7 +302,7 @@ impl<H> BufferWithHeader<H> {
     pub fn for_page(size: usize, header: H) -> Self {
         assert!(
             (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
-            "size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+            "page size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
         );
 
         Self::new(size, header)
@@ -312,7 +313,7 @@ impl<H> BufferWithHeader<H> {
     ///
     /// # Safety
     ///
-    /// This function is marked as unsafe because the caller must make three
+    /// This function is marked as unsafe because the caller must make two
     /// guarantees to prevent use after free bugs:
     ///
     /// 1. The wrapped buffer is never used after the parent buffer is dropped.
