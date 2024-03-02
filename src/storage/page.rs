@@ -211,46 +211,9 @@ struct BufferWithHeader<H> {
     content: NonNull<[u8]>,
     /// Total size of the buffer (size of header + size of content).
     size: usize,
-    /// `true` if this buffer is contained within another larger buffer.
-    #[cfg(debug_assertions)]
-    is_wrapped: bool,
 }
 
 impl<H> BufferWithHeader<H> {
-    /// Calculates the content address of the given buffer and returns a pointer
-    /// to it.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure that the buffer has enough size to contain at least
-    /// `mem::size_of::<H>() + 1` bytes.
-    unsafe fn content_of(buffer: NonNull<[u8]>) -> NonNull<[u8]> {
-        debug_assert!(
-            buffer.len() > mem::size_of::<H>(),
-            "attempt to read the content of a BufferWithHeader<H> that cannot fit any content"
-        );
-
-        NonNull::slice_from_raw_parts(
-            buffer.byte_add(mem::size_of::<H>()).cast::<u8>(),
-            Self::usable_space(buffer.len()) as usize,
-        )
-    }
-
-    /// Returns a pointer to the in-memory buffer.
-    ///
-    /// This is needed for reading and writing pages to/from disk using
-    /// [`AsRef`] and [`AsMut`].
-    fn pointer(&self) -> NonNull<[u8]> {
-        NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
-    }
-
-    /// Consumes `self` and returns a pointer to the underlying memory buffer.
-    ///
-    /// The buffer must be dropped by the caller after this function returns.
-    pub fn into_non_null(self) -> NonNull<[u8]> {
-        ManuallyDrop::new(self).pointer()
-    }
-
     /// Allocates a new buffer setting all the bytes to 0.
     ///
     /// If all the fields in the header should be set to 0 then this is good
@@ -264,33 +227,16 @@ impl<H> BufferWithHeader<H> {
     pub fn alloc(size: usize) -> Self {
         assert!(
             size > mem::size_of::<H>(),
-            "allocated buffer only has space for the header, which makes the content pointer invalid"
+            "attempt to allocate BufferWithHeader<H> of insufficient size"
         );
 
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
-        let buffer = alloc::Global
-            .allocate_zeroed(alloc::Layout::from_size_align(size as _, MEM_ALIGNMENT).unwrap())
+        let pointer = alloc::Global
+            .allocate_zeroed(alloc::Layout::from_size_align(size, MEM_ALIGNMENT).unwrap())
             .expect("could not allocate page buffer");
 
-        // SAFETY: We checked if the pointer is valid in the assertion above.
-        let content = unsafe { Self::content_of(buffer) };
-
-        Self {
-            header: buffer.cast(),
-            content,
-            size: buffer.len(),
-            #[cfg(debug_assertions)]
-            is_wrapped: false,
-        }
-    }
-
-    /// Allocates a new buffer writing the given header at the beginning.
-    pub fn new(size: usize, header: H) -> Self {
-        let mut buffer = Self::alloc(size);
-        *buffer.header_mut() = header;
-
-        buffer
+        unsafe { Self::from_non_null(pointer) }
     }
 
     /// Same as [`Self::new`] but checks that the page size is within bounds.
@@ -299,13 +245,13 @@ impl<H> BufferWithHeader<H> {
     ///
     /// Panics if the page size is less than [`MIN_PAGE_SIZE`] or greater than
     /// [`MAX_PAGE_SIZE`].
-    pub fn for_page(size: usize, header: H) -> Self {
+    pub fn alloc_page(size: usize) -> Self {
         assert!(
             (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
             "page size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
         );
 
-        Self::new(size, header)
+        Self::alloc(size)
     }
 
     /// Sames as [`Self::new`] but does not allocate, it uses the given wrapper
@@ -327,27 +273,22 @@ impl<H> BufferWithHeader<H> {
     /// Panics if the content part of the wrapper can't fit the header plus at
     /// least one byte. We can't recover from such error anyway, so we'll just
     /// terminate the program instead of forcing the caller to check the size.
-    pub unsafe fn new_in<W>(wrapper: &mut BufferWithHeader<W>, header: H) -> Self {
-        let buffer = wrapper.content_non_null();
-
-        assert!(
-            buffer.len() > mem::size_of::<H>(),
-            "wrapped buffer only has space for the header, which makes the content pointer invalid"
+    pub unsafe fn from_non_null(pointer: NonNull<[u8]>) -> Self {
+        debug_assert!(
+            pointer.len() > mem::size_of::<H>(),
+            "buffer only has space for the header, which makes the content pointer invalid"
         );
 
-        let content = unsafe { Self::content_of(buffer) };
+        let content = NonNull::slice_from_raw_parts(
+            pointer.byte_add(mem::size_of::<H>()).cast::<u8>(),
+            Self::usable_space(pointer.len()) as usize,
+        );
 
-        let mut buffer = Self {
-            header: buffer.cast(),
+        Self {
+            header: pointer.cast(),
             content,
-            size: buffer.len(),
-            #[cfg(debug_assertions)]
-            is_wrapped: true,
-        };
-
-        *buffer.header_mut() = header;
-
-        buffer
+            size: pointer.len(),
+        }
     }
 
     /// Number of bytes that can be used to store content.
@@ -363,21 +304,6 @@ impl<H> BufferWithHeader<H> {
     /// ```
     pub fn usable_space(page_size: usize) -> u16 {
         (page_size - mem::size_of::<H>()) as u16
-    }
-
-    /// Full size of the buffer in bytes.
-    ///
-    /// ```text
-    ///                size()
-    /// +-----------------------------------+
-    /// |                                   |
-    /// V                                   V
-    /// +--------+--------------------------+
-    /// | HEADER |         CONTENT          |
-    /// +--------+--------------------------+
-    /// ```
-    pub fn size(&self) -> usize {
-        self.size
     }
 
     /// Returns a read-only reference to the header.
@@ -396,37 +322,52 @@ impl<H> BufferWithHeader<H> {
         unsafe { self.header.as_mut() }
     }
 
-    /// Returns a pointer to the content of this buffer.
-    fn content_non_null(&self) -> NonNull<[u8]> {
-        self.content
-    }
-
     /// Returns a read-only reference to the content part of this buffer.
     pub fn content(&self) -> &[u8] {
         // SAFETY: The assertions in [`Self::alloc`] verify that the content
         // pointer is valid.
-        unsafe { self.content_non_null().as_ref() }
+        unsafe { self.content.as_ref() }
     }
 
     /// Returns a mutable reference to the content part of this buffer.
     pub fn content_mut(&mut self) -> &mut [u8] {
         // SAFETY: Same as [`Self::content`].
-        unsafe { self.content_non_null().as_mut() }
+        unsafe { self.content.as_mut() }
+    }
+
+    /// Returns a pointer to the in-memory buffer.
+    ///
+    /// This is needed for reading and writing pages to/from disk using
+    /// [`AsRef`] and [`AsMut`].
+    fn pointer(&self) -> NonNull<[u8]> {
+        NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { self.pointer().as_ref() }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { self.pointer().as_mut() }
+    }
+
+    /// Consumes `self` and returns a pointer to the underlying memory buffer.
+    ///
+    /// The buffer must be dropped by the caller after this function returns.
+    pub fn into_non_null(self) -> NonNull<[u8]> {
+        ManuallyDrop::new(self).pointer()
     }
 }
 
 impl<H> AsRef<[u8]> for BufferWithHeader<H> {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: We allocate the buffer so we know the pointer is valid and
-        // well aligned.
-        unsafe { self.pointer().as_ref() }
+        self.as_slice()
     }
 }
 
 impl<H> AsMut<[u8]> for BufferWithHeader<H> {
     fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: Same as [`AsRef::as_ref`].
-        unsafe { self.pointer().as_mut() }
+        self.as_mut_slice()
     }
 }
 
@@ -438,7 +379,7 @@ impl<H> PartialEq for BufferWithHeader<H> {
 
 impl<H> Clone for BufferWithHeader<H> {
     fn clone(&self) -> Self {
-        let mut buffer = Self::alloc(self.size());
+        let mut buffer = Self::alloc(self.size);
         buffer.as_mut().copy_from_slice(self.as_ref());
 
         buffer
@@ -447,16 +388,6 @@ impl<H> Clone for BufferWithHeader<H> {
 
 impl<H> Drop for BufferWithHeader<H> {
     fn drop(&mut self) {
-        // We could determine dynamically at runtime whether we need to drop or
-        // not by removing the debug_assertions condition and replacing the
-        // panic with an early return. But since cells are going to be "dropped"
-        // many times when the BTree rebalances it's better if we enforce this
-        // behaviour at compile time.
-        #[cfg(debug_assertions)]
-        if self.is_wrapped {
-            panic!("attempt to drop wrapped buffer, use mem::ManuallyDrop<T> or mem::forget()");
-        }
-
         unsafe {
             alloc::Global.deallocate(
                 self.header.cast(),
@@ -703,15 +634,8 @@ impl Cell {
         // Add padding.
         payload.resize(size as _, 0);
 
-        let mut buf = BufferWithHeader::<CellHeader>::new(
-            (size + CELL_HEADER_SIZE) as usize,
-            CellHeader {
-                size,
-                left_child: 0,
-                is_overflow: false,
-                padding: 0,
-            },
-        );
+        let mut buf = BufferWithHeader::<CellHeader>::alloc((size + CELL_HEADER_SIZE) as usize);
+        buf.header_mut().size = size;
 
         buf.content_mut().copy_from_slice(&payload);
 
@@ -992,7 +916,8 @@ pub(crate) struct Page {
 
 impl InitPage for Page {
     fn init(number: PageNumber, size: usize) -> Self {
-        let buffer = BufferWithHeader::for_page(size, PageHeader::new(size));
+        let mut buffer = BufferWithHeader::alloc_page(size);
+        *buffer.header_mut() = PageHeader::new(size);
 
         Self {
             number,
@@ -1073,7 +998,7 @@ impl Page {
 
     /// Size in bytes of the page.
     pub fn size(&self) -> usize {
-        self.buffer.size()
+        self.buffer.size
     }
 
     /// Number of cells in the page.
@@ -1093,10 +1018,7 @@ impl Page {
 
     /// Pointer to the slot array.
     fn slot_array_non_null(&self) -> NonNull<[u16]> {
-        NonNull::slice_from_raw_parts(
-            self.buffer.content_non_null().cast(),
-            self.header().num_slots as usize,
-        )
+        NonNull::slice_from_raw_parts(self.buffer.content.cast(), self.header().num_slots as usize)
     }
 
     // Slotted array as a slice.
@@ -1791,17 +1713,15 @@ pub(crate) struct PageZero {
 
 impl InitPage for PageZero {
     fn init(number: PageNumber, size: usize) -> Self {
-        let mut buffer = BufferWithHeader::for_page(
-            size,
-            DbHeader {
-                magic: MAGIC,
-                page_size: size as _,
-                total_pages: 1,
-                free_pages: 0,
-                first_free_page: 0,
-                last_free_page: 0,
-            },
-        );
+        let mut buffer = BufferWithHeader::alloc_page(size);
+        *buffer.header_mut() = DbHeader {
+            magic: MAGIC,
+            page_size: size as _,
+            total_pages: 1,
+            free_pages: 0,
+            first_free_page: 0,
+            last_free_page: 0,
+        };
 
         // SAFETY: `new_in` requires two guarantees which we meet as follows:
         //
@@ -1812,10 +1732,13 @@ impl InitPage for PageZero {
         // 2. The wrapped buffer can never be dropped because we're using
         // ManuallyDrop to store the Page instance.
         let page_buffer = unsafe {
-            BufferWithHeader::<PageHeader>::new_in(
-                &mut buffer,
-                PageHeader::new(size - mem::size_of::<DbHeader>()),
-            )
+            let page_buffer = BufferWithHeader::from_non_null(buffer.content);
+
+            page_buffer
+                .header
+                .write(PageHeader::new(size - mem::size_of::<DbHeader>()));
+
+            page_buffer
         };
 
         let page = ManuallyDrop::new(Page {
@@ -1845,7 +1768,7 @@ impl PageZero {
     }
 
     /// Mutable reference to the inner slotted page.
-    pub fn as_btree_page_mut(&mut self) -> &mut Page {
+    pub fn as_mut_btree_page(&mut self) -> &mut Page {
         &mut self.page
     }
 }
@@ -1944,7 +1867,7 @@ impl<'p> TryFrom<&'p mut MemPage> for &'p mut Page {
     fn try_from(mem_page: &'p mut MemPage) -> Result<Self, Self::Error> {
         match mem_page {
             MemPage::Btree(page) => Ok(page),
-            MemPage::Zero(page_zero) => Ok(page_zero.as_btree_page_mut()),
+            MemPage::Zero(page_zero) => Ok(page_zero.as_mut_btree_page()),
             other => Err(format!("attempt to convert {other:?} into Page")),
         }
     }
@@ -2078,13 +2001,11 @@ mod tests {
     fn buffer_with_header() {
         const CONTENT_SIZE: usize = 24;
 
-        let mut buf = BufferWithHeader::new(
-            mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE,
-            OverflowPageHeader {
-                next: 0,
-                num_bytes: 0,
-            },
-        );
+        let mut buf = BufferWithHeader::alloc(mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE);
+        *buf.header_mut() = OverflowPageHeader {
+            next: 0,
+            num_bytes: 0,
+        };
 
         buf.header_mut().num_bytes = CONTENT_SIZE as u16;
         buf.content_mut().fill(8);
