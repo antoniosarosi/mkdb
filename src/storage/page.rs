@@ -518,7 +518,10 @@ pub(crate) struct CellHeader {
 /// The other approach would be reusing [`BufferWithHeader`] again but at this
 /// point I kinda got tired of the newtype boilerplate and using
 /// `*buf.header_mut().field = value` instead of simply
-/// `buf.header.field = value` so I tried something different. The DST approach
+/// `buf.header.field = value` so I tried something different here. The code at
+/// [`super::btree`] accesses [`Cell::header`] and [`Cell::content`] many times
+/// and assigns specific values of one cell header to another cell header and
+/// doing that through function calls is just too verbose. The DST approach
 /// reduces boilerplate but makes it harder to construct the type at runtime.
 /// See [`Page::cell_at_offset`] and [`Cell::new`] for details.
 #[derive(Debug, PartialEq)]
@@ -612,17 +615,19 @@ impl Cell {
         // build it first.
         //
         // Miri doesn't complain about any of this and the allocator doesn't
-        // panic, so we probably do meet the layout requirements. The alignment
-        // is not a problem because [`BufferWithHeader`] forces allocations to
-        // be 8-aligned (the alignment of the cell header), and then the size of
-        // the allocation shouldn't be a problem either because we're adding
-        // padding manually. So when [`Box`] calls [`Layout::for_value`] to drop
-        // the allocation it probably obtains the exact same layout that
-        // [`BufferWithHeader`] uses for allocations.
+        // panic or seg fault, so we probably do meet the layout requirements.
+        // The alignment is not a problem because [`BufferWithHeader`] forces
+        // allocations to be 8-aligned (the alignment of the cell header, and in
+        // turn the alignment of [`Cell`]), and then the size of the allocation
+        // shouldn't be a problem either because we're adding padding manually.
+        // So when [`Box`] calls [`Layout::for_value`] to drop the allocation it
+        // probably obtains the exact same layout that [`BufferWithHeader`] uses
+        // for allocations.
         //
-        // We could probably use our own smart pointer that knows the exact
-        // layout needed to deallocate instead of [`Box`], but this works for
-        // now. See other similar examples in the Rust playground:
+        // We could implement our own smart pointer that knows the exact layout
+        // needed to deallocate and use that instead of [`Box`], but we're lazy
+        // and this works for now. See other similar examples in the Rust
+        // playground:
         //
         // Example 1: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=ce193d6fdcd9477463071cfa53d329b8>
         // Example 2: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=fd082276db55c278b3a37b4380ca912a>
@@ -1044,7 +1049,9 @@ impl Page {
     }
 
     /// Similar to [`Self::ideal_max_payload_size`] but allows a cell to occupy
-    /// as much as possible. See [`Self::insert`] for more details.
+    /// as much as possible.
+    ///
+    /// See [`Self::insert`] for more details.
     fn max_allowed_payload_size(&self) -> u16 {
         Self::max_payload_size_in(Self::usable_space(self.size()))
     }
@@ -1055,6 +1062,9 @@ impl Page {
     }
 
     /// Number of cells in the page.
+    ///
+    /// If the page is in "overflow" state the returned number includes the
+    /// overflow cells.
     pub fn len(&self) -> u16 {
         self.header().num_slots + self.overflow.len() as u16
     }
@@ -1107,7 +1117,9 @@ impl Page {
         let size = header.as_ref().size as usize;
 
         // See the giant comment in [`Cell::new`] for the "DST construction"
-        // explanation.
+        // explanation. Basically make a fake slice that tells the compiler
+        // what the address of the DST is and how many elements the DST stores
+        // in its dynamic part.
         let cell = ptr::slice_from_raw_parts(header.cast::<u8>().as_ptr(), size) as *mut Cell;
 
         NonNull::new_unchecked(cell)
@@ -1121,6 +1133,8 @@ impl Page {
     }
 
     /// Read-only reference to a cell.
+    ///
+    /// Returned lifetime is tied to that of the page itself.
     pub fn cell<'p>(&'p self, index: SlotId) -> &'p Cell {
         let cell = self.cell_at_slot(index);
         // SAFETY: Same as [`Self::cell_at_offset`].
