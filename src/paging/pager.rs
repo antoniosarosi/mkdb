@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{DbHeader, FreePage, InitPage, MemPage, Page, PageZero, MAGIC};
+use crate::storage::page::{AllocPageInMemory, DbHeader, FreePage, MemPage, Page, PageZero, MAGIC};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -128,7 +128,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         // if the DB file already exists we might have to set the page size to
         // that defined in the file.
         let (magic, page_size) = {
-            let mut page_zero = PageZero::init(0, self.block_size);
+            let mut page_zero = PageZero::alloc_in_memory(0, self.block_size);
             self.read(0, page_zero.as_mut())?;
             (page_zero.header().magic, page_zero.header().page_size)
         };
@@ -151,7 +151,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         }
 
         // Initialize page zero.
-        let page_zero = PageZero::init(0, self.page_size);
+        let page_zero = PageZero::alloc_in_memory(0, self.page_size);
         self.write(0, page_zero.as_ref())?;
 
         Ok(())
@@ -167,7 +167,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// that point. Evicting a clean page doesn't require IO.
     ///
     /// Note that this function does not mark the page as dirty.
-    fn lookup<P: Into<MemPage> + InitPage + AsMut<[u8]>>(
+    fn lookup<P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<usize> {
@@ -227,7 +227,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// since we need a specific lifetime).
     pub fn get_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&P>
     where
-        P: Into<MemPage> + InitPage + AsMut<[u8]>,
+        P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>,
         &'p P: TryFrom<&'p MemPage>,
         <&'p P as TryFrom<&'p MemPage>>::Error: Debug,
     {
@@ -243,7 +243,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// queue.
     pub fn get_mut_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&mut P>
     where
-        P: Into<MemPage> + InitPage + AsMut<[u8]>,
+        P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>,
         &'p mut P: TryFrom<&'p mut MemPage>,
         <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
     {
@@ -288,11 +288,11 @@ impl<I: Seek + Read + Write> Pager<I> {
     ///
     /// The page is not marked dirty, it will not be written back to disk
     /// unless [`Self::get_mut_as`] is called.
-    fn load_from_disk<P: Into<MemPage> + InitPage + AsMut<[u8]>>(
+    fn load_from_disk<P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        let mut page = P::init(page_number, self.page_size);
+        let mut page = P::alloc_in_memory(page_number, self.page_size);
         self.io.read(page_number, page.as_mut())?;
         self.load_page_into_cache(page)
     }
@@ -317,11 +317,11 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// Instead, the initialization goes through the cache system. The page
     /// is initialized in memory, cached and pushed to the write queue.
     /// Eventually, the page will be written to disk.
-    pub fn init_disk_page<P: Into<MemPage> + InitPage>(
+    pub fn init_disk_page<P: Into<MemPage> + AllocPageInMemory>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        self.load_from_mem(P::init(page_number, self.page_size))
+        self.load_from_mem(P::alloc_in_memory(page_number, self.page_size))
     }
 
     /// Returns a copy of the DB header.
@@ -373,7 +373,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// that a "use after free" bug.
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
         // Initialize last free page.
-        self.load_from_mem(FreePage::init(page_number, self.page_size))?;
+        self.load_from_mem(FreePage::alloc_in_memory(page_number, self.page_size))?;
 
         let mut header = self.read_header()?;
 
@@ -400,7 +400,7 @@ mod tests {
     use super::Pager;
     use crate::{
         paging::{cache::Cache, io::MemBuf},
-        storage::page::{Cell, InitPage, OverflowPage, Page},
+        storage::page::{AllocPageInMemory, Cell, OverflowPage, Page},
     };
 
     fn init_pager_with_cache(cache: Cache) -> io::Result<Pager<MemBuf>> {
@@ -458,7 +458,7 @@ mod tests {
         let mut pager = init_pager()?;
 
         for i in 1..=10 {
-            let mut page = Page::init(pager.alloc_page()?, pager.page_size);
+            let mut page = Page::alloc_in_memory(pager.alloc_page()?, pager.page_size);
             page.push(Cell::new(vec![
                 i;
                 Page::ideal_max_payload_size(pager.page_size)
@@ -479,7 +479,7 @@ mod tests {
         pager.sync()?;
 
         for i in 1..=10 {
-            let mut expected = Page::init(i, pager.page_size);
+            let mut expected = Page::alloc_in_memory(i, pager.page_size);
             expected.push(Cell::new(vec![
                 if update_pages.contains(&i) {
                     10 + i as u8
@@ -490,7 +490,7 @@ mod tests {
                     as usize
             ]));
 
-            let mut page = Page::init(i, pager.page_size);
+            let mut page = Page::alloc_in_memory(i, pager.page_size);
             pager.read(page.number, page.as_mut())?;
 
             assert_eq!(page, expected);
@@ -506,21 +506,21 @@ mod tests {
         let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
 
         for i in 1..=3 {
-            let mut page = OverflowPage::init(i, pager.page_size);
+            let mut page = OverflowPage::alloc_in_memory(i, pager.page_size);
             page.content_mut().fill(i as u8);
             pager.load_from_mem(page)?;
         }
 
-        let mut causes_evict = OverflowPage::init(4, pager.page_size);
+        let mut causes_evict = OverflowPage::alloc_in_memory(4, pager.page_size);
         causes_evict.content_mut().fill(4);
 
         pager.load_from_mem(causes_evict)?;
 
         for i in 1..=3 {
-            let mut page = OverflowPage::init(i, pager.page_size);
+            let mut page = OverflowPage::alloc_in_memory(i, pager.page_size);
             pager.read(i, page.as_mut())?;
 
-            let mut expected = OverflowPage::init(i, pager.page_size);
+            let mut expected = OverflowPage::alloc_in_memory(i, pager.page_size);
             expected.content_mut().fill(i as u8);
 
             assert_eq!(expected, page);

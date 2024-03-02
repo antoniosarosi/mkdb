@@ -214,29 +214,46 @@ struct BufferWithHeader<H> {
 }
 
 impl<H> BufferWithHeader<H> {
-    /// Allocates a new buffer setting all the bytes to 0.
+    /// Allocates a pointer that can fit a buffer of the given `size`.
     ///
-    /// If all the fields in the header should be set to 0 then this is good
-    /// enough, otherwise use [`Self::new`] and pass the header manually.
+    /// `size` in this case refers to the complete size of the buffer, not the
+    /// size of the content or size of the header, but the sum of both. The
+    /// returned allocation has all its bytes set to 0.
     ///
     /// # Panics
     ///
     /// Panics if `size <= mem::size_of::<H>()`. In other words, the buffer must
     /// be able to fit an entire header plus at least one byte. Otherwise
     /// accessing the content is undefined behaviour.
-    pub fn alloc(size: usize) -> Self {
+    ///
+    /// Additionally this function also panics if `size` does not meet the
+    /// requirements of [`alloc::Layout::from_size_align`]. Basically, make sure
+    /// that `size` rounded up to [`MEM_ALIGNMENT`] does not overflow
+    /// [`isize::MAX`].
+    pub fn alloc(size: usize) -> NonNull<[u8]> {
         assert!(
             size > mem::size_of::<H>(),
-            "attempt to allocate BufferWithHeader<H> of insufficient size"
+            "attempt to allocate BufferWithHeader<H> of insufficient size: size of H is {} while allocation size is {}",
+            mem::size_of::<H>(),
+            size,
         );
 
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
-        let pointer = alloc::Global
+        alloc::Global
             .allocate_zeroed(alloc::Layout::from_size_align(size, MEM_ALIGNMENT).unwrap())
-            .expect("could not allocate page buffer");
+            .expect("could not allocate BufferWithHeader<H>")
+    }
 
-        unsafe { Self::from_non_null(pointer) }
+    /// Returns a new buffer of the given size where all the bytes are 0.
+    ///
+    /// If the fields of the header need values other than 0 for initialization
+    /// then they should be written manually after this function call.
+    pub fn new(size: usize) -> Self {
+        // SAFETY: [`Self::alloc`] meets all the requirements of
+        // [`Self::from_non_null`] since it checks the pointer size and it uses
+        // [`MEM_ALIGNMENT`].
+        unsafe { Self::from_non_null(Self::alloc(size)) }
     }
 
     /// Same as [`Self::new`] but checks that the page size is within bounds.
@@ -245,38 +262,52 @@ impl<H> BufferWithHeader<H> {
     ///
     /// Panics if the page size is less than [`MIN_PAGE_SIZE`] or greater than
     /// [`MAX_PAGE_SIZE`].
-    pub fn alloc_page(size: usize) -> Self {
+    pub fn for_page(size: usize) -> Self {
         assert!(
             (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size),
             "page size {size} is not a value between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
         );
 
-        Self::alloc(size)
+        Self::new(size)
     }
 
-    /// Sames as [`Self::new`] but does not allocate, it uses the given wrapper
-    /// instead.
+    /// Constructs a new buffer from the given [`NonNull`] pointer.
     ///
     /// # Safety
     ///
-    /// This function is marked as unsafe because the caller must make two
-    /// guarantees to prevent use after free bugs:
+    /// This function is marked as unsafe because the caller must ensure that
+    /// the given `pointer` is valid and well aligned.
     ///
-    /// 1. The wrapped buffer is never used after the parent buffer is dropped.
-    /// 2. The wrapped buffer is never dropped itself.
+    /// First of all, `pointer` must be able to fit the size of the header plus
+    /// one byte of content at minimum. Additional requirements depend on the
+    /// use case:
     ///
-    /// Ensuring such behaviours should make this safe. See the implementation
-    /// of [`Drop`] for [`BufferWithHeader`] for more details.
+    /// ## Case 1: Fully Owned, Allocated Buffer
     ///
-    /// # Panics
+    /// 1. If this [`BufferWithHeader`] is intended to "own" the given `pointer`
+    /// and deallocate it after it goes out of scope then `pointer` must have
+    /// been allocated using [`BufferWithHeader::alloc`] to ensure the memory
+    /// layout is correct. Mainly, the pointer should be aligned to
+    /// [`MEM_ALIGNMENT`].
     ///
-    /// Panics if the content part of the wrapper can't fit the header plus at
-    /// least one byte. We can't recover from such error anyway, so we'll just
-    /// terminate the program instead of forcing the caller to check the size.
+    /// ## Case 2: Buffer Contained Within Larger Buffer
+    ///
+    /// 1. If this [`BufferWithHeader`] is intended to exist within another
+    /// larger buffer or allocation then its destructor must never run as it
+    /// would try to free the given `pointer`. Use [`mem::ManuallyDrop`] or
+    /// [`mem::forget`] to prevent this bug.
+    ///
+    /// 2. After the larger buffer or allocation is dropped, this inner buffer
+    /// cannot be used anymore since that would be a use after free.
+    ///
+    /// 3. The alignment in this case depends on what the buffer is used for.
+    /// The slotted [`Page`] or the [`Cell`] structures require an alignment of
+    /// [`MEM_ALIGNMENT`] while [`OverflowPage`] requires the same alignment as
+    /// its [`OverflowPageHeader`].
     pub unsafe fn from_non_null(pointer: NonNull<[u8]>) -> Self {
         debug_assert!(
             pointer.len() > mem::size_of::<H>(),
-            "buffer only has space for the header, which makes the content pointer invalid"
+            "attempt to construct BufferWithHeader<H> from invalid pointer"
         );
 
         let content = NonNull::slice_from_raw_parts(
@@ -308,11 +339,9 @@ impl<H> BufferWithHeader<H> {
 
     /// Returns a read-only reference to the header.
     pub fn header(&self) -> &H {
-        // SAFETY: The underlying [`NonNull`] pointer should always be valid and
-        // aligned since we allocate it ourselves or obtain it from another
-        // buffer that has already been allocated when using [`Self::new_in`].
-        // Unless we manually build an instance of this struct giving it an
-        // incorrect pointer this should be safe.
+        // SAFETY: If we allocated the buffer then we know the pointer is valid.
+        // Otherwise the caller must have ensured so when calling
+        // [`Self::from_non_null`].
         unsafe { self.header.as_ref() }
     }
 
@@ -324,8 +353,9 @@ impl<H> BufferWithHeader<H> {
 
     /// Returns a read-only reference to the content part of this buffer.
     pub fn content(&self) -> &[u8] {
-        // SAFETY: The assertions in [`Self::alloc`] verify that the content
-        // pointer is valid.
+        // SAFETY: Pretty much the same as [`Self::header`], if the pointer
+        // passes all the checks that we need then accessing the content should
+        // be ok.
         unsafe { self.content.as_ref() }
     }
 
@@ -335,27 +365,29 @@ impl<H> BufferWithHeader<H> {
         unsafe { self.content.as_mut() }
     }
 
-    /// Returns a pointer to the in-memory buffer.
-    ///
-    /// This is needed for reading and writing pages to/from disk using
-    /// [`AsRef`] and [`AsMut`].
-    fn pointer(&self) -> NonNull<[u8]> {
+    /// Returns a [`NonNull`] pointer to the in-memory buffer.
+    fn as_non_null(&self) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
     }
 
+    /// Returns a byte slice of the entire buffer including its header.
     fn as_slice(&self) -> &[u8] {
-        unsafe { self.pointer().as_ref() }
+        // SAFETY: What we've already discussed in [`Self::header`] and
+        // [`Self::content`].
+        unsafe { self.as_non_null().as_ref() }
     }
 
+    /// Returns a mutable byte slice of the entire buffer including its header.
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { self.pointer().as_mut() }
+        // SAFETY: At this point you should already get the idea :)
+        unsafe { self.as_non_null().as_mut() }
     }
 
     /// Consumes `self` and returns a pointer to the underlying memory buffer.
     ///
     /// The buffer must be dropped by the caller after this function returns.
     pub fn into_non_null(self) -> NonNull<[u8]> {
-        ManuallyDrop::new(self).pointer()
+        ManuallyDrop::new(self).as_non_null()
     }
 }
 
@@ -379,15 +411,16 @@ impl<H> PartialEq for BufferWithHeader<H> {
 
 impl<H> Clone for BufferWithHeader<H> {
     fn clone(&self) -> Self {
-        let mut buffer = Self::alloc(self.size);
-        buffer.as_mut().copy_from_slice(self.as_ref());
+        let mut cloned = Self::new(self.size);
+        cloned.as_mut_slice().copy_from_slice(self.as_slice());
 
-        buffer
+        cloned
     }
 }
 
 impl<H> Drop for BufferWithHeader<H> {
     fn drop(&mut self) {
+        // SAFETY: Read [`Self::from_non_null`] and [`Self::alloc`].
         unsafe {
             alloc::Global.deallocate(
                 self.header.cast(),
@@ -397,10 +430,299 @@ impl<H> Drop for BufferWithHeader<H> {
     }
 }
 
+/// Cell header located at the beginning of each cell.
+///
+/// The header stores the size of the cell without including its own size and it
+/// also stores a pointer to the BTree page the contains entries "less than"
+/// this one.
+///
+/// ```text
+///           HEADER                               CONTENT
+/// +-----------------------+-----------------------------------------------+
+/// | +------+------------+ |                                               |
+/// | | size | left_child | |                                               |
+/// | +------+------------+ |                                               |
+/// +-----------------------+-----------------------------------------------+
+///                         ^                                               ^
+///                         |                                               |
+///                         +-----------------------------------------------+
+///                                            size bytes
+/// ```
+///
+/// # Alignment
+///
+/// Cells are 64 bit aligned. See [`Page`] for more details.
+///
+/// # Overflow
+///
+/// The maximum size of a cell is about one fourth of the page size (substract
+/// the cell header size and slot pointer size). This allows to store a minimum
+/// of 4 keys per page. If a cell needs to hold more data than we can fit in a
+/// single page, then we'll set [`CellHeader::is_overflow`] to `true` and make
+/// the last 4 bytes of the content point to an overflow page.
+#[derive(Debug, PartialEq, Clone, Copy)]
+#[repr(C, align(8))]
+pub(crate) struct CellHeader {
+    /// Size of the cell content.
+    size: u16,
+
+    /// True if this cell points to an overflow page.
+    ///
+    /// Since we need to add
+    /// padding to align the fields of this struct anyway, we're not wasting
+    /// space here.
+    pub is_overflow: bool,
+
+    /// Add padding manually to avoid uninitialized bytes.
+    ///
+    /// The [`PartialEq`] implementation for [`Page`] relies on comparing the
+    /// memory buffers, but Rust does not make any guarantees about the values
+    /// of padding bytes. See here:
+    ///
+    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
+    padding: u8,
+
+    /// Page number of the BTree page that contains values less than this cell.
+    pub left_child: PageNumber,
+}
+
+/// A cell is a structure that stores a single BTree entry.
+///
+/// Each cell stores the binary entry (AKA payload or key) and a pointer to the
+/// BTree node that contains cells with keys smaller than that stored in the
+/// cell itself.
+///
+/// The [`super::BTree`] structure reorders cells around different sibling pages
+/// when an overflow or underflow occurs, so instead of hiding the low level
+/// details we provide some API that can be used by upper levels.
+///
+/// # About DSTs
+///
+/// Note that this struct is a DST (Dynamically Sized Type), which is hard to
+/// construct in Rust and is considered a "half-baked feature" (as of march 2024
+/// at least, check the [nomicon]). Not that half-baked features are a problem,
+/// we're using nightly and `#![feature()]` everywhere to see the latest and
+/// greatest of Rust, but it would be nice to have a standard way of building
+/// DSTs.
+///
+/// [nomicon]: https://web.archive.org/web/20240222131917/https://doc.rust-lang.org/nomicon/exotic-sizes.html
+///
+/// The reason we're using this instead of anything else is because we need to
+/// take both references and mutable references to cells and we also need owned
+/// cells. Without DSTs we would need to define 3 types and implement the exact
+/// same methods for all of them. Here's the last [commit] with multiple types
+/// before the refactor.
+///
+/// [commit]: https://github.com/antoniosarosi/mkdb/blob/73e806fab193d79a41c9946bb7a0cbfba372e619/src/storage/page.rs#L608-L714
+///
+/// The other approach would be reusing [`BufferWithHeader`] again but at this
+/// point I kinda got tired of the newtype boilerplate and using
+/// `*buf.header_mut().field = value` instead of simply
+/// `buf.header.field = value` so I tried something different. The DST approach
+/// reduces boilerplate but makes it harder to construct the type at runtime.
+/// See [`Page::cell_at_offset`] and [`Cell::new`] for details.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Cell {
+    /// Cell header.
+    pub header: CellHeader,
+
+    /// Cell content.
+    ///
+    /// If [`CellHeader::is_overflow`] is true then the last 4 bytes of this
+    /// array should point to an overflow page.
+    pub content: [u8],
+}
+
+impl Clone for Box<Cell> {
+    fn clone(&self) -> Self {
+        self.as_ref().to_owned()
+    }
+}
+
+impl ToOwned for Cell {
+    type Owned = Box<Self>;
+
+    fn to_owned(&self) -> Self::Owned {
+        let owned = alloc::Global
+            .allocate(Layout::for_value(self))
+            .expect("alloc error")
+            .cast::<u8>();
+
+        // SAFETY: See [`Cell::new`].
+        unsafe {
+            owned.copy_from_nonoverlapping(
+                NonNull::new_unchecked(self as *const Cell as *mut u8),
+                self.total_size() as usize,
+            );
+
+            Box::from_raw(
+                ptr::slice_from_raw_parts(owned.as_ptr(), self.header.size as usize) as *mut Cell,
+            )
+        }
+    }
+}
+
+impl PartialEq<Box<Cell>> for Cell {
+    fn eq(&self, other: &Box<Cell>) -> bool {
+        self.header == other.header && &self.content == &other.content
+    }
+}
+
+impl Cell {
+    /// Creates a new cell allocated in memory.
+    pub fn new(mut payload: Vec<u8>) -> Box<Self> {
+        let size = Self::aligned_size_of(&payload);
+        // Add padding.
+        payload.resize(size as _, 0);
+
+        let mut buf = BufferWithHeader::<CellHeader>::new((size + CELL_HEADER_SIZE) as usize);
+        buf.header_mut().size = size;
+
+        // TODO: The public API requires a [`Vec`] as payload but that's not
+        // optimal since we have to copy the vec into a new buffer that contains
+        // the header at the beginning. We should implement some custom type
+        // "PayloadBuffer" or something similar that behaves exactly like
+        // [`Vec`] buf already stores the header at the beginning and we can
+        // simply take its pointer.
+        buf.content_mut().copy_from_slice(&payload);
+
+        // This is the DST hard part. In theory, all we need to build the DST
+        // is a fat pointer, which is basically a two-tuple in the form of
+        // (address, size). Note that "size" in this context is not the same
+        // thing as the pointer length. The "size" here refers to the number
+        // of elements that the DST stores in its dynamic part. If we allocate
+        // 100 bytes but the DST stores 80 bytes because the first 20 correspond
+        // to the header, then the size of the DST is 80, not 100.
+        //
+        // It's a bit counterintuitive because you'd think the size of the DST
+        // should be the total length of the pointer, but it's not the case. The
+        // size is only used for correctly indexing the dynamic part within its
+        // bounds. Everything else is known at compile time.
+        //
+        // The other tricky part is that we have to create a "fake" slice and
+        // then cast it to our DST. And then the other tricky part is that this
+        // code is probably buggy because we're boxing our DST pointer, and in
+        // order to do so "safely" we should meet the [`Box`] memory layout
+        // requirements. See here:
+        //
+        // <https://doc.rust-lang.org/std/boxed/index.html#memory-layout>
+        //
+        // [`Box`] uses [`Layout::for_value`] to obtain the memory layout, but
+        // we can't do that because we don't have the value yet, we need to
+        // build it first.
+        //
+        // Miri doesn't complain about any of this and the allocator doesn't
+        // panic, so we probably do meet the layout requirements. The alignment
+        // is not a problem because [`BufferWithHeader`] forces allocations to
+        // be 8-aligned (the alignment of the cell header), and then the size of
+        // the allocation shouldn't be a problem either because we're adding
+        // padding manually. So when [`Box`] calls [`Layout::for_value`] to drop
+        // the allocation it probably obtains the exact same layout that
+        // [`BufferWithHeader`] uses for allocations.
+        //
+        // We could probably use our own smart pointer that knows the exact
+        // layout needed to deallocate instead of [`Box`], but this works for
+        // now. See other similar examples in the Rust playground:
+        //
+        // Example 1: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=ce193d6fdcd9477463071cfa53d329b8>
+        // Example 2: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=fd082276db55c278b3a37b4380ca912a>
+        //
+        // The second one comes from this Reddit discussion:
+        // <https://www.reddit.com/r/rust/comments/mq3kqe/is_this_the_best_way_to_do_custom_dsts_unsized/>
+        //
+        // And the first one is a simplified version of the second one that I
+        // wrote.
+        //
+        // Another important note that you should remember when reading this
+        // codebase is that I don't know what I'm doing, so don't trust me on
+        // this one, if it seg faults it seg faults :)
+        unsafe {
+            Box::from_raw(ptr::slice_from_raw_parts(
+                buf.into_non_null().cast::<u8>().as_ptr(),
+                payload.len(),
+            ) as *mut Cell)
+        }
+    }
+
+    /// Creates a new overflow cell by extending the `payload` buffer with the
+    /// `overflow_page` number.
+    pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Box<Self> {
+        payload.extend_from_slice(&overflow_page.to_le_bytes());
+
+        let mut cell = Self::new(payload);
+        cell.header.is_overflow = true;
+
+        cell
+    }
+
+    /// Returns the first overflow page of this cell.
+    pub fn overflow_page(&self) -> PageNumber {
+        if !self.header.is_overflow {
+            return 0;
+        }
+
+        PageNumber::from_le_bytes(
+            self.content[self.content.len() - mem::size_of::<PageNumber>()..]
+                .try_into()
+                .expect("failed parsing overflow page number"),
+        )
+    }
+
+    /// Total size of the cell including the header.
+    pub fn total_size(&self) -> u16 {
+        CELL_HEADER_SIZE + self.header.size
+    }
+
+    /// Total size of the cell including the header and the slot array pointer
+    /// needed to store the offset.
+    pub fn storage_size(&self) -> u16 {
+        self.total_size() + SLOT_SIZE
+    }
+
+    /// See [`Page`] for details.
+    pub fn aligned_size_of(data: &[u8]) -> u16 {
+        Layout::from_size_align(data.len(), MEM_ALIGNMENT)
+            .unwrap()
+            .pad_to_align()
+            .size() as u16
+    }
+}
+
+/// Cell that didn't fit in the slotted page. This is stored in-memory and
+/// cannot be written to disk.
+#[derive(Debug, Clone)]
+struct OverflowCell {
+    /// Owned cell.
+    cell: Box<Cell>,
+    /// Index in the slot array where the cell should have been inserted.
+    index: SlotId,
+}
+
+impl PartialEq for OverflowCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.index.eq(&other.index)
+    }
+}
+
+impl Eq for OverflowCell {}
+
+impl PartialOrd for OverflowCell {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OverflowCell {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is max-heap by default, make it min-heap.
+        self.index.cmp(&other.index).reverse()
+    }
+}
+
 /// A trait similar to [`Default`] but for initializing empty pages in memory.
-pub(crate) trait InitPage {
+pub(crate) trait AllocPageInMemory {
     /// Initializes an empty page of the given size.
-    fn init(number: PageNumber, size: usize) -> Self;
+    fn alloc_in_memory(number: PageNumber, size: usize) -> Self;
 }
 
 /// Slotted page header.
@@ -501,274 +823,6 @@ impl PageHeader {
             right_child: 0,
             padding: 0,
         }
-    }
-}
-
-/// Cell header located at the beginning of each cell.
-///
-/// The header stores the size of the cell without including its own size and it
-/// also stores a pointer to the BTree page the contains entries "less than"
-/// this one.
-///
-/// ```text
-///           HEADER                               CONTENT
-/// +-----------------------+-----------------------------------------------+
-/// | +------+------------+ |                                               |
-/// | | size | left_child | |                                               |
-/// | +------+------------+ |                                               |
-/// +-----------------------+-----------------------------------------------+
-///                         ^                                               ^
-///                         |                                               |
-///                         +-----------------------------------------------+
-///                                            size bytes
-/// ```
-///
-/// # Alignment
-///
-/// Cells are 64 bit aligned. See [`Page`] for more details.
-///
-/// # Overflow
-///
-/// The maximum size of a cell is about one fourth of the page size (substract
-/// the cell header size and slot pointer size). This allows to store a minimum
-/// of 4 keys per page. If a cell needs to hold more data than we can fit in a
-/// single page, then we'll set [`CellHeader::is_overflow`] to `true` and make
-/// the last 4 bytes of the content point to an overflow page.
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[repr(C, align(8))]
-pub(crate) struct CellHeader {
-    /// Size of the cell content.
-    size: u16,
-
-    /// True if this cell points to an overflow page.
-    ///
-    /// Since we need to add
-    /// padding to align the fields of this struct anyway, we're not wasting
-    /// space here.
-    pub is_overflow: bool,
-
-    /// Add padding manually to avoid uninitialized bytes.
-    ///
-    /// The [`PartialEq`] implementation for [`Page`] relies on comparing the
-    /// memory buffers, but Rust does not make any guarantees about the values
-    /// of padding bytes. See here:
-    ///
-    /// <https://github.com/rust-lang/unsafe-code-guidelines/issues/174>
-    padding: u8,
-
-    /// Page number of the BTree page that contains values less than this cell.
-    pub left_child: PageNumber,
-}
-
-/// A cell is a structure that stores a single BTree entry.
-///
-/// Each cell stores the binary entry (AKA payload or key) and a pointer to the
-/// BTree node that contains cells with keys smaller than that stored in the
-/// cell itself.
-///
-/// The [`super::BTree`] structure reorders cells around different sibling pages
-/// when an overflow or underflow occurs, so instead of hiding the low level
-/// details we provide some API that can be used by upper levels.
-///
-/// # About DSTs
-///
-/// Note that this struct is a DST (Dynamically Sized Type), which is hard to
-/// construct in Rust and is considered a "half-baked feature" (as of march 2024
-/// at least, check the [nomicon]). Not that half-baked features are a problem,
-/// we're using nightly and `#![feature()]` everywhere to see the latest and
-/// greatest of Rust, but it would be nice to have a standard way of building
-/// DSTs.
-///
-/// [nomicon]: https://web.archive.org/web/20240222131917/https://doc.rust-lang.org/nomicon/exotic-sizes.html
-///
-/// The reason we're using this instead of anything else is because we need to
-/// take both references and mutable references to cells and we also need owned
-/// cells. Without DSTs we would need to define 3 types and implement the exact
-/// same methods for all of them. Here's the last [commit] with multiple types
-/// before the refactor.
-///
-/// [commit]: https://github.com/antoniosarosi/mkdb/blob/73e806fab193d79a41c9946bb7a0cbfba372e619/src/storage/page.rs#L608-L714
-///
-/// The DST approach reduces boilerplate but makes it harder to construct the
-/// type at runtime. See [`Page::cell_at_offset`] and [`Cell::new`] for details.
-#[derive(Debug, PartialEq)]
-pub(crate) struct Cell {
-    /// Cell header.
-    pub header: CellHeader,
-    /// Cell content. If [`CellHeader::is_overflow`] is true then the last 4
-    /// bytes of this array should point to an overflow page.
-    pub content: [u8],
-}
-
-impl Clone for Box<Cell> {
-    fn clone(&self) -> Self {
-        let cloned = alloc::Global
-            .allocate(Layout::for_value(self.as_ref()))
-            .expect("alloc error")
-            .cast::<u8>();
-
-        // SAFETY: See [`Cell::new`].
-        unsafe {
-            cloned.copy_from_nonoverlapping(
-                NonNull::new_unchecked(self.as_ref() as *const Cell as *mut u8),
-                self.total_size() as usize,
-            );
-
-            Box::from_raw(
-                ptr::slice_from_raw_parts(cloned.as_ptr(), self.header.size as usize) as *mut Cell,
-            )
-        }
-    }
-}
-
-impl PartialEq<Box<Cell>> for Cell {
-    fn eq(&self, other: &Box<Cell>) -> bool {
-        self.header == other.header && &self.content == &other.content
-    }
-}
-
-impl Cell {
-    /// Creates a new cell allocated in memory.
-    pub fn new(mut payload: Vec<u8>) -> Box<Self> {
-        let size = Self::aligned_size_of(&payload);
-        // Add padding.
-        payload.resize(size as _, 0);
-
-        let mut buf = BufferWithHeader::<CellHeader>::alloc((size + CELL_HEADER_SIZE) as usize);
-        buf.header_mut().size = size;
-
-        buf.content_mut().copy_from_slice(&payload);
-
-        // This is the DST hard part. In theory, all we need to build the DST
-        // is a fat pointer, which is basically a two-tuple in the form of
-        // (address, size). Note that "size" in this context is not the same
-        // thing as the pointer length. The "size" here refers to the number
-        // of elements that the DST stores in its dynamic part. If we allocate
-        // 100 bytes but the DST stores 80 bytes because the first 20 correspond
-        // to the header, then the size of the DST is 80, not 100.
-        //
-        // It's a bit counterintuitive because you'd think the size of the DST
-        // should be the total length of the pointer, but it's not the case. The
-        // size is only used for correctly indexing the dynamic part within its
-        // bounds. Everything else is known at compile time.
-        //
-        // The other tricky part is that we have to create a "fake" slice and
-        // then cast it to our DST. And then the other tricky part is that this
-        // code is probably buggy because we're boxing our DST pointer, and in
-        // order to do so "safely" we should meet the [`Box`] memory layout
-        // requirements. See here:
-        //
-        // <https://doc.rust-lang.org/std/boxed/index.html#memory-layout>
-        //
-        // [`Box`] uses [`Layout::for_value`] to obtain the memory layout, but
-        // we can't do that because we don't have the value yet, we need to
-        // build it first.
-        //
-        // Miri doesn't complain about any of this and the allocator doesn't
-        // panic, so we probably do meet the layout requirements. The alignment
-        // is not a problem because [`BufferWithHeader`] forces allocations to
-        // be 8-aligned, and then the size of the allocation shouldn't be a
-        // problem either because we're adding padding manually. So when [`Box`]
-        // calls [`Layout::for_value`] to drop the allocation it probably
-        // obtains the exact same layout that [`BufferWithHeader`] uses for
-        // allocations.
-        //
-        // We could probably use our own smart pointer that knows the exact
-        // layout needed to deallocate instead of [`Box`], but this works for
-        // now. See other similar examples in the Rust playground:
-        //
-        // Example 1: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=ce193d6fdcd9477463071cfa53d329b8>
-        // Example 2: <https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=fd082276db55c278b3a37b4380ca912a>
-        //
-        // The second one comes from this Reddit discussion:
-        // <https://www.reddit.com/r/rust/comments/mq3kqe/is_this_the_best_way_to_do_custom_dsts_unsized/>
-        //
-        // And the first one is a simplified version of the second one that I
-        // wrote.
-        //
-        // Another important note that you should remember when reading this
-        // codebase is that I don't know what I'm doing, so don't trust me on
-        // this one, if it seg faults it seg faults :)
-        unsafe {
-            Box::from_raw(ptr::slice_from_raw_parts(
-                buf.into_non_null().cast::<u8>().as_ptr(),
-                payload.len(),
-            ) as *mut Cell)
-        }
-    }
-
-    /// Creates a new overflow cell by extending the `payload` buffer with the
-    /// `overflow_page` number.
-    pub fn new_overflow(mut payload: Vec<u8>, overflow_page: PageNumber) -> Box<Self> {
-        payload.extend_from_slice(&overflow_page.to_le_bytes());
-
-        let mut cell = Self::new(payload);
-        cell.header.is_overflow = true;
-
-        cell
-    }
-
-    /// Returns the first overflow page of this cell.
-    pub fn overflow_page(&self) -> PageNumber {
-        if !self.header.is_overflow {
-            return 0;
-        }
-
-        PageNumber::from_le_bytes(
-            self.content[self.content.len() - mem::size_of::<PageNumber>()..]
-                .try_into()
-                .expect("failed parsing overflow page number"),
-        )
-    }
-
-    /// Total size of the cell including the header.
-    pub fn total_size(&self) -> u16 {
-        CELL_HEADER_SIZE + self.header.size
-    }
-
-    /// Total size of the cell including the header and the slot array pointer
-    /// needed to store the offset.
-    pub fn storage_size(&self) -> u16 {
-        self.total_size() + SLOT_SIZE
-    }
-
-    /// See [`Page`] for details.
-    pub fn aligned_size_of(data: &[u8]) -> u16 {
-        Layout::from_size_align(data.len(), MEM_ALIGNMENT)
-            .unwrap()
-            .pad_to_align()
-            .size() as u16
-    }
-}
-
-/// Cell that didn't fit in the slotted page. This is stored in-memory and
-/// cannot be written to disk.
-#[derive(Debug, Clone)]
-struct OverflowCell {
-    /// Owned cell.
-    cell: Box<Cell>,
-    /// Index in the slot array where the cell should have been inserted.
-    index: SlotId,
-}
-
-impl PartialEq for OverflowCell {
-    fn eq(&self, other: &Self) -> bool {
-        self.index.eq(&other.index)
-    }
-}
-
-impl Eq for OverflowCell {}
-
-impl PartialOrd for OverflowCell {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OverflowCell {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is max-heap by default, make it min-heap.
-        self.index.cmp(&other.index).reverse()
     }
 }
 
@@ -914,9 +968,9 @@ pub(crate) struct Page {
     overflow: BinaryHeap<OverflowCell>,
 }
 
-impl InitPage for Page {
-    fn init(number: PageNumber, size: usize) -> Self {
-        let mut buffer = BufferWithHeader::alloc_page(size);
+impl AllocPageInMemory for Page {
+    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
+        let mut buffer = BufferWithHeader::for_page(size);
         *buffer.header_mut() = PageHeader::new(size);
 
         Self {
@@ -1083,11 +1137,7 @@ impl Page {
 
     /// Returns an owned cell by cloning it.
     pub fn owned_cell(&self, index: SlotId) -> Box<Cell> {
-        let cell = self.cell(index);
-        let mut boxed = Cell::new(Vec::from(&cell.content));
-        boxed.header = cell.header;
-
-        boxed
+        self.cell(index).to_owned()
     }
 
     /// Returns the child at the given `index`.
@@ -1624,11 +1674,11 @@ pub(crate) struct OverflowPage {
 /// a linked list of pages.
 pub(crate) type FreePage = OverflowPage;
 
-impl InitPage for OverflowPage {
-    fn init(number: PageNumber, size: usize) -> Self {
+impl AllocPageInMemory for OverflowPage {
+    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
         Self {
             number,
-            buffer: BufferWithHeader::alloc(size),
+            buffer: BufferWithHeader::new(size),
         }
     }
 }
@@ -1705,15 +1755,14 @@ pub(crate) struct DbHeader {
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct PageZero {
     /// Page buffer.
-    buffer: BufferWithHeader<DbHeader>,
-    /// Inner BTree slotted page. Marked as manually drop to ensure the safety
-    /// conditions of [`BufferWithHeader::new_in`].
+    buffer: ManuallyDrop<BufferWithHeader<DbHeader>>,
+    /// Inner BTree slotted page.
     page: ManuallyDrop<Page>,
 }
 
-impl InitPage for PageZero {
-    fn init(number: PageNumber, size: usize) -> Self {
-        let mut buffer = BufferWithHeader::alloc_page(size);
+impl AllocPageInMemory for PageZero {
+    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
+        let mut buffer = ManuallyDrop::new(BufferWithHeader::for_page(size));
         *buffer.header_mut() = DbHeader {
             magic: MAGIC,
             page_size: size as _,
@@ -1723,14 +1772,23 @@ impl InitPage for PageZero {
             last_free_page: 0,
         };
 
-        // SAFETY: `new_in` requires two guarantees which we meet as follows:
+        // SAFETY: `BufferWithHeader::from_non_null` requires three guarantees
+        // which we meet as follows:
         //
-        // 1. There is no way to use the wrapped buffer after the main one is
-        // dropped because we own both of them and they're gonna live as long
-        // as this struct.
+        // 1. The buffer size has already been checked when calling
+        // [`BufferWithHeader::for_page`].
         //
-        // 2. The wrapped buffer can never be dropped because we're using
-        // ManuallyDrop to store the Page instance.
+        // 2. The [`Drop`] implementation of the inner buffer will never run
+        // because page is contained within [`ManuallyDrop`].
+        //
+        // 3. We don't use the inner buffer after the main allocated one is
+        // dropped. At least not in this struct, externally though it's
+        // possible to destructure [`PageZero`], move out of all its fields and
+        // attempt to use `self.page` after `self.buffer` is dropped, but... why
+        // would anyone do that? The buffer is wrapped in [`ManuallyDrop`] in
+        // case we forget about this detail and fall into the trap.
+        // [`ManuallyDrop`] delegates the responsibility again to whichever
+        // function moves out of [`PageZero`].
         let page_buffer = unsafe {
             let page_buffer = BufferWithHeader::from_non_null(buffer.content);
 
@@ -1770,6 +1828,14 @@ impl PageZero {
     /// Mutable reference to the inner slotted page.
     pub fn as_mut_btree_page(&mut self) -> &mut Page {
         &mut self.page
+    }
+}
+
+impl Drop for PageZero {
+    fn drop(&mut self) {
+        // SAFETY: Buffer won't be used anymore because we're already dropping
+        // the entire page.
+        drop(unsafe { ManuallyDrop::take(&mut self.buffer) })
     }
 }
 
@@ -1957,7 +2023,7 @@ mod tests {
         }
 
         fn build(self) -> (Page, Vec<Box<Cell>>) {
-            let mut page = Page::init(0, self.size);
+            let mut page = Page::alloc_in_memory(0, self.size);
             page.push_all(self.cells.clone());
 
             (page, self.cells)
@@ -2001,7 +2067,7 @@ mod tests {
     fn buffer_with_header() {
         const CONTENT_SIZE: usize = 24;
 
-        let mut buf = BufferWithHeader::alloc(mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE);
+        let mut buf = BufferWithHeader::new(mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE);
         *buf.header_mut() = OverflowPageHeader {
             next: 0,
             num_bytes: 0,

@@ -9,7 +9,7 @@ use std::{
     mem,
 };
 
-use super::page::{Cell, InitPage, OverflowPage, Page, SlotId};
+use super::page::{AllocPageInMemory, Cell, OverflowPage, Page, SlotId};
 use crate::paging::pager::{PageNumber, Pager};
 
 /// [`BTree`] key comparator. Entries are stored in binary, so we need a way to
@@ -1491,7 +1491,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Root overflow.
         if is_root && node.is_overflow() {
-            let mut old_root = Page::init(self.pager.alloc_page()?, self.pager.page_size);
+            let mut old_root =
+                Page::alloc_in_memory(self.pager.alloc_page()?, self.pager.page_size);
 
             let root = self.pager.get_mut(page)?;
             old_root.append(root);
@@ -1569,7 +1570,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Allocate missing pages.
         while siblings.len() < number_of_cells_per_page.len() {
-            let new_page = Page::init(self.pager.alloc_page()?, self.pager.page_size);
+            let new_page = Page::alloc_in_memory(self.pager.alloc_page()?, self.pager.page_size);
             let parent_index = siblings.last().unwrap().index + 1;
             siblings.push(Sibling::new(new_page.number, parent_index));
             self.pager.load_from_mem(new_page)?;
@@ -1706,7 +1707,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let mut stored_bytes = first_cell_payload_size;
 
         loop {
-            let mut overflow_page = OverflowPage::init(next_overflow_page, self.pager.page_size);
+            let mut overflow_page =
+                OverflowPage::alloc_in_memory(next_overflow_page, self.pager.page_size);
 
             let overflow_bytes = min(
                 OverflowPage::usable_space(self.pager.page_size) as usize,

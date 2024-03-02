@@ -502,7 +502,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::{super::pager::PageNumber, Cache};
-    use crate::storage::page::{Cell, InitPage, MemPage, Page};
+    use crate::storage::page::{AllocPageInMemory, Cell, MemPage, Page};
 
     enum Prefetch {
         AllPages,
@@ -552,7 +552,7 @@ mod tests {
             let page_size = 256;
 
             let pages = (0..self.number_of_pages as PageNumber).map(|i| {
-                let mut page = Page::init(i, page_size);
+                let mut page = Page::alloc_in_memory(i, page_size);
                 page.push(Cell::new(vec![
                     i as u8;
                     Page::ideal_max_payload_size(page_size)
