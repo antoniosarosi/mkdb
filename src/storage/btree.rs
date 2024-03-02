@@ -263,35 +263,38 @@ pub(crate) struct BTree<'c, F, C> {
     /// Root page.
     root: PageNumber,
 
-    /// Read-Write page cache.
+    /// Pager instance.
     pager: &'c mut Pager<F>,
 
     /// Bytes comparator used to obtain [`Ordering`] instances from binary data.
     comparator: C,
 
     /// Number of siblings to examine at each side when balancing a node.
-    /// See [`Self::load_siblings`].
+    ///
+    /// See [`Self::load_siblings`] and [`Self::balance`].
     balance_siblings_per_side: usize,
-}
 
-impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
-    pub fn new(
-        pager: &'c mut Pager<F>,
-        root: PageNumber,
-        balance_siblings_per_side: usize,
-        comparator: C,
-    ) -> Self {
-        Self {
-            pager,
-            root,
-            comparator,
-            balance_siblings_per_side,
-        }
-    }
+    /// Forces pages to store at least this number of [`Cell`] instances.
+    minimum_keys: usize,
 }
 
 /// Default value for [`BTree::balance_siblings_per_side`].
 pub(crate) const DEFAULT_BALANCE_SIBLINGS_PER_SIDE: usize = 1;
+
+/// Default value for [`BTree::minimum_keys`].
+pub(crate) const DEFAULT_MINIMUM_KEYS: usize = 4;
+
+impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
+    pub fn new(pager: &'c mut Pager<F>, root: PageNumber, comparator: C) -> Self {
+        Self {
+            pager,
+            root,
+            comparator,
+            balance_siblings_per_side: DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
+            minimum_keys: DEFAULT_MINIMUM_KEYS,
+        }
+    }
+}
 
 impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// Returns the value corresponding to the key. See [`Self::search`] for
@@ -1688,7 +1691,8 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     ///
     /// Overflow pages are used if necessary. See [`OverflowPage`] for details.
     fn alloc_cell(&mut self, payload: Vec<u8>) -> io::Result<Box<Cell>> {
-        let max_payload_size = Page::ideal_max_payload_size(self.pager.page_size) as usize;
+        let max_payload_size =
+            Page::ideal_max_payload_size(self.pager.page_size, self.minimum_keys) as usize;
 
         // No overflow needed.
         if payload.len() <= max_payload_size {
@@ -1916,6 +1920,7 @@ mod tests {
         page_size: Option<usize>,
         root_at_zero: bool,
         balance_siblings_per_side: usize,
+        minimum_keys: usize,
     }
 
     impl Default for Builder {
@@ -1926,6 +1931,8 @@ mod tests {
                 page_size: None,
                 root_at_zero: false,
                 balance_siblings_per_side: DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
+                // We use small page sizes for tests which don't allow many keys
+                minimum_keys: 1,
             }
         }
     }
@@ -1971,12 +1978,13 @@ mod tests {
             }
 
             // TODO: Do something about leaking, we shouldn't need that here.
-            let mut btree = BTree::new(
-                Box::leak(Box::new(pager)),
-                if self.root_at_zero { 0 } else { 1 },
-                self.balance_siblings_per_side,
-                FixedSizeMemCmp::for_type::<Key>(),
-            );
+            let mut btree = BTree {
+                pager: Box::leak(Box::new(pager)),
+                root: if self.root_at_zero { 0 } else { 1 },
+                balance_siblings_per_side: self.balance_siblings_per_side,
+                comparator: FixedSizeMemCmp::for_type::<Key>(),
+                minimum_keys: self.minimum_keys,
+            };
 
             btree.extend_from_keys(self.keys)?;
 
@@ -2044,19 +2052,16 @@ mod tests {
     /// Computes the page size needed to store `order - 1` keys of type [`Key`]
     /// in one page.
     fn optimal_page_size_for_order(order: usize) -> usize {
-        let key_size = Cell::new(vec![0; mem::size_of::<Key>()]).storage_size();
-        let total_space_needed = PAGE_HEADER_SIZE + key_size * (order as u16 - 1);
-
-        align_upwards(total_space_needed as _, MEM_ALIGNMENT)
+        optimal_page_size_for_max_payload(mem::size_of::<Key>(), order - 1)
     }
 
-    /// Computes the page size needed to store cells of at least `max` size.
-    fn optimal_page_size_for_max_payload(max: usize) -> usize {
+    /// Computes the page size needed to store at least `min_keys` each carrying
+    /// `size` amount of payload.
+    fn optimal_page_size_for_max_payload(max: usize, min_keys: usize) -> usize {
         let one_max_cell_size =
             CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, MEM_ALIGNMENT) as u16;
 
-        // TODO: Hardcoded 4. Make it configurable.
-        let total_size = PAGE_HEADER_SIZE + one_max_cell_size * 4;
+        let total_size = PAGE_HEADER_SIZE + one_max_cell_size * min_keys as u16;
 
         align_upwards(total_size as usize, MEM_ALIGNMENT)
     }
@@ -3410,10 +3415,7 @@ mod tests {
     /// ```
     #[test]
     fn delete_leaving_leaf_balanced_and_internal_unbalanced() -> io::Result<()> {
-        let mut btree = BTree::builder()
-            .page_size(optimal_page_size_for_max_payload(16))
-            .keys(1..=77)
-            .try_build()?;
+        let mut btree = BTree::builder().order(7).keys(1..=77).try_build()?;
 
         btree.remove_key(6)?;
         btree.remove_key(9)?;

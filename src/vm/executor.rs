@@ -23,16 +23,11 @@ pub(crate) fn btree_new<I>(
     pager: &mut Pager<I>,
     root: PageNumber,
 ) -> BTree<'_, I, FixedSizeMemCmp> {
-    BTree::new(
-        pager,
-        root,
-        DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
-        FixedSizeMemCmp::for_type::<RowId>(),
-    )
+    BTree::new(pager, root, FixedSizeMemCmp::for_type::<RowId>())
 }
 
 fn index_btree<I, C: BytesCmp>(pager: &mut Pager<I>, root: PageNumber, cmp: C) -> BTree<'_, I, C> {
-    BTree::new(pager, root, DEFAULT_BALANCE_SIBLINGS_PER_SIDE, cmp)
+    BTree::new(pager, root, cmp)
 }
 
 pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(

@@ -1018,30 +1018,29 @@ impl Page {
     ///
     /// It's calculated by substracting the cell header size and the slot
     /// pointer size from the usable space and then aligning the result
-    /// downwards to [`CELL_ALIGNMENT`]. This makes sure that at least one cell
+    /// downwards to [`MEM_ALIGNMENT`]. This makes sure that at least one cell
     /// can successfuly fit in the given space.
     fn max_payload_size_in(usable_space: u16) -> u16 {
         (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(MEM_ALIGNMENT as u16 - 1)
     }
 
-    /// The maximum size that the payload of a single cell "should" take on
-    /// the page.
-    ///
-    /// We hardcoded the number 4 here so that the BTree can always store at
-    /// least 4 cells in every page, but this should probably be configurable.
-    pub fn ideal_max_payload_size(page_size: usize) -> u16 {
-        let usable_space = Self::usable_space(page_size);
+    /// Maximum size that the payload of a single [`Cell`] should take on the
+    /// page to allow the page to store at least `min_cells`.
+    pub fn ideal_max_payload_size(page_size: usize, min_cells: usize) -> u16 {
+        debug_assert!(
+            min_cells > 0,
+            "if you're not gonna store any cells then why are you even calling this function?"
+        );
 
-        let max_size = Self::max_payload_size_in(usable_space / 4);
+        let ideal_size =
+            Self::max_payload_size_in(Self::usable_space(page_size) / min_cells as u16);
 
-        // When the page size is too small we can't fit 4 keys. This is mostly
-        // for tests, since we use small page sizes for simplicity.
-        #[cfg(debug_assertions)]
-        if max_size == 0 {
-            return Self::max_payload_size_in(usable_space);
-        }
+        debug_assert!(
+            ideal_size > 0,
+            "page size {page_size} is too small to store {min_cells} cells"
+        );
 
-        max_size
+        ideal_size
     }
 
     /// Similar to [`Self::ideal_max_payload_size`] but allows a cell to occupy
@@ -1623,11 +1622,10 @@ pub(crate) struct OverflowPageHeader {
 /// Cell overflow page.
 ///
 /// Cells have a maximum size that depends on the page size. See
-/// [`Page::max_payload_size`] for details. If the page size is big enough we
-/// attempt to fit at least 4 cells in each page. However, when the payload
-/// size of a cell exceeds the maximum size, we need to allocate extra pages
-/// to store the contents of that cell. The cell then points to the first
-/// overflow page, and that page points to the next and so on.
+/// [`Page::ideal_max_payload_size`] for details. However, when the payload size
+/// of a cell exceeds the maximum size, we need to allocate extra pages to store
+/// the contents of that cell. The cell then points to the first overflow page,
+/// and that page points to the next and so on.
 ///
 /// ```text
 /// PAGE       SLOT          FREE

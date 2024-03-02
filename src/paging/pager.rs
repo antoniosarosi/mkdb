@@ -461,7 +461,7 @@ mod tests {
             let mut page = Page::alloc_in_memory(pager.alloc_page()?, pager.page_size);
             page.push(Cell::new(vec![
                 i;
-                Page::ideal_max_payload_size(pager.page_size)
+                Page::ideal_max_payload_size(pager.page_size, 1)
                     as usize
             ]));
 
@@ -486,7 +486,7 @@ mod tests {
                 } else {
                     i as u8
                 };
-                Page::ideal_max_payload_size(pager.page_size)
+                Page::ideal_max_payload_size(pager.page_size, 1)
                     as usize
             ]));
 

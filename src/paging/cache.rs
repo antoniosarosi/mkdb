@@ -555,7 +555,7 @@ mod tests {
                 let mut page = Page::alloc_in_memory(i, page_size);
                 page.push(Cell::new(vec![
                     i as u8;
-                    Page::ideal_max_payload_size(page_size)
+                    Page::ideal_max_payload_size(page_size, 1)
                         as usize
                 ]));
                 MemPage::Btree(page)
