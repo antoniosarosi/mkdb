@@ -35,7 +35,7 @@ pub(crate) fn analyze<I: Seek + Read + Write + paging::io::Sync>(
         }
 
         Statement::Create(Create::Index { table, .. }) => {
-            db.table_metadata(&table)?;
+            db.table_metadata(table)?;
         }
 
         Statement::Insert {
@@ -43,7 +43,7 @@ pub(crate) fn analyze<I: Seek + Read + Write + paging::io::Sync>(
             columns,
             values,
         } => {
-            let (schema, _) = db.table_metadata(&into)?;
+            let (schema, _) = db.table_metadata(into)?;
 
             if columns.len() != values.len() {
                 return Err(DbError::Sql(SqlError::ColumnValueCountMismatch));
@@ -61,7 +61,7 @@ pub(crate) fn analyze<I: Seek + Read + Write + paging::io::Sync>(
             }
 
             for (expr, col) in values.iter().zip(columns) {
-                analyze_assignment(&schema, &col, expr, false)?;
+                analyze_assignment(&schema, col, expr, false)?;
             }
         }
 
@@ -136,7 +136,7 @@ fn analyze_assignment(
     allow_identifiers: bool,
 ) -> Result<(), SqlError> {
     let index = schema
-        .index_of(&column)
+        .index_of(column)
         .ok_or(SqlError::InvalidColumn(column.into()))?;
 
     let expected_data_type = GenericDataType::from(schema.columns[index].data_type);

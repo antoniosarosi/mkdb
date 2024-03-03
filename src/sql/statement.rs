@@ -155,7 +155,7 @@ pub(crate) enum Drop {
 
 /// Optimized version of [`std::slice::Join`] with no intermediary [`Vec`] and
 /// strings.
-fn join<T: Display>(values: &Vec<T>, separator: &str) -> String {
+fn join<T: Display>(values: &[T], separator: &str) -> String {
     let mut joined = String::new();
 
     // TODO: What exactly can fail here? Out of memory?

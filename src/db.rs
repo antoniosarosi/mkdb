@@ -335,7 +335,7 @@ impl QueryResolution {
 
             for (i, col) in row.iter().enumerate() {
                 string.push(' ');
-                string.push_str(&col);
+                string.push_str(col);
                 for _ in 0..widths[i] - col.len() - 1 {
                     string.push(' ');
                 }
@@ -426,6 +426,7 @@ impl Database<File> {
     pub fn init(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::options()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -455,7 +456,7 @@ impl BytesCmp for StringCmp {
         let a = tuple::deserialize_values(a, &self.schema);
         let b = tuple::deserialize_values(b, &self.schema);
         match (&a[0], &b[0]) {
-            (Value::String(a), Value::String(b)) => a.cmp(&b),
+            (Value::String(a), Value::String(b)) => a.cmp(b),
             _ => unreachable!(),
         }
     }
@@ -481,7 +482,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         // hash map of table name -> schema, we wouldn't even need to update it
         // as we don't support ALTER table statements.
         let mut schema = match query.get(0, "sql") {
-            Some(Value::String(sql)) => match Parser::new(&sql).parse_statement()? {
+            Some(Value::String(sql)) => match Parser::new(sql).parse_statement()? {
                 Statement::Create(Create::Table { columns, .. }) => Schema::from(columns),
                 _ => unreachable!(),
             },

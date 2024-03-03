@@ -17,7 +17,7 @@ pub(crate) fn resolve_expression(
     match expr {
         Expression::Value(value) => Ok(value.clone()),
 
-        Expression::Identifier(ident) => match schema.index_of(&ident) {
+        Expression::Identifier(ident) => match schema.index_of(ident) {
             Some(index) => Ok(tuple[index].clone()),
             None => Err(SqlError::InvalidColumn(ident.clone())),
         },
@@ -44,8 +44,8 @@ pub(crate) fn resolve_expression(
             operator,
             right,
         } => {
-            let left = resolve_expression(tuple, schema, &left)?;
-            let right = resolve_expression(tuple, schema, &right)?;
+            let left = resolve_expression(tuple, schema, left)?;
+            let right = resolve_expression(tuple, schema, right)?;
 
             let mismatched_types = || {
                 SqlError::TypeError(TypeError::CannotApplyBinary {
@@ -114,7 +114,7 @@ pub(crate) fn eval_where(
         return Ok(true);
     };
 
-    match resolve_expression(&tuple, &schema, &expr)? {
+    match resolve_expression(tuple, schema, expr)? {
         Value::Bool(b) => Ok(b),
 
         other => Err(SqlError::TypeError(TypeError::ExpectedType {

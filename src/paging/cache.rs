@@ -169,7 +169,7 @@ type FrameId = usize;
 /// Acquiring mutable references to pages automatically sets their `dirty` flag
 /// to 1, so that the cache client, [`super::pager::Pager`] in this case, can
 /// determine whether an evicted page should be written to disk.
-pub(super) struct Cache {
+pub(crate) struct Cache {
     /// Buffer pool.
     buffer: Vec<Frame>,
     /// Maximum number of pages that can be stored in memory.

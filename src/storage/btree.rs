@@ -65,9 +65,20 @@ struct Search {
     index: Result<u16, u16>,
 }
 
+/// The result of a remove operation on the BTree.
+struct Removal {
+    /// The removed cell.
+    cell: Box<Cell>,
+    /// Page number of the leaf node where a substitute was found.
+    leaf_node: PageNumber,
+    /// If the removal ocurred on an internal node, then this is its page number.
+    internal_node: Option<PageNumber>,
+}
+
 /// Stores the page number and the index in the parent page entries that points
-/// back to this node. See [`BTree::load_siblings`] and [`BTree::balance`] for
-/// details.
+/// back to this node.
+///
+/// See [`BTree::load_siblings`] and [`BTree::balance`] for details.
 struct Sibling {
     /// Page number of this sibling node.
     page: PageNumber,
@@ -81,8 +92,9 @@ impl Sibling {
     }
 }
 
-/// Used to search either the minimum or maximum key of a subtree. See
-/// [`BTree::search_leaf_key`] for details.
+/// Used to search either the minimum or maximum key of a subtree.
+///
+/// See [`BTree::search_leaf_key`] for details.
 enum LeafKeySearch {
     /// Maximum key in a leaf node.
     Max,
@@ -90,6 +102,10 @@ enum LeafKeySearch {
     Min,
 }
 
+/// Used for reading payloads stored in the BTree.
+///
+/// Most of the times the BTree can simply return a reference, but large
+/// payloads require reassembly to construct a buffer with contiguous data.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Payload<'s> {
     /// Payload did not need reassembly, so we returned a reference to the
@@ -104,7 +120,7 @@ impl<'s> AsRef<[u8]> for Payload<'s> {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::PageRef(reference) => reference,
-            Self::Reassembled(boxed) => &boxed,
+            Self::Reassembled(boxed) => boxed,
         }
     }
 }
@@ -297,8 +313,9 @@ impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
 }
 
 impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
-    /// Returns the value corresponding to the key. See [`Self::search`] for
-    /// details.
+    /// Returns the value corresponding to the key.
+    ///
+    /// See [`Self::search`] for details.
     pub fn get(&mut self, entry: &[u8]) -> io::Result<Option<Payload>> {
         let search = self.search(self.root, entry, &mut Vec::new())?;
 
@@ -611,7 +628,11 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// API and calls [`Self::balance`] at the end.
     pub fn remove(&mut self, entry: &[u8]) -> io::Result<Option<Box<Cell>>> {
         let mut parents = Vec::new();
-        let Some((entry, leaf_node, internal_node)) = self.remove_entry(entry, &mut parents)?
+        let Some(Removal {
+            cell,
+            leaf_node,
+            internal_node,
+        }) = self.remove_entry(entry, &mut parents)?
         else {
             return Ok(None);
         };
@@ -631,20 +652,21 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             }
         }
 
-        Ok(Some(entry))
+        Ok(Some(cell))
     }
 
-    /// Finds the node where `key` is located and removes it from the entry
-    /// list, replacing it with either its predecessor or successor in the case
-    /// of internal nodes. The returned tuple contains the removed entry and the
-    /// page number of the leaf node that was used to substitute the key.
-    /// [`Self::balance`] must be called on the leaf node after this operation.
-    /// See [`Self::remove`] for more details.
+    /// Finds the node where `key` is located and removes it from the page.
+    ///
+    /// The removes [`Cell`] is replaced with either its predecessor or
+    /// successor in the case of internal nodes. [`Self::balance`] must be
+    /// called on the leaf node after this operation, and possibly on the
+    /// internal node if the leaf was balanced. See [`Self::remove`] for more
+    /// details.
     fn remove_entry(
         &mut self,
         entry: &[u8],
         parents: &mut Vec<PageNumber>,
-    ) -> io::Result<Option<(Box<Cell>, PageNumber, Option<PageNumber>)>> {
+    ) -> io::Result<Option<Removal>> {
         let search = self.search(self.root, entry, parents)?;
         let node = self.pager.get(search.page)?;
 
@@ -658,7 +680,11 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Leaf node is the simplest case, remove key and pop off the stack.
         if node.is_leaf() {
             let cell = self.pager.get_mut(search.page)?.remove(index);
-            return Ok(Some((cell, search.page, None)));
+            return Ok(Some(Removal {
+                cell,
+                leaf_node: search.page,
+                internal_node: None,
+            }));
         }
 
         // Root or internal nodes require additional work. We need to find a
@@ -682,16 +708,22 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let node = self.pager.get_mut(search.page)?;
 
         substitute.header.left_child = node.child(index);
-        let entry = node.replace(index, substitute);
+        let cell = node.replace(index, substitute);
 
-        Ok(Some((entry, leaf_node, Some(node.number))))
+        Ok(Some(Removal {
+            cell,
+            leaf_node,
+            internal_node: Some(node.number),
+        }))
     }
 
     /// Traverses the tree all the way down to the leaf nodes, following the
-    /// path specified by [`LeafKeySearch`]. [`LeafKeySearch::Max`] will always
-    /// choose the last child for recursion, while [`LeafKeySearch::Min`] will
-    /// always choose the first child. This function is used to find successors
-    /// or predecessors of keys in internal nodes.
+    /// path specified by [`LeafKeySearch`].
+    ///
+    /// [`LeafKeySearch::Max`] will always choose the last child for recursion,
+    /// while [`LeafKeySearch::Min`] will always choose the first child. This
+    /// function is used to find successors or predecessors of keys in internal
+    /// nodes.
     fn search_leaf_key(
         &mut self,
         page: PageNumber,
@@ -735,6 +767,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         self.search_leaf_key(page, parents, LeafKeySearch::Min)
     }
 
+    /// Returns the greatest entry in this tree.
     pub fn max(&mut self) -> io::Result<Option<Payload>> {
         if self.pager.get(self.root)?.len() == 0 {
             return Ok(None);
@@ -926,7 +959,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    /// 
+    ///
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1585,12 +1618,10 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         }
 
         // Put pages in ascending order to favor sequential IO where possible.
-        for (i, page) in BinaryHeap::from_iter(siblings.iter().map(|s| Reverse(s.page)))
+        BinaryHeap::from_iter(siblings.iter().map(|s| Reverse(s.page)))
             .iter()
             .enumerate()
-        {
-            siblings[i].page = page.0;
-        }
+            .for_each(|(i, Reverse(page))| siblings[i].page = *page);
 
         // Begin redistribution.
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
@@ -1703,6 +1734,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let first_cell_payload_size = max_payload_size - mem::size_of::<PageNumber>();
         let mut next_overflow_page = self.pager.alloc_page()?;
 
+        // TODO: We're making a copy of the vec and the Cell::new makes another one...
         let cell = Cell::new_overflow(
             Vec::from(&payload[..first_cell_payload_size]),
             next_overflow_page,
@@ -1764,14 +1796,14 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// If the cell at the given slot is not "overflow" then this simply returns
     /// a reference to its content.
     fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Payload> {
-        // TODO: Check if we can circumvent Rust borrowing rules to make stuff
-        // like this cleaner.
-        if !self.pager.get(page)?.cell(slot).header.is_overflow {
-            let cell = self.pager.get(page)?.cell(slot);
-            return Ok(Payload::PageRef(&cell.content));
+        let cell = self.pager.get(page)?.cell(slot);
+
+        // TODO: Check if we can circumvent Rust borrowing rules to use just
+        // `cell.content` here.
+        if !cell.header.is_overflow {
+            return Ok(Payload::PageRef(&self.pager.get(page)?.cell(slot).content));
         }
 
-        let cell = self.pager.get(page)?.cell(slot);
         let mut overflow_page = cell.overflow_page();
 
         let mut payload =

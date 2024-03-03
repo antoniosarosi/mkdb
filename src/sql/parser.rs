@@ -53,7 +53,7 @@ impl Display for ErrorKind {
             ErrorKind::Expected { expected, found } => write!(
                 f,
                 "expected {}, found '{found}' instead",
-                ErrorKind::expected_token_string(&expected)
+                ErrorKind::expected_token_string(expected)
             ),
 
             ErrorKind::ExpectedOneOf { expected, found } => {
@@ -82,7 +82,7 @@ impl Display for ErrorKind {
 
             ErrorKind::UnexpectedEof => f.write_str("unexpected EOF"),
 
-            ErrorKind::Other(message) => f.write_str(&message),
+            ErrorKind::Other(message) => f.write_str(message),
         }
     }
 }
@@ -97,7 +97,7 @@ pub(crate) struct ParserError {
 
 impl Display for ParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.kind.to_string())
+        write!(f, "{}", self.kind)
     }
 }
 

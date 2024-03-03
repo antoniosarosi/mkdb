@@ -124,7 +124,7 @@ pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
             }
 
             DataType::Bool => {
-                values.push(Value::Bool(if buf[index] == 0 { false } else { true }));
+                values.push(Value::Bool(buf[index] != 0));
                 index += mem::size_of::<bool>();
             }
         }

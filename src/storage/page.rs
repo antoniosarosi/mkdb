@@ -118,7 +118,7 @@ use std::{
     alloc::{self, Allocator, Layout},
     cmp::Ordering,
     collections::BinaryHeap,
-    fmt::Debug,
+    fmt::{self, Debug},
     iter,
     mem::{self, ManuallyDrop},
     ops::{Bound, RangeBounds},
@@ -203,7 +203,6 @@ pub(crate) type SlotId = u16;
 ///
 /// References to the entire memory buffer (including both the header and the
 /// content) can be obtained using [`AsRef::as_ref`] and [`AsMut::as_mut`].
-#[derive(Debug)]
 struct BufferWithHeader<H> {
     /// Pointer to the header located at the beginning of the buffer.
     header: NonNull<H>,
@@ -378,7 +377,7 @@ impl<H> BufferWithHeader<H> {
     }
 
     /// Returns a mutable byte slice of the entire buffer including its header.
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    fn as_slice_mut(&mut self) -> &mut [u8] {
         // SAFETY: At this point you should already get the idea :)
         unsafe { self.as_non_null().as_mut() }
     }
@@ -399,7 +398,7 @@ impl<H> AsRef<[u8]> for BufferWithHeader<H> {
 
 impl<H> AsMut<[u8]> for BufferWithHeader<H> {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
+        self.as_slice_mut()
     }
 }
 
@@ -412,9 +411,19 @@ impl<H> PartialEq for BufferWithHeader<H> {
 impl<H> Clone for BufferWithHeader<H> {
     fn clone(&self) -> Self {
         let mut cloned = Self::new(self.size);
-        cloned.as_mut_slice().copy_from_slice(self.as_slice());
+        cloned.as_slice_mut().copy_from_slice(self.as_slice());
 
         cloned
+    }
+}
+
+impl<H: Debug> Debug for BufferWithHeader<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferWithHeader")
+            .field("size", &self.size)
+            .field("header", self.header())
+            .field("content", &self.content())
+            .finish()
     }
 }
 
@@ -455,11 +464,10 @@ impl<H> Drop for BufferWithHeader<H> {
 ///
 /// # Overflow
 ///
-/// The maximum size of a cell is about one fourth of the page size (substract
-/// the cell header size and slot pointer size). This allows to store a minimum
-/// of 4 keys per page. If a cell needs to hold more data than we can fit in a
-/// single page, then we'll set [`CellHeader::is_overflow`] to `true` and make
-/// the last 4 bytes of the content point to an overflow page.
+/// The maximum size of a cell is defined by [`Page::ideal_max_payload_size`].
+/// If a cell needs to hold more data than its maximum size allows, then we'll
+/// set [`CellHeader::is_overflow`] to `true` and make the last 4 bytes of the
+/// content point to an [`OverflowPage`].
 #[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(C, align(8))]
 pub(crate) struct CellHeader {
@@ -517,13 +525,15 @@ pub(crate) struct CellHeader {
 ///
 /// The other approach would be reusing [`BufferWithHeader`] again but at this
 /// point I kinda got tired of the newtype boilerplate and using
-/// `*buf.header_mut().field = value` instead of simply
-/// `buf.header.field = value` so I tried something different here. The code at
-/// [`super::btree`] accesses [`Cell::header`] and [`Cell::content`] many times
-/// and assigns specific values of one cell header to another cell header and
-/// doing that through function calls is just too verbose. The DST approach
-/// reduces boilerplate but makes it harder to construct the type at runtime.
-/// See [`Page::cell_at_offset`] and [`Cell::new`] for details.
+/// `*buf.header_mut().field = other.header().field` instead of simply
+/// `buf.header.field = other.header.field` so I tried something different
+/// here.
+///
+/// The code at [`super::btree`] accesses [`Cell::header`] and [`Cell::content`]
+/// many times and assigns specific values of one cell header to another cell
+/// header and doing that through function calls is just too verbose. The DST
+/// approach reduces boilerplate but makes it harder to construct the type at
+/// runtime. See [`Page::cell_at_offset`] and [`Cell::new`] for details.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Cell {
     /// Cell header.
@@ -536,41 +546,6 @@ pub(crate) struct Cell {
     pub content: [u8],
 }
 
-impl Clone for Box<Cell> {
-    fn clone(&self) -> Self {
-        self.as_ref().to_owned()
-    }
-}
-
-impl ToOwned for Cell {
-    type Owned = Box<Self>;
-
-    fn to_owned(&self) -> Self::Owned {
-        let owned = alloc::Global
-            .allocate(Layout::for_value(self))
-            .expect("alloc error")
-            .cast::<u8>();
-
-        // SAFETY: See [`Cell::new`].
-        unsafe {
-            owned.copy_from_nonoverlapping(
-                NonNull::new_unchecked(self as *const Cell as *mut u8),
-                self.total_size() as usize,
-            );
-
-            Box::from_raw(
-                ptr::slice_from_raw_parts(owned.as_ptr(), self.header.size as usize) as *mut Cell,
-            )
-        }
-    }
-}
-
-impl PartialEq<Box<Cell>> for Cell {
-    fn eq(&self, other: &Box<Cell>) -> bool {
-        self.header == other.header && &self.content == &other.content
-    }
-}
-
 impl Cell {
     /// Creates a new cell allocated in memory.
     pub fn new(mut payload: Vec<u8>) -> Box<Self> {
@@ -579,6 +554,8 @@ impl Cell {
         payload.resize(size as _, 0);
 
         let mut buf = BufferWithHeader::<CellHeader>::new((size + CELL_HEADER_SIZE) as usize);
+
+        // Buffer with header sets everything to 0, we only need to change this.
         buf.header_mut().size = size;
 
         // TODO: The public API requires a [`Vec`] as payload but that's not
@@ -690,6 +667,35 @@ impl Cell {
             .unwrap()
             .pad_to_align()
             .size() as u16
+    }
+}
+
+impl Clone for Box<Cell> {
+    fn clone(&self) -> Self {
+        self.as_ref().to_owned()
+    }
+}
+
+impl ToOwned for Cell {
+    type Owned = Box<Self>;
+
+    fn to_owned(&self) -> Self::Owned {
+        let cell = ptr::from_ref(self);
+
+        let owned = alloc::Global
+            .allocate(Layout::for_value(self))
+            .expect("alloc error while cloning cell")
+            .as_non_null_ptr();
+
+        // SAFETY: See [`Cell::new`].
+        unsafe {
+            owned.copy_from_nonoverlapping(
+                NonNull::new_unchecked(cell.cast_mut().cast()),
+                self.total_size() as usize,
+            );
+
+            Box::from_raw(owned.as_ptr().with_metadata_of(cell))
+        }
     }
 }
 
@@ -1135,14 +1141,14 @@ impl Page {
     /// Read-only reference to a cell.
     ///
     /// Returned lifetime is tied to that of the page itself.
-    pub fn cell<'p>(&'p self, index: SlotId) -> &'p Cell {
+    pub fn cell(&self, index: SlotId) -> &Cell {
         let cell = self.cell_at_slot(index);
         // SAFETY: Same as [`Self::cell_at_offset`].
         unsafe { cell.as_ref() }
     }
 
     /// Mutable reference to a cell.
-    pub fn cell_mut<'p>(&'p mut self, index: SlotId) -> &'p mut Cell {
+    pub fn cell_mut(&mut self, index: SlotId) -> &mut Cell {
         let mut cell = self.cell_at_slot(index);
         // SAFETY: Same as [`Self::cell_at_offset`].
         unsafe { cell.as_mut() }
@@ -1594,7 +1600,7 @@ impl Page {
 }
 
 impl Debug for Page {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Page")
             .field("header", self.header())
             .field("number", &self.number)
@@ -1623,7 +1629,7 @@ impl Debug for Page {
 }
 
 /// Header of an overflow page.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct OverflowPageHeader {
     /// Next overflow page.
@@ -1838,7 +1844,7 @@ impl PageZero {
     }
 
     /// Mutable reference to the inner slotted page.
-    pub fn as_mut_btree_page(&mut self) -> &mut Page {
+    pub fn as_btree_page_mut(&mut self) -> &mut Page {
         &mut self.page
     }
 }
@@ -1925,7 +1931,7 @@ impl From<PageZero> for MemPage {
 /// WARNING: Verbose duplicated code ahead :(
 /// See [`crate::paging::pager::Pager::get_as`] for details.
 /// We should probably use a macro to generate this but there are only 3 types
-/// of pages for now so it's not that bad.
+/// of pages for now so it's not that bad (still pretty bad).
 
 impl<'p> TryFrom<&'p MemPage> for &'p Page {
     type Error = String;
@@ -1945,7 +1951,7 @@ impl<'p> TryFrom<&'p mut MemPage> for &'p mut Page {
     fn try_from(mem_page: &'p mut MemPage) -> Result<Self, Self::Error> {
         match mem_page {
             MemPage::Btree(page) => Ok(page),
-            MemPage::Zero(page_zero) => Ok(page_zero.as_mut_btree_page()),
+            MemPage::Zero(page_zero) => Ok(page_zero.as_btree_page_mut()),
             other => Err(format!("attempt to convert {other:?} into Page")),
         }
     }
@@ -1997,6 +2003,8 @@ impl<'p> TryFrom<&'p mut MemPage> for &'p mut OverflowPage {
 
 #[cfg(test)]
 mod tests {
+    use core::slice;
+
     use super::*;
 
     fn variable_size_cells(sizes: &[usize]) -> Vec<Box<Cell>> {
@@ -2063,7 +2071,7 @@ mod tests {
         for (i, cell) in cells.iter().enumerate() {
             expected_offset -= cell.total_size() as usize;
             assert_eq!(page.slot_array()[i], expected_offset as u16);
-            assert_eq!(page.cell(i as u16), cell);
+            assert_eq!(page.cell(i as u16), cell.as_ref());
         }
     }
 
@@ -2071,29 +2079,46 @@ mod tests {
     /// not the offsets.
     fn compare_cells(page: &Page, cells: &Vec<Box<Cell>>) {
         for (i, cell) in cells.iter().enumerate() {
-            assert_eq!(page.cell(i as _), cell);
+            assert_eq!(page.cell(i as _), cell.as_ref());
         }
     }
 
     #[test]
     fn buffer_with_header() {
+        const HEADER_SIZE: usize = mem::size_of::<OverflowPageHeader>();
         const CONTENT_SIZE: usize = 24;
+        const TOTAL_SIZE: usize = HEADER_SIZE + CONTENT_SIZE;
 
-        let mut buf = BufferWithHeader::new(mem::size_of::<OverflowPageHeader>() + CONTENT_SIZE);
-        *buf.header_mut() = OverflowPageHeader {
-            next: 0,
-            num_bytes: 0,
+        let mut buf = BufferWithHeader::<OverflowPageHeader>::new(TOTAL_SIZE);
+
+        let header = OverflowPageHeader {
+            next: 10,
+            num_bytes: CONTENT_SIZE as u16,
         };
 
-        buf.header_mut().num_bytes = CONTENT_SIZE as u16;
-        buf.content_mut().fill(8);
+        let content_byte = 0b10101010; // 170 in decimal
 
-        assert_eq!(buf.header().num_bytes, CONTENT_SIZE as u16);
-        assert_eq!(buf.content(), &[8; CONTENT_SIZE]);
+        *buf.header_mut() = header;
+        buf.content_mut().fill(content_byte);
+
+        let mut expected_buffer = [content_byte; TOTAL_SIZE];
+
+        unsafe {
+            expected_buffer[..HEADER_SIZE].copy_from_slice(slice::from_raw_parts(
+                ptr::from_ref(&header).cast(),
+                HEADER_SIZE,
+            ));
+        };
+
+        assert_eq!(buf.size, TOTAL_SIZE);
+        assert_eq!(buf.header(), &header);
+        assert_eq!(buf.content(), &[content_byte; CONTENT_SIZE]);
+        assert_eq!(buf.as_slice(), &expected_buffer);
     }
 
-    // Some important notes to keep in mind before you read the code below:
-    // - For pages of size 512, Page::max_payload_size() equals 112.
+    // TODO: Size of cells in the tests below are hardcoded, if the size of
+    // the page header or cell header changes the tests might fail. Calculate
+    // the sizes relative to the headers.
 
     #[test]
     fn push_fixed_size_cells() {

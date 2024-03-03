@@ -3,6 +3,8 @@
 #![feature(allocator_api)]
 #![feature(map_try_insert)]
 #![feature(vec_into_raw_parts)]
+#![feature(set_ptr_value)]
+#![feature(slice_ptr_get)]
 
 mod db;
 mod os;
@@ -35,7 +37,7 @@ fn main() -> io::Result<()> {
 
         let prompt = "mkdb> ";
 
-        stream.write(
+        stream.write_all(
             format!("Welcome to the MKDB 'shell' (not really a shell). Type SQL statements below or 'quit' to exit the program.\n\n{prompt}")
                 .as_bytes(),
         )?;
@@ -52,7 +54,7 @@ fn main() -> io::Result<()> {
                 && &statement[statement.len() - exit_command.len()..] == exit_command
             {
                 println!("Close {conn} connection");
-                stream.write("Closing connection\n".as_bytes())?;
+                stream.write_all("Closing connection\n".as_bytes())?;
                 break;
             }
 
@@ -60,15 +62,15 @@ fn main() -> io::Result<()> {
                 let _ = match db.exec(&statement) {
                     Ok(result) => {
                         if !result.is_empty() {
-                            stream.write(result.to_ascii_table().as_bytes())
+                            stream.write_all(result.to_ascii_table().as_bytes())
                         } else {
-                            stream.write("OK".as_bytes())
+                            stream.write_all("OK".as_bytes())
                         }
                     }
 
-                    Err(e) => stream.write(e.to_string().as_bytes()),
+                    Err(e) => stream.write_all(e.to_string().as_bytes()),
                 };
-                stream.write(format!("\n{prompt}").as_bytes()).unwrap();
+                stream.write_all(format!("\n{prompt}").as_bytes()).unwrap();
                 statement = String::new();
             }
         }

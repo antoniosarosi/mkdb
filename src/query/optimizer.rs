@@ -103,7 +103,7 @@ fn simplfy(expression: &mut Expression) {
         Expression::UnaryOperation { expr, .. } => {
             simplfy(expr);
             if let Expression::Value(_) = expr.as_ref() {
-                *expression = resolve_literal_expression(&expression)
+                *expression = resolve_literal_expression(expression)
             }
         }
 
@@ -118,7 +118,7 @@ fn simplfy(expression: &mut Expression) {
             match (left.as_mut(), operator, right.as_mut()) {
                 // Resolve expression with literal values to a single value.
                 (Expression::Value(_), _op, Expression::Value(_)) => {
-                    *expression = resolve_literal_expression(&expression);
+                    *expression = resolve_literal_expression(expression);
                 }
 
                 // Resolve these expressions to "x":
@@ -196,7 +196,7 @@ fn simplfy(expression: &mut Expression) {
                     // Swap "x" with 4.
                     mem::swap(variable.as_mut(), right_value);
                     // Compute 4 + 2.
-                    *left.as_mut() = resolve_literal_expression(&left);
+                    *left.as_mut() = resolve_literal_expression(left);
                     // Swap 6 + x to make it x + 6
                     mem::swap(left, right);
                 }
