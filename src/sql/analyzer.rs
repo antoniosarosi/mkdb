@@ -10,7 +10,7 @@ use std::io::{Read, Seek, Write};
 use crate::{
     db::{Database, DbError, GenericDataType, Schema, SqlError, TypeError},
     paging,
-    sql::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
+    sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
 };
 
 /// Analyzes the given statement and returns an error if any.

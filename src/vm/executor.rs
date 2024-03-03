@@ -5,14 +5,17 @@ use std::{
 
 use crate::{
     db::{
-        Database, DbError, GenericDataType, QueryResolution, QueryResult, RowId, Schema, SqlError,
+        Database, DbError, GenericDataType, Projection, QueryResult, RowId, Schema, SqlError,
         StringCmp, TypeError, MKDB_META,
     },
     paging::{
         self,
         pager::{PageNumber, Pager},
     },
-    sql::{Column, Constraint, Create, DataType, Expression, Parser, Statement, Value},
+    sql::{
+        parser::Parser,
+        statement::{Column, Constraint, Create, DataType, Expression, Statement, Value},
+    },
     storage::{
         page::Page, tuple, BTree, BytesCmp, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
     },
@@ -65,7 +68,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 ))?;
             }
 
-            Ok(QueryResolution::empty())
+            Ok(Projection::empty())
         }
 
         Statement::Create(Create::Index {
@@ -88,7 +91,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 })
             ))?;
 
-            Ok(QueryResolution::empty())
+            Ok(Projection::empty())
         }
 
         Statement::Insert {
@@ -199,7 +202,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 }
             }
 
-            Ok(QueryResolution::empty())
+            Ok(Projection::empty())
         }
 
         Statement::Select {
@@ -305,7 +308,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 })
             }
 
-            Ok(QueryResolution::new(
+            Ok(Projection::new(
                 results_schema,
                 results.into_iter().map(|r| r.0).collect(),
             ))
@@ -340,7 +343,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 btree.remove(&tuple::serialize_row_id(row_id))?;
             }
 
-            Ok(QueryResolution::empty())
+            Ok(Projection::empty())
         }
 
         Statement::Update {
@@ -380,7 +383,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 btree.insert(update)?;
             }
 
-            Ok(QueryResolution::empty())
+            Ok(Projection::empty())
         }
 
         _ => todo!("rest of SQL statements"),

@@ -4,7 +4,6 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
-    mem,
     path::Path,
     usize,
 };
@@ -15,10 +14,14 @@ use crate::{
         self,
         pager::{PageNumber, Pager},
     },
-    query::{analyzer::analyze, optimizer::optimize},
     sql::{
-        BinaryOperator, Column, Constraint, Create, DataType, Expression, Parser, ParserError,
-        Statement, UnaryOperator, Value,
+        analyzer::analyze,
+        optimizer::optimize,
+        parser::{Parser, ParserError},
+        statement::{
+            BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement,
+            UnaryOperator, Value,
+        },
     },
     storage::{tuple, BytesCmp},
     vm,
@@ -43,7 +46,7 @@ pub(crate) struct Database<I> {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct QueryResolution {
+pub(crate) struct Projection {
     pub schema: Schema,
     pub results: Vec<Vec<Value>>,
 }
@@ -269,9 +272,9 @@ impl From<Vec<Column>> for Schema {
     }
 }
 
-pub(crate) type QueryResult = Result<QueryResolution, DbError>;
+pub(crate) type QueryResult = Result<Projection, DbError>;
 
-impl QueryResolution {
+impl Projection {
     pub fn new(schema: Schema, results: Vec<Vec<Value>>) -> Self {
         Self { schema, results }
     }
@@ -550,9 +553,12 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, GenericDataType, QueryResolution, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, GenericDataType, Projection, Schema, SqlError, TypeError},
         paging::{io::MemBuf, pager::Pager},
-        sql::{self, Column, Constraint, DataType, Expression, Parser, Value},
+        sql::{
+            parser::Parser,
+            statement::{Column, Constraint, DataType, Expression, Value},
+        },
     };
 
     impl PartialEq for DbError {
@@ -589,7 +595,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution::new(
+            Projection::new(
                 mkdb_meta_schema(),
                 vec![
                     vec![
@@ -629,7 +635,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -687,7 +693,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -724,7 +730,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -772,7 +778,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -813,7 +819,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -862,7 +868,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -917,7 +923,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "age".into(),
@@ -972,7 +978,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -1021,7 +1027,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: mkdb_meta_schema(),
                 results: vec![
                     vec![
@@ -1147,7 +1153,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -1187,7 +1193,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -1231,7 +1237,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),
@@ -1287,7 +1293,7 @@ mod tests {
 
         assert_eq!(
             query,
-            QueryResolution {
+            Projection {
                 schema: Schema::from(vec![
                     Column {
                         name: "id".into(),

@@ -277,7 +277,7 @@ impl<'i> Parser<'i> {
     /// works.
     ///
     /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
-    pub(crate) fn parse_expression(&mut self) -> ParseResult<Expression> {
+    pub(super) fn parse_expression(&mut self) -> ParseResult<Expression> {
         self.parse_expr(0)
     }
 

@@ -2,7 +2,7 @@ use std::mem;
 
 use crate::{
     db::{RowId, Schema},
-    sql::{DataType, Value},
+    sql::statement::{DataType, Value},
 };
 
 pub(crate) fn deserialize_row_id(buf: &[u8]) -> RowId {

@@ -10,8 +10,6 @@ use std::{
     collections::{BinaryHeap, HashSet},
     fmt::Debug,
     io::{self, Read, Seek, Write},
-    mem::MaybeUninit,
-    ptr,
 };
 
 use super::{cache::Cache, io::BlockIo};

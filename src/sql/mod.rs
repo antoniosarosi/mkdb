@@ -1,12 +1,9 @@
 //! Simple SQL parser and AST for our toy database.
 
-mod parser;
-mod statement;
 mod token;
 mod tokenizer;
 
-pub(crate) use parser::{ParseResult, Parser, ParserError};
-pub(crate) use statement::{
-    BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement, UnaryOperator,
-    Value,
-};
+pub(crate) mod analyzer;
+pub(crate) mod optimizer;
+pub(crate) mod parser;
+pub(crate) mod statement;

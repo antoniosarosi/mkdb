@@ -7,7 +7,7 @@ use std::mem;
 
 use crate::{
     db::Schema,
-    sql::{BinaryOperator, Expression, Statement, UnaryOperator, Value},
+    sql::statement::{BinaryOperator, Expression, Statement, UnaryOperator, Value},
     vm,
 };
 
@@ -247,9 +247,10 @@ fn resolve_literal_expression(expression: &Expression) -> Expression {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        query::optimizer::{optimize, simplfy},
-        sql::{BinaryOperator, Expression, ParseResult, Parser, Statement, Value},
+    use super::{optimize, simplfy};
+    use crate::sql::{
+        parser::{ParseResult, Parser},
+        statement::{BinaryOperator, Expression, Statement, Value},
     };
 
     struct Opt<'e> {
