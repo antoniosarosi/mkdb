@@ -10,6 +10,8 @@ use std::{
     collections::{BinaryHeap, HashSet},
     fmt::Debug,
     io::{self, Read, Seek, Write},
+    mem::MaybeUninit,
+    ptr,
 };
 
 use super::{cache::Cache, io::BlockIo};
@@ -266,6 +268,43 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// Default return type for [`Self::get_mut_as`].
     pub fn get_mut(&mut self, page_number: PageNumber) -> io::Result<&mut Page> {
         self.get_mut_as::<Page>(page_number)
+    }
+
+    /// Returns mutable references to many pages at the same time.
+    ///
+    /// If it's not possible or duplicated pages are received then [`None`] is
+    /// returned instead.
+    pub fn get_many_mut<const N: usize>(
+        &mut self,
+        pages: [PageNumber; N],
+    ) -> io::Result<Option<[&mut Page; N]>> {
+        if self.cache.max_size() < N {
+            return Ok(None);
+        }
+
+        // TODO: This algorithm can be optimized by telling the cache to
+        // give us space, then once we have all the space we need figure out
+        // which pages are not in memory, load them from disk and finally build
+        // the mutable refs. Easier said than done :)
+        for i in 0..N {
+            self.lookup::<Page>(pages[i])?;
+        }
+
+        // Couldn't cache all pages, bail out. Ideally we should use pin() and
+        // then once we have all the space unpin() and return the refs, but that
+        // could introduce some hard to spot bugs.
+        if pages.iter().any(|page| !self.cache.contains(page)) {
+            return Ok(None);
+        }
+
+        for page in pages {
+            self.push_to_write_queue(page);
+        }
+
+        Ok(self
+            .cache
+            .get_many_mut(pages)
+            .map(|pages| pages.map(|page| page.try_into().expect("page type conversion error"))))
     }
 
     /// Loads the given page into the cache buffer.
@@ -527,6 +566,47 @@ mod tests {
         }
 
         assert!(!pager.cache.must_evict_dirty_page());
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_many_mut_ok() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
+
+        let mut cells = Vec::new();
+
+        for i in 1..=3 {
+            let mut page = Page::alloc_in_memory(i, pager.page_size);
+            let cell = Cell::new(Vec::from(&i.to_le_bytes()));
+            page.push(cell.clone());
+            cells.push(cell);
+            pager.load_from_mem(page)?;
+        }
+
+        let mut_refs = pager.get_many_mut([1, 2, 3])?;
+
+        assert!(mut_refs.is_some());
+
+        for ((mut_ref, page_num), cell) in mut_refs.unwrap().into_iter().zip(1..=3).zip(cells) {
+            assert_eq!(mut_ref.number, page_num);
+            assert_eq!(mut_ref.len(), 1);
+            assert_eq!(mut_ref.cell(0), cell.as_ref());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_many_mut_fail() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
+
+        pager.load_from_mem(Page::alloc_in_memory(0, pager.page_size))?;
+        pager.cache.pin(0);
+
+        let mut_refs = pager.get_many_mut([1, 2, 3])?;
+
+        assert!(mut_refs.is_none());
 
         Ok(())
     }

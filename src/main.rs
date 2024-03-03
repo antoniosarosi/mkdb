@@ -5,6 +5,8 @@
 #![feature(vec_into_raw_parts)]
 #![feature(set_ptr_value)]
 #![feature(slice_ptr_get)]
+#![feature(get_many_mut)]
+#![feature(map_many_mut)]
 
 mod db;
 mod os;

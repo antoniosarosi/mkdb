@@ -959,7 +959,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    ///
+    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1511,15 +1511,26 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         if is_root && is_underflow {
             let child_page = node.header().right_child;
 
-            if child_page != 0 {
-                let mut child_node = self.pager.get(child_page)?.clone();
-                let root = self.pager.get(page)?;
+            // Root doesn't have children, can't do anything.
+            if child_page == 0 {
+                return Ok(());
+            }
 
-                // Account for page zero having less space than the rest of pages.
-                if root.can_consume_without_overflow(&child_node) {
-                    self.pager.get_mut(page)?.append(&mut child_node);
-                    self.pager.free_page(child_page)?;
+            let mut cloned_child: Page;
+
+            let [root, child_node] = match self.pager.get_many_mut([page, child_page])? {
+                Some(mut_refs) => mut_refs,
+                None => {
+                    cloned_child = self.pager.get(child_page)?.clone();
+                    let root = self.pager.get_mut(page)?;
+                    [root, &mut cloned_child]
                 }
+            };
+
+            // Account for page zero having less space than the rest of pages.
+            if root.can_consume_without_overflow(child_node) {
+                root.append(child_node);
+                self.pager.free_page(child_page)?;
             }
 
             return Ok(());

@@ -306,6 +306,16 @@ impl Cache {
         }
     }
 
+    /// Max number of pages that can be stored in this cache.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// Returns `true` if the given page is cached.
+    pub fn contains(&self, page_number: &PageNumber) -> bool {
+        self.pages.contains_key(page_number)
+    }
+
     /// Returns a frame ID that can be used to access the in-memory page.
     ///
     /// If the page is not cached or has been invalidated by calling
@@ -318,6 +328,25 @@ impl Cache {
     pub fn get_mut(&mut self, page_number: PageNumber) -> Option<FrameId> {
         self.try_reference_page(page_number)
             .inspect(|frame_id| self.buffer[*frame_id].mark_dirty())
+    }
+
+    /// Returns many mutable references at once if possible.
+    ///
+    /// Otherwise [`None`] is returned.
+    pub fn get_many_mut<const N: usize>(
+        &mut self,
+        pages: [PageNumber; N],
+    ) -> Option<[&mut MemPage; N]> {
+        self.pages.get_many_mut(pages.each_ref()).map(|frame_ids| {
+            self.buffer
+                .get_many_mut(frame_ids.map(|frame_id| *frame_id))
+                .unwrap()
+                .map(|frame| {
+                    frame.reference();
+                    frame.mark_dirty();
+                    &mut frame.page
+                })
+        })
     }
 
     /// Returns the frame ID of `page_number` and sets if ref bit to 1.
@@ -413,8 +442,8 @@ impl Cache {
             // buffer multiple times, that's not a bug per se, it's just slow.
             #[cfg(debug_assertions)]
             {
-                if rounds == 1 {
-                    todo!("clock has gone full circle without evicting any page");
+                if rounds == 3 {
+                    todo!("clock has gone full circle {rounds} times without evicting any page");
                 }
 
                 if self.clock == initial_location {
