@@ -839,11 +839,13 @@ impl PageHeader {
 
 /// Fixed size slotted page.
 ///
-/// This is what we store on disk. The page maintains a "slot array" located
-/// after the header that grows towards the right. On the opposite side is where
-/// used cells are located, leaving free space in the middle of the page. Each
-/// item in the slot array points to one of the used cells through its offset,
-/// calculated from the start of the page (before the header).
+/// This is the most important data structure here since it allows us to store
+/// BTree nodes on disk, which are used for both indexes and tables. The page
+/// maintains a "slot array" located after the header that grows towards the
+/// right. On the opposite side is where used cells are located, leaving free
+/// space in the middle of the page. Each item in the slot array points to one
+/// of the used cells through its offset, calculated from the start of the slot
+/// array (after the [`PageHeader`]).
 ///
 /// ```text
 ///   HEADER   SLOT ARRAY       FREE SPACE             USED CELLS
@@ -892,8 +894,8 @@ impl PageHeader {
 ///
 /// The second reason this is useful is because we could maintain the same slot
 /// number for the rest of the cells when one of them is deleted. For example,
-/// if we deleted CELL 2 in the figure above, we wouldn't have to compact the
-/// slot array like this:
+/// if we deleted CELL 2 in the figure above, we wouldn't necessarily have to
+/// compact the slot array like this:
 ///
 /// ```text
 ///   HEADER SLOT ARRAY       FREE SPACE              USED CELLS
@@ -937,10 +939,10 @@ impl PageHeader {
 /// point to slot indexes from outside the page, so there's no need to attempt
 /// to maintain their current position for as long as possible. This [commit]
 /// contains the last version that used to do so. Another benefit of the current
-/// aproach is that BTree nodes and disk pages are the same thing, because
-/// everything is stored in a BTree, so we need less generics, less types and
-/// less code. Take a look at the [btree.c] file from SQLite 2.X.X for the
-/// inspiration.
+/// aproach (index organized storage) is that BTree nodes and disk pages are the
+/// same thing, because everything is stored in a BTree, so we need less
+/// generics, less types and less code. Take a look at the [btree.c] file from
+/// SQLite 2.X.X for the inspiration.
 ///
 /// Check these lectures for some background on slotted pages and data storage:
 ///
@@ -962,10 +964,16 @@ impl PageHeader {
 ///
 /// # Overflow
 ///
-/// To deal with overflow we maintain a list of cells that didn't fit in the
-/// slotted page and we store the index where they should have been inserted
-/// in the slotted array. Not all methods take overflow into account, most of
-/// them don't care because once the page overflows the BTree balancing
+/// Slotted pages are fixed size, so if we keep inserting cells into them at
+/// some point they will "overflow". A [`Page`] is considered "overflow" if it
+/// contains at least one cell that did not fit in the fixed size available
+/// space. Do not confuse this with [`OverflowPage`], which are used to store
+/// large binary contents on disk in a linked list of pages.
+///
+/// To deal with [`Page`] overflow we maintain a list of cells that didn't fit
+/// in the slotted page and we store the index where they should have been
+/// inserted in the slotted array. Not all methods take overflow into account,
+/// most of them don't care because once the page overflows the BTree balancing
 /// algorithm will move all the cells out of the page and reorganize them across
 /// siblings. The only method that needs to work correctly is [`Page::drain`] as
 /// that's the one used to move the cells out.
@@ -1797,7 +1805,8 @@ impl AllocPageInMemory for PageZero {
         // [`BufferWithHeader::for_page`].
         //
         // 2. The [`Drop`] implementation of the inner buffer will never run
-        // because page is contained within [`ManuallyDrop`].
+        // because page is contained within [`ManuallyDrop`] and we control
+        // exactly how the destructors run.
         //
         // 3. We don't use the inner buffer after the main allocated one is
         // dropped. At least not in this struct, externally though it's
@@ -1851,9 +1860,25 @@ impl PageZero {
 
 impl Drop for PageZero {
     fn drop(&mut self) {
-        // SAFETY: Buffer won't be used anymore because we're already dropping
-        // the entire page.
-        drop(unsafe { ManuallyDrop::take(&mut self.buffer) })
+        // SAFETY: We need to drop 2 different allocations:
+        //
+        // 1. Our PageZero buffer that stores the database header and the
+        // slotted page.
+        //
+        // 2. The slotted page overflow list.
+        //
+        // This should be "safe" here because none of this allocations can be
+        // used after this code runs, the compiler should prevent it if calling
+        // [`mem::drop`] or allowing it to insert the drop call automatically.
+        unsafe {
+            let Page {
+                buffer, overflow, ..
+            } = ManuallyDrop::take(&mut self.page);
+
+            mem::forget(buffer);
+            mem::drop(overflow);
+            ManuallyDrop::drop(&mut self.buffer);
+        }
     }
 }
 
@@ -2294,5 +2319,34 @@ mod tests {
         assert_eq!(page.overflow.len(), 2);
         assert_eq!(page.len(), num_cells_in_page + 2);
         assert_eq!(page.drain(..).collect::<Vec<_>>(), cells);
+    }
+
+    #[test]
+    fn page_zero() {
+        let full_page_size = 512;
+        let slotted_page_size = full_page_size - DB_HEADER_SIZE as usize;
+        let min_cells = 4;
+        let overflow_cells = min_cells + 2;
+        let payload_size = Page::ideal_max_payload_size(slotted_page_size, min_cells) as usize;
+
+        let mut page = PageZero::alloc_in_memory(0, full_page_size);
+        let mut cells = Vec::new();
+
+        for i in 1..=overflow_cells {
+            let cell = Cell::new(vec![i as u8; payload_size]);
+            cells.push(cell.clone());
+            page.as_btree_page_mut().push(cell);
+        }
+
+        assert_eq!(page.buffer.size, full_page_size);
+        assert_eq!(page.as_btree_page().size(), slotted_page_size);
+        assert!(page.as_btree_page().is_overflow());
+        assert_eq!(page.as_btree_page().overflow.len(), 2);
+
+        for (i, cell) in cells[..min_cells].iter().enumerate() {
+            assert_eq!(page.as_btree_page().cell(i as u16), cell.as_ref());
+        }
+
+        // Use cargo miri test page::tests::page_zero to test the Drop impl
     }
 }

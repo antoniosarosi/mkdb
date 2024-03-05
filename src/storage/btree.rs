@@ -964,7 +964,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    ///
+    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
