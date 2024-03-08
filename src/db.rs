@@ -109,23 +109,6 @@ impl From<TypeError> for SqlError {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum ExpectedExpression {
-    Identifier,
-    Assignment,
-    Value,
-}
-
-impl Display for ExpectedExpression {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Identifier => "identifier",
-            Self::Value => "literal value",
-            Self::Assignment => "assignment",
-        })
-    }
-}
-
-#[derive(Debug, PartialEq)]
 pub(crate) enum SqlError {
     InvalidTable(String),
     InvalidColumn(String),
@@ -133,10 +116,6 @@ pub(crate) enum SqlError {
     MissingColumns,
     MultiplePrimaryKeys,
     TypeError(TypeError),
-    Expected {
-        expected: ExpectedExpression,
-        found: Expression,
-    },
     DivisionByZero(i128, i128),
     Other(String),
 }
@@ -172,7 +151,6 @@ impl Display for SqlError {
                     )
                 }
             },
-            Self::Expected { expected, found } => write!(f, "expected {expected}, found {found}"),
             Self::DivisionByZero(left, right) => write!(f, "division by zero: {left} / {right}"),
             Self::Other(message) => f.write_str(message),
         }
@@ -298,90 +276,6 @@ impl Projection {
 
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
-    }
-
-    pub fn to_ascii_table(&self) -> String {
-        // Initialize width of each column to the length of the table headers.
-        let mut widths: Vec<usize> = self
-            .schema
-            .columns
-            .iter()
-            .map(|col| col.name.len())
-            .collect();
-
-        // We only need strings.
-        let rows: Vec<Vec<String>> = self
-            .results
-            .iter()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect();
-
-        // Find the maximum width for each column.
-        for row in &rows {
-            for (i, col) in row.iter().enumerate() {
-                if col.len() > widths[i] {
-                    widths[i] = col.len();
-                }
-            }
-        }
-
-        // We'll add both a leading and trailing space to the widest string in
-        // each column, so increase width by 2.
-        widths.iter_mut().for_each(|w| *w += 2);
-
-        // Create border according to width: +-----+---------+------+-----+
-        let mut border = String::from('+');
-        for width in &widths {
-            for _ in 0..*width {
-                border.push('-');
-            }
-            border.push('+');
-        }
-
-        // Builds one row: | for | example | this | one |
-        let make_row = |row: &Vec<String>| -> String {
-            let mut string = String::from('|');
-
-            for (i, col) in row.iter().enumerate() {
-                string.push(' ');
-                string.push_str(col);
-                for _ in 0..widths[i] - col.len() - 1 {
-                    string.push(' ');
-                }
-                string.push('|');
-            }
-
-            string
-        };
-
-        // Header
-        let mut table = String::from(&border);
-        table.push('\n');
-
-        table.push_str(&make_row(
-            &self
-                .schema
-                .columns
-                .iter()
-                .map(|col| col.name.clone())
-                .collect(),
-        ));
-        table.push('\n');
-
-        table.push_str(&border);
-        table.push('\n');
-
-        // Content
-        for row in &rows {
-            table.push_str(&make_row(row));
-            table.push('\n');
-        }
-
-        if !rows.is_empty() {
-            table.push_str(&border);
-        }
-
-        table
     }
 }
 

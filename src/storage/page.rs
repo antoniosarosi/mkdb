@@ -2126,7 +2126,8 @@ mod tests {
         *buf.header_mut() = header;
         buf.content_mut().fill(content_byte);
 
-        let mut expected_buffer = [content_byte; TOTAL_SIZE];
+        let mut expected_buffer = [0; TOTAL_SIZE];
+        expected_buffer[HEADER_SIZE..].fill(content_byte);
 
         unsafe {
             expected_buffer[..HEADER_SIZE].copy_from_slice(slice::from_raw_parts(
