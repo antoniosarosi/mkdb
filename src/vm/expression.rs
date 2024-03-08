@@ -15,7 +15,7 @@ pub(crate) fn resolve_expression(
     expr: &Expression,
 ) -> Result<Value, SqlError> {
     match expr {
-        Expression::Value(value) => Ok(value.clone()),
+        Expression::Value(value) => Ok(value.clone()), // TODO: Avoid cloning
 
         Expression::Identifier(ident) => match schema.index_of(ident) {
             Some(index) => Ok(tuple[index].clone()),
@@ -84,12 +84,16 @@ pub(crate) fn resolve_expression(
                         return Err(mismatched_types());
                     };
 
+                    if arithmetic == &BinaryOperator::Div && *right == 0 {
+                        return Err(SqlError::DivisionByZero(*left, *right));
+                    }
+
                     Value::Number(match arithmetic {
                         BinaryOperator::Plus => left + right,
                         BinaryOperator::Minus => left - right,
                         BinaryOperator::Mul => left * right,
                         BinaryOperator::Div => left / right,
-                        _ => unreachable!(),
+                        _ => unreachable!("unhandled arithmetic operator: {arithmetic}"),
                     })
                 }
             })
@@ -108,12 +112,8 @@ pub(crate) fn resolve_expression(
 pub(crate) fn eval_where(
     schema: &Schema,
     tuple: &Vec<Value>,
-    r#where: &Option<Expression>,
+    expr: &Expression,
 ) -> Result<bool, SqlError> {
-    let Some(expr) = r#where else {
-        return Ok(true);
-    };
-
     match resolve_expression(tuple, schema, expr)? {
         Value::Bool(b) => Ok(b),
 
@@ -121,5 +121,17 @@ pub(crate) fn eval_where(
             expected: GenericDataType::Bool,
             found: Expression::Value(other),
         })),
+    }
+}
+
+/// Returns true if the expression evaluates to true or there is no expression.
+pub(crate) fn eval_optional_where(
+    schema: &Schema,
+    tuple: &Vec<Value>,
+    r#where: &Option<Expression>,
+) -> Result<bool, SqlError> {
+    match r#where {
+        Some(expr) => eval_where(schema, tuple, expr),
+        None => Ok(true),
     }
 }

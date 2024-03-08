@@ -1,3 +1,7 @@
 //! Code that runs on parsed SQL statements.
 
-mod planner;
+mod optimizer;
+
+pub(crate) mod planner;
+
+pub(crate) use planner::generate_plan;

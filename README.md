@@ -58,12 +58,15 @@ Then use `cargo` to test the `page` module:
 cargo +nightly miri test storage::page::tests
 ```
 
-The [`./src/paging/`](./src/paging/) module is not unsafe by itself but it
-heavily relies on the page module so it's worth testing with Miri as well:
+The [`./src/paging/`](./src/paging/) and
+[`./src/storage/btree.rs`](./src/storage/btree.rs) modules are not unsafe
+themselves but they heavily rely on the slotted page module so it's worth
+testing them with Miri as well:
 
 ```bash
 cargo +nightly miri test paging
+cargo +nightly miri test storage::btree::tests
 ```
 
-Same goes for [`./src/storage/btree.rs`](./src/storage/btree.rs) If all those
-modules work correctly without UB then the rest of the codebase should be fine.
+If all these modules work correctly without UB then the rest of the codebase
+should be fine.

@@ -10,4 +10,4 @@ mod executor;
 mod expression;
 
 pub(crate) use executor::{btree_new, exec};
-pub(crate) use expression::{eval_where, resolve_expression};
+pub(crate) use expression::{eval_optional_where, eval_where, resolve_expression};

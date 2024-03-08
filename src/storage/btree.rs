@@ -125,11 +125,6 @@ impl<'s> AsRef<[u8]> for Payload<'s> {
     }
 }
 
-pub(crate) struct Cursor {
-    page: PageNumber,
-    slot: SlotId,
-}
-
 /// B*-Tree implementation inspired by "Art of Computer Programming Volume 3:
 /// Sorting and Searching" and SQLite 2.X.X
 ///

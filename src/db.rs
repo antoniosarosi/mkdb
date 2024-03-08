@@ -1,10 +1,12 @@
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::HashMap,
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
     path::Path,
+    rc::Rc,
     usize,
 };
 
@@ -14,10 +16,12 @@ use crate::{
         self,
         pager::{PageNumber, Pager},
     },
+    query,
     sql::{
         analyzer::analyze,
         optimizer::optimize,
         parser::{Parser, ParserError},
+        prepare::prepare,
         statement::{
             BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement,
             UnaryOperator, Value,
@@ -41,7 +45,7 @@ pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 pub(crate) type RowId = u64;
 
 pub(crate) struct Database<I> {
-    pub pager: Pager<I>,
+    pub pager: Rc<RefCell<Pager<I>>>,
     row_ids: HashMap<String, u64>,
 }
 
@@ -133,6 +137,7 @@ pub(crate) enum SqlError {
         expected: ExpectedExpression,
         found: Expression,
     },
+    DivisionByZero(i128, i128),
     Other(String),
 }
 
@@ -168,6 +173,7 @@ impl Display for SqlError {
                 }
             },
             Self::Expected { expected, found } => write!(f, "expected {expected}, found {found}"),
+            Self::DivisionByZero(left, right) => write!(f, "division by zero: {left} / {right}"),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -209,7 +215,7 @@ impl From<SqlError> for DbError {
 }
 
 /// Table schema.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Schema {
     /// Column definitions.
     pub columns: Vec<Column>,
@@ -417,7 +423,7 @@ fn mkdb_meta_schema() -> Schema {
 }
 
 impl<I> Database<I> {
-    fn new(pager: Pager<I>) -> Self {
+    pub fn new(pager: Rc<RefCell<Pager<I>>>) -> Self {
         Self {
             pager,
             row_ids: HashMap::new(),
@@ -446,7 +452,7 @@ impl Database<File> {
 
         pager.init()?;
 
-        Ok(Database::new(pager))
+        Ok(Database::new(Rc::new(RefCell::new(pager))))
     }
 }
 
@@ -508,7 +514,8 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             return Ok(*row_id);
         }
 
-        let mut btree = vm::btree_new(&mut self.pager, root);
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = vm::btree_new(&mut pager, root);
 
         // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
         let row_id = if let Some(max) = btree.max()? {
@@ -534,14 +541,16 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
         analyze(&statement, self)?;
         optimize(&mut statement);
+        prepare(&mut statement, self)?;
 
         // TODO: Rollback if it fails.
         let query_resolution = vm::exec(statement, self);
 
         // TODO: Transactions.
-        self.pager.write_dirty_pages()?;
-        self.pager.flush()?;
-        self.pager.sync()?;
+        let mut pager = self.pager.borrow_mut();
+        pager.write_dirty_pages()?;
+        pager.flush()?;
+        pager.sync()?;
 
         query_resolution
     }
@@ -549,7 +558,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io};
+    use std::{cell::RefCell, collections::HashMap, io, rc::Rc};
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
@@ -581,7 +590,7 @@ mod tests {
 
         pager.init()?;
 
-        Ok(Database::new(pager))
+        Ok(Database::new(Rc::new(RefCell::new(pager))))
     }
 
     #[test]
@@ -1151,29 +1160,7 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![]
-            }
-        );
+        assert_eq!(query, Projection::empty());
 
         Ok(())
     }
