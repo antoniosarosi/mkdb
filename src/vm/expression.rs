@@ -1,7 +1,9 @@
+//! Code that executes [`Expression`] trees and resolves them into [`Value`].
+
 use std::mem;
 
 use crate::{
-    db::{GenericDataType, Schema, SqlError, TypeError},
+    db::{Schema, SqlError, TypeError, VmDataType},
     sql::statement::{BinaryOperator, Expression, UnaryOperator, Value},
 };
 
@@ -107,6 +109,14 @@ pub(crate) fn resolve_expression(
     }
 }
 
+/// Same as [`resolve_expression`] but without variables.
+///
+/// If the given expression actually contains variables
+/// (AKA [`Expression::Identifier`]) then an error is returned.
+pub(crate) fn resolve_literal_expression(expr: &Expression) -> Result<Value, SqlError> {
+    resolve_expression(&vec![], &Schema::empty(), expr)
+}
+
 /// Returns `true` if the where [`Expression`] applied to the given tuple
 /// evaluates to true.
 pub(crate) fn eval_where(
@@ -115,23 +125,11 @@ pub(crate) fn eval_where(
     expr: &Expression,
 ) -> Result<bool, SqlError> {
     match resolve_expression(tuple, schema, expr)? {
-        Value::Bool(b) => Ok(b),
+        Value::Bool(bool) => Ok(bool),
 
         other => Err(SqlError::TypeError(TypeError::ExpectedType {
-            expected: GenericDataType::Bool,
+            expected: VmDataType::Bool,
             found: Expression::Value(other),
         })),
-    }
-}
-
-/// Returns true if the expression evaluates to true or there is no expression.
-pub(crate) fn eval_optional_where(
-    schema: &Schema,
-    tuple: &Vec<Value>,
-    r#where: &Option<Expression>,
-) -> Result<bool, SqlError> {
-    match r#where {
-        Some(expr) => eval_where(schema, tuple, expr),
-        None => Ok(true),
     }
 }

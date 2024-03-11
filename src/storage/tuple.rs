@@ -13,7 +13,7 @@ pub(crate) fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
-pub(crate) fn serialize_values(schema: &Schema, values: &Vec<Value>) -> Vec<u8> {
+pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     macro_rules! serialize_big_endian {
         ($num:expr, $int:ty) => {
             TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()

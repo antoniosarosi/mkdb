@@ -605,7 +605,7 @@ mod tests {
     impl Cache {
         fn load_many<P: IntoIterator<Item = MemPage>>(&mut self, pages: P) {
             for page in pages {
-                self.load(page.into());
+                self.load(page);
             }
         }
 
@@ -732,7 +732,7 @@ mod tests {
         // Should not evict page 0 because it's pinned.
         cache.load(pages[3].clone());
 
-        assert_eq!(pinned, true);
+        assert!(pinned);
         assert_eq!(cache.clock, 1);
         assert_eq!(cache.buffer[0].page, pages[0]);
         assert_eq!(cache.buffer[1].page, pages[3]);

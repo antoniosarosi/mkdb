@@ -127,7 +127,7 @@ fn ascii_table(projection: Projection) -> String {
 
         for (i, col) in row.iter().enumerate() {
             string.push(' ');
-            string.push_str(&col);
+            string.push_str(col);
             for _ in 0..widths[i] - col.len() - 1 {
                 string.push(' ');
             }

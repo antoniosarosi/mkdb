@@ -1645,6 +1645,9 @@ pub(crate) struct OverflowPageHeader {
     /// Number of bytes stored in this page. Not to be confused with the page
     /// size.
     pub num_bytes: u16,
+    /// See [`PageHeader::padding`] for details. Basically we need this because
+    /// Miri.
+    padding: u16,
 }
 
 /// Cell overflow page.
@@ -1867,7 +1870,7 @@ impl Drop for PageZero {
         //
         // 2. The slotted page overflow list.
         //
-        // This should be "safe" here because none of this allocations can be
+        // This should be "safe" here because none of these allocations can be
         // used after this code runs, the compiler should prevent it if calling
         // [`mem::drop`] or allowing it to insert the drop call automatically.
         unsafe {
@@ -2028,10 +2031,11 @@ impl<'p> TryFrom<&'p mut MemPage> for &'p mut OverflowPage {
 
 #[cfg(test)]
 mod tests {
-    use core::slice;
+    use std::slice;
 
     use super::*;
 
+    /// Returns a list of variable size cells.
     fn variable_size_cells(sizes: &[usize]) -> Vec<Box<Cell>> {
         sizes
             .iter()
@@ -2040,25 +2044,41 @@ mod tests {
             .collect()
     }
 
+    /// Returns a list of `amount` cells each carrying `size` bytes of payload.
     fn fixed_size_cells(size: usize, amount: usize) -> Vec<Box<Cell>> {
         variable_size_cells(&vec![size; amount])
     }
 
+    /// Returns the optimal page size to fit the given cells.
+    ///
+    /// Note that after inserting all the cells in the page, the page might
+    /// still contain some free bytes because we must align to
+    /// [`MEM_ALIGNMENT`].
+    fn optimal_page_size_to_fit(cells: &[Box<Cell>]) -> usize {
+        let size = PAGE_HEADER_SIZE + cells.iter().map(|cell| cell.storage_size()).sum::<u16>();
+
+        Layout::from_size_align(size as usize, MEM_ALIGNMENT)
+            .unwrap()
+            .pad_to_align()
+            .size()
+    }
+
+    /// Page builder for tests.
     struct Builder {
-        size: usize,
+        size: Option<usize>,
         cells: Vec<Box<Cell>>,
     }
 
     impl Builder {
         fn new() -> Self {
             Self {
-                size: MIN_PAGE_SIZE,
+                size: None,
                 cells: Vec::new(),
             }
         }
 
         fn size(mut self, size: usize) -> Self {
-            self.size = size;
+            self.size = Some(size);
             self
         }
 
@@ -2068,7 +2088,9 @@ mod tests {
         }
 
         fn build(self) -> (Page, Vec<Box<Cell>>) {
-            let mut page = Page::alloc_in_memory(0, self.size);
+            let size = self.size.unwrap_or(optimal_page_size_to_fit(&self.cells));
+
+            let mut page = Page::alloc_in_memory(0, size);
             page.push_all(self.cells.clone());
 
             (page, self.cells)
@@ -2091,23 +2113,58 @@ mod tests {
     ///
     /// * `cells` - List of cells that have been inserted in the page
     /// (in order). Necessary for checking data corruption.
-    fn compare_consecutive_offsets(page: &Page, cells: &Vec<Box<Cell>>) {
+    fn assert_eq_cells_consecutive_offsets(page: &Page, cells: &[Box<Cell>]) {
+        assert_eq_cells(page, cells);
+
         let mut expected_offset = page.size() - PAGE_HEADER_SIZE as usize;
         for (i, cell) in cells.iter().enumerate() {
             expected_offset -= cell.total_size() as usize;
-            assert_eq!(page.slot_array()[i], expected_offset as u16);
-            assert_eq!(page.cell(i as u16), cell.as_ref());
+            assert_eq!(
+                page.slot_array()[i],
+                expected_offset as u16,
+                "offset mismatch for cell at index {i}: {cell:?}"
+            );
         }
     }
 
-    /// Same as [`compare_consecutive_offsets`] but only checks the cell values,
-    /// not the offsets.
-    fn compare_cells(page: &Page, cells: &Vec<Box<Cell>>) {
+    /// Checks that the page contains all the given cells.
+    ///
+    /// The order of the cells must be the same as the one in the page.
+    fn assert_eq_cells(page: &Page, cells: &[Box<Cell>]) {
+        assert_eq!(
+            page.header().num_slots,
+            cells.len() as u16,
+            "length of slot array does not match length of inserted cells"
+        );
+
+        assert_free_space_matches_inserted_cells(page, cells);
+
         for (i, cell) in cells.iter().enumerate() {
-            assert_eq!(page.cell(i as _), cell.as_ref());
+            assert_eq!(
+                page.cell(i as _),
+                cell.as_ref(),
+                "data for cell at index {i} is corrupted or otherwise bugged"
+            );
         }
     }
 
+    /// Computes the expected free space after inserting the given cells and
+    /// checks that the page has that amount of free space.
+    fn assert_free_space_matches_inserted_cells(page: &Page, cells: &[Box<Cell>]) {
+        let used_space =
+            PAGE_HEADER_SIZE + cells.iter().map(|cell| cell.storage_size()).sum::<u16>();
+        let expected_free_space = page.size() - used_space as usize;
+
+        assert_eq!(
+            page.header().free_space,
+            expected_free_space as u16,
+            "page of size {} should contain {expected_free_space} bytes of free space after inserting paylods of sizes {:?}",
+            page.size(),
+            cells.iter().map(|cell| cell.header.size).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Simple test to check whether allocations and reads/writes work.
     #[test]
     fn buffer_with_header() {
         const HEADER_SIZE: usize = mem::size_of::<OverflowPageHeader>();
@@ -2119,6 +2176,7 @@ mod tests {
         let header = OverflowPageHeader {
             next: 10,
             num_bytes: CONTENT_SIZE as u16,
+            padding: 0,
         };
 
         let content_byte = 0b10101010; // 170 in decimal
@@ -2142,53 +2200,112 @@ mod tests {
         assert_eq!(buf.as_slice(), &expected_buffer);
     }
 
-    // TODO: Size of cells in the tests below are hardcoded, if the size of
-    // the page header or cell header changes the tests might fail. Calculate
-    // the sizes relative to the headers.
-
+    /// Insert 3 cells that carry 32 bytes of content (full size includes header
+    /// and alignment).
+    ///
+    /// ```text
+    ///  +--------+----+----+----+------+--------+--------+--------+
+    ///  |   HDR  | O1 | O2 | O3 | FREE |   C3   |   C2   |   C1   |
+    ///  +--------+----+----+----+------+--------+--------+--------+
+    ///                                  32 bytes 32 bytes 32 bytes
+    /// ```
     #[test]
     fn push_fixed_size_cells() {
-        let (page, cells) = Page::builder()
-            .size(512)
-            .cells(fixed_size_cells(32, 3))
-            .build();
+        let (page, cells) = Page::builder().cells(fixed_size_cells(32, 3)).build();
 
-        assert_eq!(page.header().num_slots, cells.len() as u16);
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
     }
 
+    /// Insert 3 cells of different content size: 64, 32 and 80 bytes (full size
+    /// includes header and alignment).
+    ///
+    /// ```text
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///  |   HDR  | O1 | O2 | O3 | FREE |       C3        |  C2  |     C1    |
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///                                      80 bytes     32 bytes  64 bytes
+    /// ```
     #[test]
     fn push_variable_size_cells() {
         let (page, cells) = Page::builder()
-            .size(512)
             .cells(variable_size_cells(&[64, 32, 80]))
             .build();
 
-        assert_eq!(page.header().num_slots, cells.len() as u16);
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
     }
 
+    /// Delete slot number 1 from here:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+------+--------+--------+--------+
+    ///  |   HDR  | O1 | O2 | O3 | FREE |   C3   |   C2   |   C1   |
+    ///  +--------+----+----+----+------+--------+--------+--------+
+    ///                                  32 bytes 32 bytes 32 bytes
+    /// ```
+    ///
+    /// Result:
+    ///
+    /// ```text
+    ///  +--------+----+----+-----------+--------+--------+--------+
+    ///  |   HDR  | O1 | O3 |    FREE   |   C3   |  FREE  |   C1   |
+    ///  +--------+----+----+-----------+--------+--------+--------+
+    ///                                  32 bytes 32 bytes 32 bytes
+    /// ```
     #[test]
     fn delete_slot() {
-        let (mut page, mut cells) = Page::builder()
-            .size(512)
-            .cells(fixed_size_cells(32, 3))
-            .build();
+        let (mut page, mut cells) = Page::builder().cells(fixed_size_cells(32, 3)).build();
 
         let expected_offsets = [page.slot_array()[0], page.slot_array()[2]];
 
         page.remove(1);
         cells.remove(1);
 
-        assert_eq!(page.header().num_slots, 2);
         assert_eq!(page.slot_array(), expected_offsets);
-        compare_cells(&page, &cells);
+        assert_eq_cells(&page, &cells);
     }
 
+    /// Remove slot 1 from here:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----+----+------+--+------------+------+----------+----+
+    ///  |   HDR  | O1 | O2 | O3 | O4 | O5 | FREE |C5|     C4     |  C3  |    C2    | C1 |
+    ///  +--------+----+----+----+----+----+------+--+------------+------+----------+----+
+    ///                                            8       72        32       64      24
+    ///                                          bytes    bytes     bytes    bytes   bytes
+    /// ```
+    ///
+    /// Then remove slot 2 from this result:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----+-----------+--+------------+------+----------+----+
+    ///  |   HDR  | O1 | O3 | O4 | O5 |    FREE   |C5|     C4     |  C3  |   FREE   | C1 |
+    ///  +--------+----+----+----+----+-----------+--+------------+------+----------+----+
+    ///                                            8       72        32       64      24
+    ///                                          bytes    bytes     bytes    bytes   bytes
+    /// ```
+    ///
+    /// Now defragment this result:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----------------+--+------------+------+----------+----+
+    ///  |   HDR  | O1 | O3 | O5 |      FREE      |C5|    FREE    |  C3  |   FREE   | C1 |
+    ///  +--------+----+----+----+----------------+--+------------+------+----------+----+
+    ///                                  F         8       72        32       64      24
+    ///                                          bytes    bytes     bytes    bytes   bytes
+    /// ```
+    ///
+    /// Final result:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----------------------------------------+--+------+----+
+    ///  |   HDR  | O1 | O3 | O5 |                  FREE                  |C5|  C3  | C1 |
+    ///  +--------+----+----+----+----------------------------------------+--+------+----+
+    ///                                        F + 72 + 64 + 2H            8    32    24
+    ///                                             bytes                bytes bytes bytes
+    /// ```
     #[test]
     fn defragment() {
         let (mut page, mut cells) = Page::builder()
-            .size(512)
             .cells(variable_size_cells(&[24, 64, 32, 72, 8]))
             .build();
 
@@ -2199,32 +2316,60 @@ mod tests {
 
         page.defragment();
 
-        assert_eq!(page.header().num_slots, 3);
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
     }
 
+    /// Create cells of unaligned size and insert them to check that padding
+    /// is correct.
     #[test]
     fn unaligned_content() {
         let (page, cells) = Page::builder()
-            .size(512)
             .cells(variable_size_cells(&[7, 19, 20]))
             .build();
 
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
 
         // Check padding
-        for i in 0..cells.len() {
+        for (i, cell) in cells.iter().enumerate() {
             assert_eq!(
                 page.cell(i as u16).content.len(),
-                Cell::aligned_size_of(&cells[i].content) as usize
+                Cell::aligned_size_of(&cell.content) as usize
             );
         }
     }
 
+    /// Start with this page:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----+------+----+--------+--------+--------+
+    ///  |   HDR  | O1 | O2 | O3 | O4 | FREE | C4 |   C3   |   C2   |   C1   |
+    ///  +--------+----+----+----+----+------+----+--------+--------+--------+
+    ///                                        64     112      112      112
+    ///                                       bytes  bytes    bytes    bytes
+    /// ```
+    ///
+    /// Remove slot 1:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+-----------+----+--------+--------+--------+
+    ///  |   HDR  | O1 | O3 | O4 |    FREE   | C4 |   C3   |  FREE  |   C1   |
+    ///  +--------+----+----+----+-----------+----+--------+--------+--------+
+    ///                              < 112     64     112      112      112
+    ///                              bytes    bytes  bytes    bytes    bytes
+    /// ```
+    ///
+    /// Inserting payload of size 112 should trigger auto-defragmentation:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+----+------+--------+----+--------+--------+
+    ///  |   HDR  | O1 | O3 | O4 | O5 | FREE |   C5   | C4 |   C3   |   C1   |
+    ///  +--------+----+----+----+----+------+--------+----+--------+--------+
+    ///                                < 112     112    64     112      112
+    ///                                bytes    bytes  bytes  bytes    bytes
+    /// ```
     #[test]
     fn insert_defragmenting() {
         let (mut page, mut cells) = Page::builder()
-            .size(512)
             .cells(variable_size_cells(&[64, 112, 112, 112]))
             .build();
 
@@ -2236,13 +2381,29 @@ mod tests {
         cells.push(new_cell.clone());
         page.push(new_cell);
 
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
     }
 
+    /// Start with this page:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///  |   HDR  | O1 | O2 | O3 | FREE |       C3        |  C2  |     C1    |
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///                                     112 bytes     32 bytes  64 bytes
+    /// ```
+    ///
+    /// Replace C2 with payload of same size C4:
+    ///
+    /// ```text
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///  |   HDR  | O1 | O4 | O3 | FREE |       C3        |  C4  |     C1    |
+    ///  +--------+----+----+----+------+-----------------+------+-----------+
+    ///                                     112 bytes     32 bytes  64 bytes
+    /// ```
     #[test]
     fn replace_cell_in_place() {
         let (mut page, mut cells) = Page::builder()
-            .size(512)
             .cells(variable_size_cells(&[64, 32, 112]))
             .build();
 
@@ -2251,13 +2412,32 @@ mod tests {
 
         page.replace(1, new_cell);
 
-        compare_consecutive_offsets(&page, &cells);
+        assert_eq_cells_consecutive_offsets(&page, &cells);
     }
 
+    /// Start with this page:
+    ///
+    /// ```text
+    ///  +--------+----+----+----------------------+---------------+-----------+
+    ///  |   HDR  | O1 | O2 |         FREE         |      C2       |     C1    |
+    ///  +--------+----+----+----------------------+---------------+-----------+
+    ///                           >= 96 bytes           96 bytes      64 bytes
+    /// ```
+    ///
+    /// Replace C1 with paylod C3 of size 96 bytes:
+    ///
+    /// ```text
+    ///  +--------+----+----+------+---------------+---------------+-----------+
+    ///  |   HDR  | O3 | O2 | FREE |      C3       |      C2       |   FREE    |
+    ///  +--------+----+----+------+---------------+---------------+-----------+
+    ///                                96 bytes         96 bytes      64 bytes
+    /// ```
     #[test]
     fn replace_cell_removing_previous() {
         let (mut page, mut cells) = Page::builder()
-            .size(512)
+            .size(optimal_page_size_to_fit(&variable_size_cells(&[
+                64, 96, 96,
+            ])))
             .cells(variable_size_cells(&[64, 96]))
             .build();
 
@@ -2272,17 +2452,14 @@ mod tests {
 
         page.replace(0, new_cell);
 
-        assert_eq!(page.header().num_slots, 2);
         assert_eq!(page.slot_array()[0], expected_offset as u16);
-        compare_cells(&page, &cells);
+        assert_eq_cells(&page, &cells);
     }
 
+    /// Check basic drain usage.
     #[test]
     fn drain() {
-        let (mut page, mut cells) = Page::builder()
-            .size(512)
-            .cells(fixed_size_cells(32, 4))
-            .build();
+        let (mut page, mut cells) = Page::builder().cells(fixed_size_cells(32, 4)).build();
 
         let expected_offsets = [page.slot_array()[0], page.slot_array()[3]];
 
@@ -2291,37 +2468,31 @@ mod tests {
             cells.drain(1..=2).collect::<Vec<_>>()
         );
 
-        assert_eq!(page.header().num_slots, 2);
         assert_eq!(page.slot_array(), expected_offsets);
-        compare_cells(&page, &cells);
+        assert_eq_cells(&page, &cells);
     }
 
+    /// Inserts two cells more than the page can fit and then drains the
+    /// entire page.
+    ///
+    /// This is the most important test here because this is what the BTree
+    /// does when it runs the balancing algorithm.
     #[test]
     fn insert_with_overflow() {
-        let cell_size = 32;
-        let page_size = 512;
+        let (mut page, mut cells) = Page::builder().cells(fixed_size_cells(32, 3)).build();
 
-        let num_cells_in_page =
-            Page::usable_space(page_size) / Cell::new(vec![0; cell_size]).storage_size();
-
-        let (mut page, mut cells) = Page::builder()
-            .size(512)
-            .cells(fixed_size_cells(cell_size, num_cells_in_page as usize))
-            .build();
-
-        let mut cell_data = num_cells_in_page + 1;
         for i in [1, 3] {
-            let new_cell = Cell::new(vec![cell_data as u8; cell_size]);
+            let new_cell = Cell::new(vec![(cells.len() + 1) as u8; 32]);
             cells.insert(i, new_cell.clone());
             page.insert(i as _, new_cell);
-            cell_data += 1;
         }
 
         assert_eq!(page.overflow.len(), 2);
-        assert_eq!(page.len(), num_cells_in_page + 2);
+        assert_eq!(page.len() as usize, cells.len());
         assert_eq!(page.drain(..).collect::<Vec<_>>(), cells);
     }
 
+    /// Mainly written to test the [`Drop`] impl for [`PageZero`] with Miri.
     #[test]
     fn page_zero() {
         let full_page_size = 512;

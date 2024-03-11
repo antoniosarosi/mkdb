@@ -284,8 +284,8 @@ impl<I: Seek + Read + Write> Pager<I> {
         // give us space, then once we have all the space we need figure out
         // which pages are not in memory, load them from disk and finally build
         // the mutable refs. Easier said than done :)
-        for i in 0..N {
-            self.lookup::<Page>(pages[i])?;
+        for page in &pages {
+            self.lookup::<Page>(*page)?;
         }
 
         // Couldn't cache all pages, bail out. Ideally we should use pin() and

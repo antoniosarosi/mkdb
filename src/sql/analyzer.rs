@@ -8,7 +8,7 @@
 use std::io::{Read, Seek, Write};
 
 use crate::{
-    db::{Database, DbError, GenericDataType, Schema, SqlError, TypeError},
+    db::{Database, DbError, Schema, SqlError, TypeError, VmDataType},
     paging,
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
 };
@@ -117,12 +117,12 @@ fn analyze_where(schema: &Schema, r#where: &Option<Expression>) -> Result<(), Db
         return Ok(());
     };
 
-    if let GenericDataType::Bool = analyze_expression(schema, expr)? {
+    if let VmDataType::Bool = analyze_expression(schema, expr)? {
         return Ok(());
     };
 
     Err(DbError::Sql(SqlError::TypeError(TypeError::ExpectedType {
-        expected: GenericDataType::Bool,
+        expected: VmDataType::Bool,
         found: expr.clone(),
     })))
 }
@@ -139,7 +139,7 @@ fn analyze_assignment(
         .index_of(column)
         .ok_or(SqlError::InvalidColumn(column.into()))?;
 
-    let expected_data_type = GenericDataType::from(schema.columns[index].data_type);
+    let expected_data_type = VmDataType::from(schema.columns[index].data_type);
     let pre_eval_data_type = if allow_identifiers {
         analyze_expression(schema, value)?
     } else {
@@ -165,12 +165,12 @@ fn analyze_assignment(
 ///
 /// If there are type errors or unknown columns not present in the given
 /// schema then an error is returned.
-fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<GenericDataType, SqlError> {
+fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<VmDataType, SqlError> {
     Ok(match expr {
         Expression::Value(value) => match value {
-            Value::Bool(_) => GenericDataType::Bool,
-            Value::Number(_) => GenericDataType::Number,
-            Value::String(_) => GenericDataType::String,
+            Value::Bool(_) => VmDataType::Bool,
+            Value::Number(_) => VmDataType::Number,
+            Value::String(_) => VmDataType::String,
         },
 
         Expression::Identifier(ident) => {
@@ -179,17 +179,17 @@ fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<GenericDataT
                 .ok_or(SqlError::InvalidColumn(ident.clone()))?;
 
             match schema.columns[index].data_type {
-                DataType::Bool => GenericDataType::Bool,
-                DataType::Varchar(_) => GenericDataType::String,
-                _ => GenericDataType::Number,
+                DataType::Bool => VmDataType::Bool,
+                DataType::Varchar(_) => VmDataType::String,
+                _ => VmDataType::Number,
             }
         }
 
         Expression::UnaryOperation { operator, expr } => match analyze_expression(schema, expr)? {
-            GenericDataType::Number => GenericDataType::Number,
+            VmDataType::Number => VmDataType::Number,
 
             _ => Err(TypeError::ExpectedType {
-                expected: GenericDataType::Number,
+                expected: VmDataType::Number,
                 found: *expr.clone(),
             })?,
         },
@@ -223,21 +223,19 @@ fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<GenericDataT
                 | BinaryOperator::Lt
                 | BinaryOperator::LtEq
                 | BinaryOperator::Gt
-                | BinaryOperator::GtEq => GenericDataType::Bool,
+                | BinaryOperator::GtEq => VmDataType::Bool,
 
-                BinaryOperator::And | BinaryOperator::Or
-                    if left_data_type == GenericDataType::Bool =>
-                {
-                    GenericDataType::Bool
+                BinaryOperator::And | BinaryOperator::Or if left_data_type == VmDataType::Bool => {
+                    VmDataType::Bool
                 }
 
                 BinaryOperator::Plus
                 | BinaryOperator::Minus
                 | BinaryOperator::Div
                 | BinaryOperator::Mul
-                    if left_data_type == GenericDataType::Number =>
+                    if left_data_type == VmDataType::Number =>
                 {
-                    GenericDataType::Number
+                    VmDataType::Number
                 }
 
                 _ => Err(mismatched_types())?,

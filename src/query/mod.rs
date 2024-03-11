@@ -2,6 +2,5 @@
 
 mod optimizer;
 
+pub(crate) mod plan;
 pub(crate) mod planner;
-
-pub(crate) use planner::generate_plan;

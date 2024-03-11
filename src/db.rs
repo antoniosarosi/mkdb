@@ -18,16 +18,14 @@ use crate::{
     },
     query,
     sql::{
-        analyzer::analyze,
-        optimizer::optimize,
+        self,
         parser::{Parser, ParserError},
-        prepare::prepare,
         statement::{
             BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement,
             UnaryOperator, Value,
         },
     },
-    storage::{tuple, BytesCmp},
+    storage::{tuple, BTree, BytesCmp, FixedSizeMemCmp},
     vm,
 };
 
@@ -55,17 +53,18 @@ pub(crate) struct Projection {
     pub results: Vec<Vec<Value>>,
 }
 
-/// Generic data types without SQL details such as `UNSIGNED` or `VARCHAR(max)`.
+/// Generic data types used at runtime by [`crate::vm`] without SQL details
+/// such as `UNSIGNED` or `VARCHAR(max)`.
 ///
 /// Basically the variants of [`Value`] but without inner data.
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum GenericDataType {
+pub(crate) enum VmDataType {
     Bool,
     String,
     Number,
 }
 
-impl Display for GenericDataType {
+impl Display for VmDataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Bool => "boolean",
@@ -75,12 +74,12 @@ impl Display for GenericDataType {
     }
 }
 
-impl From<DataType> for GenericDataType {
+impl From<DataType> for VmDataType {
     fn from(data_type: DataType) -> Self {
         match data_type {
-            DataType::Varchar(_) => GenericDataType::String,
-            DataType::Bool => GenericDataType::Bool,
-            _ => GenericDataType::Number,
+            DataType::Varchar(_) => VmDataType::String,
+            DataType::Bool => VmDataType::Bool,
+            _ => VmDataType::Number,
         }
     }
 }
@@ -97,7 +96,7 @@ pub(crate) enum TypeError {
         right: Expression,
     },
     ExpectedType {
-        expected: GenericDataType,
+        expected: VmDataType,
         found: Expression,
     },
 }
@@ -280,7 +279,7 @@ impl Projection {
 }
 
 /// Schema of the table used to keep track of the database information.
-fn mkdb_meta_schema() -> Schema {
+pub(crate) fn mkdb_meta_schema() -> Schema {
     Schema::from(vec![
         // Either "index" or "table"
         Column {
@@ -366,7 +365,7 @@ impl BytesCmp for StringCmp {
 }
 
 impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
-    pub fn table_metadata(&mut self, table: &String) -> Result<(Schema, PageNumber), DbError> {
+    pub fn table_metadata(&mut self, table: &str) -> Result<(Schema, PageNumber), DbError> {
         if table == MKDB_META {
             let mut schema = mkdb_meta_schema();
             schema.prepend_row_id();
@@ -378,7 +377,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         ))?;
 
         if query.is_empty() {
-            return Err(DbError::Sql(SqlError::InvalidTable(table.clone())));
+            return Err(DbError::Sql(SqlError::InvalidTable(table.into())));
         }
 
         // TODO: Find some way to avoid parsing SQL every time. Probably a
@@ -402,16 +401,17 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         Ok((schema, root))
     }
 
-    pub(crate) fn next_row_id(&mut self, table: &str, root: PageNumber) -> io::Result<RowId> {
+    pub(crate) fn next_row_id(&mut self, table: &str) -> Result<RowId, DbError> {
         if let Some(row_id) = self.row_ids.get_mut(table) {
             *row_id += 1;
             return Ok(*row_id);
         }
 
-        let mut pager = self.pager.borrow_mut();
-        let mut btree = vm::btree_new(&mut pager, root);
+        let (_, root) = self.table_metadata(table)?;
 
-        // TODO: Error handling, use aggregate (SELECT MAX(row_id)...)
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = BTree::new(&mut pager, root, FixedSizeMemCmp::for_type::<RowId>());
+
         let row_id = if let Some(max) = btree.max()? {
             tuple::deserialize_row_id(max.as_ref()) + 1
         } else {
@@ -423,22 +423,16 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
     }
 
     pub fn exec(&mut self, input: &str) -> QueryResult {
-        let mut parser = Parser::new(input);
-
-        let mut statements = parser.try_parse()?;
-
-        if statements.len() > 1 {
-            todo!("handle multiple statements at once");
-        }
-
-        let mut statement = statements.remove(0);
-
-        analyze(&statement, self)?;
-        optimize(&mut statement);
-        prepare(&mut statement, self)?;
+        let statement = sql::pipeline(input, self)?;
 
         // TODO: Rollback if it fails.
-        let query_resolution = vm::exec(statement, self);
+        let projection = if query::planner::needs_plan(&statement) {
+            let plan = query::planner::generate_plan(statement, self)?;
+            vm::exec_plan(plan)?
+        } else {
+            vm::exec_statement(statement, self)?;
+            Projection::empty()
+        };
 
         // TODO: Transactions.
         let mut pager = self.pager.borrow_mut();
@@ -446,7 +440,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         pager.flush()?;
         pager.sync()?;
 
-        query_resolution
+        Ok(projection)
     }
 }
 
@@ -456,7 +450,7 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, GenericDataType, Projection, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, Projection, Schema, SqlError, TypeError, VmDataType},
         paging::{io::MemBuf, pager::Pager},
         sql::{
             parser::Parser,
@@ -498,29 +492,26 @@ mod tests {
 
         assert_eq!(
             query,
-            Projection::new(
-                mkdb_meta_schema(),
+            Projection::new(mkdb_meta_schema(), vec![
                 vec![
-                    vec![
-                        Value::String("table".into()),
-                        Value::String("users".into()),
-                        Value::Number(1),
-                        Value::String("users".into()),
-                        Value::String(Parser::new(sql).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("index".into()),
-                        Value::String("users_pk_index".into()),
-                        Value::Number(2),
-                        Value::String("users".into()),
-                        Value::String(
-                            Parser::new("CREATE INDEX users_pk_index ON users(id);")
-                                .parse_statement()?
-                                .to_string()
-                        )
-                    ]
+                    Value::String("table".into()),
+                    Value::String("users".into()),
+                    Value::Number(1),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(sql).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("users_pk_index".into()),
+                    Value::Number(2),
+                    Value::String("users".into()),
+                    Value::String(
+                        Parser::new("CREATE INDEX users_pk_index ON users(id);")
+                            .parse_statement()?
+                            .to_string()
+                    )
                 ]
-            )
+            ])
         );
 
         Ok(())
@@ -536,27 +527,24 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![Value::Number(1), Value::String("John Doe".into())],
-                    vec![Value::Number(2), Value::String("Jane Doe".into())],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![Value::Number(1), Value::String("John Doe".into())],
+                vec![Value::Number(2), Value::String("Jane Doe".into())],
+            ]
+        });
 
         Ok(())
     }
@@ -594,29 +582,26 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users ORDER BY id;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None,
-                    },
-                    Column {
-                        name: "email".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: Some(Constraint::Unique),
-                    }
-                ]),
-                results: expected
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None,
+                },
+                Column {
+                    name: "email".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: Some(Constraint::Unique),
+                }
+            ]),
+            results: expected
+        });
 
         Ok(())
     }
@@ -631,40 +616,37 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(1),
-                        Value::String("John Doe".into()),
-                        Value::Number(18)
-                    ],
-                    vec![
-                        Value::Number(2),
-                        Value::String("Jane Doe".into()),
-                        Value::Number(22)
-                    ],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+            ]
+        });
 
         Ok(())
     }
@@ -679,32 +661,29 @@ mod tests {
 
         let query = db.exec("SELECT * FROM products;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "price".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    },
-                    Column {
-                        name: "discount".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![Value::Number(1), Value::Number(110), Value::Number(4),],
-                    vec![Value::Number(2), Value::Number(40), Value::Number(20),],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "price".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                },
+                Column {
+                    name: "discount".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![Value::Number(1), Value::Number(110), Value::Number(4),],
+                vec![Value::Number(2), Value::Number(40), Value::Number(20),],
+            ]
+        });
 
         Ok(())
     }
@@ -720,40 +699,37 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE age > 18;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(2),
-                        Value::String("Jane Doe".into()),
-                        Value::Number(22)
-                    ],
-                    vec![
-                        Value::Number(3),
-                        Value::String("Some Dude".into()),
-                        Value::Number(24)
-                    ],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+            ]
+        });
 
         Ok(())
     }
@@ -769,45 +745,42 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users ORDER BY name, age;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(1),
-                        Value::String("John Doe".into()),
-                        Value::Number(18)
-                    ],
-                    vec![
-                        Value::Number(2),
-                        Value::String("John Doe".into()),
-                        Value::Number(22)
-                    ],
-                    vec![
-                        Value::Number(3),
-                        Value::String("Some Dude".into()),
-                        Value::Number(24)
-                    ]
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("John Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
                 ]
-            }
-        );
+            ]
+        });
 
         Ok(())
     }
@@ -824,47 +797,44 @@ mod tests {
 
         let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "is_admin".into(),
-                        data_type: DataType::Bool,
-                        constraint: None,
-                    },
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(18),
-                        Value::String("John Doe".into()),
-                        Value::Number(1),
-                        Value::Bool(true),
-                    ],
-                    vec![
-                        Value::Number(22),
-                        Value::String("Jane Doe".into()),
-                        Value::Number(2),
-                        Value::Bool(false),
-                    ],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "is_admin".into(),
+                    data_type: DataType::Bool,
+                    constraint: None,
+                },
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(18),
+                    Value::String("John Doe".into()),
+                    Value::Number(1),
+                    Value::Bool(true),
+                ],
+                vec![
+                    Value::Number(22),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(2),
+                    Value::Bool(false),
+                ],
+            ]
+        });
 
         Ok(())
     }
@@ -879,32 +849,29 @@ mod tests {
 
         let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "price / 10".into(),
-                        data_type: DataType::BigInt,
-                        constraint: None
-                    },
-                    Column {
-                        name: "discount * 100".into(),
-                        data_type: DataType::BigInt,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![Value::Number(1), Value::Number(10), Value::Number(500),],
-                    vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "price / 10".into(),
+                    data_type: DataType::BigInt,
+                    constraint: None
+                },
+                Column {
+                    name: "discount * 100".into(),
+                    data_type: DataType::BigInt,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![Value::Number(1), Value::Number(10), Value::Number(500),],
+                vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
+            ]
+        });
 
         Ok(())
     }
@@ -928,56 +895,53 @@ mod tests {
 
         let query = db.exec("SELECT * FROM mkdb_meta;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: mkdb_meta_schema(),
-                results: vec![
-                    vec![
-                        Value::String("table".into()),
-                        Value::String("users".into()),
-                        Value::Number(1),
-                        Value::String("users".into()),
-                        Value::String(Parser::new(&t1).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("index".into()),
-                        Value::String("users_pk_index".into()),
-                        Value::Number(2),
-                        Value::String("users".into()),
-                        Value::String(Parser::new(i1).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("table".into()),
-                        Value::String("tasks".into()),
-                        Value::Number(3),
-                        Value::String("tasks".into()),
-                        Value::String(Parser::new(&t2).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("index".into()),
-                        Value::String("tasks_pk_index".into()),
-                        Value::Number(4),
-                        Value::String("tasks".into()),
-                        Value::String(Parser::new(i2).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("table".into()),
-                        Value::String("products".into()),
-                        Value::Number(5),
-                        Value::String("products".into()),
-                        Value::String(Parser::new(&t3).parse_statement()?.to_string())
-                    ],
-                    vec![
-                        Value::String("index".into()),
-                        Value::String("products_pk_index".into()),
-                        Value::Number(6),
-                        Value::String("products".into()),
-                        Value::String(Parser::new(i3).parse_statement()?.to_string())
-                    ],
-                ]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: mkdb_meta_schema(),
+            results: vec![
+                vec![
+                    Value::String("table".into()),
+                    Value::String("users".into()),
+                    Value::Number(1),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(t1).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("users_pk_index".into()),
+                    Value::Number(2),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(i1).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("tasks".into()),
+                    Value::Number(3),
+                    Value::String("tasks".into()),
+                    Value::String(Parser::new(t2).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("tasks_pk_index".into()),
+                    Value::Number(4),
+                    Value::String("tasks".into()),
+                    Value::String(Parser::new(i2).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("products".into()),
+                    Value::Number(5),
+                    Value::String("products".into()),
+                    Value::String(Parser::new(t3).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("products_pk_index".into()),
+                    Value::Number(6),
+                    Value::String("products".into()),
+                    Value::String(Parser::new(i3).parse_statement()?.to_string())
+                ],
+            ]
+        });
 
         Ok(())
     }
@@ -1072,33 +1036,30 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![vec![
-                    Value::Number(1),
-                    Value::String("John Doe".into()),
-                    Value::Number(18)
-                ]]
-            }
-        );
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![vec![
+                Value::Number(1),
+                Value::String("John Doe".into()),
+                Value::Number(18)
+            ]]
+        });
 
         Ok(())
     }
@@ -1116,45 +1077,42 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(1),
-                        Value::String("John Doe".into()),
-                        Value::Number(20)
-                    ],
-                    vec![
-                        Value::Number(2),
-                        Value::String("Jane Doe".into()),
-                        Value::Number(20)
-                    ],
-                    vec![
-                        Value::Number(3),
-                        Value::String("Some Dude".into()),
-                        Value::Number(20)
-                    ]
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(20)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(20)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(20)
                 ]
-            }
-        );
+            ]
+        });
 
         Ok(())
     }
@@ -1172,45 +1130,42 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(
-            query,
-            Projection {
-                schema: Schema::from(vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraint: None
-                    },
-                    Column {
-                        name: "age".into(),
-                        data_type: DataType::Int,
-                        constraint: None
-                    }
-                ]),
-                results: vec![
-                    vec![
-                        Value::Number(1),
-                        Value::String("John Doe".into()),
-                        Value::Number(18)
-                    ],
-                    vec![
-                        Value::Number(2),
-                        Value::String("Updated Name".into()),
-                        Value::Number(20)
-                    ],
-                    vec![
-                        Value::Number(3),
-                        Value::String("Updated Name".into()),
-                        Value::Number(20)
-                    ]
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraint: Some(Constraint::PrimaryKey),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraint: None
+                },
+                Column {
+                    name: "age".into(),
+                    data_type: DataType::Int,
+                    constraint: None
+                }
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Updated Name".into()),
+                    Value::Number(20)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Updated Name".into()),
+                    Value::Number(20)
                 ]
-            }
-        );
+            ]
+        });
 
         Ok(())
     }
@@ -1285,7 +1240,7 @@ mod tests {
         assert_eq!(
             db.exec("INSERT INTO users(id, name) VALUES ('String', 10);"),
             Err(DbError::Sql(SqlError::TypeError(TypeError::ExpectedType {
-                expected: GenericDataType::Number,
+                expected: VmDataType::Number,
                 found: Expression::Value(Value::String("String".into()))
             })))
         );

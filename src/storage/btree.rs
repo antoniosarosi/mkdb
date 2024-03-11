@@ -1893,20 +1893,19 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     }
 }
 
+/// BTree testing framework.
+///
+/// Most of the tests use fixed size 64 bit keys to easily test whether the
+/// BTree balancing algorithm does the correct thing in each situation. To
+/// easily compare the state of the [`BTree`] structure with something human
+/// readable we use [`Node`] instances, which allow us to define a tree as if we
+/// used some JSON-like syntax. There's also a [`Builder`] struct that can be
+/// used to insert many 64 bit keys at once into the tree and also tune
+/// parameters such as [`BTree::balance_siblings_per_side`]. See the tests for
+/// more details and examples. Remember that `order` means the maximum number of
+/// children in a BTree that stores fixed size keys.
 #[cfg(test)]
 mod tests {
-    //! BTree testing framework.
-    //!
-    //! Most of the tests use fixed size 64 bit keys to easily test whether the
-    //! BTree balancing algorithm does the correct thing in each situation. To
-    //! easily compare the state of the [`BTree`] structure with something human
-    //! readable we use [`Node`] instances, which allow us to define a tree as
-    //! if we used some JSON-like syntax. There's also a [`Builder`] struct that
-    //! can be used to insert many 64 bit keys at once into the tree and also
-    //! tune parameters such as [`BTree::balance_siblings_per_side`]. See the
-    //! tests for more details and examples. Remember that `order` means the
-    //! maximum number of children in a BTree that stores fixed size keys.
-
     use std::{
         alloc::Layout,
         io::{self},
@@ -1925,25 +1924,6 @@ mod tests {
         },
     };
 
-    /// Allows us to build an entire tree manually and then compare it to an
-    /// actual [`BTree`] structure. See tests below for examples.
-    #[derive(Debug, PartialEq)]
-    struct Node {
-        keys: Vec<Key>,
-        children: Vec<Self>,
-    }
-
-    impl Node {
-        /// Leaf nodes have no children. This method saves us some unecessary
-        /// typing and makes the tree structure more readable.
-        fn leaf(keys: impl IntoIterator<Item = Key>) -> Self {
-            Self {
-                keys: keys.into_iter().collect(),
-                children: Vec::new(),
-            }
-        }
-    }
-
     /// Fixed size key used for most of the tests.
     type Key = u64;
 
@@ -1956,7 +1936,28 @@ mod tests {
         Key::from_be_bytes(buf[..mem::size_of::<Key>()].try_into().unwrap())
     }
 
-    /// Builder for [`BTree<MemBuf>`] with fixed size keys.
+    /// Allows us to build an entire tree manually and then compare it to an
+    /// actual [`BTree`] structure. See tests below for examples.
+    #[derive(Debug, PartialEq)]
+    struct Node {
+        keys: Vec<Key>,
+        children: Vec<Self>,
+    }
+
+    impl Node {
+        /// Leaf nodes have no children.
+        ///
+        /// This method saves us some unecessary typing and makes the tree
+        /// structure more readable.
+        fn leaf(keys: impl IntoIterator<Item = Key>) -> Self {
+            Self {
+                keys: keys.into_iter().collect(),
+                children: Vec::new(),
+            }
+        }
+    }
+
+    /// Builder for [`BTree<'c, MemBuf, FixedSizeCmp>`].
     struct Builder {
         keys: Vec<Key>,
         order: usize,
@@ -2029,7 +2030,7 @@ mod tests {
                 minimum_keys: self.minimum_keys,
             };
 
-            btree.extend_from_keys(self.keys)?;
+            btree.try_insert_all_keys(self.keys)?;
 
             Ok(btree)
         }
@@ -2067,7 +2068,7 @@ mod tests {
             self.remove(&serialize_key(key))
         }
 
-        fn extend_from_keys(&mut self, keys: impl IntoIterator<Item = Key>) -> io::Result<()> {
+        fn try_insert_all_keys(&mut self, keys: impl IntoIterator<Item = Key>) -> io::Result<()> {
             for key in keys {
                 self.insert(Vec::from(serialize_key(key)))?;
             }
@@ -2163,13 +2164,10 @@ mod tests {
     fn split_root() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=4).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![3],
-                children: vec![Node::leaf([1, 2]), Node::leaf([4])]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![3],
+            children: vec![Node::leaf([1, 2]), Node::leaf([4])]
+        });
 
         Ok(())
     }
@@ -2204,13 +2202,10 @@ mod tests {
     fn delay_leaf_node_split() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=7).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4],
-                children: vec![Node::leaf([1, 2, 3]), Node::leaf([5, 6, 7])]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4],
+            children: vec![Node::leaf([1, 2, 3]), Node::leaf([5, 6, 7])]
+        });
 
         Ok(())
     }
@@ -2245,13 +2240,10 @@ mod tests {
     fn split_leaf_node() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=8).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![3, 6],
-                children: vec![Node::leaf([1, 2]), Node::leaf([4, 5]), Node::leaf([7, 8])]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![3, 6],
+            children: vec![Node::leaf([1, 2]), Node::leaf([4, 5]), Node::leaf([7, 8])]
+        });
 
         Ok(())
     }
@@ -2272,18 +2264,15 @@ mod tests {
     fn basic_insertion() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=15).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4, 8, 12],
-                children: vec![
-                    Node::leaf([1, 2, 3]),
-                    Node::leaf([5, 6, 7]),
-                    Node::leaf([9, 10, 11]),
-                    Node::leaf([13, 14, 15]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 12],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10, 11]),
+                Node::leaf([13, 14, 15]),
+            ]
+        });
 
         Ok(())
     }
@@ -2322,26 +2311,23 @@ mod tests {
     fn propagate_split_to_root() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=16).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![11],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![14],
-                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![11],
+            children: vec![
+                Node {
+                    keys: vec![4, 8],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![14],
+                    children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -2385,32 +2371,29 @@ mod tests {
     fn delay_internal_node_split() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=27).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![15],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8, 11],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                            Node::leaf([12, 13, 14]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![19, 22, 25],
-                        children: vec![
-                            Node::leaf([16, 17, 18]),
-                            Node::leaf([20, 21]),
-                            Node::leaf([23, 24]),
-                            Node::leaf([26, 27]),
-                        ]
-                    },
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![15],
+            children: vec![
+                Node {
+                    keys: vec![4, 8, 11],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                        Node::leaf([12, 13, 14]),
+                    ]
+                },
+                Node {
+                    keys: vec![19, 22, 25],
+                    children: vec![
+                        Node::leaf([16, 17, 18]),
+                        Node::leaf([20, 21]),
+                        Node::leaf([23, 24]),
+                        Node::leaf([26, 27]),
+                    ]
+                },
+            ]
+        });
 
         Ok(())
     }
@@ -2453,38 +2436,35 @@ mod tests {
     fn propagate_split_to_internal_nodes() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=31).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![11, 23],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![15, 19],
-                        children: vec![
-                            Node::leaf([12, 13, 14]),
-                            Node::leaf([16, 17, 18]),
-                            Node::leaf([20, 21, 22]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![26, 29],
-                        children: vec![
-                            Node::leaf([24, 25]),
-                            Node::leaf([27, 28]),
-                            Node::leaf([30, 31]),
-                        ]
-                    },
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![11, 23],
+            children: vec![
+                Node {
+                    keys: vec![4, 8],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![15, 19],
+                    children: vec![
+                        Node::leaf([12, 13, 14]),
+                        Node::leaf([16, 17, 18]),
+                        Node::leaf([20, 21, 22]),
+                    ]
+                },
+                Node {
+                    keys: vec![26, 29],
+                    children: vec![
+                        Node::leaf([24, 25]),
+                        Node::leaf([27, 28]),
+                        Node::leaf([30, 31]),
+                    ]
+                },
+            ]
+        });
 
         Ok(())
     }
@@ -2509,41 +2489,38 @@ mod tests {
     fn sequential_insertion() -> io::Result<()> {
         let btree = BTree::builder().keys(1..=46).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![15, 31],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8, 11],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                            Node::leaf([12, 13, 14]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![19, 23, 27],
-                        children: vec![
-                            Node::leaf([16, 17, 18]),
-                            Node::leaf([20, 21, 22]),
-                            Node::leaf([24, 25, 26]),
-                            Node::leaf([28, 29, 30]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![35, 39, 43],
-                        children: vec![
-                            Node::leaf([32, 33, 34]),
-                            Node::leaf([36, 37, 38]),
-                            Node::leaf([40, 41, 42]),
-                            Node::leaf([44, 45, 46]),
-                        ]
-                    },
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![15, 31],
+            children: vec![
+                Node {
+                    keys: vec![4, 8, 11],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                        Node::leaf([12, 13, 14]),
+                    ]
+                },
+                Node {
+                    keys: vec![19, 23, 27],
+                    children: vec![
+                        Node::leaf([16, 17, 18]),
+                        Node::leaf([20, 21, 22]),
+                        Node::leaf([24, 25, 26]),
+                        Node::leaf([28, 29, 30]),
+                    ]
+                },
+                Node {
+                    keys: vec![35, 39, 43],
+                    children: vec![
+                        Node::leaf([32, 33, 34]),
+                        Node::leaf([36, 37, 38]),
+                        Node::leaf([40, 41, 42]),
+                        Node::leaf([44, 45, 46]),
+                    ]
+                },
+            ]
+        });
 
         Ok(())
     }
@@ -2579,18 +2556,15 @@ mod tests {
 
         btree.remove_key(13)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4, 8, 12],
-                children: vec![
-                    Node::leaf([1, 2, 3]),
-                    Node::leaf([5, 6, 7]),
-                    Node::leaf([9, 10, 11]),
-                    Node::leaf([14, 15]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 12],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10, 11]),
+                Node::leaf([14, 15]),
+            ]
+        });
 
         Ok(())
     }
@@ -2635,26 +2609,23 @@ mod tests {
 
         btree.remove_key(8)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![11],
-                children: vec![
-                    Node {
-                        keys: vec![4, 7],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6]),
-                            Node::leaf([9, 10]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![14],
-                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![11],
+            children: vec![
+                Node {
+                    keys: vec![4, 7],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![14],
+                    children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -2698,26 +2669,23 @@ mod tests {
 
         btree.remove_key(11)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![10],
-                children: vec![
-                    Node {
-                        keys: vec![4, 7],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6]),
-                            Node::leaf([8, 9]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![14],
-                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![10],
+            children: vec![
+                Node {
+                    keys: vec![4, 7],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6]),
+                        Node::leaf([8, 9]),
+                    ]
+                },
+                Node {
+                    keys: vec![14],
+                    children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -2763,31 +2731,28 @@ mod tests {
 
         btree.remove_key(11)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![12],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![15, 19, 23],
-                        children: vec![
-                            Node::leaf([13, 14]),
-                            Node::leaf([16, 17, 18]),
-                            Node::leaf([20, 21, 22]),
-                            Node::leaf([24, 25, 26]),
-                        ]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![12],
+            children: vec![
+                Node {
+                    keys: vec![4, 8],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![15, 19, 23],
+                    children: vec![
+                        Node::leaf([13, 14]),
+                        Node::leaf([16, 17, 18]),
+                        Node::leaf([20, 21, 22]),
+                        Node::leaf([24, 25, 26]),
+                    ]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -2835,18 +2800,15 @@ mod tests {
 
         btree.try_remove_all_keys((14..=15).rev())?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4, 8, 11],
-                children: vec![
-                    Node::leaf([1, 2, 3]),
-                    Node::leaf([5, 6, 7]),
-                    Node::leaf([9, 10]),
-                    Node::leaf([12, 13]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 11],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10]),
+                Node::leaf([12, 13]),
+            ]
+        });
 
         Ok(())
     }
@@ -2894,17 +2856,14 @@ mod tests {
 
         btree.try_remove_all_keys((12..=15).rev())?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4, 8],
-                children: vec![
-                    Node::leaf([1, 2, 3]),
-                    Node::leaf([5, 6, 7]),
-                    Node::leaf([9, 10, 11]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10, 11]),
+            ]
+        });
 
         Ok(())
     }
@@ -2977,18 +2936,15 @@ mod tests {
 
         btree.try_remove_all_keys(15..=16)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![4, 8, 11],
-                children: vec![
-                    Node::leaf([1, 2, 3]),
-                    Node::leaf([5, 6, 7]),
-                    Node::leaf([9, 10]),
-                    Node::leaf([12, 13, 14]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 11],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10]),
+                Node::leaf([12, 13, 14]),
+            ]
+        });
 
         Ok(())
     }
@@ -3032,38 +2988,35 @@ mod tests {
 
         btree.try_remove_all_keys(1..=3)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![15, 27],
-                children: vec![
-                    Node {
-                        keys: vec![7, 11],
-                        children: vec![
-                            Node::leaf([4, 5, 6]),
-                            Node::leaf([8, 9, 10]),
-                            Node::leaf([12, 13, 14]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![19, 23],
-                        children: vec![
-                            Node::leaf([16, 17, 18]),
-                            Node::leaf([20, 21, 22]),
-                            Node::leaf([24, 25, 26]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![30, 33],
-                        children: vec![
-                            Node::leaf([28, 29]),
-                            Node::leaf([31, 32]),
-                            Node::leaf([34, 35]),
-                        ]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![15, 27],
+            children: vec![
+                Node {
+                    keys: vec![7, 11],
+                    children: vec![
+                        Node::leaf([4, 5, 6]),
+                        Node::leaf([8, 9, 10]),
+                        Node::leaf([12, 13, 14]),
+                    ]
+                },
+                Node {
+                    keys: vec![19, 23],
+                    children: vec![
+                        Node::leaf([16, 17, 18]),
+                        Node::leaf([20, 21, 22]),
+                        Node::leaf([24, 25, 26]),
+                    ]
+                },
+                Node {
+                    keys: vec![30, 33],
+                    children: vec![
+                        Node::leaf([28, 29]),
+                        Node::leaf([31, 32]),
+                        Node::leaf([34, 35]),
+                    ]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -3124,32 +3077,29 @@ mod tests {
             .try_remove_all_keys(1..=3)
             .and_then(|_| btree.remove_key(35))?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![19],
-                children: vec![
-                    Node {
-                        keys: vec![7, 11, 15],
-                        children: vec![
-                            Node::leaf([4, 5, 6]),
-                            Node::leaf([8, 9, 10]),
-                            Node::leaf([12, 13, 14]),
-                            Node::leaf([16, 17, 18]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![23, 27, 31],
-                        children: vec![
-                            Node::leaf([20, 21, 22]),
-                            Node::leaf([24, 25, 26]),
-                            Node::leaf([28, 29, 30]),
-                            Node::leaf([32, 33, 34]),
-                        ]
-                    },
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![19],
+            children: vec![
+                Node {
+                    keys: vec![7, 11, 15],
+                    children: vec![
+                        Node::leaf([4, 5, 6]),
+                        Node::leaf([8, 9, 10]),
+                        Node::leaf([12, 13, 14]),
+                        Node::leaf([16, 17, 18]),
+                    ]
+                },
+                Node {
+                    keys: vec![23, 27, 31],
+                    children: vec![
+                        Node::leaf([20, 21, 22]),
+                        Node::leaf([24, 25, 26]),
+                        Node::leaf([28, 29, 30]),
+                        Node::leaf([32, 33, 34]),
+                    ]
+                },
+            ]
+        });
 
         Ok(())
     }
@@ -3190,31 +3140,28 @@ mod tests {
     fn greater_order_insertion() -> io::Result<()> {
         let btree = BTree::builder().order(6).keys(1..=36).try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![24],
-                children: vec![
-                    Node {
-                        keys: vec![6, 12, 18],
-                        children: vec![
-                            Node::leaf([1, 2, 3, 4, 5]),
-                            Node::leaf([7, 8, 9, 10, 11]),
-                            Node::leaf([13, 14, 15, 16, 17]),
-                            Node::leaf([19, 20, 21, 22, 23]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![29, 33],
-                        children: vec![
-                            Node::leaf([25, 26, 27, 28]),
-                            Node::leaf([30, 31, 32]),
-                            Node::leaf([34, 35, 36]),
-                        ]
-                    },
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![24],
+            children: vec![
+                Node {
+                    keys: vec![6, 12, 18],
+                    children: vec![
+                        Node::leaf([1, 2, 3, 4, 5]),
+                        Node::leaf([7, 8, 9, 10, 11]),
+                        Node::leaf([13, 14, 15, 16, 17]),
+                        Node::leaf([19, 20, 21, 22, 23]),
+                    ]
+                },
+                Node {
+                    keys: vec![29, 33],
+                    children: vec![
+                        Node::leaf([25, 26, 27, 28]),
+                        Node::leaf([30, 31, 32]),
+                        Node::leaf([34, 35, 36]),
+                    ]
+                },
+            ]
+        });
 
         Ok(())
     }
@@ -3256,20 +3203,17 @@ mod tests {
 
         btree.try_remove_all_keys(34..=36)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![6, 12, 18, 24, 30],
-                children: vec![
-                    Node::leaf([1, 2, 3, 4, 5]),
-                    Node::leaf([7, 8, 9, 10, 11]),
-                    Node::leaf([13, 14, 15, 16, 17]),
-                    Node::leaf([19, 20, 21, 22, 23]),
-                    Node::leaf([25, 26, 27, 28, 29]),
-                    Node::leaf([31, 32, 33]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![6, 12, 18, 24, 30],
+            children: vec![
+                Node::leaf([1, 2, 3, 4, 5]),
+                Node::leaf([7, 8, 9, 10, 11]),
+                Node::leaf([13, 14, 15, 16, 17]),
+                Node::leaf([19, 20, 21, 22, 23]),
+                Node::leaf([25, 26, 27, 28, 29]),
+                Node::leaf([31, 32, 33]),
+            ]
+        });
 
         Ok(())
     }
@@ -3311,18 +3255,15 @@ mod tests {
         btree.remove_key(3)?;
         btree.insert_key(16)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![5, 9, 13],
-                children: vec![
-                    Node::leaf([1, 2, 4]),
-                    Node::leaf([6, 7, 8]),
-                    Node::leaf([10, 11, 12]),
-                    Node::leaf([14, 15, 16]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![5, 9, 13],
+            children: vec![
+                Node::leaf([1, 2, 4]),
+                Node::leaf([6, 7, 8]),
+                Node::leaf([10, 11, 12]),
+                Node::leaf([14, 15, 16]),
+            ]
+        });
 
         Ok(())
     }
@@ -3335,7 +3276,7 @@ mod tests {
         // Size of the payloads. Add 10 bytes to each one of them to make the
         // calcultions mentally (header size + slot size). We need to fill up
         // 244 bytes per page.
-        let payload_sizes = vec![
+        let payload_sizes = [
             // 7 entries, 238 bytes total. This fills the root page.
             vec![48, 16, 8, 24, 48, 16, 8],
             // 10 entries, 244 bytes total. Inserting the first one will split
@@ -3366,16 +3307,13 @@ mod tests {
         // | 1,2,3,4,5,6,7 |  | 9,10,11,12,13,14,15,16,17,18 |
         // +---------------+  +------------------------------+
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![8],
-                children: vec![
-                    Node::leaf([1, 2, 3, 4, 5, 6, 7]),
-                    Node::leaf([9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![8],
+            children: vec![
+                Node::leaf([1, 2, 3, 4, 5, 6, 7]),
+                Node::leaf([9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
+            ]
+        });
 
         Ok(())
     }
@@ -3474,36 +3412,33 @@ mod tests {
 
         btree.remove_key(7)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![42],
-                children: vec![
-                    Node {
-                        keys: vec![5, 14, 21, 28, 35],
-                        children: vec![
-                            Node::leaf([1, 2, 3, 4]),
-                            Node::leaf([8, 10, 11, 12, 13]),
-                            Node::leaf([15, 16, 17, 18, 19, 20]),
-                            Node::leaf([22, 23, 24, 25, 26, 27]),
-                            Node::leaf([29, 30, 31, 32, 33, 34]),
-                            Node::leaf([36, 37, 38, 39, 40, 41]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![49, 56, 63, 70, 74],
-                        children: vec![
-                            Node::leaf([43, 44, 45, 46, 47, 48]),
-                            Node::leaf([50, 51, 52, 53, 54, 55]),
-                            Node::leaf([57, 58, 59, 60, 61, 62]),
-                            Node::leaf([64, 65, 66, 67, 68, 69]),
-                            Node::leaf([71, 72, 73]),
-                            Node::leaf([75, 76, 77]),
-                        ]
-                    }
-                ]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![42],
+            children: vec![
+                Node {
+                    keys: vec![5, 14, 21, 28, 35],
+                    children: vec![
+                        Node::leaf([1, 2, 3, 4]),
+                        Node::leaf([8, 10, 11, 12, 13]),
+                        Node::leaf([15, 16, 17, 18, 19, 20]),
+                        Node::leaf([22, 23, 24, 25, 26, 27]),
+                        Node::leaf([29, 30, 31, 32, 33, 34]),
+                        Node::leaf([36, 37, 38, 39, 40, 41]),
+                    ]
+                },
+                Node {
+                    keys: vec![49, 56, 63, 70, 74],
+                    children: vec![
+                        Node::leaf([43, 44, 45, 46, 47, 48]),
+                        Node::leaf([50, 51, 52, 53, 54, 55]),
+                        Node::leaf([57, 58, 59, 60, 61, 62]),
+                        Node::leaf([64, 65, 66, 67, 68, 69]),
+                        Node::leaf([71, 72, 73]),
+                        Node::leaf([75, 76, 77]),
+                    ]
+                }
+            ]
+        });
 
         Ok(())
     }
@@ -3548,21 +3483,18 @@ mod tests {
             .keys(1..=15)
             .try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![],
-                children: vec![Node {
-                    keys: vec![4, 8, 12],
-                    children: vec![
-                        Node::leaf([1, 2, 3]),
-                        Node::leaf([5, 6, 7]),
-                        Node::leaf([9, 10, 11]),
-                        Node::leaf([13, 14, 15]),
-                    ]
-                }]
-            }
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![],
+            children: vec![Node {
+                keys: vec![4, 8, 12],
+                children: vec![
+                    Node::leaf([1, 2, 3]),
+                    Node::leaf([5, 6, 7]),
+                    Node::leaf([9, 10, 11]),
+                    Node::leaf([13, 14, 15]),
+                ]
+            }]
+        });
 
         Ok(())
     }
@@ -3593,26 +3525,23 @@ mod tests {
             .keys(1..=16)
             .try_build()?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![11],
-                children: vec![
-                    Node {
-                        keys: vec![4, 8],
-                        children: vec![
-                            Node::leaf([1, 2, 3]),
-                            Node::leaf([5, 6, 7]),
-                            Node::leaf([9, 10]),
-                        ]
-                    },
-                    Node {
-                        keys: vec![14],
-                        children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
-                    }
-                ]
-            },
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![11],
+            children: vec![
+                Node {
+                    keys: vec![4, 8],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![14],
+                    children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                }
+            ]
+        },);
 
         Ok(())
     }
@@ -3626,13 +3555,10 @@ mod tests {
 
         btree.try_remove_all_keys(2..=16)?;
 
-        assert_eq!(
-            Node::try_from(btree)?,
-            Node {
-                keys: vec![1],
-                children: vec![]
-            },
-        );
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![1],
+            children: vec![]
+        },);
 
         Ok(())
     }
