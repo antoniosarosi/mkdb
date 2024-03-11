@@ -128,7 +128,7 @@ pub(crate) struct Column {
     pub name: String,
     pub data_type: DataType,
     // TODO: Vec of constraints. Not important for now.
-    pub constraint: Option<Constraint>,
+    pub constraints: Vec<Constraint>,
 }
 
 /// `CREATE` statement.
@@ -207,7 +207,7 @@ impl Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.name, self.data_type)?;
 
-        if let Some(constraint) = &self.constraint {
+        for constraint in &self.constraints {
             f.write_char(' ')?;
             f.write_str(match constraint {
                 Constraint::PrimaryKey => "PRIMARY KEY",

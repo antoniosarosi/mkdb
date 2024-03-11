@@ -227,10 +227,10 @@ impl<'i> Parser<'i> {
             Keyword::Insert => {
                 self.expect_keyword(Keyword::Into)?;
                 let into = self.parse_identifier()?;
-                let columns = self.parse_identifier_list(true)?;
+                let columns = self.parse_identifier_list()?;
 
                 self.expect_keyword(Keyword::Values)?;
-                let values = self.parse_comma_separated_expressions()?;
+                let values = self.parse_comma_separated(Self::parse_expression, true)?;
 
                 Statement::Insert {
                     into,
@@ -423,23 +423,28 @@ impl<'i> Parser<'i> {
             _ => unreachable!(),
         };
 
-        let constraint = match self.consume_one_of(&[Keyword::Primary, Keyword::Unique]) {
-            Keyword::Primary => {
-                self.expect_keyword(Keyword::Key)?;
-                Some(Constraint::PrimaryKey)
+        let mut constraints = Vec::new();
+
+        while let Some(constraint) = self
+            .consume_one_of(&[Keyword::Primary, Keyword::Unique])
+            .as_option()
+        {
+            match constraint {
+                Keyword::Primary => {
+                    self.expect_keyword(Keyword::Key)?;
+                    constraints.push(Constraint::PrimaryKey);
+                }
+
+                Keyword::Unique => constraints.push(Constraint::Unique),
+
+                _ => unreachable!(),
             }
-
-            Keyword::Unique => Some(Constraint::Unique),
-
-            Keyword::None => None,
-
-            _ => unreachable!(),
-        };
+        }
 
         Ok(Column {
             name,
             data_type,
-            constraint,
+            constraints,
         })
     }
 
@@ -472,14 +477,8 @@ impl<'i> Parser<'i> {
         mut subparser: impl FnMut(&mut Self) -> ParseResult<T>,
         required_parenthesis: bool,
     ) -> ParseResult<Vec<T>> {
-        let found_left_paren = self.consume_optional_token(Token::LeftParen);
-
-        if required_parenthesis && !found_left_paren {
-            let found = self.next_token()?;
-            return Err(self.error(ErrorKind::Expected {
-                expected: Token::LeftParen,
-                found,
-            }));
+        if required_parenthesis {
+            self.expect_token(Token::LeftParen)?;
         }
 
         let mut results = vec![subparser(self)?];
@@ -487,14 +486,14 @@ impl<'i> Parser<'i> {
             results.push(subparser(self)?);
         }
 
-        if found_left_paren {
+        if required_parenthesis {
             self.expect_token(Token::RightParen)?;
         }
 
         Ok(results)
     }
 
-    /// Used to parse the expressions after `SELECT`, `WHERE`, `SET` or `VALUES`.
+    /// Used to parse the expressions after `SELECT`, `WHERE`, `SET` or `ORDER BY`.
     fn parse_comma_separated_expressions(&mut self) -> ParseResult<Vec<Expression>> {
         self.parse_comma_separated(Self::parse_expression, false)
     }
@@ -505,8 +504,8 @@ impl<'i> Parser<'i> {
     }
 
     /// Expects a list of identifiers, not complete expressions.
-    fn parse_identifier_list(&mut self, required_parenthesis: bool) -> ParseResult<Vec<String>> {
-        self.parse_comma_separated(Self::parse_identifier, required_parenthesis)
+    fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
+        self.parse_comma_separated(Self::parse_identifier, true)
     }
 
     /// Parses the entire `WHERE` clause if the next token is [`Keyword::Where`].
@@ -747,7 +746,6 @@ impl<'i> Parser<'i> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::statement::Assignment;
 
     #[test]
     fn parse_simple_select() {
@@ -913,17 +911,17 @@ mod tests {
                     Column {
                         name: "id".into(),
                         data_type: DataType::Int,
-                        constraint: Some(Constraint::PrimaryKey),
+                        constraints: vec![Constraint::PrimaryKey],
                     },
                     Column {
                         name: "name".into(),
                         data_type: DataType::Varchar(255),
-                        constraint: None,
+                        constraints: vec![],
                     },
                     Column {
                         name: "email".into(),
                         data_type: DataType::Varchar(255),
-                        constraint: Some(Constraint::Unique),
+                        constraints: vec![Constraint::Unique],
                     },
                 ]
             }))

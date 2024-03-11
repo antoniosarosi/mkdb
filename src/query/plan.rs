@@ -202,6 +202,10 @@ pub(crate) struct Project<I> {
 
 impl<I: Seek + Read + Write> Project<I> {
     pub fn new(source: Box<Plan<I>>, output: Vec<Expression>) -> Self {
+        let mut schema = Schema::empty();
+
+
+
         Self { source, output }
     }
 
@@ -225,7 +229,7 @@ impl<I: Seek + Read + Write> Project<I> {
                     results_schema.push(Column {
                         name: expr.to_string(),    // TODO: AS alias
                         data_type: DataType::Bool, // We'll set it later
-                        constraint: None,
+                        constraints: vec![],
                     });
 
                     unknown_types.push(i);

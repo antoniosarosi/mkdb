@@ -240,7 +240,7 @@ impl Schema {
         let col = Column {
             name: String::from("row_id"),
             data_type: DataType::UnsignedBigInt,
-            constraint: None,
+            constraints: vec![],
         };
 
         self.columns.insert(0, col);
@@ -285,32 +285,32 @@ pub(crate) fn mkdb_meta_schema() -> Schema {
         Column {
             name: String::from("type"),
             data_type: DataType::Varchar(255),
-            constraint: None,
+            constraints: vec![],
         },
         // Index or table name
         Column {
             name: String::from("name"),
             data_type: DataType::Varchar(255),
-            constraint: Some(Constraint::Unique),
+            constraints: vec![Constraint::Unique],
         },
         // Root page
         Column {
             name: String::from("root"),
             data_type: DataType::Int,
-            constraint: Some(Constraint::Unique),
+            constraints: vec![Constraint::Unique],
         },
         // Table name
         Column {
             name: String::from("table_name"),
             data_type: DataType::Varchar(255),
-            constraint: Some(Constraint::Unique),
+            constraints: vec![Constraint::Unique],
         },
         // SQL used to create the index or table.
         // TODO: Implement and use some TEXT data type with higher length limits.
         Column {
             name: String::from("sql"),
             data_type: DataType::Varchar(1000),
-            constraint: None,
+            constraints: vec![],
         },
     ])
 }
@@ -532,12 +532,12 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -587,17 +587,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None,
+                    constraints: vec![],
                 },
                 Column {
                     name: "email".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: Some(Constraint::Unique),
+                    constraints: vec![Constraint::Unique],
                 }
             ]),
             results: expected
@@ -621,17 +621,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -666,17 +666,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "price".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "discount".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -704,17 +704,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -750,17 +750,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -802,22 +802,22 @@ mod tests {
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "is_admin".into(),
                     data_type: DataType::Bool,
-                    constraint: None,
+                    constraints: vec![],
                 },
             ]),
             results: vec![
@@ -854,17 +854,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "price / 10".into(),
                     data_type: DataType::BigInt,
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "discount * 100".into(),
                     data_type: DataType::BigInt,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -1041,17 +1041,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![vec![
@@ -1082,17 +1082,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![
@@ -1135,17 +1135,17 @@ mod tests {
                 Column {
                     name: "id".into(),
                     data_type: DataType::Int,
-                    constraint: Some(Constraint::PrimaryKey),
+                    constraints: vec![Constraint::PrimaryKey],
                 },
                 Column {
                     name: "name".into(),
                     data_type: DataType::Varchar(255),
-                    constraint: None
+                    constraints: vec![]
                 },
                 Column {
                     name: "age".into(),
                     data_type: DataType::Int,
-                    constraint: None
+                    constraints: vec![]
                 }
             ]),
             results: vec![

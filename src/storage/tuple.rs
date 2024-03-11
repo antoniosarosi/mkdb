@@ -13,13 +13,13 @@ pub(crate) fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
-pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
-    macro_rules! serialize_big_endian {
-        ($num:expr, $int:ty) => {
-            TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()
-        };
-    }
+macro_rules! serialize_big_endian {
+    ($num:expr, $int:ty) => {
+        TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()
+    };
+}
 
+pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     debug_assert_eq!(
         schema.len(),
         values.len(),
@@ -66,20 +66,20 @@ pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     buf
 }
 
+macro_rules! deserialize_big_endian {
+    ($buf:expr, $index:expr, $int:ty) => {
+        <$int>::from_be_bytes(
+            $buf[$index..$index + mem::size_of::<$int>()]
+                .try_into()
+                .unwrap(),
+        )
+        .into()
+    };
+}
+
 pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
     let mut values = Vec::new();
     let mut index = 0;
-
-    macro_rules! deserialize_big_endian {
-        ($buf:expr, $index:expr, $int:ty) => {
-            <$int>::from_be_bytes(
-                $buf[index..index + mem::size_of::<$int>()]
-                    .try_into()
-                    .unwrap(),
-            )
-            .into()
-        };
-    }
 
     // TODO: Alignment.
     for column in &schema.columns {

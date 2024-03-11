@@ -25,15 +25,6 @@ pub(crate) fn exec_statement<I: Seek + Read + Write + paging::io::Sync>(
         Statement::Create(Create::Table { name, columns }) => {
             let root = alloc_root_page(db)?;
 
-            let mut maybe_primary_key = None;
-
-            for col in &columns {
-                if let Some(Constraint::PrimaryKey) = col.constraint {
-                    maybe_primary_key = Some(col.name.clone());
-                    break;
-                }
-            }
-
             insert_into_mkdb_meta(db, vec![
                 Value::String(String::from("table")),
                 Value::String(name.clone()),
@@ -42,12 +33,15 @@ pub(crate) fn exec_statement<I: Seek + Read + Write + paging::io::Sync>(
                 Value::String(sql),
             ])?;
 
-            if let Some(primary_key) = maybe_primary_key {
+            if let Some(primary_key) = columns
+                .into_iter()
+                .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
+            {
                 exec_statement(
                     Statement::Create(Create::Index {
                         name: format!("{name}_pk_index"),
                         table: name,
-                        column: primary_key,
+                        column: primary_key.name,
                     }),
                     db,
                 )?;
@@ -90,24 +84,19 @@ fn alloc_root_page<I: Seek + Read + Write + paging::io::Sync>(
 /// ```no_run
 /// #[rustfmt::skip]
 /// db.exec(r#"
-///     INSERT INTO mkdb_meta (type, name, root, table_name, sql) VALUES (
-///         "table",
-///         "example",
-///         1,
-///         "example",
-///         'CREATE TABLE example (id INT PRIMARY KEY);'
-///     );
+///     INSERT INTO mkdb_meta (type, name, root, table_name, sql)
+///     VALUES ("table", "example", 1, "example", 'CREATE TABLE example (id INT);');
 /// "#);
 /// ```
 ///
 /// But we're doing it manually to avoid mutually recursive calls since
-/// [`Database`] calls [`exec`] and then [`exec`] would call [`Database`] again
-/// which in turn calls [`exec`] again. That actually works perfectly fine and
-/// it's how the [`crate::sql::parser`] executes under the hood. Mutual
-/// recursion is nice for recursive descent parsers but for this case it makes
-/// it harder to debug tests when they fail because we have to figure out which
-/// SQL statement is actually failing, the one we want to run or those that
-/// are triggered by the VM?
+/// [`Database`] calls [`exec_statement`] and then [`exec_statement`] would call
+/// [`Database`] again which in turn calls [`exec`] again. That actually works
+/// perfectly fine and it's how the [`crate::sql::parser`] executes under the
+/// hood. Mutual recursion is nice for recursive descent parsers but for this
+/// case it makes it harder to debug tests when they fail because we have to
+/// figure out which SQL statement is actually failing, the one we want to run
+/// or those that are triggered by the VM?
 ///
 /// Plus, if we already know exactly what we're doing we don't need to go
 /// through all the SQL parsing stages and since we're not running queries we

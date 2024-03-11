@@ -25,7 +25,7 @@ pub(crate) fn analyze<I: Seek + Read + Write + paging::io::Sync>(
             let mut found_primary_key = false;
 
             for col in columns {
-                if let Some(Constraint::PrimaryKey) = col.constraint {
+                if col.constraints.contains(&Constraint::PrimaryKey) {
                     if found_primary_key {
                         return Err(DbError::Sql(SqlError::MultiplePrimaryKeys));
                     }

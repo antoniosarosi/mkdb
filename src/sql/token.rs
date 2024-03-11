@@ -70,6 +70,19 @@ pub(crate) enum Whitespace {
     Newline,
 }
 
+impl Keyword {
+    /// Maps [`Keyword::None`] to [`Option::None`] and anything else to
+    /// [`Option::Some`].
+    ///
+    /// Mainly used for `while let Some(keyword) =` loops.
+    pub fn as_option(&self) -> Option<Keyword> {
+        match self {
+            Keyword::None => None,
+            keyword => Some(*keyword),
+        }
+    }
+}
+
 impl Token {
     /// Returns `true` if the given char can be used for identifiers or
     /// keywords.
