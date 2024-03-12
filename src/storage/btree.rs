@@ -919,7 +919,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    ///
+    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1871,10 +1871,14 @@ impl Cursor {
         }
     }
 
-    /// For some reason traversing a BTree level by level without blowing up
-    /// the memory by storing a billion page numbers in a queue ain't easy.
+    /// Sequential BTree traversal algorihtm.
     ///
-    /// This is what we want to do:
+    /// For some reason traversing a BTree level by level without blowing up
+    /// the memory by storing a billion page numbers in a queue and maintaing
+    /// the iterator state at the same time ain't easy.
+    ///
+    /// What we want to do is breadth-first search, without "searching" anything
+    /// in particular:
     ///
     /// ```text
     ///                                                          +--+--+--+
@@ -1898,8 +1902,13 @@ impl Cursor {
     /// same thing at depth 1, and so on until we reach the maximum depth and
     /// we read all the leaf nodes.
     ///
-    /// Doing that while maintaing the state of the iterator requires some
-    /// sophisticated algorithm.
+    /// As mentioned previously, we can't push all the children of a page into a
+    /// [`VecDeque`], scan the page, pop the next one from the queue and then
+    /// repeat the process because the number of pages we have to push grows
+    /// exponentially with the tree depth. By the time we reach the leaf nodes
+    /// of a balanced BTree of order 4 and depth 16 we have to push 4^16 page
+    /// numbers into the queue, more than 4 billion 4-byte integers which add up
+    /// to roughly 16 GiB of memory.
     ///
     /// TODO: Explain how the algorithm works.
     ///
@@ -1911,23 +1920,14 @@ impl Cursor {
     /// BTree root. But even so the balancing algorithm cannot maintain all
     /// pages in sequential order when the BTree root overflows, so this
     /// optimization is definitely not easy to implement.
-    pub fn next<I: Seek + Read + Write>(
+    fn try_next<I: Seek + Read + Write>(
         &mut self,
         pager: &mut Pager<I>,
-    ) -> Option<io::Result<(PageNumber, SlotId)>> {
-        if self.done {
-            return None;
-        }
-
+    ) -> io::Result<(PageNumber, SlotId)> {
         // We return the "current" position and prepare the next one on every call.
-        let position = Some(Ok((self.page, self.slot)));
+        let position = Ok((self.page, self.slot));
 
-        let page = match pager.get(self.page) {
-            Ok(page) => page,
-            Err(e) => return Some(Err(e.into())),
-        };
-
-        let reached_max_depth = page.is_leaf();
+        let page = pager.get(self.page)?;
 
         // This page is not done yet, we don't have to move to the next one.
         if self.slot + 1 < page.len() {
@@ -1950,16 +1950,13 @@ impl Cursor {
         }
 
         // This is where things get complicated real quick.
+        let reached_max_depth = page.is_leaf();
         let mut depth = self.descent.len() - 1;
         let mut child = self.page;
 
         // Go upwards until we find the next branch we have to take.
         loop {
-            let parent = match pager.get(self.descent[depth]) {
-                Ok(page) => page,
-                Err(e) => return Some(Err(e.into())),
-            };
-
+            let parent = pager.get(self.descent[depth])?;
             let index = parent.iter_children().position(|c| c == child).unwrap() as u16;
 
             // Found it!
@@ -1968,16 +1965,19 @@ impl Cursor {
                 break;
             }
 
+            // Made it all the way to the root and we didn't take any branch. This
+            // means we have to go one level deeper.
             if depth == 0 {
+                // If we were coming from a leaf node then this is it, we're done.
                 if reached_max_depth {
                     self.done = true;
                     return position;
-                } else {
-                    child = parent.child(0);
-                    // Add another level, we'll set the correct value later.
-                    self.descent.push(0);
-                    break;
                 }
+
+                // Otherwise take the leftmost child and increase depth.
+                child = pager.get(self.descent[depth])?.child(0);
+                self.descent.push(0);
+                break;
             }
 
             // Keep moving up.
@@ -1990,11 +1990,7 @@ impl Cursor {
         while depth < self.descent.len() - 1 {
             depth += 1;
             self.descent[depth] = child;
-
-            child = match pager.get(child) {
-                Ok(page) => page.child(0),
-                Err(e) => return Some(Err(e.into())),
-            };
+            child = pager.get(child)?.child(0);
         }
 
         // After a hard day's work, we are finally done. Now keep calm until
@@ -2003,6 +1999,17 @@ impl Cursor {
         self.slot = 0;
 
         position
+    }
+
+    pub fn next<I: Seek + Read + Write>(
+        &mut self,
+        pager: &mut Pager<I>,
+    ) -> Option<io::Result<(PageNumber, SlotId)>> {
+        if self.done {
+            return None;
+        }
+
+        Some(self.try_next(pager))
     }
 }
 
