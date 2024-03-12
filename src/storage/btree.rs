@@ -782,46 +782,6 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         self.reassemble_payload(page, slot).map(Some)
     }
 
-    pub fn iter(&'c mut self) -> impl Iterator<Item = io::Result<Box<[u8]>>> + 'c {
-        let mut children = vec![self.root];
-        let mut slot = 0;
-
-        // TODO: Unwrap & Payload Box/Ref & repeated code fix this bruh
-        std::iter::from_fn(move || {
-            if children.is_empty() {
-                return None;
-            }
-
-            let page = children[0];
-
-            if slot < self.pager.get(page).unwrap().len() {
-                let payload = match self.reassemble_payload(page, slot).unwrap() {
-                    Payload::PageRef(r) => Box::from(r),
-                    Payload::Reassembled(b) => b,
-                };
-                slot += 1;
-                return Some(Ok(payload));
-            }
-
-            children.remove(0);
-            children.extend(self.pager.get(page).unwrap().iter_children());
-            slot = 1;
-
-            if children.is_empty() {
-                return None;
-            }
-
-            let page = children[0];
-
-            let payload = match self.reassemble_payload(page, 0).unwrap() {
-                Payload::PageRef(r) => Box::from(r),
-                Payload::Reassembled(b) => b,
-            };
-
-            Some(Ok(payload))
-        })
-    }
-
     /// B*-Tree balancing algorithm inspired by (or rather stolen from) SQLite
     /// 2.X.X. Take a look at the original source code here:
     ///
@@ -959,7 +919,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    /// 
+    ///
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -1844,7 +1804,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     #[cfg(debug_assertions)]
     pub fn json(&mut self) -> io::Result<String> {
         let mut nodes = Vec::new();
-        self.read_into_mem(0, &mut nodes)?;
+        self.read_into_mem(self.root, &mut nodes)?;
 
         nodes.sort_by(|n1, n2| n1.number.cmp(&n2.number));
 
@@ -1893,6 +1853,159 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct Cursor {
+    page: PageNumber,
+    slot: SlotId,
+    done: bool,
+    descent: Vec<PageNumber>,
+}
+
+impl Cursor {
+    pub fn new(page: PageNumber, slot: SlotId) -> Self {
+        Self {
+            page,
+            slot,
+            descent: vec![],
+            done: false,
+        }
+    }
+
+    /// For some reason traversing a BTree level by level without blowing up
+    /// the memory by storing a billion page numbers in a queue ain't easy.
+    ///
+    /// This is what we want to do:
+    ///
+    /// ```text
+    ///                                                          +--+--+--+
+    /// Traverse Depth 0   ----------------->                    |  |  |  |
+    ///        |                                                 +--+--+--+
+    ///        |                                                      |
+    ///        |                                 +--------------------+-------------------+
+    ///        |                                 |                                        |
+    ///        V                            +--+--+--+                                +--+--+--+
+    /// Traverse Depth 1   --------->       |  |  |  |           --------->           |  |  |  |
+    ///        |                            +--+--+--+                                +--+--+--+
+    ///        |                                 |                                         |
+    ///        |                   +-------------+-------------+             +-------------+-------------+
+    ///        |                   |             |             |             |             |             |
+    ///        V              +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+
+    /// Traverse Depth 2   -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  |
+    ///                       +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+
+    /// ```
+    ///
+    /// Basically, get all the cells in all the pages at depth 0 first, then
+    /// same thing at depth 2, and so on until we reach the maximum depth and
+    /// we read all the leaf nodes.
+    ///
+    /// Doing that while maintaing the state of the iterator requires some
+    /// sophisticated algorithm.
+    ///
+    /// TODO: Explain how the algorithm works.
+    ///
+    /// TODO: This is not exactly sequential IO since BTree pages are not
+    /// guaranteed to be linked sequentially. Pretty sure there must be a way to
+    /// make this 100% sequential IO, but it would require some other disk data
+    /// structure to maintain free pages sorted sequentially so that when the
+    /// BTree allocates a page the page is guaranteed to be located after the
+    /// BTree root. But even so the balancing algorithm cannot maintain all
+    /// pages in sequential order when the BTree root overflows, so this
+    /// optimization is definitely not easy to implement.
+    pub fn next<I: Seek + Read + Write>(
+        &mut self,
+        pager: &mut Pager<I>,
+    ) -> Option<io::Result<(PageNumber, SlotId)>> {
+        if self.done {
+            return None;
+        }
+
+        // We return the "current" position and prepare the next one on every call.
+        let position = Some(Ok((self.page, self.slot)));
+
+        let page = match pager.get(self.page) {
+            Ok(page) => page,
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        let reached_max_depth = page.is_leaf();
+
+        // This page is not done yet, we don't have to move to the next one.
+        if self.slot + 1 < page.len() {
+            self.slot += 1;
+            return position;
+        }
+
+        // We were reading the root, next time it's not gonna be as easy :)
+        if self.descent.is_empty() {
+            self.descent.push(self.page);
+            self.page = page.child(0);
+            self.slot = 0;
+
+            // Little guard for empty roots.
+            if page.is_leaf() {
+                self.done = true;
+            }
+
+            return position;
+        }
+
+        // This is where things get complicated real quick.
+        let mut depth = self.descent.len() - 1;
+        let mut child = self.page;
+
+        // Go upwards until we find the next branch we have to take.
+        loop {
+            let parent = match pager.get(self.descent[depth]) {
+                Ok(page) => page,
+                Err(e) => return Some(Err(e.into())),
+            };
+
+            let index = parent.iter_children().position(|c| c == child).unwrap() as u16;
+
+            // Found it!
+            if index < parent.len() {
+                child = parent.child(index + 1);
+                break;
+            }
+
+            if depth == 0 {
+                if reached_max_depth {
+                    self.done = true;
+                    return position;
+                } else {
+                    child = parent.child(0);
+                    // Add another level, we'll set the correct value later.
+                    self.descent.push(0);
+                    break;
+                }
+            }
+
+            // Keep moving up.
+            child = self.descent[depth];
+            depth -= 1;
+        }
+
+        // Now go downwards back to the same depth we were at previously and
+        // update the descent path.
+        while depth < self.descent.len() - 1 {
+            depth += 1;
+            self.descent[depth] = child;
+
+            child = match pager.get(child) {
+                Ok(page) => page.child(0),
+                Err(e) => return Some(Err(e.into())),
+            };
+        }
+
+        // After a hard day's work, we are finally done. Now keep calm until
+        // we're done with all the cells in this page.
+        self.page = child;
+        self.slot = 0;
+
+        position
+    }
+}
+
 /// BTree testing framework.
 ///
 /// Most of the tests use fixed size 64 bit keys to easily test whether the
@@ -1906,13 +2019,9 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 /// children in a BTree that stores fixed size keys.
 #[cfg(test)]
 mod tests {
-    use std::{
-        alloc::Layout,
-        io::{self},
-        mem,
-    };
+    use std::{alloc::Layout, collections::HashSet, io, mem};
 
-    use super::{BTree, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
+    use super::{BTree, Cursor, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
         paging::{
             io::MemBuf,
@@ -3559,6 +3668,81 @@ mod tests {
             keys: vec![1],
             children: vec![]
         },);
+
+        Ok(())
+    }
+
+    /// Traverse this tree:
+    ///
+    /// ```text
+    ///                                                 +----+ P1
+    ///                            +--------------------| 18 |---------------------+
+    ///                           /                     +----+                      \
+    ///                        +---+ P16                                          +----+ P17
+    ///              +---------| 9 |---------+                             +------| 24 |-------+
+    ///             /          +---+          \                           /       +----+        \
+    ///         +-----+                    +-------+                   +----+                +-------+
+    ///         | 3,6 | P6                 | 12,15 | P7                | 21 | P11            | 27,29 | P15
+    ///         +-----+                    +-------+                   +----+                +-------+
+    ///        /   |   \                  /    |    \                   /  \                 /   |   \
+    /// +-----+ +-----+ +-----+  +-------+ +-------+ +-------+  +-------+ +-------+  +-------+ +----+ +----+
+    /// | 1,2 | | 4,5 | | 7,8 |  | 10,11 | | 13,14 | | 16,17 |  | 19,20 | | 22,23 |  | 25,26 | | 28 | | 30 |
+    /// +-----+ +-----+ +-----+  +-------+ +-------+ +-------+  +-------+ +-------+  +-------+ +----+ +----+
+    ///   P2      P3      P4       P5          P8        P9        P10       P12        P13      P14   P18
+    /// ```
+    #[test]
+    fn basic_cursor() -> io::Result<()> {
+        let btree = BTree::builder().order(3).keys(1..=30).try_build()?;
+
+        let mut cursor = Cursor::new(1, 0);
+
+        #[rustfmt::skip]
+        let expected = [
+            18,
+            9, 24,
+            3, 6, 12, 15, 21, 27, 29,
+            1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 30,
+        ];
+
+        for expected_key in expected {
+            let (page, slot) = cursor.next(btree.pager).expect(&format!(
+                "cursor should return the position of key {expected_key} but returns None"
+            ))?;
+
+            let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
+
+            assert_eq!(
+                key,
+                expected_key,
+                "cursor at position ({page}, {slot}) should return {expected_key} but returns {key}"
+            );
+        }
+
+        assert!(cursor.next(btree.pager).is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_with_more_depth_and_keys() -> io::Result<()> {
+        let btree = BTree::builder().order(6).keys(1..=300).try_build()?;
+        let mut cursor = Cursor::new(1, 0);
+
+        let mut keys = HashSet::new();
+
+        while let Some(position) = cursor.next(btree.pager) {
+            let (page, slot) = position?;
+            let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
+            keys.insert(key);
+        }
+
+        assert!(cursor.next(btree.pager).is_none());
+
+        assert_eq!(
+            HashSet::from_iter(1..=300),
+            keys,
+            "cursor probably skipped pages or cells"
+        );
 
         Ok(())
     }

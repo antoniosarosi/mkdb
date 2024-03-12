@@ -1,8 +1,8 @@
 use std::{
-    cell::RefCell,
+    cell::{RefCell, RefMut},
     cmp::Ordering,
     collections::VecDeque,
-    io::{Read, Seek, Write},
+    io::{self, Read, Seek, Write},
     mem,
     rc::Rc,
 };
@@ -11,7 +11,7 @@ use crate::{
     db::{DbError, Projection, RowId, Schema},
     paging::pager::{PageNumber, Pager},
     sql::statement::{Assignment, Column, DataType, Expression, Value},
-    storage::{page::SlotId, tuple, BTree, FixedSizeMemCmp},
+    storage::{page::SlotId, tuple, BTree, Cursor, FixedSizeMemCmp},
     vm,
 };
 
@@ -96,9 +96,8 @@ impl<I: Seek + Read + Write> BufferedIter<I> {
 
 pub(crate) struct SeqScan<I> {
     schema: Schema,
-    queue: VecDeque<PageNumber>,
-    slot: SlotId,
     pager: Rc<RefCell<Pager<I>>>,
+    cursor: Cursor,
 }
 
 impl<I: Seek + Read + Write> SeqScan<I> {
@@ -106,8 +105,7 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         Self {
             pager,
             schema,
-            slot: 0,
-            queue: VecDeque::from([root]),
+            cursor: Cursor::new(root, 0),
         }
     }
 
@@ -122,41 +120,25 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         // the page empty. See the documentation of [`crate::storage::btree`]
         // and [`crate::storage::page`] to fully understand what's going on
         // here. This guard should work for all cases anyway.
-        //
-        // TODO: This is not exactly sequential IO since BTree pages are not
-        // guaranteed to be linked sequentially. Pretty sure there must be a way
-        // to make this 100% sequential IO, but it would require some other disk
-        // data structure to maintain free pages sorted sequentially so that
-        // when the BTree allocates a page the page is guaranteed to be located
-        // after the BTree root. But even so the balancing algorithm cannot
-        // maintain all pages in sequential order when the BTree root overflows,
-        // so this optimization is definitely not easy to implement.
-        let page = 'find_current_page: loop {
-            match pager.get(*self.queue.front()?) {
-                // The page where we left last time has cells, keep returning content.
-                Ok(page) if page.len() > 0 => break 'find_current_page page,
+        let (page_number, slot) = 'position: loop {
+            let (page_number, slot) = match self.cursor.next(&mut pager)? {
+                Ok(position) => position,
+                Err(e) => return Some(Err(e.into())),
+            };
 
-                // Page is empty, find the next page that has some content.
-                Ok(page) => {
-                    self.queue.pop_front();
-                    self.queue.extend(page.iter_children());
-                }
-
-                // Not our problem, yeet it :)
-                Err(e) => return Some(Err(DbError::Io(e))),
-            }
+            match pager.get(page_number) {
+                Ok(page) if page.len() > 0 => break 'position (page_number, slot),
+                Err(e) => return Some(Err(e.into())),
+                _ => {}
+            };
         };
 
-        let row = tuple::deserialize_values(&page.cell(self.slot).content, &self.schema);
+        let page = match pager.get(page_number) {
+            Ok(page) => page,
+            Err(e) => return Some(Err(e.into())),
+        };
 
-        self.slot += 1;
-
-        // We're done with this page, move to the next one.
-        if self.slot >= page.len() {
-            self.queue.pop_front();
-            self.queue.extend(page.iter_children());
-            self.slot = 0;
-        }
+        let row = tuple::deserialize_values(&page.cell(slot).content, &self.schema);
 
         Some(Ok(Projection {
             results: vec![row],
@@ -203,8 +185,6 @@ pub(crate) struct Project<I> {
 impl<I: Seek + Read + Write> Project<I> {
     pub fn new(source: Box<Plan<I>>, output: Vec<Expression>) -> Self {
         let mut schema = Schema::empty();
-
-
 
         Self { source, output }
     }
