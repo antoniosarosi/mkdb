@@ -1895,7 +1895,7 @@ impl Cursor {
     /// ```
     ///
     /// Basically, get all the cells in all the pages at depth 0 first, then
-    /// same thing at depth 2, and so on until we reach the maximum depth and
+    /// same thing at depth 1, and so on until we reach the maximum depth and
     /// we read all the leaf nodes.
     ///
     /// Doing that while maintaing the state of the iterator requires some
