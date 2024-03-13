@@ -1,20 +1,19 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::RefCell,
     cmp::Ordering,
-    collections::VecDeque,
-    io::{self, Read, Seek, Write},
+    io::{Read, Seek, Write},
     mem,
     rc::Rc,
 };
 
 use crate::{
-    db::{DbError, Projection, RowId, Schema, SqlError, VmDataType},
+    db::{DbError, RowId, Schema, SqlError, VmDataType},
     paging::pager::{PageNumber, Pager},
     sql::{
         analyzer,
         statement::{Assignment, Column, DataType, Expression, Value},
     },
-    storage::{page::SlotId, tuple, BTree, Cursor, FixedSizeMemCmp},
+    storage::{tuple, BTree, Cursor, FixedSizeMemCmp},
     vm,
 };
 
@@ -37,7 +36,7 @@ pub(crate) enum Plan<I> {
 // but that's even more verbose than this and requires I: 'static everywhere. So
 // match it for now :)
 impl<I: Seek + Read + Write> Plan<I> {
-    pub fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+    pub fn next(&mut self) -> Result<Option<Tuple>, DbError> {
         match self {
             Self::SeqScan(scan) => scan.next(),
             Self::Filter(filter) => filter.next(),
@@ -86,32 +85,24 @@ impl<I: Seek + Read + Write> BufferedIter<I> {
     }
 
     pub fn collect(&mut self) -> Result<(), DbError> {
-        let Some(first) = self.source.next() else {
-            return Ok(());
-        };
-
-        self.collection = vec![first?];
-
-        while let Some(tuple) = self.source.next() {
-            self.collection.push(tuple?);
+        while let Some(tuple) = self.source.next()? {
+            self.collection.push(tuple);
         }
 
         Ok(())
     }
 
-    pub fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+    pub fn next(&mut self) -> Result<Option<Tuple>, DbError> {
         if !self.collected {
-            if let Err(e) = self.collect() {
-                return Some(Err(e));
-            }
+            self.collect()?;
             self.collected = true;
         }
 
         if self.collection.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        Some(Ok(self.collection.remove(0)))
+        Ok(Some(self.collection.remove(0)))
     }
 }
 
@@ -130,20 +121,16 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
         let mut pager = self.pager.borrow_mut();
 
-        let (page_number, slot) = match self.cursor.next(&mut pager)? {
-            Ok(position) => position,
-            Err(e) => return Some(Err(e.into())),
+        let Some((page_number, slot)) = self.cursor.next(&mut pager).transpose()? else {
+            return Ok(None);
         };
 
-        let page = match pager.get(page_number) {
-            Ok(page) => page,
-            Err(e) => return Some(Err(e.into())),
-        };
+        let page = pager.get(page_number)?;
 
-        Some(Ok(tuple::deserialize_values(
+        Ok(Some(tuple::deserialize_values(
             &page.cell(slot).content,
             &self.schema,
         )))
@@ -160,23 +147,14 @@ impl<I: Seek + Read + Write> Filter<I> {
         Self { source, filter }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
-        loop {
-            let tuple = match self.source.next()? {
-                Ok(tuple) => tuple,
-                Err(e) => return Some(Err(e)),
-            };
-
-            let matches_predicate = match vm::eval_where(self.source.schema(), &tuple, &self.filter)
-            {
-                Ok(eval) => eval,
-                Err(e) => return Some(Err(DbError::Sql(e))),
-            };
-
-            if matches_predicate {
-                return Some(Ok(tuple));
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
+        while let Some(tuple) = self.source.next()? {
+            if vm::eval_where(self.source.schema(), &tuple, &self.filter)? {
+                return Ok(Some(tuple));
             }
         }
+
+        Ok(None)
     }
 }
 
@@ -233,22 +211,17 @@ impl<I: Seek + Read + Write> Project<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
-        let tuple = match self.source.next()? {
-            Ok(tuple) => tuple,
-            Err(e) => return Some(Err(e)),
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(tuple) = self.source.next()? else {
+            return Ok(None);
         };
 
-        let mut resolved_values = Vec::new();
-
-        for expr in &self.projection {
-            match vm::resolve_expression(&tuple, self.source.schema(), expr) {
-                Ok(v) => resolved_values.push(v),
-                Err(e) => return Some(Err(e.into())),
-            }
-        }
-
-        Some(Ok(resolved_values))
+        Ok(Some(
+            self.projection
+                .iter()
+                .map(|expr| vm::resolve_expression(&tuple, self.source.schema(), expr))
+                .collect::<Result<Tuple, _>>()?,
+        ))
     }
 }
 
@@ -265,21 +238,19 @@ impl Values {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
         if self.done {
-            return None;
+            return Ok(None);
         }
 
         self.done = true;
 
-        let values = self
-            .values
-            .iter()
-            .map(vm::resolve_literal_expression)
-            .collect::<Result<Vec<Value>, SqlError>>()
-            .map_err(|e| e.into());
-
-        Some(values)
+        Ok(Some(
+            self.values
+                .iter()
+                .map(vm::resolve_literal_expression)
+                .collect::<Result<Vec<Value>, SqlError>>()?,
+        ))
     }
 }
 
@@ -334,11 +305,10 @@ impl<I: Seek + Read + Write> Sort<I> {
         Ok(())
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
         if !self.sorted {
-            if let Err(e) = self.source.collect().and_then(|_| self.sort()) {
-                return Some(Err(e));
-            }
+            self.source.collect()?;
+            self.sort()?;
             self.sorted = true;
         }
 
@@ -368,20 +338,17 @@ impl<I: Seek + Read + Write> Insert<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
-        let mut pager = self.pager.borrow_mut();
-
-        let tuple = match self.source.next()? {
-            Ok(tuple) => tuple,
-            Err(e) => return Some(Err(e)),
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(tuple) = self.source.next()? else {
+            return Ok(None);
         };
 
+        let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.insert(tuple::serialize_values(&self.schema, &tuple)) {
-            Ok(_) => Some(Ok(Vec::new())),
-            Err(e) => Some(Err(e.into())),
-        }
+        btree.insert(tuple::serialize_values(&self.schema, &tuple))?;
+
+        Ok(Some(vec![]))
     }
 }
 
@@ -407,36 +374,27 @@ impl<I: Seek + Read + Write> Update<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
-        let mut tuple = match self.source.next()? {
-            Ok(tuple) => tuple,
-            Err(e) => return Some(Err(e)),
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(mut tuple) = self.source.next()? else {
+            return Ok(None);
         };
 
         for assignment in &self.assignments {
-            let value = vm::resolve_expression(&tuple, self.source.schema(), &assignment.value);
+            let idx = self
+                .source
+                .schema()
+                .index_of(&assignment.identifier)
+                .unwrap();
 
-            match value {
-                Ok(v) => {
-                    let idx = self
-                        .source
-                        .schema()
-                        .index_of(&assignment.identifier)
-                        .unwrap();
-                    tuple[idx] = v;
-                }
-
-                Err(e) => return Some(Err(e.into())),
-            }
+            tuple[idx] = vm::resolve_expression(&tuple, self.source.schema(), &assignment.value)?;
         }
 
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.insert(tuple::serialize_values(self.source.schema(), &tuple)) {
-            Ok(_) => Some(Ok(Vec::new())),
-            Err(e) => Some(Err(e.into())),
-        }
+        btree.insert(tuple::serialize_values(self.source.schema(), &tuple))?;
+
+        Ok(Some(vec![]))
     }
 }
 
@@ -455,18 +413,16 @@ impl<I: Seek + Read + Write> Delete<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
-        let row = match self.source.next()? {
-            Ok(projection) => projection,
-            Err(e) => return Some(Err(e)),
+    fn next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(row) = self.source.next()? else {
+            return Ok(None);
         };
 
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.remove(&tuple::serialize_values(self.source.schema(), &row)) {
-            Ok(_) => Some(Ok(Tuple::new())),
-            Err(e) => Some(Err(e.into())),
-        }
+        btree.remove(&tuple::serialize_values(self.source.schema(), &row))?;
+
+        Ok(Some(vec![]))
     }
 }
