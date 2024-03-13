@@ -1460,7 +1460,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         let is_root = parents.is_empty();
 
         // The root is a special case because it can be fully empty.
-        let is_underflow = node.len() == 0 || !is_root && node.is_underflow();
+        let is_underflow = node.is_empty() || !is_root && node.is_underflow();
 
         // Nothing to do, the node is balanced.
         if !node.is_overflow() && !is_underflow {
@@ -1826,7 +1826,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     fn node_json(&mut self, page: &Page) -> io::Result<String> {
         let mut string = format!("{{\"page\":{},\"entries\":[", page.number);
 
-        if page.len() >= 1 {
+        if !page.is_empty() {
             let key = &page.cell(0).content;
             string.push_str(&format!("{:?}", key));
 
@@ -2200,7 +2200,7 @@ impl Cursor {
 /// children in a BTree that stores fixed size keys.
 #[cfg(test)]
 mod tests {
-    use std::{alloc::Layout, collections::HashSet, io, mem};
+    use std::{alloc::Layout, io, mem};
 
     use super::{BTree, Cursor, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
@@ -2220,6 +2220,14 @@ mod tests {
     /// Serialize into big endian and use [`FixedSizeMemCmp`] for comparisons.
     fn serialize_key(key: Key) -> [u8; mem::size_of::<Key>()] {
         key.to_be_bytes()
+    }
+
+    /// Same as [`serialize_key`] but allows the caller to specify the length.
+    fn serialize_key_of_size(key: Key, len: usize) -> Vec<u8> {
+        let mut buf = Vec::from(key.to_be_bytes());
+        buf.append(&mut vec![0; len - mem::size_of::<Key>()]);
+
+        buf
     }
 
     fn deserialize_key(buf: &[u8]) -> Key {
@@ -2390,12 +2398,12 @@ mod tests {
     }
 
     /// Computes the page size needed to store at least `min_keys` each carrying
-    /// `size` amount of payload.
+    /// `max` amount of payload.
     fn optimal_page_size_for_max_payload(max: usize, min_keys: usize) -> usize {
-        let one_max_cell_size =
+        let cell_storage_size =
             CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, MEM_ALIGNMENT) as u16;
 
-        let total_size = PAGE_HEADER_SIZE + one_max_cell_size * min_keys as u16;
+        let total_size = PAGE_HEADER_SIZE + cell_storage_size * min_keys as u16;
 
         align_upwards(total_size as usize, MEM_ALIGNMENT)
     }
@@ -3560,49 +3568,48 @@ mod tests {
 
     #[test]
     fn variable_length_data() -> io::Result<()> {
-        // Page::usable_space() is 244 bytes and Page::max_payload_size() is 48.
-        let page_size = 256;
+        // Payload size of each cell in bytes.
+        let payload_sizes = [64, 32, 48, 16, 8, 8];
 
-        // Size of the payloads. Add 10 bytes to each one of them to make the
-        // calcultions mentally (header size + slot size). We need to fill up
-        // 244 bytes per page.
-        let payload_sizes = [
-            // 7 entries, 238 bytes total. This fills the root page.
-            vec![48, 16, 8, 24, 48, 16, 8],
-            // 10 entries, 244 bytes total. Inserting the first one will split
-            // the root moving the 7 entries above into the left child, leaving
-            // the first entry below in the root and moving the other 9 into
-            // the right child.
-            vec![8, 8, 8, 8, 8, 8, 8, 24, 16, 48],
-            // We can squeeze one more key into the right child before the root
-            // needs 3 children.
-            vec![8],
-        ];
+        // TODO: This does the same thing as
+        // [`super::page::tests::optimal_page_size_to_fit`]. Make a module for
+        // test utilities or something.
+        let page_size = {
+            let space_needed = PAGE_HEADER_SIZE
+                + payload_sizes
+                    .iter()
+                    .map(|size| size + CELL_HEADER_SIZE + SLOT_SIZE)
+                    .sum::<u16>();
+
+            align_upwards(space_needed as usize, MEM_ALIGNMENT)
+        };
 
         let mut btree = BTree::builder().page_size(page_size).try_build()?;
 
-        for (i, size) in payload_sizes.iter().flatten().enumerate() {
-            let mut entry = vec![0; *size];
-            entry[..mem::size_of::<Key>()].copy_from_slice(&serialize_key(i as Key + 1));
-            btree.insert(entry)?;
+        // This should fill the root page.
+        for (i, size) in payload_sizes.iter().enumerate() {
+            btree.insert(serialize_key_of_size(i as Key + 1, *size as usize))?;
         }
+
+        // Now adding another 48 byte key should cause it to split.
+        btree.insert(serialize_key_of_size(payload_sizes.len() as Key, 48))?;
 
         // Considering the size of each cell, this is how the BTree should
         // end up looking:
         //
-        //                 +---+
-        //         +-------| 8 |--------+
-        //        /        +---+         \
-        // +---------------+  +------------------------------+
-        // | 1,2,3,4,5,6,7 |  | 9,10,11,12,13,14,15,16,17,18 |
-        // +---------------+  +------------------------------+
-
+        //             48 bytes
+        //              +---+
+        //         +----| 3 |----+
+        //        /     +---+     \
+        // +------+              +---------+
+        // | 1, 2 |              | 4, 5, 6 |
+        // +------+              +---------+
+        //  64b 32b               16b 8b 48b
+        //
+        //  96 bytes               72 bytes
         assert_eq!(Node::try_from(btree)?, Node {
-            keys: vec![8],
-            children: vec![
-                Node::leaf([1, 2, 3, 4, 5, 6, 7]),
-                Node::leaf([9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
-            ]
+            keys: vec![3],
+            children: vec![Node::leaf([1, 2]), Node::leaf([4, 5, 6])]
         });
 
         Ok(())
@@ -3633,100 +3640,93 @@ mod tests {
     /// [`BTree::remove`].
     ///
     /// ```text
-    ///                                                                                                                      Remove 6,9 and then double the size of 5 and 8
-    ///                                                                                                                                            |
-    ///                                                                                                                                            V
-    ///                                                                                                                                          +----+
-    ///                                                                           +--------------------------------------------------------------| 49 |-----------------------------------------------------+
-    ///                                                                          /                                                               +----+                                                      \
-    ///                                                                         /                                                                                                                             \
-    ///                                                              +------------------+                                                                                                               +-------------+
-    ///            +-------------------------------------------------| 7,14,21,28,35,42 |-------------------------------------------+                                +----------------------------------| 56,63,70,74 |--------------------+
-    ///           /                                                  +------------------+                                            \                              /                                   +-------------+                     \
-    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                    \                            /                                        /  |  \                          \
-    ///         /                  /                      +----------------+   |   +------------+                 \                    \                          /                            +-----------+   |   +------------+             \
-    ///        /                  /                      /                     |                 \                 \                    \                        /                            /                |                 \             \
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
-    /// | 1,2,3,4,5,6 |  | 8,9,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |  | 43,44,45,46,47,48 |    | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    ///                                      Remove 11 and 13 then double the size of 6, 18, 10 and 14
+    ///                                                              |
+    ///                                                              V
+    ///                                                           +----+
+    ///                                  +------------------------| 24 |---------------------------+
+    ///                                 /                         +----+                            \
+    ///                                /                                                             \
+    ///                           +---------+                                                     +-------+
+    ///          +----------------| 6,12,18 |---------------------+                         +-----| 29,33 |-----+
+    ///         /                 +---------+                      \                       /      +-------+      \
+    ///        /                   /      \                         \                     /           |           \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10,11 |  | 13,14,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28 |  | 30,31,32 |  | 34,35,36 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
     ///
-    ///                                                                                                                       Remove 7. The internal node should rebalance.
-    ///                                                                                                                                            |
-    ///                                                                                                                                            V
-    ///                                                                                                                                          +----+
-    ///                                                                           +--------------------------------------------------------------| 49 |-----------------------------------------------------+
-    ///                                                                          /                                                               +----+                                                      \
-    ///                                                                         /                                                                                                                             \
-    ///                                                              +------------------+                                                                                                               +-------------+
-    ///            +-------------------------------------------------| 7,14,21,28,35,42 |-------------------------------------------+                                +----------------------------------| 56,63,70,74 |--------------------+
-    ///           /                                                  +------------------+                                            \                              /                                   +-------------+                     \
-    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                    \                            /                                        /  |  \                          \
-    ///         /                  /                      +----------------+   |   +------------+                 \                    \                          /                            +-----------+   |   +------------+             \
-    ///        /                  /                      /                     |                 \                 \                    \                        /                            /                |                 \             \
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
-    /// | 1,2,3,4,5XX |  | 8XX,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |  | 43,44,45,46,47,48 |    | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+  +-------------------+    +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    ///                                      Removing 12 should cause the internal node to rebalance
+    ///                                                              |
+    ///                                                              V
+    ///                                                           +----+
+    ///                                  +------------------------| 24 |---------------------------+
+    ///                                 /                         +----+                            \
+    ///                                /                                                             \
+    ///                       +---------------+                                                   +-------+
+    ///          +------------| 6-XX,12,18-XX |-------------------+                         +-----| 29,33 |-----+
+    ///         /             +---------------+                    \                       /      +-------+      \
+    ///        /                   /      \                         \                     /           |           \
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9,10-XX |  | 14-XX,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28 |  | 30,31,32 |  | 34,35,36 |
+    /// +-----------+  +-------------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
     ///
-    ///                                                                                                                   FINAL RESULT
-    ///                                                                                                                        |
-    ///                                                                                                                        V
-    ///                                                                                                                      +----+
-    ///                                                                           +------------------------------------------| 42 |-------------------------------------------------+
-    ///                                                                          /                                           +----+                                                  \
-    ///                                                                         /                                                                                                     \
-    ///                                                              +------------------+                                                                                       +----------------+
-    ///            +-------------------------------------------------| 5XX,14,21,28,35  |                                                    +----------------------------------| 49,56,63,70,74 |----------------------------------------+
-    ///           /                                                  +------------------+                                                   /                                   +----------------+                                         \
-    ///          /                  +----------------------------------/    /  |  \   \--------------------------+                         /                                        /  |  \    \-------------------------------+            \
-    ///         /                  /                      +----------------+   |   +------------+                 \                       /                            +-----------+   |   +------------+                       \             \
-    ///        /                  /                      /                     |                 \                 \                     /                            /                |                 \                       \             \
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+    +-------------------+  +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
-    /// | 1,2,3,4     |  | 8XX,10,11,12,13 |  | 15,16,17,18,19,20 |  | 22,23,24,25,26,27 |  | 31,33,34 |  | 36,37,38,40,41 |    | 43,44,45,46,47,48 |  | 50,51,52,53,54,55 |  | 57,58,59,60,61,62 |  | 64,65,66,67,68,69 |  | 71,72,73 |  | 75,76,77 |
-    /// +-------------+  +-----------------+  +-------------------+  +-------------------+  +----------+  +----------------+    +-------------------+  +-------------------+  +-------------------+  +-------------------+  +----------+  +----------+
+    ///                                            Final Result
+    ///                                                  |
+    ///                                                  V
+    ///                                              +-------+
+    ///                        +---------------------| 18-XX |------------------------+
+    ///                       /                      +-------+                         \
+    ///                      /                                                          \
+    ///              +------------+                                                 +----------+
+    ///          +---| 6-XX,10-XX |---+                          +------------------| 24,29,33 |------------+
+    ///         /    +------------+    \                        /                   +----------+             \
+    ///        /           |            \                      /                      /      \                \
+    /// +-----------+  +-------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
+    /// | 1,2,3,4,5 |  | 7,8,9 |  | 14-XX,15,16,17 |  | 19,20,21,22,23 |  | 25,26,27,28 |  | 30,31,32 |  | 34,35,36 |
+    /// +-----------+  +-------+  +----------------+  +----------------+  +-------------+  +----------+  +----------+
     /// ```
     #[test]
     fn delete_leaving_leaf_balanced_and_internal_unbalanced() -> io::Result<()> {
-        let mut btree = BTree::builder().order(7).keys(1..=77).try_build()?;
+        // We need to make the cells big enough to make sure alignment and
+        // header sizes don't mess up what we're trying to do here.
+        let payload_size = 32;
 
-        btree.remove_key(6)?;
-        btree.remove_key(9)?;
+        let mut btree = BTree::builder()
+            .page_size(optimal_page_size_for_max_payload(payload_size, 5))
+            .try_build()?;
 
-        let double_size_of_key = |k| -> Vec<u8> {
-            let mut large_key = serialize_key(k).to_vec();
-            large_key.append(&mut serialize_key(0).to_vec());
-            large_key
-        };
+        for key in 1..=36 {
+            btree.insert(serialize_key_of_size(key, payload_size))?;
+        }
 
-        btree.insert(double_size_of_key(5))?;
-        btree.insert(double_size_of_key(8))?;
+        btree.try_remove_all_keys([11, 13])?;
 
-        btree.remove_key(7)?;
+        for key in [6, 18, 10, 14] {
+            btree.insert(serialize_key_of_size(key, payload_size * 2))?;
+        }
+
+        btree.remove_key(12)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
-            keys: vec![42],
+            keys: vec![18],
             children: vec![
                 Node {
-                    keys: vec![5, 14, 21, 28, 35],
+                    keys: vec![6, 10],
                     children: vec![
-                        Node::leaf([1, 2, 3, 4]),
-                        Node::leaf([8, 10, 11, 12, 13]),
-                        Node::leaf([15, 16, 17, 18, 19, 20]),
-                        Node::leaf([22, 23, 24, 25, 26, 27]),
-                        Node::leaf([29, 30, 31, 32, 33, 34]),
-                        Node::leaf([36, 37, 38, 39, 40, 41]),
+                        Node::leaf([1, 2, 3, 4, 5]),
+                        Node::leaf([7, 8, 9]),
+                        Node::leaf([14, 15, 16, 17]),
                     ]
                 },
                 Node {
-                    keys: vec![49, 56, 63, 70, 74],
+                    keys: vec![24, 29, 33],
                     children: vec![
-                        Node::leaf([43, 44, 45, 46, 47, 48]),
-                        Node::leaf([50, 51, 52, 53, 54, 55]),
-                        Node::leaf([57, 58, 59, 60, 61, 62]),
-                        Node::leaf([64, 65, 66, 67, 68, 69]),
-                        Node::leaf([71, 72, 73]),
-                        Node::leaf([75, 76, 77]),
+                        Node::leaf([19, 20, 21, 22, 23]),
+                        Node::leaf([25, 26, 27, 28]),
+                        Node::leaf([30, 31, 32]),
+                        Node::leaf([34, 35, 36]),
                     ]
-                }
+                },
             ]
         });
 
@@ -3860,9 +3860,9 @@ mod tests {
         let mut cursor = Cursor::new(btree.root, 0);
 
         for expected_key in keys {
-            let (page, slot) = cursor.next(btree.pager).expect(&format!(
-                "cursor should return the position of key {expected_key} but returns None"
-            ))?;
+            let (page, slot) = cursor.next(btree.pager).unwrap_or_else(|| {
+                panic!("cursor should return the position of key {expected_key} but returns None")
+            })?;
 
             let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
 

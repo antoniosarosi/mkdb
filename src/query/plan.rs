@@ -112,25 +112,9 @@ impl<I: Seek + Read + Write> SeqScan<I> {
     fn next(&mut self) -> Option<Result<Projection, DbError>> {
         let mut pager = self.pager.borrow_mut();
 
-        // Finding the page from which we should return content while maintaing
-        // the iterator state is not trivial. In theory, a page could be empty
-        // but still have one child. That is not a bug, although the BTree will
-        // not allow it except for some edge cases of page zero, since page zero
-        // has less space and the balancing algorithm sometimes needs to leave
-        // the page empty. See the documentation of [`crate::storage::btree`]
-        // and [`crate::storage::page`] to fully understand what's going on
-        // here. This guard should work for all cases anyway.
-        let (page_number, slot) = 'position: loop {
-            let (page_number, slot) = match self.cursor.next(&mut pager)? {
-                Ok(position) => position,
-                Err(e) => return Some(Err(e.into())),
-            };
-
-            match pager.get(page_number) {
-                Ok(page) if page.len() > 0 => break 'position (page_number, slot),
-                Err(e) => return Some(Err(e.into())),
-                _ => {}
-            };
+        let (page_number, slot) = match self.cursor.next(&mut pager)? {
+            Ok(position) => position,
+            Err(e) => return Some(Err(e.into())),
         };
 
         let page = match pager.get(page_number) {
