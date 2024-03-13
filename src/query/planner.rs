@@ -27,9 +27,9 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             values,
         } => {
             let (schema, root) = db.table_metadata(&into)?;
-            let source = Box::new(Plan::Values(Values::new(schema, values)));
+            let source = Box::new(Plan::Values(Values::new(values)));
 
-            Plan::Insert(Insert::new(root, Rc::clone(&db.pager), source))
+            Plan::Insert(Insert::new(root, Rc::clone(&db.pager), source, schema))
         }
 
         Statement::Select {

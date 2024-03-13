@@ -165,7 +165,10 @@ fn analyze_assignment(
 ///
 /// If there are type errors or unknown columns not present in the given
 /// schema then an error is returned.
-fn analyze_expression(schema: &Schema, expr: &Expression) -> Result<VmDataType, SqlError> {
+pub(crate) fn analyze_expression(
+    schema: &Schema,
+    expr: &Expression,
+) -> Result<VmDataType, SqlError> {
     Ok(match expr {
         Expression::Value(value) => match value {
             Value::Bool(_) => VmDataType::Bool,

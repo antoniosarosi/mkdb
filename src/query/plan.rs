@@ -8,12 +8,17 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, Projection, RowId, Schema},
+    db::{DbError, Projection, RowId, Schema, SqlError, VmDataType},
     paging::pager::{PageNumber, Pager},
-    sql::statement::{Assignment, Column, DataType, Expression, Value},
+    sql::{
+        analyzer,
+        statement::{Assignment, Column, DataType, Expression, Value},
+    },
     storage::{page::SlotId, tuple, BTree, Cursor, FixedSizeMemCmp},
     vm,
 };
+
+pub(crate) type Tuple = Vec<Value>;
 
 pub(crate) enum Plan<I> {
     Values(Values),
@@ -32,7 +37,7 @@ pub(crate) enum Plan<I> {
 // but that's even more verbose than this and requires I: 'static everywhere. So
 // match it for now :)
 impl<I: Seek + Read + Write> Plan<I> {
-    pub fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    pub fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         match self {
             Self::SeqScan(scan) => scan.next(),
             Self::Filter(filter) => filter.next(),
@@ -44,11 +49,26 @@ impl<I: Seek + Read + Write> Plan<I> {
             Self::Delete(delete) => delete.next(),
         }
     }
+
+    pub fn schema(&self) -> &Schema {
+        match self {
+            Self::SeqScan(scan) => &scan.schema,
+            Self::Project(project) => &project.schema,
+            Self::Insert(insert) => &insert.schema,
+
+            Self::Filter(filter) => filter.source.schema(),
+            Self::Sort(sort) => sort.source.schema(),
+            Self::Update(update) => update.source.schema(),
+            Self::Delete(delete) => delete.source.schema(),
+
+            _ => unreachable!(),
+        }
+    }
 }
 
 pub(crate) struct BufferedIter<I> {
     source: Box<Plan<I>>,
-    pub collection: Projection,
+    pub collection: Vec<Tuple>,
     collected: bool,
 }
 
@@ -56,9 +76,13 @@ impl<I: Seek + Read + Write> BufferedIter<I> {
     pub fn new(source: Box<Plan<I>>) -> Self {
         Self {
             source,
-            collection: Projection::empty(),
+            collection: Vec::new(),
             collected: false,
         }
+    }
+
+    pub fn schema(&self) -> &Schema {
+        self.source.schema()
     }
 
     pub fn collect(&mut self) -> Result<(), DbError> {
@@ -66,16 +90,16 @@ impl<I: Seek + Read + Write> BufferedIter<I> {
             return Ok(());
         };
 
-        self.collection = first?;
+        self.collection = vec![first?];
 
-        while let Some(projection) = self.source.next() {
-            self.collection.results.append(&mut projection?.results);
+        while let Some(tuple) = self.source.next() {
+            self.collection.push(tuple?);
         }
 
         Ok(())
     }
 
-    pub fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    pub fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         if !self.collected {
             if let Err(e) = self.collect() {
                 return Some(Err(e));
@@ -87,10 +111,7 @@ impl<I: Seek + Read + Write> BufferedIter<I> {
             return None;
         }
 
-        // TODO: Is it even possible to write this more inefficiently?
-        Some(Ok(Projection::new(self.collection.schema.clone(), vec![
-            self.collection.results.remove(0),
-        ])))
+        Some(Ok(self.collection.remove(0)))
     }
 }
 
@@ -109,7 +130,7 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         let mut pager = self.pager.borrow_mut();
 
         let (page_number, slot) = match self.cursor.next(&mut pager)? {
@@ -122,12 +143,10 @@ impl<I: Seek + Read + Write> SeqScan<I> {
             Err(e) => return Some(Err(e.into())),
         };
 
-        let row = tuple::deserialize_values(&page.cell(slot).content, &self.schema);
-
-        Some(Ok(Projection {
-            results: vec![row],
-            schema: self.schema.clone(), // TODO: Shouldn't need to clone this.
-        }))
+        Some(Ok(tuple::deserialize_values(
+            &page.cell(slot).content,
+            &self.schema,
+        )))
     }
 }
 
@@ -141,21 +160,21 @@ impl<I: Seek + Read + Write> Filter<I> {
         Self { source, filter }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         loop {
-            let projection = match self.source.next()? {
-                Ok(projection) => projection,
+            let tuple = match self.source.next()? {
+                Ok(tuple) => tuple,
                 Err(e) => return Some(Err(e)),
             };
 
-            let matches_predicate =
-                match vm::eval_where(&projection.schema, &projection.results[0], &self.filter) {
-                    Ok(eval) => eval,
-                    Err(e) => return Some(Err(DbError::Sql(e))),
-                };
+            let matches_predicate = match vm::eval_where(self.source.schema(), &tuple, &self.filter)
+            {
+                Ok(eval) => eval,
+                Err(e) => return Some(Err(DbError::Sql(e))),
+            };
 
             if matches_predicate {
-                return Some(Ok(projection));
+                return Some(Ok(tuple));
             }
         }
     }
@@ -163,34 +182,23 @@ impl<I: Seek + Read + Write> Filter<I> {
 
 pub(crate) struct Project<I> {
     source: Box<Plan<I>>,
-    output: Vec<Expression>,
+    schema: Schema,
+    projection: Vec<Expression>,
 }
 
 impl<I: Seek + Read + Write> Project<I> {
-    pub fn new(source: Box<Plan<I>>, output: Vec<Expression>) -> Self {
+    pub fn new(source: Box<Plan<I>>, projection: Vec<Expression>) -> Self {
         let mut schema = Schema::empty();
-
-        Self { source, output }
-    }
-
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
-        let projection = match self.source.next()? {
-            Ok(projection) => projection,
-            Err(e) => return Some(Err(e)),
-        };
-
-        let mut results_schema = Schema::empty();
-        let mut resolved_values = Vec::new();
         let mut unknown_types = Vec::new();
 
-        for (i, expr) in self.output.iter().enumerate() {
+        for (i, expr) in projection.iter().enumerate() {
             match expr {
-                Expression::Identifier(ident) => results_schema.push(
-                    projection.schema.columns[projection.schema.index_of(ident).unwrap()].clone(),
+                Expression::Identifier(ident) => schema.push(
+                    source.schema().columns[source.schema().index_of(ident).unwrap()].clone(),
                 ),
 
                 _ => {
-                    results_schema.push(Column {
+                    schema.push(Column {
                         name: expr.to_string(),    // TODO: AS alias
                         data_type: DataType::Bool, // We'll set it later
                         constraints: vec![],
@@ -199,56 +207,79 @@ impl<I: Seek + Read + Write> Project<I> {
                     unknown_types.push(i);
                 }
             }
+        }
 
-            match vm::resolve_expression(&projection.results[0], &projection.schema, expr) {
+        // TODO: There are no expressions that can evaluate to strings as of
+        // right now and we set the default to be bool. So if there's an
+        // expression that evaluates to a number we'll change its type. The
+        // problem is that we don't know the exact kind of number, an expression
+        // with a raw value like 4294967296 should evaluate to UnsignedBigInt
+        // but -65536 should probably evaluate to Int. Expressions that have
+        // identifiers in them should probably evaluate to the type of the
+        // identifier. Not gonna worry about this for now, this is a toy
+        // database after all :)
+        for i in unknown_types {
+            if let VmDataType::Number =
+                analyzer::analyze_expression(source.schema(), &projection[i]).unwrap()
+            {
+                schema.columns[i].data_type = DataType::BigInt;
+            }
+        }
+
+        Self {
+            source,
+            projection,
+            schema,
+        }
+    }
+
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+        let tuple = match self.source.next()? {
+            Ok(tuple) => tuple,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let mut resolved_values = Vec::new();
+
+        for expr in &self.projection {
+            match vm::resolve_expression(&tuple, self.source.schema(), expr) {
                 Ok(v) => resolved_values.push(v),
                 Err(e) => return Some(Err(e.into())),
             }
         }
 
-        for i in unknown_types {
-            if let Value::Number(_) = &projection.results[0][i] {
-                results_schema.columns[i].data_type = DataType::BigInt;
-            }
-        }
-
-        Some(Ok(Projection::new(results_schema, vec![resolved_values])))
+        Some(Ok(resolved_values))
     }
 }
 
 pub(crate) struct Values {
-    schema: Option<Schema>, // TODO: need to move out of schema
     values: Vec<Expression>,
     done: bool,
 }
 
 impl Values {
-    pub fn new(schema: Schema, values: Vec<Expression>) -> Self {
+    pub fn new(values: Vec<Expression>) -> Self {
         Self {
-            schema: Some(schema),
             values,
             done: false,
         }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         if self.done {
             return None;
         }
 
-        let schema = self.schema.take().unwrap();
         self.done = true;
 
         let values = self
             .values
             .iter()
             .map(vm::resolve_literal_expression)
-            .collect::<Result<_, _>>();
+            .collect::<Result<Vec<Value>, SqlError>>()
+            .map_err(|e| e.into());
 
-        match values {
-            Ok(values) => Some(Ok(Projection::new(schema, vec![values]))),
-            Err(e) => Some(Err(e.into())),
-        }
+        Some(values)
     }
 }
 
@@ -268,16 +299,17 @@ impl<I: Seek + Read + Write> Sort<I> {
     }
 
     fn sort(&mut self) -> Result<(), DbError> {
-        for row in &mut self.source.collection.results {
+        for i in 0..self.source.collection.len() {
             for expr in &self.by {
-                let sort_key = vm::resolve_expression(row, &self.source.collection.schema, expr)?;
-                row.push(sort_key);
+                let sort_key =
+                    vm::resolve_expression(&self.source.collection[i], self.source.schema(), expr)?;
+                self.source.collection[i].push(sort_key);
             }
         }
 
-        let sort_keys_idx = self.source.collection.schema.len();
+        let sort_keys_idx = self.source.schema().len();
 
-        self.source.collection.results.sort_by(|a, b| {
+        self.source.collection.sort_by(|a, b| {
             for (sort_key_a, sort_key_b) in a[sort_keys_idx..].iter().zip(&b[sort_keys_idx..]) {
                 match sort_key_a.partial_cmp(sort_key_b) {
                     Some(ordering) if ordering != Ordering::Equal => return ordering,
@@ -295,14 +327,14 @@ impl<I: Seek + Read + Write> Sort<I> {
         });
 
         // TODO: This can probably be done in one single pass when returning the results
-        for row in &mut self.source.collection.results {
+        for row in &mut self.source.collection {
             row.drain(sort_keys_idx..);
         }
 
         Ok(())
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         if !self.sorted {
             if let Err(e) = self.source.collect().and_then(|_| self.sort()) {
                 return Some(Err(e));
@@ -318,29 +350,36 @@ pub(crate) struct Insert<I> {
     root: PageNumber,
     pager: Rc<RefCell<Pager<I>>>,
     source: Box<Plan<I>>,
+    schema: Schema,
 }
 
 impl<I: Seek + Read + Write> Insert<I> {
-    pub fn new(root: PageNumber, pager: Rc<RefCell<Pager<I>>>, source: Box<Plan<I>>) -> Self {
+    pub fn new(
+        root: PageNumber,
+        pager: Rc<RefCell<Pager<I>>>,
+        source: Box<Plan<I>>,
+        schema: Schema,
+    ) -> Self {
         Self {
             root,
             pager,
             source,
+            schema,
         }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         let mut pager = self.pager.borrow_mut();
 
-        let values = match self.source.next()? {
-            Ok(projection) => projection,
+        let tuple = match self.source.next()? {
+            Ok(tuple) => tuple,
             Err(e) => return Some(Err(e)),
         };
 
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.insert(tuple::serialize_values(&values.schema, &values.results[0])) {
-            Ok(_) => Some(Ok(Projection::empty())),
+        match btree.insert(tuple::serialize_values(&self.schema, &tuple)) {
+            Ok(_) => Some(Ok(Vec::new())),
             Err(e) => Some(Err(e.into())),
         }
     }
@@ -368,19 +407,23 @@ impl<I: Seek + Read + Write> Update<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
-        let mut row = match self.source.next()? {
-            Ok(projection) => projection,
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
+        let mut tuple = match self.source.next()? {
+            Ok(tuple) => tuple,
             Err(e) => return Some(Err(e)),
         };
 
         for assignment in &self.assignments {
-            let value = vm::resolve_expression(&row.results[0], &row.schema, &assignment.value);
+            let value = vm::resolve_expression(&tuple, self.source.schema(), &assignment.value);
 
             match value {
                 Ok(v) => {
-                    let idx = row.schema.index_of(&assignment.identifier).unwrap();
-                    row.results[0][idx] = v;
+                    let idx = self
+                        .source
+                        .schema()
+                        .index_of(&assignment.identifier)
+                        .unwrap();
+                    tuple[idx] = v;
                 }
 
                 Err(e) => return Some(Err(e.into())),
@@ -390,8 +433,8 @@ impl<I: Seek + Read + Write> Update<I> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.insert(tuple::serialize_values(&row.schema, &row.results[0])) {
-            Ok(_) => Some(Ok(Projection::empty())),
+        match btree.insert(tuple::serialize_values(self.source.schema(), &tuple)) {
+            Ok(_) => Some(Ok(Vec::new())),
             Err(e) => Some(Err(e.into())),
         }
     }
@@ -412,7 +455,7 @@ impl<I: Seek + Read + Write> Delete<I> {
         }
     }
 
-    fn next(&mut self) -> Option<Result<Projection, DbError>> {
+    fn next(&mut self) -> Option<Result<Tuple, DbError>> {
         let row = match self.source.next()? {
             Ok(projection) => projection,
             Err(e) => return Some(Err(e)),
@@ -421,8 +464,8 @@ impl<I: Seek + Read + Write> Delete<I> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        match btree.remove(&tuple::serialize_values(&row.schema, &row.results[0])) {
-            Ok(_) => Some(Ok(Projection::empty())),
+        match btree.remove(&tuple::serialize_values(self.source.schema(), &row)) {
+            Ok(_) => Some(Ok(Tuple::new())),
             Err(e) => Some(Err(e.into())),
         }
     }

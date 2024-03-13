@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, Write};
 
 use crate::{
-    db::QueryResult,
+    db::{Projection, QueryResult},
     paging,
     query::plan::{BufferedIter, Plan},
 };
@@ -12,7 +12,7 @@ pub(crate) fn exec_plan<I: Seek + Read + Write + paging::io::Sync>(plan: Plan<I>
     let mut iter = BufferedIter::new(Box::new(plan));
     iter.collect()?;
 
-    Ok(iter.collection)
+    Ok(Projection::new(iter.schema().clone(), iter.collection))
 }
 
 // TODO: Move the plan iterators here or something.

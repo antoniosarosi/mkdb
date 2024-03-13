@@ -1018,7 +1018,7 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection::empty());
+        assert!(query.results.is_empty());
 
         Ok(())
     }
