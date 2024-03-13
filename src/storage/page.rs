@@ -1083,6 +1083,11 @@ impl Page {
         self.header().num_slots + self.overflow.len() as u16
     }
 
+    /// Returns `true` if this page doesn't store any cells.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Reference to the page header.
     pub fn header(&self) -> &PageHeader {
         self.buffer.header()

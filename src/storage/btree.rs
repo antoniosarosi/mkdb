@@ -769,13 +769,13 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
     /// Returns the greatest entry in this tree.
     pub fn max(&mut self) -> io::Result<Option<Payload>> {
-        if self.pager.get(self.root)?.len() == 0 {
+        if self.pager.get(self.root)?.is_empty() {
             return Ok(None);
         }
 
         let (page, slot) = self.search_max_key(self.root, &mut Vec::new())?;
 
-        if self.pager.get(page)?.len() == 0 {
+        if self.pager.get(page)?.is_empty() {
             return Ok(None);
         }
 
@@ -2119,10 +2119,17 @@ impl Cursor {
             self.init = true;
         }
 
+        let node = pager.get(self.page)?;
+
+        // The only page that can be empty is the root. The BTree will not allow
+        // the rest of pages to stay empty.
+        if node.is_empty() && node.is_leaf() {
+            self.done = true;
+            return Ok(None);
+        }
+
         // We return the "current" position and prepare the next one on every call.
         let position = Ok(Some((self.page, self.slot)));
-
-        let node = pager.get(self.page)?;
 
         // We are currently returning keys from a leaf node and we're not done
         // yet, so simply move to the next key (or cell in this case).
@@ -3905,5 +3912,42 @@ mod tests {
         let mut btree = BTree::builder().order(6).keys(keys.clone()).try_build()?;
 
         assert_cursor_traversal_matches(&mut btree, keys)
+    }
+
+    /// Should work with this tree.
+    ///
+    /// ```text
+    ///                 +--------+
+    ///                 |        | Empty Root
+    ///                 +--------+
+    ///                     |
+    ///                 +--------+
+    ///         +-------| 4,8,12 |--------+
+    ///       /         +--------+         \
+    ///     /           /        \          \
+    /// +-------+  +-------+  +---------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    /// +-------+  +-------+  +---------+  +----------+
+    /// ```
+    #[test]
+    fn cursor_on_empty_root_with_children() -> io::Result<()> {
+        let keys = 1..=15;
+
+        let mut btree = BTree::builder()
+            .root_at_zero(true)
+            .keys(keys.clone())
+            .try_build()?;
+
+        assert_cursor_traversal_matches(&mut btree, keys)
+    }
+
+    #[test]
+    fn cursor_on_empty_root_with_no_children() -> io::Result<()> {
+        let btree = BTree::builder().try_build()?;
+        let mut cursor = Cursor::new(btree.root, 0);
+
+        assert!(cursor.next(btree.pager).is_none());
+
+        Ok(())
     }
 }
