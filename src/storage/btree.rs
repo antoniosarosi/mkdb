@@ -1853,12 +1853,19 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     }
 }
 
+/// BTree cursor.
 #[derive(Debug)]
 pub(crate) struct Cursor {
+    /// The page that the cursor points at currently.
     page: PageNumber,
+    /// Current slot in [`Self::page`].
     slot: SlotId,
-    done: bool,
+    /// Stack of parents. See the documentation of [`Self::try_next`].
     descent: Vec<PageNumber>,
+    /// Lazy initialization.
+    init: bool,
+    /// `true` if there are no more elements to return.
+    done: bool,
 }
 
 impl Cursor {
@@ -1867,149 +1874,309 @@ impl Cursor {
             page,
             slot,
             descent: vec![],
+            init: false,
             done: false,
         }
     }
 
-    /// Sequential BTree traversal algorihtm.
-    ///
-    /// For some reason traversing a BTree level by level without blowing up
-    /// the memory by storing a billion page numbers in a queue and maintaing
-    /// the iterator state at the same time ain't easy.
-    ///
-    /// What we want to do is breadth-first search, without "searching" anything
-    /// in particular:
+    /// Moves the cursor to the leftmost node in the current subtree.
     ///
     /// ```text
-    ///                                                          +--+--+--+
-    /// Traverse Depth 0   ----------------->                    |  |  |  |
-    ///        |                                                 +--+--+--+
-    ///        |                                                      |
-    ///        |                                 +--------------------+-------------------+
-    ///        |                                 |                                        |
-    ///        V                            +--+--+--+                                +--+--+--+
-    /// Traverse Depth 1   --------->       |  |  |  |           --------->           |  |  |  |
-    ///        |                            +--+--+--+                                +--+--+--+
-    ///        |                                 |                                         |
-    ///        |                   +-------------+-------------+             +-------------+-------------+
-    ///        |                   |             |             |             |             |             |
-    ///        V              +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+
-    /// Traverse Depth 2   -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  | -> |  |  |  |
-    ///                       +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+    +--+--+--+
+    ///                          self.page starts here
+    ///                                    |
+    ///                                    V
+    ///                               +--------+ PAGE 1
+    ///                       +-------|   11   |-------+
+    ///                      /        +--------+        \
+    ///                     /                            \
+    ///                +-------+ PAGE 7              +--------+ PAGE 8
+    ///           +----|  4,8  |----+                |   14   |
+    ///          /     +-------+     \               +--------+
+    ///         /          |          \               /      \
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///     | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///      PAGE 2      PAGE 3     PAGE 4        PAGE 5     PAGE 6
+    ///         ^
+    ///         |
+    ///     self.page
+    ///     ends here
+    /// ```
+    fn move_to_leftmost<I: Seek + Read + Write>(&mut self, pager: &mut Pager<I>) -> io::Result<()> {
+        let mut node = pager.get(self.page)?;
+
+        while !node.is_leaf() {
+            self.descent.push(self.page);
+            self.page = node.child(0);
+            node = pager.get(self.page)?;
+        }
+
+        self.slot = 0;
+
+        Ok(())
+    }
+
+    /// Disk BTree traversal algorithm.
+    ///
+    /// Traversing a disk BTree with an iterator that maintains its state (which
+    /// means no recursion) without blowing up the memory by storing a billion
+    /// page numbers in a queue while maximizing sequential IO is not easy at
+    /// all.
+    ///
+    /// There are two main ways to traverse a tree (or graph), discussed below.
+    ///
+    /// # Breadth-First Search (BFS)
+    ///
+    /// Ideally, this is how BFS should look like:
+    ///
+    /// ```text
+    ///                                     +--------+ PAGE 1
+    /// DEPTH 0                     +-------|   11   |-------+
+    ///                            /        +--------+        \
+    ///                           /                            \
+    ///                      +-------+ PAGE 7              +--------+ PAGE 8
+    /// DEPTH 1         +----|  4,8  |----+                |   14   |
+    ///                /     +-------+     \               +--------+
+    ///               /          |          \               /      \
+    ///           +-------+  +-------+  +-------+     +-------+  +-------+
+    /// DEPTH 2   | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    ///           +-------+  +-------+  +-------+     +-------+  +-------+
+    ///            PAGE 2      PAGE 3     PAGE 4        PAGE 5     PAGE 6
+    ///
+    /// Key Order:     [11, 4, 8, 14, 1, 2, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16]
+    /// Visited Pages: [1, 7, 8, 2, 3, 4, 5, 6]
     /// ```
     ///
-    /// Basically, get all the cells in all the pages at depth 0 first, then
-    /// same thing at depth 1, and so on until we reach the maximum depth and
-    /// we read all the leaf nodes.
+    /// If it's not clear from the diagram, in words it would be: return all
+    /// the keys from all the pages at depth 0, then move to depth 1 and return
+    /// all the keys from all the pages at that level, and so on until we're
+    /// done.
     ///
-    /// As mentioned previously, we can't push all the children of a page into a
-    /// [`VecDeque`], scan the page, pop the next one from the queue and then
-    /// repeat the process because the number of pages we have to push grows
-    /// exponentially with the tree depth. By the time we reach the leaf nodes
-    /// of a balanced BTree of order 4 and depth 16 we have to push 4^16 page
-    /// numbers into the queue, more than 4 billion 4-byte integers which add up
-    /// to roughly 16 GiB of memory.
+    /// Normal BFS requires a FIFO queue where we push the children page numbers
+    /// of every page we visit and then pop the next page from the front of the
+    /// queue. Now that's nice and all until you have to deal with disk BTrees
+    /// that could potentially contain billions of nodes.
     ///
-    /// TODO: Explain how the algorithm works.
+    /// By the time we reach the leaf nodes of a balanced BTree of order 4 and
+    /// depth 15 we have to push 4^15 page numbers into the queue, more than 1
+    /// billion 4-byte integers which add up to roughly 4 GiB of memory. As
+    /// always, a database system can never assume that something "fits in
+    /// memory". This algorithm has exponential space complexity, or more
+    /// specifically O(b^d) where b is the branching factor (number of children
+    /// per node, also known as order in our case) and d is the maximum depth of
+    /// the tree.
     ///
-    /// TODO: This is not exactly sequential IO since BTree pages are not
-    /// guaranteed to be linked sequentially. Pretty sure there must be a way to
-    /// make this 100% sequential IO, but it would require some other disk data
-    /// structure to maintain free pages sorted sequentially so that when the
-    /// BTree allocates a page the page is guaranteed to be located after the
-    /// BTree root. But even so the balancing algorithm cannot maintain all
-    /// pages in sequential order when the BTree root overflows, so this
-    /// optimization is definitely not easy to implement.
+    /// So we can't use normal BFS, but there are variants of BFS that don't
+    /// require so much memory. We'll discuss them later as they are related to
+    /// depth-first search.
+    ///
+    /// # Depth-First Search (DFS)
+    ///
+    /// Depth-first search traverses the tree vertically instead of
+    /// horizontally.
+    ///
+    /// This is how a conventional non-recursive depth-first traversal would
+    /// look like:
+    ///
+    /// ```text
+    ///                               +--------+ PAGE 1
+    ///                       +-------|   11   |-------+
+    ///                      /        +--------+        \
+    ///                     /                            \
+    ///                +-------+ PAGE 7              +--------+ PAGE 8
+    ///           +----|  4,8  |----+                |   14   |
+    ///          /     +-------+     \               +--------+
+    ///         /          |          \               /      \
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///     | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///      PAGE 2      PAGE 3     PAGE 4        PAGE 5     PAGE 6
+    ///
+    /// Key Order:     [11, 14, 15, 16, 12, 13, 4, 8, 9, 10, 5, 6, 7, 1, 2, 3]
+    /// Visited Pages: [1, 8, 6, 5, 7, 4, 3, 2]
+    /// ```
+    ///
+    /// Again, in words: return all the keys in the current page, move to one
+    /// of its children, return all the keys in that child, move to one of the
+    /// child's children, return all the keys and repeat until the bottom is
+    /// reached. Then take another branch of the tree and repeat the process.
+    ///
+    /// Depth-first doesn't use a FIFO queue, it uses a stack or LIFO queue
+    /// instead where we push children page numbers and pop them off the stack.
+    /// The advantage of DFS over BFS is that since it goes down vertically the
+    /// memory usage is limited because the tree depth grows exponentially, the
+    /// bigger the tree is the less likely it is to grow another level.
+    ///
+    /// Using the same example from before, a BTree of order 4 and depth 15
+    /// would only require the stack to store 4 * 15 page numbers at once, since
+    /// the space complexity is O(b * d). That's only a few bytes. The time
+    /// complexity is the same as BFS, no change there.
+    ///
+    /// # Memory Efficient BFS
+    ///
+    /// At this point it's pretty clear that we have to go "depth" first because
+    /// of memory constraints. The problem is dealing with sequential IO. Since
+    /// we don't have a B+Tree where leaf nodes contain all the data and are
+    /// linked together, we can't do 100% sequential IO.
+    ///
+    /// The LIFO depth-first approach will basically send us at the end of the
+    /// file first, then it will do some reversed sequential IO, then send us at
+    /// the middle of the file and do more reversed sequential IO, and so on.
+    /// Doesn't seem ideal.
+    ///
+    /// The best we can do is chunks of sequential IO, because the way the BTree
+    /// is build and balanced causes all the pages at the same depth level to be
+    /// sequential, although reusing freed pages might mess that up a little. So
+    /// we could do a breadth-first traversal that's a little smarter and
+    /// doesn't store all the children in a queue but uses a stack instead where
+    /// it maintains the parents of the current node so that it can backtrack
+    /// when needed. Something like this:
+    ///
+    /// ```text
+    ///                               +--------+ PAGE 1
+    ///                       +-------|   11   |-------+
+    ///                      /        +--------+        \
+    ///                     /                            \
+    ///                +-------+ PAGE 7              +--------+ PAGE 8
+    ///           +----|  4,8  |----+                |   14   |
+    ///          /     +-------+     \               +--------+
+    ///         /          |          \               /      \
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///     | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///      PAGE 2      PAGE 3     PAGE 4        PAGE 5     PAGE 6
+    ///
+    /// Key Order:     [11, 4, 8, 14, 1, 2, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16]
+    /// Visited Pages: [1, 7, 1, 8, 1, 7, 2, 7, 3, 7, 4, 7, 1, 8, 5, 8, 6, 14, 11]
+    /// ```
+    ///
+    /// When the algorithm is done with one node it has to go back to the parent
+    /// to grab the next sibling. If there's no next sibling, then go to the
+    /// grandparent and back down through the uncle to find the cousin, and so
+    /// on. When it's done with one entire depth level it has to move to the
+    /// next one by going back to the root and following the leftmost pointers.
+    /// That's why you can see it moving upwards so many times in the visited
+    /// pages array. This [commit] implements such solution.
+    ///
+    /// [commit]: https://github.com/antoniosarosi/mkdb/blob/653a0628f4f4a91ac1ae0e1d6237811b5abdf449/src/storage/btree.rs#L1923-L2014
+    ///
+    /// The "moving upwards" part is not as bad as it seems, since we can pin
+    /// the parent pages in the cache or store only their children numbers in a
+    /// local cache. The problem is when we are located at the maximum depth
+    /// level and we have to move from a leaf of one subtree to the leaf of
+    /// another subtree. For example, going from page 4 to page 5 in the figure
+    /// above requires moving both upwards towards the root and then downwards
+    /// through another branch towards the leaf node. This process has to be
+    /// repeated for every branch of the root node.
+    ///
+    /// # In-Order Depth-First Search
+    ///
+    /// Regardless, there's another similar solution that visits less pages
+    /// overall. We can basically do a sophisticated in-order depth first
+    /// traversal that works with BTrees:
+    ///
+    /// ```text
+    ///                               +--------+ PAGE 1
+    ///                       +-------|   11   |-------+
+    ///                      /        +--------+        \
+    ///                     /                            \
+    ///                +-------+ PAGE 7              +--------+ PAGE 8
+    ///           +----|  4,8  |----+                |   14   |
+    ///          /     +-------+     \               +--------+
+    ///         /          |          \               /      \
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///     | 1,2,3 |  | 5,6,7 |  | 9,10  |     | 12,13 |  | 15,16 |
+    ///     +-------+  +-------+  +-------+     +-------+  +-------+
+    ///      PAGE 2      PAGE 3     PAGE 4        PAGE 5     PAGE 6
+    ///
+    /// Key Order:     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    /// Visited Pages: [1, 7, 2, 7, 3, 7, 4, 7, 1, 8, 5, 8, 6, 8, 1]
+    /// ```
+    ///
+    /// It uses the same backtracking technique with the stack that we mentioned
+    /// before but it takes advantage of the fact that it has to move upwards
+    /// by returning keys when it does so. That in turn reduces the number of
+    /// times we have to go back upwards, because once we are done with a
+    /// subtree we'll never visit any of its pages again.
+    ///
+    /// Of course, just like [`BTree::balance`], this algorithm is inspired by
+    /// SQLite 2. Take a look at the [original].
+    ///
+    /// [original]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L1630-L1677
     fn try_next<I: Seek + Read + Write>(
         &mut self,
         pager: &mut Pager<I>,
-    ) -> io::Result<(PageNumber, SlotId)> {
+    ) -> io::Result<Option<(PageNumber, SlotId)>> {
+        // Wish everything was as easy as this.
+        if self.done {
+            return Ok(None);
+        }
+
+        // This only runs on the first call to `try_next`. Lazy initialization
+        // for the iterator.
+        if !self.init {
+            self.move_to_leftmost(pager)?;
+            self.init = true;
+        }
+
         // We return the "current" position and prepare the next one on every call.
-        let position = Ok((self.page, self.slot));
+        let position = Ok(Some((self.page, self.slot)));
 
-        let page = pager.get(self.page)?;
+        let node = pager.get(self.page)?;
 
-        // This page is not done yet, we don't have to move to the next one.
-        if self.slot + 1 < page.len() {
+        // We are currently returning keys from a leaf node and we're not done
+        // yet, so simply move to the next key (or cell in this case).
+        if node.is_leaf() && self.slot + 1 < node.len() {
             self.slot += 1;
             return position;
         }
 
-        // We were reading the root, next time it's not gonna be as easy :)
-        if self.descent.is_empty() {
+        // The last position we returned was pointing at an internal node and
+        // the node has more children. Move to the bottom of the next subtree to
+        // maintain order.
+        if !node.is_leaf() && self.slot < node.len() {
             self.descent.push(self.page);
-            self.page = page.child(0);
-            self.slot = 0;
-
-            // Little guard for empty roots.
-            if page.is_leaf() {
-                self.done = true;
-            }
+            self.page = node.child(self.slot + 1);
+            self.move_to_leftmost(pager)?;
 
             return position;
         }
 
-        // This is where things get complicated real quick.
-        let reached_max_depth = page.is_leaf();
-        let mut depth = self.descent.len() - 1;
-        let mut child = self.page;
+        // Now we know for sure we have to move upwards because we are done with
+        // the current subtree. We'll go back the same path we came from until
+        // we find the next branch that we have to take.
+        let mut found_branch = false;
 
-        // Go upwards until we find the next branch we have to take.
-        loop {
-            let parent = pager.get(self.descent[depth])?;
-            let index = parent.iter_children().position(|c| c == child).unwrap() as u16;
+        while !self.descent.is_empty() && !found_branch {
+            let parent = pager.get(self.descent.pop().unwrap())?;
+            // TODO: We can get rid of this O(n) by storing the index in the stack.
+            let index = parent.iter_children().position(|c| c == self.page).unwrap() as u16;
+            self.page = parent.number;
 
-            // Found it!
             if index < parent.len() {
-                child = parent.child(index + 1);
-                break;
+                self.slot = index;
+                found_branch = true;
             }
-
-            // Made it all the way to the root and we didn't take any branch. This
-            // means we have to go one level deeper.
-            if depth == 0 {
-                // If we were coming from a leaf node then this is it, we're done.
-                if reached_max_depth {
-                    self.done = true;
-                    return position;
-                }
-
-                // Otherwise take the leftmost child and increase depth.
-                child = pager.get(self.descent[depth])?.child(0);
-                self.descent.push(0);
-                break;
-            }
-
-            // Keep moving up.
-            child = self.descent[depth];
-            depth -= 1;
         }
 
-        // Now go downwards back to the same depth we were at previously and
-        // update the descent path.
-        while depth < self.descent.len() - 1 {
-            depth += 1;
-            self.descent[depth] = child;
-            child = pager.get(child)?.child(0);
+        // We went all the way back to the root and didn't find any branch. We
+        // are done.
+        if self.descent.is_empty() && !found_branch {
+            self.done = true;
         }
-
-        // After a hard day's work, we are finally done. Now keep calm until
-        // we're done with all the cells in this page.
-        self.page = child;
-        self.slot = 0;
 
         position
     }
 
+    /// Returns the next position in the BTree.
+    ///
+    /// See [`Self::try_next`] for the actual code. This one just flips
+    /// [`Result<Option>`] to make it [`Option<Result>`].
     pub fn next<I: Seek + Read + Write>(
         &mut self,
         pager: &mut Pager<I>,
     ) -> Option<io::Result<(PageNumber, SlotId)>> {
-        if self.done {
-            return None;
-        }
-
-        Some(self.try_next(pager))
+        self.try_next(pager).transpose()
     }
 }
 
@@ -3679,6 +3846,31 @@ mod tests {
         Ok(())
     }
 
+    fn assert_cursor_traversal_matches(
+        btree: &mut BTree<'_, MemBuf, FixedSizeMemCmp>,
+        keys: impl Iterator<Item = Key>,
+    ) -> io::Result<()> {
+        let mut cursor = Cursor::new(btree.root, 0);
+
+        for expected_key in keys {
+            let (page, slot) = cursor.next(btree.pager).expect(&format!(
+                "cursor should return the position of key {expected_key} but returns None"
+            ))?;
+
+            let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
+
+            assert_eq!(
+                key,
+                expected_key,
+                "cursor at position ({page}, {slot}) should return {expected_key} but returns {key}"
+            );
+        }
+
+        assert!(cursor.next(btree.pager).is_none());
+
+        Ok(())
+    }
+
     /// Traverse this tree:
     ///
     /// ```text
@@ -3699,58 +3891,19 @@ mod tests {
     /// ```
     #[test]
     fn basic_cursor() -> io::Result<()> {
-        let btree = BTree::builder().order(3).keys(1..=30).try_build()?;
+        let keys = 1..=30;
+        let mut btree = BTree::builder().order(3).keys(keys.clone()).try_build()?;
 
-        let mut cursor = Cursor::new(1, 0);
-
-        #[rustfmt::skip]
-        let expected = [
-            18,
-            9, 24,
-            3, 6, 12, 15, 21, 27, 29,
-            1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 30,
-        ];
-
-        for expected_key in expected {
-            let (page, slot) = cursor.next(btree.pager).expect(&format!(
-                "cursor should return the position of key {expected_key} but returns None"
-            ))?;
-
-            let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
-
-            assert_eq!(
-                key,
-                expected_key,
-                "cursor at position ({page}, {slot}) should return {expected_key} but returns {key}"
-            );
-        }
-
-        assert!(cursor.next(btree.pager).is_none());
-
-        Ok(())
+        assert_cursor_traversal_matches(&mut btree, keys)
     }
 
+    /// Not gonna draw this one but you get the idea.
+    #[cfg(not(miri))]
     #[test]
     fn cursor_with_more_depth_and_keys() -> io::Result<()> {
-        let btree = BTree::builder().order(6).keys(1..=300).try_build()?;
-        let mut cursor = Cursor::new(1, 0);
+        let keys = 1..=400;
+        let mut btree = BTree::builder().order(6).keys(keys.clone()).try_build()?;
 
-        let mut keys = HashSet::new();
-
-        while let Some(position) = cursor.next(btree.pager) {
-            let (page, slot) = position?;
-            let key = deserialize_key(&btree.pager.get(page)?.cell(slot).content);
-            keys.insert(key);
-        }
-
-        assert!(cursor.next(btree.pager).is_none());
-
-        assert_eq!(
-            HashSet::from_iter(1..=300),
-            keys,
-            "cursor probably skipped pages or cells"
-        );
-
-        Ok(())
+        assert_cursor_traversal_matches(&mut btree, keys)
     }
 }

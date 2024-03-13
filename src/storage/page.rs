@@ -1168,6 +1168,10 @@ impl Page {
     }
 
     /// Returns the child at the given `index`.
+    ///
+    /// Remember that the number of children is always `num_slots + 1`. There's
+    /// always one more child than keys, that's why we return `right_child` if
+    /// the index is exactly the length of the keys.
     pub fn child(&self, index: SlotId) -> PageNumber {
         if index == self.len() {
             self.header().right_child
