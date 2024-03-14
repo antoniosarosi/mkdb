@@ -2103,7 +2103,7 @@ impl Cursor {
     /// SQLite 2. Take a look at the [original].
     ///
     /// [original]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L1630-L1677
-    fn try_next<I: Seek + Read + Write>(
+    pub fn try_next<I: Seek + Read + Write>(
         &mut self,
         pager: &mut Pager<I>,
     ) -> io::Result<Option<(PageNumber, SlotId)>> {

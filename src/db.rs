@@ -27,6 +27,7 @@ use crate::{
     },
     storage::{tuple, BTree, BytesCmp, FixedSizeMemCmp},
     vm,
+    vm::plan::Plan,
 };
 
 /// Database file default page size.
@@ -278,6 +279,17 @@ impl Projection {
     }
 }
 
+impl<I: Seek + Read + Write> TryFrom<Plan<I>> for Projection {
+    type Error = DbError;
+
+    fn try_from(plan: Plan<I>) -> Result<Self, Self::Error> {
+        let schema = plan.schema().unwrap_or(Schema::empty());
+        let results = plan.collect::<Result<Vec<_>, DbError>>()?;
+
+        Ok(Self { schema, results })
+    }
+}
+
 /// Schema of the table used to keep track of the database information.
 pub(crate) fn mkdb_meta_schema() -> Schema {
     Schema::from(vec![
@@ -428,9 +440,9 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         // TODO: Rollback if it fails.
         let projection = if query::planner::needs_plan(&statement) {
             let plan = query::planner::generate_plan(statement, self)?;
-            vm::exec_plan(plan)?
+            vm::plan::exec(plan)?
         } else {
-            vm::exec_statement(statement, self)?;
+            vm::statement::exec(statement, self)?;
             Projection::empty()
         };
 

@@ -15,9 +15,7 @@
 //! - [Postgres JIT module](https://github.com/postgres/postgres/tree/master/src/backend/jit)
 
 mod expression;
-mod plan;
-mod statement;
 
+pub(crate) mod plan;
+pub(crate) mod statement;
 pub(crate) use expression::{eval_where, resolve_expression, resolve_literal_expression};
-pub(crate) use plan::exec_plan;
-pub(crate) use statement::exec_statement;
