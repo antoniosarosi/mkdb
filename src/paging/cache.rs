@@ -36,18 +36,64 @@ const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
 /// [`Cache::is_evictable`] for more details on this.
 const MIN_CACHE_SIZE: usize = 2;
 
-/// The buffer pool is made of a list of frames. Each frame holds a page, a
-/// reference bit and a dirty bit.
+/// Maximum percentage of pages that can be pinned at any given moment.
+///
+/// Once this percentage is reached the cache will refuse to pin more pages
+/// until the percentage goes back below the limit.
+///
+/// **This number must be a value between 0 and 100**. Ideally not 0, because
+/// that's useless.
+const DEFAULT_PIN_PERCENTAGE_LIMIT: f32 = 60.0;
+
+/// Reference bit. It's set to 1 every time a [`Frame`] is accessed.
+const REF_FLAG: u8 = 0b001;
+
+/// Dirty bit. Set to 1 every time a cached [`MemPage`] is modified.
+const DIRTY_FLAG: u8 = 0b010;
+
+/// Whether the [`MemPage`] is currently pinned.
+const PINNED_FLAG: u8 = 0b100;
+
+/// The buffer pool is made of a list of frames.
+///
+/// Each frame holds a page and a collection of bit flags. Possible flags are
+/// [`REF_FLAG`], [`DIRTY_FLAG`] and [`PINNED_FLAG`].
 #[derive(Debug, PartialEq)]
 struct Frame {
     /// In-memory representation of a page.
     page: MemPage,
-    /// Reference bit. It's set to 1 every time this frame is accessed.
-    reference: bool,
-    /// Dirty bit. Set to 1 every time the page is modified.
-    dirty: bool,
-    /// Whether this page is currently pinned.
-    pinned: bool,
+    /// Bit flags.
+    flags: u8,
+}
+
+impl Frame {
+    /// Builds a new frame with [`REF_FLAG`] set to 0.
+    fn new_unreferenced(page: MemPage) -> Self {
+        Self { page, flags: 0 }
+    }
+
+    /// Builds a new frame with [`REF_FLAG`] set to 1.
+    fn new_referenced(page: MemPage) -> Self {
+        Self {
+            page,
+            flags: REF_FLAG,
+        }
+    }
+
+    /// Sets the given flag(s) to 1.
+    fn set(&mut self, flags: u8) {
+        self.flags |= flags
+    }
+
+    /// Sets the given flag(s) to 0.
+    fn unset(&mut self, flags: u8) {
+        self.flags &= !flags
+    }
+
+    /// Returns `true` if all the given flags are set.
+    fn is_set(&self, flags: u8) -> bool {
+        self.flags & flags == flags
+    }
 }
 
 /// Frames are identified by their index in [`Cache::buffer`].
@@ -92,13 +138,13 @@ type FrameId = usize;
 /// will execute the eviction policy, which consists in incrementing the clock
 /// pointer until it points to a page that is not currently referenced.
 ///
-/// If the clock finds pages that are referenced in the process, it resets their
-/// reference bit back to 0, so that they can be evicted the next time the clock
+/// If the clock finds pages that are referenced in the process it resets their
+/// reference bit back to 0 so that they can be evicted the next time the clock
 /// passes by. This algorithm is an approximation of LRU (Least Recently Used)
 /// that does not require timestamps.
 ///
 /// Following the example above, the clock pointer already points at page 1,
-/// which is not currently referenced. So if we want to load page 5, we can
+/// which is not currently referenced. So if we want to load page 5 we can
 /// evict page 1:
 ///
 /// ```text
@@ -167,103 +213,81 @@ type FrameId = usize;
 /// ```
 ///
 /// Acquiring mutable references to pages automatically sets their `dirty` flag
-/// to 1, so that the cache client, [`super::pager::Pager`] in this case, can
+/// to 1 so that the cache client, [`super::pager::Pager`] in this case, can
 /// determine whether an evicted page should be written to disk.
 pub(crate) struct Cache {
     /// Buffer pool.
     buffer: Vec<Frame>,
-    /// Maximum number of pages that can be stored in memory.
-    max_size: usize,
     /// Page table. Maps page numbers to frame indexes in the buffer pool.
     pages: HashMap<PageNumber, FrameId>,
     /// Clock pointer. Keeps cycling around the buffer pool.
     clock: FrameId,
+    /// Maximum number of pages that can be stored in memory.
+    max_size: usize,
+    /// Maximum percentage of pages that can be pinned at once.
+    pin_percentage_limit: f32,
+    /// Number of pinned pages.
+    pinned_pages: usize,
 }
 
-impl Frame {
-    /// Builds a new frame with [`Frame::reference`] set to 0.
-    fn new_unreferenced(page: MemPage) -> Self {
+/// Cache builder.
+pub(crate) struct Builder {
+    max_size: usize,
+    pin_percentage_limit: f32,
+}
+
+impl Builder {
+    /// Creates a new builder. Everything is set to default values.
+    pub fn new() -> Self {
         Self {
-            page,
-            reference: false,
-            dirty: false,
-            pinned: false,
+            max_size: DEFAULT_MAX_CACHE_SIZE,
+            pin_percentage_limit: DEFAULT_PIN_PERCENTAGE_LIMIT,
         }
     }
 
-    /// Builds a new frame with [`Frame::reference`] set to 1.
-    fn new_referenced(page: MemPage) -> Self {
-        Self {
-            page,
-            reference: true,
-            dirty: false,
-            pinned: false,
+    /// Sets the maximum size of the cache.
+    ///
+    /// `max_size` must be greater than [`MIN_CACHE_SIZE`] for the cache to work
+    /// properly.
+    pub fn max_size(&mut self, max_size: usize) -> &mut Self {
+        assert!(
+            max_size >= MIN_CACHE_SIZE,
+            "buffer pool size must be at least {MIN_CACHE_SIZE}"
+        );
+
+        self.max_size = max_size;
+        self
+    }
+
+    /// Sets the maximum percentage of pages that can be pinned at once.
+    ///
+    /// [`Cache::pin`] will return `false` once this percentage is reached.
+    pub fn pin_percentage_limit(&mut self, pin_percentage_limit: f32) -> &mut Self {
+        assert!(
+            0.0 <= pin_percentage_limit && pin_percentage_limit <= 100.0,
+            "pin_percentage_limit must a percentage (0..=100), in case that's not clear enough: {pin_percentage_limit}"
+        );
+
+        self.pin_percentage_limit = pin_percentage_limit;
+        self
+    }
+
+    /// Builds the cache and pre-allocates the buffer pool and page table.
+    pub fn build(&self) -> Cache {
+        Cache {
+            clock: 0,
+            pinned_pages: 0,
+            pin_percentage_limit: self.pin_percentage_limit,
+            max_size: self.max_size,
+            buffer: Vec::with_capacity(self.max_size),
+            pages: HashMap::with_capacity(self.max_size),
         }
-    }
-
-    /// Returns `true` if this frame is currently referenced.
-    #[inline]
-    fn is_referenced(&self) -> bool {
-        self.reference
-    }
-
-    /// Returns `true` if this frame is marked dirty.
-    #[inline]
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Returns `true` if this page is currently pinned.
-    #[inline]
-    fn is_pinned(&self) -> bool {
-        self.pinned
-    }
-
-    /// Set reference bit to 0.
-    #[inline]
-    fn unreference(&mut self) {
-        self.reference = false;
-    }
-
-    /// Set reference bit to 1.
-    #[inline]
-    fn reference(&mut self) {
-        self.reference = true;
-    }
-
-    /// Set dirty flag to 1.
-    #[inline]
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Set dirty flag to 0.
-    #[inline]
-    fn mark_clean(&mut self) {
-        self.dirty = false;
-    }
-
-    /// Pin this page.
-    #[inline]
-    fn pin(&mut self) {
-        self.pinned = true;
-    }
-
-    /// Unpin this page.
-    #[inline]
-    fn unpin(&mut self) {
-        self.pinned = false;
     }
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self {
-            clock: 0,
-            max_size: DEFAULT_MAX_CACHE_SIZE,
-            buffer: Vec::with_capacity(DEFAULT_MAX_CACHE_SIZE),
-            pages: HashMap::with_capacity(DEFAULT_MAX_CACHE_SIZE),
-        }
+        Self::builder().build()
     }
 }
 
@@ -287,23 +311,14 @@ impl Cache {
         Self::default()
     }
 
-    /// Sets the value of [`Self::max_size`].
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max_size` < [`MIN_CACHE_SIZE`].
-    pub fn with_max_size(max_size: usize) -> Self {
-        assert!(
-            max_size >= MIN_CACHE_SIZE,
-            "buffer pool size must be at least {MIN_CACHE_SIZE}"
-        );
+    /// Build it as you wish if defaults aren't good enough :)
+    pub fn builder() -> Builder {
+        Builder::new()
+    }
 
-        Self {
-            clock: 0,
-            max_size,
-            buffer: Vec::with_capacity(max_size),
-            pages: HashMap::with_capacity(max_size),
-        }
+    /// Shortcut for `Cache::builder().max_size(max_size).build()`.
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self::builder().max_size(max_size).build()
     }
 
     /// Max number of pages that can be stored in this cache.
@@ -316,18 +331,18 @@ impl Cache {
         self.pages.contains_key(page_number)
     }
 
-    /// Returns a frame ID that can be used to access the in-memory page.
+    /// Returns a [`FrameId`] that can be used to access the in-memory page.
     ///
     /// If the page is not cached or has been invalidated by calling
     /// [`Self::invalidate`], then this function returns [`None`].
     pub fn get(&mut self, page_number: PageNumber) -> Option<FrameId> {
-        self.try_reference_page(page_number)
+        self.ref_page(page_number)
     }
 
     /// Same as [`Self::get`] but marks the page as dirty.
     pub fn get_mut(&mut self, page_number: PageNumber) -> Option<FrameId> {
-        self.try_reference_page(page_number)
-            .inspect(|frame_id| self.buffer[*frame_id].mark_dirty())
+        self.ref_page(page_number)
+            .inspect(|frame_id| self.buffer[*frame_id].set(DIRTY_FLAG))
     }
 
     /// Returns many mutable references at once if possible.
@@ -342,20 +357,20 @@ impl Cache {
                 .get_many_mut(frame_ids.map(|frame_id| *frame_id))
                 .unwrap()
                 .map(|frame| {
-                    frame.reference();
-                    frame.mark_dirty();
+                    frame.set(REF_FLAG | DIRTY_FLAG);
                     &mut frame.page
                 })
         })
     }
 
-    /// Returns the frame ID of `page_number` and sets if ref bit to 1.
+    /// Returns the [`FrameId`] of `page_number` and automatically sets its ref
+    /// bit to 1.
     ///
     /// If the page can't be found then nothing happens and [`None`] is
     /// returned.
-    fn try_reference_page(&mut self, page_number: PageNumber) -> Option<usize> {
+    fn ref_page(&mut self, page_number: PageNumber) -> Option<usize> {
         self.pages.get(&page_number).map(|frame_id| {
-            self.buffer[*frame_id].reference();
+            self.buffer[*frame_id].set(REF_FLAG);
             *frame_id
         })
     }
@@ -416,7 +431,7 @@ impl Cache {
         }
 
         self.cycle_clock();
-        self.buffer[self.clock].is_dirty()
+        self.buffer[self.clock].is_set(DIRTY_FLAG)
     }
 
     /// Cycles the clock until it points to a page that can be safely evicted.
@@ -427,7 +442,7 @@ impl Cache {
         let mut rounds = 0;
 
         while !self.is_evictable(self.clock) {
-            self.buffer[self.clock].unreference();
+            self.buffer[self.clock].unset(REF_FLAG);
             self.tick();
 
             // This could end up in an infinite loop in some situations:
@@ -480,104 +495,150 @@ impl Cache {
         // Or maybe once we add transactions and stuff we come to the conclusion
         // that the replacement algorithm should be smart about what pages can
         // and cannot be replaced based on what the DB is doing, who knows ¯\_(ツ)_/¯
-        !frame.is_referenced() && !frame.is_pinned() && !frame.page.is_overflow()
+        !frame.is_set(REF_FLAG) && !frame.is_set(PINNED_FLAG) && !frame.page.is_overflow()
+    }
+
+    /// Sets the given flags of a page to 1.
+    ///
+    /// Returns `true` if the page was present in the cache and its flags were
+    /// updated.
+    fn set_flags(&mut self, page_number: PageNumber, flags: u8) -> bool {
+        self.pages.get(&page_number).map_or(false, |frame_id| {
+            self.buffer[*frame_id].set(flags);
+            true
+        })
+    }
+
+    /// Sets the flags of a page back to 0.
+    ///
+    /// Returns `true` if the page was present in the cache and its flags were
+    /// updated.
+    fn unset_flags(&mut self, page_number: PageNumber, flags: u8) -> bool {
+        self.pages.get(&page_number).map_or(false, |frame_id| {
+            self.buffer[*frame_id].unset(flags);
+            true
+        })
     }
 
     /// Manually marks the page as dirty.
-    pub fn mark_dirty(&mut self, page_number: PageNumber) {
-        if let Some(frame_id) = self.get(page_number) {
-            self.buffer[frame_id].mark_dirty();
-        }
+    ///
+    /// Returns `true` if the page was present and marked as dirty.
+    pub fn mark_dirty(&mut self, page_number: PageNumber) -> bool {
+        self.set_flags(page_number, DIRTY_FLAG)
     }
 
     /// Sets the dirty flag of the given page back to 0.
-    pub fn mark_clean(&mut self, page_number: PageNumber) {
-        if let Some(frame_id) = self.get(page_number) {
-            self.buffer[frame_id].mark_clean();
-        }
+    ///
+    /// Returns `true` if the page was present and marked as clean.
+    pub fn mark_clean(&mut self, page_number: PageNumber) -> bool {
+        self.unset_flags(page_number, DIRTY_FLAG)
     }
 
     /// Marks a page as unevictable.
     ///
     /// Returns `true` if the page was present and pinned.
-    pub fn pin(&mut self, page: PageNumber) -> bool {
-        self.pages.get(&page).map_or(false, |frame_id| {
-            self.buffer[*frame_id].pin();
-            true
-        })
+    pub fn pin(&mut self, page_number: PageNumber) -> bool {
+        let pinned_percentage = self.pinned_pages as f32 / self.max_size as f32 * 100.0;
+
+        if pinned_percentage >= self.pin_percentage_limit {
+            return false;
+        }
+
+        let pinned = self.set_flags(page_number, PINNED_FLAG);
+
+        if pinned {
+            self.pinned_pages += 1;
+        }
+
+        pinned
     }
 
     /// Marks the `page` as evictable again.
     ///
     /// Returns true if the page was present and upinned.
-    pub fn unpin(&mut self, page: PageNumber) -> bool {
-        self.pages.get(&page).map_or(false, |frame_id| {
-            self.buffer[*frame_id].unpin();
-            true
-        })
+    pub fn unpin(&mut self, page_number: PageNumber) -> bool {
+        let unpinned = self.unset_flags(page_number, PINNED_FLAG);
+
+        if unpinned {
+            self.pinned_pages -= 1;
+        }
+
+        unpinned
     }
 
     /// Invalidates a cached page. Requesting this page again will yield
     /// [`None`].
     pub fn invalidate(&mut self, page_number: PageNumber) {
         if let Some(frame_id) = self.pages.remove(&page_number) {
-            let frame = &mut self.buffer[frame_id];
-            frame.unreference();
-            frame.mark_clean();
+            self.buffer[frame_id].flags = 0;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{super::pager::PageNumber, Cache};
-    use crate::storage::page::{AllocPageInMemory, Cell, MemPage, Page};
+    use super::{super::pager::PageNumber, Builder, Cache};
+    use crate::{
+        paging::cache::{DIRTY_FLAG, PINNED_FLAG, REF_FLAG},
+        storage::page::{AllocPageInMemory, Cell, MemPage, Page},
+    };
 
+    /// Allows us to prepare the cache and then just [`assert_eq!`] stuff.
+    struct TestBuilder {
+        builder: Builder,
+        number_of_pages: usize,
+        prefetch: Prefetch,
+    }
+
+    /// How many pages to load into the cache before returning it.
     enum Prefetch {
         AllPages,
         UntilBufferIsFull,
         None,
     }
 
-    struct Builder {
-        number_of_pages: usize,
-        max_size: usize,
-        prefetch: Prefetch,
-    }
-
-    impl Builder {
+    impl TestBuilder {
         fn new() -> Self {
             Self {
                 number_of_pages: 3,
-                max_size: 3,
                 prefetch: Prefetch::None,
+                builder: Cache::builder(),
             }
         }
 
-        fn total_pages(mut self, number_of_pages: usize) -> Self {
+        /// Total number of pages that should be created and returned.
+        ///
+        /// Don't confuse this with [`Self::max_size`], which is the size of
+        /// the cache.
+        fn total_pages(&mut self, number_of_pages: usize) -> &mut Self {
             self.number_of_pages = number_of_pages;
             self
         }
 
-        fn max_size(mut self, max_size: usize) -> Self {
-            self.max_size = max_size;
+        fn max_size(&mut self, max_size: usize) -> &mut Self {
+            self.builder.max_size(max_size);
             self
         }
 
-        fn prefetch(mut self, prefetch: Prefetch) -> Self {
+        fn pin_percentage_limit(&mut self, pin_percentage_limit: f32) -> &mut Self {
+            self.builder.pin_percentage_limit(pin_percentage_limit);
+            self
+        }
+
+        fn prefetch(&mut self, prefetch: Prefetch) -> &mut Self {
             self.prefetch = prefetch;
             self
         }
 
-        fn prefetch_all_pages(self) -> Self {
+        fn prefetch_all_pages(&mut self) -> &mut Self {
             self.prefetch(Prefetch::AllPages)
         }
 
-        fn prefetch_until_buffer_is_full(self) -> Self {
+        fn prefetch_until_buffer_is_full(&mut self) -> &mut Self {
             self.prefetch(Prefetch::UntilBufferIsFull)
         }
 
-        fn build(self) -> (Cache, Vec<MemPage>) {
+        fn build(&self) -> (Cache, Vec<MemPage>) {
             let page_size = 256;
 
             let pages = (0..self.number_of_pages as PageNumber).map(|i| {
@@ -590,12 +651,14 @@ mod tests {
                 MemPage::Btree(page)
             });
 
-            let mut cache = Cache::with_max_size(self.max_size);
+            let mut cache = self.builder.build();
+
+            let prefetch = pages.clone();
 
             cache.load_many(match self.prefetch {
-                Prefetch::AllPages => pages.clone().take(self.number_of_pages),
-                Prefetch::UntilBufferIsFull => pages.clone().take(self.max_size),
-                Prefetch::None => pages.clone().take(0),
+                Prefetch::AllPages => prefetch.take(self.number_of_pages),
+                Prefetch::UntilBufferIsFull => prefetch.take(cache.max_size()),
+                Prefetch::None => prefetch.take(0),
             });
 
             (cache, pages.collect())
@@ -609,14 +672,14 @@ mod tests {
             }
         }
 
-        fn builder() -> Builder {
-            Builder::new()
+        fn test() -> TestBuilder {
+            TestBuilder::new()
         }
     }
 
     #[test]
     fn fill_buffer() {
-        let (cache, pages) = Cache::builder()
+        let (cache, pages) = Cache::test()
             .total_pages(3)
             .max_size(3)
             .prefetch_until_buffer_is_full()
@@ -628,13 +691,13 @@ mod tests {
         for (i, page) in pages.into_iter().enumerate() {
             assert_eq!(page, cache.buffer[i].page);
             assert_eq!(cache.pages[&page.number()], i);
-            assert!(!cache.buffer[i].reference);
+            assert_eq!(cache.buffer[i].flags, 0);
         }
     }
 
     #[test]
     fn start_clock_when_buffer_is_full() {
-        let (cache, pages) = Cache::builder()
+        let (cache, pages) = Cache::test()
             .total_pages(6)
             .max_size(3)
             .prefetch_all_pages()
@@ -651,7 +714,7 @@ mod tests {
 
     #[test]
     fn reference_page() {
-        let (mut cache, pages) = Cache::builder()
+        let (mut cache, pages) = Cache::test()
             .total_pages(3)
             .max_size(3)
             .prefetch_until_buffer_is_full()
@@ -661,14 +724,13 @@ mod tests {
             let index = cache.get(page.number());
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
-            assert!(cache.buffer[i].reference);
-            assert!(!cache.buffer[i].dirty);
+            assert_eq!(cache.buffer[i].flags, REF_FLAG);
         }
     }
 
     #[test]
     fn mark_dirty() {
-        let (mut cache, pages) = Cache::builder()
+        let (mut cache, pages) = Cache::test()
             .total_pages(3)
             .max_size(3)
             .prefetch_until_buffer_is_full()
@@ -678,14 +740,13 @@ mod tests {
             let index = cache.get_mut(page.number());
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
-            assert!(cache.buffer[i].reference);
-            assert!(cache.buffer[i].dirty);
+            assert_eq!(cache.buffer[i].flags, REF_FLAG | DIRTY_FLAG);
         }
     }
 
     #[test]
     fn evict_first_unreferenced_page() {
-        let (mut cache, pages) = Cache::builder()
+        let (mut cache, pages) = Cache::test()
             .total_pages(4)
             .max_size(3)
             .prefetch_until_buffer_is_full()
@@ -721,7 +782,7 @@ mod tests {
 
     #[test]
     fn dont_evict_pinned_page() {
-        let (mut cache, pages) = Cache::builder()
+        let (mut cache, pages) = Cache::test()
             .total_pages(4)
             .max_size(3)
             .prefetch_until_buffer_is_full()
@@ -733,9 +794,53 @@ mod tests {
         cache.load(pages[3].clone());
 
         assert!(pinned);
+        assert_eq!(cache.buffer[0].flags, PINNED_FLAG);
         assert_eq!(cache.clock, 1);
         assert_eq!(cache.buffer[0].page, pages[0]);
         assert_eq!(cache.buffer[1].page, pages[3]);
         assert_eq!(cache.buffer[2].page, pages[2]);
+    }
+
+    #[test]
+    fn dont_pin_page_if_pin_percentage_limit_reached() {
+        let (mut cache, _) = Cache::test()
+            .total_pages(10)
+            .max_size(10)
+            .pin_percentage_limit(30.0)
+            .prefetch_until_buffer_is_full()
+            .build();
+
+        for page in 0..=2 {
+            cache.pin(page);
+        }
+
+        let pinned = cache.pin(3);
+
+        assert!(!pinned);
+        assert_eq!(cache.buffer[3].flags, 0);
+        assert_eq!(cache.pinned_pages, 3);
+    }
+
+    #[test]
+    fn pin_again_if_pin_percentage_goes_below_limit() {
+        let (mut cache, _) = Cache::test()
+            .total_pages(10)
+            .max_size(10)
+            .pin_percentage_limit(50.0)
+            .prefetch_until_buffer_is_full()
+            .build();
+
+        for page in 0..=4 {
+            cache.pin(page);
+        }
+
+        let unpinned = cache.unpin(0);
+        let pinned = cache.pin(5);
+
+        assert!(unpinned);
+        assert!(pinned);
+        assert_eq!(cache.buffer[0].flags, 0);
+        assert_eq!(cache.buffer[5].flags, PINNED_FLAG);
+        assert_eq!(cache.pinned_pages, 5);
     }
 }
