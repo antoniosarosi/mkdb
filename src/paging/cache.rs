@@ -21,20 +21,29 @@ use std::{
 };
 
 use super::pager::PageNumber;
-use crate::storage::page::MemPage;
+use crate::{db::DEFAULT_PAGE_SIZE, storage::page::MemPage};
 
 /// Default value for [`Cache::max_size`].
-const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
+pub(crate) const DEFAULT_MAX_CACHE_SIZE: usize = 1024;
 
 /// Minimum allowed cache size.
 ///
 /// Due to how the [`crate::storage::BTree`] structure works, we need to be able
 /// to store at least 2 pages in the cache because at any given moment one of
 /// the pages could be in "overflow" state, which causes the page to become
-/// unevictable. If the cache can only hold one page and the page cannot be
+/// unevictable. If the cache can only hold one page and that page cannot be
 /// evicted, then we won't be able to read more pages. See
 /// [`Cache::is_evictable`] for more details on this.
-const MIN_CACHE_SIZE: usize = 2;
+///
+/// In theory, a cache of size 1 could work because when
+/// [`crate::storage::BTree::insert`] overflows a page it immediately calls
+/// [`crate::storage::BTree::balance`], which moves all the cells out of the
+/// page leaving it empty without reading other pages in the process.
+///
+/// But if we change the code in the balancing algorithm and we read another
+/// page before clearing overflow buffers then that bug is gonna be hard to
+/// spot.
+pub(crate) const MIN_CACHE_SIZE: usize = 2;
 
 /// Maximum percentage of pages that can be pinned at any given moment.
 ///
@@ -62,21 +71,19 @@ const PINNED_FLAG: u8 = 0b100;
 struct Frame {
     /// In-memory representation of a page.
     page: MemPage,
+    /// The page number stored in this [`Frame`]. Inverse of [`Cache::pages`].
+    page_number: PageNumber,
     /// Bit flags.
     flags: u8,
 }
 
 impl Frame {
     /// Builds a new frame with [`REF_FLAG`] set to 0.
-    fn new_unreferenced(page: MemPage) -> Self {
-        Self { page, flags: 0 }
-    }
-
-    /// Builds a new frame with [`REF_FLAG`] set to 1.
-    fn new_referenced(page: MemPage) -> Self {
+    fn new(page_number: PageNumber, page: MemPage) -> Self {
         Self {
             page,
-            flags: REF_FLAG,
+            page_number,
+            flags: 0,
         }
     }
 
@@ -224,6 +231,8 @@ pub(crate) struct Cache {
     clock: FrameId,
     /// Maximum number of pages that can be stored in memory.
     max_size: usize,
+    /// Size of each page.
+    page_size: usize,
     /// Maximum percentage of pages that can be pinned at once.
     pin_percentage_limit: f32,
     /// Number of pinned pages.
@@ -233,6 +242,7 @@ pub(crate) struct Cache {
 /// Cache builder.
 pub(crate) struct Builder {
     max_size: usize,
+    page_size: usize,
     pin_percentage_limit: f32,
 }
 
@@ -241,6 +251,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             max_size: DEFAULT_MAX_CACHE_SIZE,
+            page_size: DEFAULT_PAGE_SIZE,
             pin_percentage_limit: DEFAULT_PIN_PERCENTAGE_LIMIT,
         }
     }
@@ -265,10 +276,19 @@ impl Builder {
     pub fn pin_percentage_limit(&mut self, pin_percentage_limit: f32) -> &mut Self {
         assert!(
             0.0 <= pin_percentage_limit && pin_percentage_limit <= 100.0,
-            "pin_percentage_limit must a percentage (0..=100), in case that's not clear enough: {pin_percentage_limit}"
+            "pin_percentage_limit must a percentage (0..=100) and not {pin_percentage_limit}, in case that's not clear enough"
         );
 
         self.pin_percentage_limit = pin_percentage_limit;
+        self
+    }
+
+    /// Page size used for the initial page allocations.
+    ///
+    /// In theory, the cache can store pages of different sizes, but it should
+    /// not.
+    pub fn page_size(&mut self, page_size: usize) -> &mut Self {
+        self.page_size = page_size;
         self
     }
 
@@ -279,6 +299,7 @@ impl Builder {
             pinned_pages: 0,
             pin_percentage_limit: self.pin_percentage_limit,
             max_size: self.max_size,
+            page_size: self.page_size,
             buffer: Vec::with_capacity(self.max_size),
             pages: HashMap::with_capacity(self.max_size),
         }
@@ -321,9 +342,18 @@ impl Cache {
         Self::builder().max_size(max_size).build()
     }
 
+    /// Shortcut for `Cache::builder().page_size(page_size).build()`.
+    pub fn with_page_size(page_size: usize) -> Self {
+        Self::builder().page_size(page_size).build()
+    }
+
     /// Max number of pages that can be stored in this cache.
     pub fn max_size(&self) -> usize {
         self.max_size
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
     }
 
     /// Returns `true` if the given page is cached.
@@ -375,56 +405,79 @@ impl Cache {
         })
     }
 
-    /// Loads a page into the buffer pool.
-    ///
-    /// Doesn't matter where the page comes from, it could have been created in
-    /// memory or read from disk. At this level we need an owned version of the
-    /// page.
+    /// Maps a [`PageNumber`] to a [`FrameId`].
     ///
     /// There are 3 possible cases:
     ///
-    /// 1. We're trying to load a page that already exists in the cache. We'll
-    /// assume this is a new version of the page and replace the old one, since
-    /// pages are uniquelly identified by their [`PageNumber`] and we shouldn't
-    /// have the same number multiple times in the cache.
+    /// 1. The [`PageNumber`] is already cached and we know the [`FrameId`].
+    /// Pretty much a no-op.
     ///
-    /// 2. The cache buffer is not full yet, so we can load pages without
-    /// evicting anything.
+    /// 2. The cache buffer is not full yet, so we can obtain frames without
+    /// evicting anything. Again, almost a no-op except for the allocation.
     ///
-    /// 3. We must evict a page in order to load a new one. The evicted page is
-    /// returned to the caller.
+    /// 3. We must evict a page in order to load a new one. This is when the
+    /// clock algorithm runs. Worst case is O(n), but figuring out exaclty how
+    /// bad "n" is... definitely not easy.
     ///
     /// In any case, there is no IO at the cache level, all of this is done in
     /// memory. IO is controlled mostly by the [`super::pager`] module.
-    pub fn load(&mut self, page: MemPage) -> Option<MemPage> {
-        // Already cached, drop the previous page and replace it with the new one.
-        if let Some(index) = self.pages.get(&page.number()) {
-            self.buffer[*index].page = page;
-            return None;
+    ///
+    /// There's an important detail for layers on top of this one: [`Self::map`]
+    /// simply gives you a [`FrameId`]. It doesn't change the content of the
+    /// page that was originally stored in that frame.
+    pub fn map(&mut self, page_number: PageNumber) -> FrameId {
+        // Already cached.
+        if let Some(frame_id) = self.pages.get(&page_number) {
+            return *frame_id;
         }
 
-        // Buffer is not full, push the page and return.
+        // Buffer is not full. Allocate the new page and return the frame ID.
+        //
+        // TODO: We should pre-allocate all the pages at the beginning and
+        // ideally using a single giant allocation for the buffers in order to
+        // improve locality. But that requires more unsafe code and dealing with
+        // drops and ManuallyDrop and bla bla. Already wrote like 2000 lines of
+        // unsafe code for the slotted page so there's no motivation :)
         if self.buffer.len() < self.max_size {
-            self.pages.insert(page.number(), self.buffer.len());
-            self.buffer.push(Frame::new_unreferenced(page));
+            let frame_id = self.buffer.len();
+            self.pages.insert(page_number, frame_id);
 
-            return None;
+            self.buffer
+                .push(Frame::new(page_number, MemPage::alloc(self.page_size)));
+
+            return frame_id;
         }
 
-        // Buffer is full, evict some page and load the new one.
+        // Buffer is full, find a page that we can evict.
         self.cycle_clock();
-        self.pages.insert(page.number(), self.clock);
 
-        let evict = mem::replace(&mut self.buffer[self.clock], Frame::new_referenced(page));
-        self.pages.remove(&evict.page.number());
+        // This page doesn't exist in the cache anymore.
+        let frame = &mut self.buffer[self.clock];
+        self.pages.remove(&frame.page_number);
 
-        Some(evict.page)
+        // Now the frame holds the new page.
+        frame.page_number = page_number;
+        frame.set(REF_FLAG);
+        self.pages.insert(page_number, self.clock);
+
+        self.clock
+    }
+
+    /// Loads a page from memory into the cache.
+    ///
+    /// The evicted page is returned. This function shouldn't be used much since
+    /// it requires allocating a page in order to call this function and
+    /// dropping the evicted one. Ideally [`Self::map`] should be called in
+    /// order to reuse allocations.
+    pub fn load(&mut self, page_number: PageNumber, page: MemPage) -> MemPage {
+        let frame_id = self.map(page_number);
+        mem::replace(&mut self.buffer[frame_id].page, page)
     }
 
     /// Returns `true` if the next page to be evicted is dirty.
     ///
     /// Notice that this function **does not actually evict any page**. The
-    /// eviction will take place when [`Self::load`] is called.
+    /// eviction will take place when [`Self::map`] is called.
     pub fn must_evict_dirty_page(&mut self) -> bool {
         if self.buffer.len() < self.max_size {
             return false;
@@ -445,16 +498,20 @@ impl Cache {
             self.buffer[self.clock].unset(REF_FLAG);
             self.tick();
 
-            // This could end up in an infinite loop in some situations:
+            // This technically looks like it could end up in an infinite loop
+            // in some situations but it's almost impossible.
             //
-            // - All pages are pinned.
-            // - Clock unsets references but pages are re-referenced again.
+            // 1. Infinite loop if all pages are pinned. Can only happen if
+            // `Cache::pin_percentage_limit == 0.0` and callers don't unpin the
+            // pages when they are done with them.
             //
-            // None of these scenarios should actually happen because callers
-            // should unpin pages when they're done with them and at some point
-            // in time somebody should stop reading and referencing pages so
-            // that at least one can be evicted. The clock can cycle through the
-            // buffer multiple times, that's not a bug per se, it's just slow.
+            // 2. Clock unsets references as it cycles through the buffer but
+            // other threads acquire references again. This thing is not even
+            // multi-threaded yet so we'll consider this problem later.
+            //
+            // Regardless, the clock can cycle through the buffer multiple
+            // times, that's not a bug per se, it's just slow. We only need to
+            // make sure that it doesn't enter an infinite loop.
             #[cfg(debug_assertions)]
             {
                 if rounds == 3 {
@@ -475,6 +532,7 @@ impl Cache {
         // there are no benchmarks to prove this and it probably doesn't even
         // matter in practice. Still, since the clock could be cycling through
         // a huge buffer multiple times, this should be investigated.
+        // Researching useless micro-optimizations is definitely fun :)
         self.clock += 1;
         if self.clock >= self.buffer.len() {
             self.clock = 0;
@@ -580,7 +638,7 @@ mod tests {
     use super::{super::pager::PageNumber, Builder, Cache};
     use crate::{
         paging::cache::{DIRTY_FLAG, PINNED_FLAG, REF_FLAG},
-        storage::page::{AllocPageInMemory, Cell, MemPage, Page},
+        storage::page::{Cell, MemPage, Page},
     };
 
     /// Allows us to prepare the cache and then just [`assert_eq!`] stuff.
@@ -642,7 +700,7 @@ mod tests {
             let page_size = 256;
 
             let pages = (0..self.number_of_pages as PageNumber).map(|i| {
-                let mut page = Page::alloc_in_memory(i, page_size);
+                let mut page = Page::alloc(page_size);
                 page.push(Cell::new(vec![
                     i as u8;
                     Page::ideal_max_payload_size(page_size, 1)
@@ -653,7 +711,7 @@ mod tests {
 
             let mut cache = self.builder.build();
 
-            let prefetch = pages.clone();
+            let prefetch = (0..pages.len() as PageNumber).zip(pages.clone());
 
             cache.load_many(match self.prefetch {
                 Prefetch::AllPages => prefetch.take(self.number_of_pages),
@@ -666,9 +724,10 @@ mod tests {
     }
 
     impl Cache {
-        fn load_many<P: IntoIterator<Item = MemPage>>(&mut self, pages: P) {
-            for page in pages {
-                self.load(page);
+        fn load_many<P: IntoIterator<Item = (PageNumber, MemPage)>>(&mut self, pages: P) {
+            for (page_number, page) in pages {
+                let frame_id = self.map(page_number);
+                self.buffer[frame_id].page = page;
             }
         }
 
@@ -689,9 +748,8 @@ mod tests {
         assert_eq!(cache.clock, 0);
 
         for (i, page) in pages.into_iter().enumerate() {
-            assert_eq!(page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number()], i);
-            assert_eq!(cache.buffer[i].flags, 0);
+            assert_eq!(cache.buffer[i].page, page);
+            assert_eq!(cache.pages[&(i as PageNumber)], i);
         }
     }
 
@@ -703,12 +761,11 @@ mod tests {
             .prefetch_all_pages()
             .build();
 
-        assert_eq!(cache.buffer.len(), cache.max_size);
         assert_eq!(cache.clock, cache.max_size - 1);
 
-        for (i, page) in pages[cache.max_size..].iter().enumerate() {
+        for ((i, page), page_number) in pages[cache.max_size..].iter().enumerate().zip(3..=5) {
             assert_eq!(*page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number()], i);
+            assert_eq!(cache.pages[&page_number], i);
         }
     }
 
@@ -721,7 +778,7 @@ mod tests {
             .build();
 
         for (i, page) in pages.into_iter().enumerate() {
-            let index = cache.get(page.number());
+            let index = cache.get(i as PageNumber);
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
             assert_eq!(cache.buffer[i].flags, REF_FLAG);
@@ -737,7 +794,7 @@ mod tests {
             .build();
 
         for (i, page) in pages.into_iter().enumerate() {
-            let index = cache.get_mut(page.number());
+            let index = cache.get_mut(i as PageNumber);
             assert_eq!(Some(i), index);
             assert_eq!(page, cache.buffer[i].page);
             assert_eq!(cache.buffer[i].flags, REF_FLAG | DIRTY_FLAG);
@@ -753,14 +810,14 @@ mod tests {
             .build();
 
         // Reference all pages except last one.
-        for page in &pages[..cache.max_size - 1] {
-            cache.get(page.number());
+        for i in 0..2 {
+            cache.get(i);
         }
 
         // Should evict page 2 and replace it with page 3.
-        let evicted = cache.load(pages[3].clone());
+        let evicted = cache.load(3, pages[3].clone());
 
-        assert_eq!(evicted, Some(pages[2].clone()));
+        assert_eq!(evicted, pages[2].clone());
 
         assert_eq!(cache.clock, cache.max_size - 1);
 
@@ -769,14 +826,11 @@ mod tests {
             pages[pages.len() - 1]
         );
 
-        assert_eq!(
-            cache.pages[&pages[pages.len() - 1].number()],
-            cache.max_size - 1
-        );
+        assert_eq!(cache.pages[&3], cache.max_size - 1);
 
         for (i, page) in pages[..cache.max_size - 1].iter().enumerate() {
             assert_eq!(*page, cache.buffer[i].page);
-            assert_eq!(cache.pages[&page.number()], i);
+            assert_eq!(cache.pages[&(i as PageNumber)], i);
         }
     }
 
@@ -791,7 +845,7 @@ mod tests {
         let pinned = cache.pin(0);
 
         // Should not evict page 0 because it's pinned.
-        cache.load(pages[3].clone());
+        cache.load(3, pages[3].clone());
 
         assert!(pinned);
         assert_eq!(cache.buffer[0].flags, PINNED_FLAG);

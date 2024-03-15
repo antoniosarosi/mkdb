@@ -13,7 +13,9 @@ use std::{
 };
 
 use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{AllocPageInMemory, DbHeader, FreePage, MemPage, Page, PageZero, MAGIC};
+use crate::storage::page::{
+    DbHeader, FreePage, MemPage, Page, PageTypeConversion, PageZero, MAGIC,
+};
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
@@ -43,13 +45,19 @@ impl<I> Pager<I> {
             io: BlockIo::new(io, page_size, block_size),
             block_size,
             page_size,
-            cache: Cache::new(),
+            cache: Cache::with_page_size(page_size),
             dirty_pages: HashSet::new(),
         }
     }
 
     /// Same as [`Self::new`] but allows a custom cache instance.
     pub fn with_cache(io: I, page_size: usize, block_size: usize, cache: Cache) -> Self {
+        assert_eq!(
+            cache.page_size(),
+            page_size,
+            "Cache::page_size must be the same as Pager::page_size"
+        );
+
         Self {
             io: BlockIo::new(io, page_size, block_size),
             block_size,
@@ -128,7 +136,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         // if the DB file already exists we might have to set the page size to
         // that defined in the file.
         let (magic, page_size) = {
-            let mut page_zero = PageZero::alloc_in_memory(0, self.block_size);
+            let mut page_zero = PageZero::alloc(self.block_size);
             self.read(0, page_zero.as_mut())?;
             (page_zero.header().magic, page_zero.header().page_size)
         };
@@ -145,46 +153,17 @@ impl<I: Seek + Read + Write> Pager<I> {
         // everywhere or using a custom `LittleEndian<I>(I)` type, which would
         // be a no-op if the endianness of the machine is correct. But instead
         // we could just implement some functionality for dumping the SQL
-        // insert statements just like MySQL or any other database does.
+        // insert statements just like MySQL or any other database does and not
+        // deal with flipping bits around.
         if magic.swap_bytes() == MAGIC {
             panic!("the database file has been created using a different endianness than the one used by this machine");
         }
 
         // Initialize page zero.
-        let page_zero = PageZero::alloc_in_memory(0, self.page_size);
+        let page_zero = PageZero::alloc(self.page_size);
         self.write(0, page_zero.as_ref())?;
 
         Ok(())
-    }
-
-    /// Returns the cache index of the given `page_number`.
-    ///
-    /// This function doesn't fail if the page is not cached, it will load the
-    /// page from disk instead. So Best case scenario is when the page is
-    /// already cached in memory. Worst case scenario is when we have to evict a
-    /// dirty page in order to load the new one, which requires at least two IO
-    /// operations, but possibly more since we flush the entire write queue at
-    /// that point. Evicting a clean page doesn't require IO.
-    ///
-    /// Note that this function does not mark the page as dirty.
-    fn lookup<P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>>(
-        &mut self,
-        page_number: PageNumber,
-    ) -> io::Result<usize> {
-        if let Some(index) = self.cache.get(page_number) {
-            return Ok(index);
-        }
-
-        // We always know the type of page zero. See [`Self::get_as`] for
-        // details on page types.
-        if page_number == 0 {
-            self.load_from_disk::<PageZero>(page_number)?;
-        } else {
-            self.load_from_disk::<P>(page_number)?;
-        }
-
-        // Unwrapping is safe because we've just loaded the page into cache.
-        Ok(self.cache.get(page_number).unwrap())
     }
 
     /// Returns a page as a concrete type.
@@ -224,10 +203,11 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// [`enum_dispatch`](https://docs.rs/enum_dispatch/) which basically
     /// automates what we're doing here by implementing [`TryFrom`] for each
     /// enum member using macros (didn't actually test if it works in our case
-    /// since we need a specific lifetime).
+    /// since we need a specific lifetime). Another solution would be writing
+    /// our own macro.
     pub fn get_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&P>
     where
-        P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>,
+        P: PageTypeConversion + AsMut<[u8]>,
         &'p P: TryFrom<&'p MemPage>,
         <&'p P as TryFrom<&'p MemPage>>::Error: Debug,
     {
@@ -243,7 +223,7 @@ impl<I: Seek + Read + Write> Pager<I> {
     /// queue.
     pub fn get_mut_as<'p, P>(&'p mut self, page_number: PageNumber) -> io::Result<&mut P>
     where
-        P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>,
+        P: PageTypeConversion + AsMut<[u8]>,
         &'p mut P: TryFrom<&'p mut MemPage>,
         <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
     {
@@ -305,80 +285,74 @@ impl<I: Seek + Read + Write> Pager<I> {
             .map(|pages| pages.map(|page| page.try_into().expect("page type conversion error"))))
     }
 
-    /// Loads the given page into the cache buffer.
+    /// Returns the cache index of the given `page_number`.
     ///
-    /// If the cache evicts a dirty page we use the opportunity to write all
-    /// the dirty pages that we currenlty track. This doesn't mean that the
-    /// dirty pages will be written to disk, they might be buffered by the
-    /// underlying OS until [`Self::sync`] is called.
-    fn load_page_into_cache(&mut self, page: impl Into<MemPage>) -> io::Result<()> {
-        if self.cache.must_evict_dirty_page() {
-            self.write_dirty_pages()?;
+    /// This function doesn't fail if the page is not cached, it will load the
+    /// page from disk instead. So Best case scenario is when the page is
+    /// already cached in memory. Worst case scenario is when we have to evict a
+    /// dirty page in order to load the new one, which requires at least two IO
+    /// operations, but possibly more since we flush the entire write queue at
+    /// that point. Evicting a clean page doesn't require IO.
+    ///
+    /// Note that this function does not mark the page as dirty.
+    fn lookup<P: PageTypeConversion + AsMut<[u8]>>(
+        &mut self,
+        page_number: PageNumber,
+    ) -> io::Result<usize> {
+        if let Some(index) = self.cache.get(page_number) {
+            return Ok(index);
         }
 
-        self.cache.load(page.into());
+        // We always know the type of page zero. See [`Self::get_as`] for
+        // details on page types.
+        if page_number == 0 {
+            self.load_from_disk::<PageZero>(page_number)?;
+        } else {
+            self.load_from_disk::<P>(page_number)?;
+        }
 
-        Ok(())
+        // Unwrapping is safe because we've just loaded the page into cache.
+        Ok(self.cache.get(page_number).unwrap())
     }
 
     /// Loads a page from disk into the cache.
     ///
     /// The page is not marked dirty, it will not be written back to disk
     /// unless [`Self::get_mut_as`] is called.
-    fn load_from_disk<P: Into<MemPage> + AllocPageInMemory + AsMut<[u8]>>(
+    fn load_from_disk<P: PageTypeConversion + AsMut<[u8]>>(
         &mut self,
         page_number: PageNumber,
     ) -> io::Result<()> {
-        let mut page = P::alloc_in_memory(page_number, self.page_size);
-        self.io.read(page_number, page.as_mut())?;
-        self.load_page_into_cache(page)
-    }
-
-    /// Loads a page created in memory into the cache.
-    ///
-    /// Doing so automatically marks the page as dirty, since it's gonna have
-    /// to be written to disk at some point.
-    pub fn load_from_mem(&mut self, page: impl Into<MemPage>) -> io::Result<()> {
-        let page: MemPage = page.into();
-        let page_number = page.number();
-
-        self.load_page_into_cache(page)?;
-        self.push_to_write_queue(page_number);
+        let index = self.map_page::<P>(page_number)?;
+        self.io.read(page_number, self.cache[index].as_mut())?;
 
         Ok(())
     }
 
-    /// Initializes the contents of a disk page.
+    /// Maps a page number to a cache entry.
     ///
-    /// This does not immediately write to disk as it would be inefficient.
-    /// Instead, the initialization goes through the cache system. The page
-    /// is initialized in memory, cached and pushed to the write queue.
-    /// Eventually, the page will be written to disk.
-    pub fn init_disk_page<P: Into<MemPage> + AllocPageInMemory>(
-        &mut self,
-        page_number: PageNumber,
-    ) -> io::Result<()> {
-        self.load_from_mem(P::alloc_in_memory(page_number, self.page_size))
-    }
-
-    /// Returns a copy of the DB header.
+    /// This process involves two expensive steps in the worst case scenario:
     ///
-    /// Since the header is small it's gonna be faster to copy it once, modify
-    /// it and then write it back instead of accessing it through the cache
-    /// system, which requires making sure that the borrow rules are met and
-    /// other details.
-    fn read_header(&mut self) -> io::Result<DbHeader> {
-        self.get_as::<PageZero>(0).map(PageZero::header).copied()
+    /// 1. Execute the eviction algorithm to find which page must be evicted.
+    ///
+    /// 2. If the page that must be evicted is dirty, then use the opportunity
+    /// to write all dirty pages sequentially at once.
+    ///
+    /// The eviction algorithm is O(n) so worst case requires O(n) work in
+    /// memory and O(n) disk IO to write all the pages.
+    fn map_page<P: PageTypeConversion>(&mut self, page_number: PageNumber) -> io::Result<usize> {
+        if self.cache.must_evict_dirty_page() {
+            self.write_dirty_pages()?;
+        }
+
+        let index = self.cache.map(page_number);
+        self.cache[index].reinit_as::<P>();
+
+        Ok(index)
     }
 
-    /// Writes the header back to page zero. See [`Self::read_header`].
-    fn write_header(&mut self, header: DbHeader) -> io::Result<()> {
-        *self.get_mut_as::<PageZero>(0)?.header_mut() = header;
-        Ok(())
-    }
-
-    /// Allocates a new page that can be used to write data.
-    pub fn alloc_page(&mut self) -> io::Result<PageNumber> {
+    /// Allocates a new page on disk that can be used to write data.
+    pub fn alloc_disk_page(&mut self) -> io::Result<PageNumber> {
         let mut header = self.read_header()?;
 
         let free_page = if header.first_free_page == 0 {
@@ -391,7 +365,7 @@ impl<I: Seek + Read + Write> Pager<I> {
             let page = self.get_as::<FreePage>(header.last_free_page)?;
             header.first_free_page = page.header().next;
             header.free_pages -= 1;
-            page.number
+            header.last_free_page
         };
 
         if header.first_free_page == 0 {
@@ -403,14 +377,25 @@ impl<I: Seek + Read + Write> Pager<I> {
         Ok(free_page)
     }
 
+    /// Allocates a page on disk and creates the cache entry for it.
+    pub fn alloc_page<P: PageTypeConversion>(&mut self) -> io::Result<PageNumber> {
+        let page_number = self.alloc_disk_page()?;
+        self.map_page::<P>(page_number)?;
+
+        Ok(page_number)
+    }
+
     /// Adds the given page to the free list.
     ///
     /// **Important**: do not use the page after calling this function, since it
-    /// will be replaced by a free page and all the data will be lost. Consider
-    /// that a "use after free" bug.
+    /// will be replaced by a [`FreePage`] instance and all the data will be
+    /// lost. Consider that a "use after free" bug.
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
         // Initialize last free page.
-        self.load_from_mem(FreePage::alloc_in_memory(page_number, self.page_size))?;
+        let index = self.lookup::<FreePage>(page_number)?;
+        self.cache[index].reinit_as::<FreePage>();
+
+        self.push_to_write_queue(page_number);
 
         let mut header = self.read_header()?;
 
@@ -428,6 +413,22 @@ impl<I: Seek + Read + Write> Pager<I> {
 
         self.write_header(header)
     }
+
+    /// Returns a copy of the DB header.
+    ///
+    /// Since the header is small it's gonna be faster to copy it once, modify
+    /// it and then write it back instead of accessing it through the cache
+    /// system, which requires making sure that the borrow rules are met and
+    /// other details.
+    fn read_header(&mut self) -> io::Result<DbHeader> {
+        self.get_as::<PageZero>(0).map(PageZero::header).copied()
+    }
+
+    /// Writes the header back to page zero. See [`Self::read_header`].
+    fn write_header(&mut self, header: DbHeader) -> io::Result<()> {
+        *self.get_mut_as::<PageZero>(0)?.header_mut() = header;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -437,26 +438,31 @@ mod tests {
     use super::Pager;
     use crate::{
         paging::{cache::Cache, io::MemBuf},
-        storage::page::{AllocPageInMemory, Cell, OverflowPage, Page},
+        storage::page::{Cell, OverflowPage, Page},
     };
 
     fn init_pager_with_cache(cache: Cache) -> io::Result<Pager<MemBuf>> {
-        let mut pager = Pager::with_cache(io::Cursor::new(Vec::new()), 256, 256, cache);
+        let mut pager = Pager::with_cache(
+            io::Cursor::new(Vec::new()),
+            cache.page_size(),
+            cache.page_size(),
+            cache,
+        );
         pager.init()?;
 
         Ok(pager)
     }
 
     fn init_pager() -> io::Result<Pager<MemBuf>> {
-        init_pager_with_cache(Cache::default())
+        init_pager_with_cache(Cache::builder().page_size(64).max_size(64).build())
     }
 
     #[test]
-    fn alloc_page() -> io::Result<()> {
+    fn alloc_disk_page() -> io::Result<()> {
         let mut pager = init_pager()?;
 
         for i in 1..=10 {
-            assert_eq!(pager.alloc_page()?, i);
+            assert_eq!(pager.alloc_disk_page()?, i);
         }
 
         let header = pager.read_header()?;
@@ -474,7 +480,7 @@ mod tests {
         let mut pager = init_pager()?;
 
         for _ in 1..=10 {
-            pager.alloc_page()?;
+            pager.alloc_disk_page()?;
         }
 
         for p in [5, 7, 9] {
@@ -495,14 +501,16 @@ mod tests {
         let mut pager = init_pager()?;
 
         for i in 1..=10 {
-            let mut page = Page::alloc_in_memory(pager.alloc_page()?, pager.page_size);
+            let mut page = Page::alloc(pager.page_size);
             page.push(Cell::new(vec![
                 i;
                 Page::ideal_max_payload_size(pager.page_size, 1)
                     as usize
             ]));
 
-            pager.write(page.number, page.as_ref())?;
+            let page_number = pager.alloc_disk_page()?;
+
+            pager.write(page_number, page.as_ref())?;
         }
 
         let update_pages = [5, 7, 9];
@@ -516,7 +524,7 @@ mod tests {
         pager.sync()?;
 
         for i in 1..=10 {
-            let mut expected = Page::alloc_in_memory(i, pager.page_size);
+            let mut expected = Page::alloc(pager.page_size);
             expected.push(Cell::new(vec![
                 if update_pages.contains(&i) {
                     10 + i as u8
@@ -527,40 +535,49 @@ mod tests {
                     as usize
             ]));
 
-            let mut page = Page::alloc_in_memory(i, pager.page_size);
-            pager.read(page.number, page.as_mut())?;
+            let mut page = Page::alloc(pager.page_size);
+            pager.read(i, page.as_mut())?;
 
             assert_eq!(page, expected);
         }
 
         assert!(!pager.cache.must_evict_dirty_page());
+        assert!(pager.dirty_pages.is_empty());
 
         Ok(())
     }
 
     #[test]
     fn write_pages_when_dirty_page_is_evicted() -> io::Result<()> {
-        let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
+        let mut pager = init_pager_with_cache(Cache::builder().max_size(3).page_size(64).build())?;
 
-        for i in 1..=3 {
-            let mut page = OverflowPage::alloc_in_memory(i, pager.page_size);
-            page.content_mut().fill(i as u8);
-            pager.load_from_mem(page)?;
+        // Cache size is 3 and pager needs to read page 0 to allocate. So this
+        // will fill the cache.
+        for i in 1..=2 {
+            let page_number = pager.alloc_page::<OverflowPage>()?;
+            pager
+                .get_mut_as::<OverflowPage>(page_number)?
+                .content_mut()
+                .fill(i as u8);
         }
 
-        let mut causes_evict = OverflowPage::alloc_in_memory(4, pager.page_size);
-        causes_evict.content_mut().fill(4);
+        pager.cache.pin(0);
 
-        pager.load_from_mem(causes_evict)?;
+        // Trying to allocate another page will evict one of the previous.
+        let causes_evict = pager.alloc_page::<OverflowPage>()?;
+        pager
+            .get_mut_as::<OverflowPage>(causes_evict)?
+            .content_mut()
+            .fill(3);
 
-        for i in 1..=3 {
-            let mut page = OverflowPage::alloc_in_memory(i, pager.page_size);
+        for i in 1..=2 {
+            let mut page = OverflowPage::alloc(pager.page_size);
             pager.read(i, page.as_mut())?;
 
-            let mut expected = OverflowPage::alloc_in_memory(i, pager.page_size);
+            let mut expected = OverflowPage::alloc(pager.page_size);
             expected.content_mut().fill(i as u8);
 
-            assert_eq!(expected, page);
+            assert_eq!(page, expected);
         }
 
         assert!(!pager.cache.must_evict_dirty_page());
@@ -574,20 +591,18 @@ mod tests {
 
         let mut cells = Vec::new();
 
-        for i in 1..=3 {
-            let mut page = Page::alloc_in_memory(i, pager.page_size);
+        for i in 1..=3_u32 {
+            let page_number = pager.alloc_page::<Page>()?;
             let cell = Cell::new(Vec::from(&i.to_le_bytes()));
-            page.push(cell.clone());
+            pager.get_mut(page_number)?.push(cell.clone());
             cells.push(cell);
-            pager.load_from_mem(page)?;
         }
 
         let mut_refs = pager.get_many_mut([1, 2, 3])?;
 
         assert!(mut_refs.is_some());
 
-        for ((mut_ref, page_num), cell) in mut_refs.unwrap().into_iter().zip(1..=3).zip(cells) {
-            assert_eq!(mut_ref.number, page_num);
+        for (mut_ref, cell) in mut_refs.unwrap().into_iter().zip(cells) {
             assert_eq!(mut_ref.len(), 1);
             assert_eq!(mut_ref.cell(0), cell.as_ref());
         }
@@ -599,12 +614,43 @@ mod tests {
     fn get_many_mut_fail() -> io::Result<()> {
         let mut pager = init_pager_with_cache(Cache::with_max_size(3))?;
 
-        pager.load_from_mem(Page::alloc_in_memory(0, pager.page_size))?;
+        // Read page zero into cache.
+        pager.get(0)?;
+        // Pin it.
         pager.cache.pin(0);
 
+        // Cache size is 3 and one page is pinned, so this is impossible.
         let mut_refs = pager.get_many_mut([1, 2, 3])?;
 
         assert!(mut_refs.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn cache_pressure() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::builder().max_size(5).page_size(256).build())?;
+
+        let max_pages = 25;
+
+        let mut page_numbers = Vec::new();
+
+        for _ in 1..max_pages {
+            let page_number = pager.alloc_page::<OverflowPage>()?;
+            page_numbers.push(page_number);
+
+            pager
+                .get_mut_as::<OverflowPage>(page_number)?
+                .content_mut()
+                .fill(page_number as u8);
+        }
+
+        for page_number in page_numbers {
+            let mut expected = OverflowPage::alloc(pager.page_size);
+            expected.content_mut().fill(page_number as u8);
+
+            assert_eq!(pager.get_as::<OverflowPage>(page_number)?, &expected);
+        }
 
         Ok(())
     }

@@ -71,8 +71,7 @@ fn alloc_root_page<I: Seek + Read + Write + paging::io::Sync>(
     db: &mut Database<I>,
 ) -> io::Result<PageNumber> {
     let mut pager = db.pager.borrow_mut();
-    let root = pager.alloc_page()?;
-    pager.init_disk_page::<Page>(root)?;
+    let root = pager.alloc_disk_page()?;
 
     Ok(root)
 }

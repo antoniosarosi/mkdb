@@ -116,6 +116,7 @@
 
 use std::{
     alloc::{self, Allocator, Layout},
+    any,
     cmp::Ordering,
     collections::BinaryHeap,
     fmt::{self, Debug},
@@ -232,7 +233,9 @@ impl<H> BufferWithHeader<H> {
     pub fn alloc(size: usize) -> NonNull<[u8]> {
         assert!(
             size > mem::size_of::<H>(),
-            "attempt to allocate BufferWithHeader<H> of insufficient size: size of H is {} while allocation size is {}",
+            "attempt to allocate {} of insufficient size: size of {} is {} while allocation size is {}",
+            any::type_name::<Self>(),
+            any::type_name::<H>(),
             mem::size_of::<H>(),
             size,
         );
@@ -306,7 +309,11 @@ impl<H> BufferWithHeader<H> {
     pub unsafe fn from_non_null(pointer: NonNull<[u8]>) -> Self {
         debug_assert!(
             pointer.len() > mem::size_of::<H>(),
-            "attempt to construct BufferWithHeader<H> from invalid pointer"
+            "attempt to construct {} from invalid pointer of size {} when size of {} is {}",
+            any::type_name::<Self>(),
+            pointer.len(),
+            any::type_name::<H>(),
+            mem::size_of::<H>(),
         );
 
         let content = NonNull::slice_from_raw_parts(
@@ -321,6 +328,43 @@ impl<H> BufferWithHeader<H> {
         }
     }
 
+    /// Similar to [`NonNull::cast`].
+    ///
+    /// Transforms this buffer into a buffer with a different header type.
+    pub fn cast<T>(self) -> BufferWithHeader<T> {
+        let Self {
+            header,
+            content,
+            size,
+        } = self;
+
+        assert!(
+            size > mem::size_of::<T>(),
+            "cannot cast {} of total size {size} to {} where the size of {} is {}",
+            any::type_name::<Self>(),
+            any::type_name::<BufferWithHeader<T>>(),
+            any::type_name::<T>(),
+            mem::size_of::<T>(),
+        );
+
+        mem::forget(self);
+
+        let header = header.cast();
+
+        let content = unsafe {
+            NonNull::slice_from_raw_parts(
+                header.byte_add(mem::size_of::<T>()).cast::<u8>(),
+                BufferWithHeader::<T>::usable_space(size) as usize,
+            )
+        };
+
+        BufferWithHeader {
+            header,
+            content,
+            size,
+        }
+    }
+
     /// Number of bytes that can be used to store content.
     ///
     /// ```text
@@ -332,8 +376,8 @@ impl<H> BufferWithHeader<H> {
     /// | HEADER |         CONTENT          |
     /// +--------+--------------------------+
     /// ```
-    pub fn usable_space(page_size: usize) -> u16 {
-        (page_size - mem::size_of::<H>()) as u16
+    pub fn usable_space(size: usize) -> u16 {
+        (size - mem::size_of::<H>()) as u16
     }
 
     /// Returns a read-only reference to the header.
@@ -699,8 +743,9 @@ impl ToOwned for Cell {
     }
 }
 
-/// Cell that didn't fit in the slotted page. This is stored in-memory and
-/// cannot be written to disk.
+/// Cell that didn't fit in the slotted page
+///
+///  This is stored in-memory and cannot be written to disk.
 #[derive(Debug, Clone)]
 struct OverflowCell {
     /// Owned cell.
@@ -728,12 +773,6 @@ impl Ord for OverflowCell {
         // BinaryHeap is max-heap by default, make it min-heap.
         self.index.cmp(&other.index).reverse()
     }
-}
-
-/// A trait similar to [`Default`] but for initializing empty pages in memory.
-pub(crate) trait AllocPageInMemory {
-    /// Initializes an empty page of the given size.
-    fn alloc_in_memory(number: PageNumber, size: usize) -> Self;
 }
 
 /// Slotted page header.
@@ -979,25 +1018,10 @@ impl PageHeader {
 /// that's the one used to move the cells out.
 #[derive(Clone)]
 pub(crate) struct Page {
-    /// Page number on disk.
-    pub number: PageNumber,
     /// Fixed size in-memory buffer that contains the data read from disk.
     buffer: BufferWithHeader<PageHeader>,
     /// Overflow list.
     overflow: BinaryHeap<OverflowCell>,
-}
-
-impl AllocPageInMemory for Page {
-    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
-        let mut buffer = BufferWithHeader::for_page(size);
-        *buffer.header_mut() = PageHeader::new(size);
-
-        Self {
-            number,
-            buffer,
-            overflow: BinaryHeap::new(),
-        }
-    }
 }
 
 // TODO: Technically two pages could have the exact same content but different
@@ -1007,7 +1031,7 @@ impl AllocPageInMemory for Page {
 // inserts data in the same order.
 impl PartialEq for Page {
     fn eq(&self, other: &Self) -> bool {
-        self.number == other.number && self.buffer == other.buffer
+        self.buffer == other.buffer
     }
 }
 
@@ -1023,7 +1047,25 @@ impl AsMut<[u8]> for Page {
     }
 }
 
+impl<H> From<BufferWithHeader<H>> for Page {
+    fn from(buffer: BufferWithHeader<H>) -> Self {
+        let mut buffer = buffer.cast();
+
+        *buffer.header_mut() = PageHeader::new(buffer.size);
+
+        Self {
+            buffer,
+            overflow: BinaryHeap::new(),
+        }
+    }
+}
+
 impl Page {
+    /// Allocates a new page of `size` bytes in memory.
+    pub fn alloc(size: usize) -> Self {
+        Self::from(BufferWithHeader::<PageHeader>::for_page(size))
+    }
+
     /// Amount of space that can be used in a page to store [`Cell`] instances.
     ///
     /// Since [`MAX_PAGE_SIZE`] is 64 KiB, the usable space should be a value
@@ -1146,6 +1188,12 @@ impl Page {
 
     /// Returns a pointer to the [`Cell`] located at the given slot.
     fn cell_at_slot(&self, index: SlotId) -> NonNull<Cell> {
+        debug_assert!(
+            index < self.header().num_slots,
+            "slot index {index} out of bounds for slot array length {}",
+            self.header().num_slots
+        );
+
         // SAFETY: The slot array always stores valid offsets within the page
         // that point to actual initialized cells.
         unsafe { self.cell_at_offset(self.slot_array()[index as usize]) }
@@ -1206,23 +1254,14 @@ impl Page {
         !self.overflow.is_empty()
     }
 
-    /// Returns `true` if [`Self::append`] can be called with `other` as a
-    /// parameter without causig `self` to overflow.
-    pub fn can_consume_without_overflow(&self, other: &Self) -> bool {
-        if other.is_overflow() {
-            return false;
-        }
-
-        let used_bytes = Self::usable_space(other.size()) - other.header().free_space;
-
-        self.header().free_space >= used_bytes
+    /// Number of used bytes in this page.
+    pub fn used_bytes(&self) -> u16 {
+        Self::usable_space(self.size()) - self.header().free_space
     }
 
-    /// Just like [`Vec::append`], this function removes all the cells in
-    /// `other` and adds them to `self`.
-    pub fn append(&mut self, other: &mut Self) {
-        other.drain(..).for_each(|cell| self.push(cell));
-        self.header_mut().right_child = other.header().right_child;
+    /// Number of free bytes in this page.
+    pub fn free_space(&self) -> u16 {
+        self.header().free_space
     }
 
     /// Returns `true` if this page has no children.
@@ -1619,9 +1658,9 @@ impl Page {
 impl Debug for Page {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Page")
-            .field("header", self.header())
-            .field("number", &self.number)
+            .field("overflow", &self.overflow)
             .field("size", &self.size())
+            .field("header", self.header())
             .field("slots", &self.slot_array())
             .field_with("cells", |f| {
                 let mut list = f.debug_list();
@@ -1702,8 +1741,6 @@ pub(crate) struct OverflowPageHeader {
 /// the [`Cell`] payload point to the first overflow page.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct OverflowPage {
-    /// Page number.
-    pub number: PageNumber,
     /// In-memory page buffer.
     buffer: BufferWithHeader<OverflowPageHeader>,
 }
@@ -1711,15 +1748,6 @@ pub(crate) struct OverflowPage {
 /// We can reuse the overflow page to represent free pages since we only need
 /// a linked list of pages.
 pub(crate) type FreePage = OverflowPage;
-
-impl AllocPageInMemory for OverflowPage {
-    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
-        Self {
-            number,
-            buffer: BufferWithHeader::new(size),
-        }
-    }
-}
 
 impl AsRef<[u8]> for OverflowPage {
     fn as_ref(&self) -> &[u8] {
@@ -1733,7 +1761,25 @@ impl AsMut<[u8]> for OverflowPage {
     }
 }
 
+impl<H> From<BufferWithHeader<H>> for OverflowPage {
+    fn from(buffer: BufferWithHeader<H>) -> Self {
+        let mut buffer = buffer.cast();
+
+        *buffer.header_mut() = OverflowPageHeader {
+            next: 0,
+            num_bytes: 0,
+            padding: 0,
+        };
+
+        Self { buffer }
+    }
+}
+
 impl OverflowPage {
+    pub fn alloc(size: usize) -> Self {
+        Self::from(BufferWithHeader::<OverflowPageHeader>::for_page(size))
+    }
+
     /// Total space that can be used for overflow payloads.
     pub fn usable_space(page_size: usize) -> u16 {
         BufferWithHeader::<OverflowPageHeader>::usable_space(page_size)
@@ -1798,12 +1844,13 @@ pub(crate) struct PageZero {
     page: ManuallyDrop<Page>,
 }
 
-impl AllocPageInMemory for PageZero {
-    fn alloc_in_memory(number: PageNumber, size: usize) -> Self {
-        let mut buffer = ManuallyDrop::new(BufferWithHeader::for_page(size));
+impl<H> From<BufferWithHeader<H>> for PageZero {
+    fn from(buffer: BufferWithHeader<H>) -> Self {
+        let mut buffer = ManuallyDrop::new(buffer.cast());
+
         *buffer.header_mut() = DbHeader {
             magic: MAGIC,
-            page_size: size as _,
+            page_size: buffer.size as u32,
             total_pages: 1,
             free_pages: 0,
             first_free_page: 0,
@@ -1833,13 +1880,12 @@ impl AllocPageInMemory for PageZero {
 
             page_buffer
                 .header
-                .write(PageHeader::new(size - mem::size_of::<DbHeader>()));
+                .write(PageHeader::new(buffer.size - mem::size_of::<DbHeader>()));
 
             page_buffer
         };
 
         let page = ManuallyDrop::new(Page {
-            number,
             buffer: page_buffer,
             overflow: BinaryHeap::new(),
         });
@@ -1849,6 +1895,31 @@ impl AllocPageInMemory for PageZero {
 }
 
 impl PageZero {
+    /// Creates a new page in memory.
+    pub fn alloc(size: usize) -> Self {
+        Self::from(BufferWithHeader::<DbHeader>::for_page(size))
+    }
+
+    /// Drops all the metadata and returns the inner buffer.
+    fn into_buffer(mut self) -> BufferWithHeader<DbHeader> {
+        // SAFETY: Neither the `ManuallyDrop` nor the `Page` will be used again
+        // after this.
+        let Page {
+            buffer, overflow, ..
+        } = unsafe { ManuallyDrop::take(&mut self.page) };
+
+        mem::forget(buffer);
+        mem::drop(overflow);
+
+        // SAFETY: The `ManuallyDrop` won't be used again after this. The
+        // inner buffer is safe to use if it was correctly allocated to begin
+        // with.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        mem::forget(self);
+
+        buffer
+    }
+
     /// Read-only reference to the database file header.
     pub fn header(&self) -> &DbHeader {
         self.buffer.header()
@@ -1872,25 +1943,7 @@ impl PageZero {
 
 impl Drop for PageZero {
     fn drop(&mut self) {
-        // SAFETY: We need to drop 2 different allocations:
-        //
-        // 1. Our PageZero buffer that stores the database header and the
-        // slotted page.
-        //
-        // 2. The slotted page overflow list.
-        //
-        // This should be "safe" here because none of these allocations can be
-        // used after this code runs, the compiler should prevent it if calling
-        // [`mem::drop`] or allowing it to insert the drop call automatically.
-        unsafe {
-            let Page {
-                buffer, overflow, ..
-            } = ManuallyDrop::take(&mut self.page);
-
-            mem::forget(buffer);
-            mem::drop(overflow);
-            ManuallyDrop::drop(&mut self.buffer);
-        }
+        unsafe { drop(ptr::from_mut(self).read().into_buffer()) }
     }
 }
 
@@ -1917,13 +1970,47 @@ pub(crate) enum MemPage {
     Btree(Page),
 }
 
+/// See [`crate::paging::pager::Pager::get_as`]
+pub(crate) trait PageTypeConversion = From<BufferWithHeader<PageHeader>>
+    + From<BufferWithHeader<OverflowPageHeader>>
+    + From<BufferWithHeader<DbHeader>>
+    + Into<MemPage>;
+
 impl MemPage {
-    /// Returns the disk page number.
-    pub fn number(&self) -> PageNumber {
-        match self {
-            Self::Zero(_) => 0,
-            Self::Overflow(page) => page.number,
-            Self::Btree(page) => page.number,
+    /// Allocates a dummy page in memory.
+    ///
+    /// Used by the [`crate::paging::cache`] module to fill up the buffer pool.
+    /// [`Self::reinit_as`] can be used to convert the type to a different one
+    /// reusing the same allocation, so it doesn't matter what type we choose
+    /// here. We're choosing the most common type.
+    pub fn alloc(size: usize) -> Self {
+        MemPage::Btree(Page::alloc(size))
+    }
+
+    /// Converts this page into another type.
+    ///
+    /// This is not only a "conversion" but also a "reinitialization" since
+    /// it drops all the metadata of the old type and reuses only its page
+    /// buffer to initialize the new type.
+    ///
+    /// Basically we need this to reuse allocated buffers because it doesn't
+    /// make sense to allocate a new buffer every single time we want to create
+    /// a page if we already have a giant cache of pages.
+    pub fn reinit_as<P: PageTypeConversion>(&mut self) {
+        // SAFETY: We basically move out of self temporarily to create the new
+        // type and then write the new variant back. If we already have mutable
+        // access to self this should be "safe". At this point I already hate
+        // the word "safe".
+        unsafe {
+            let mem_page = ptr::from_mut(self);
+
+            let converted = match mem_page.read() {
+                Self::Zero(zero) => P::from(zero.into_buffer()),
+                Self::Overflow(overflow) => P::from(overflow.buffer),
+                Self::Btree(page) => P::from(page.buffer),
+            };
+
+            mem_page.write(converted.into())
         }
     }
 
@@ -1947,6 +2034,16 @@ impl AsRef<[u8]> for MemPage {
     }
 }
 
+impl AsMut<[u8]> for MemPage {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Zero(page) => page.as_mut(),
+            Self::Overflow(page) => page.as_mut(),
+            Self::Btree(page) => page.as_mut(),
+        }
+    }
+}
+
 impl From<Page> for MemPage {
     fn from(page: Page) -> MemPage {
         MemPage::Btree(page)
@@ -1965,7 +2062,7 @@ impl From<PageZero> for MemPage {
     }
 }
 
-/// WARNING: Verbose duplicated code ahead :(
+/// WARNING: Verbose duplicated garbage code ahead.
 /// See [`crate::paging::pager::Pager::get_as`] for details.
 /// We should probably use a macro to generate this but there are only 3 types
 /// of pages for now so it's not that bad (still pretty bad).
@@ -2099,7 +2196,7 @@ mod tests {
         fn build(self) -> (Page, Vec<Box<Cell>>) {
             let size = self.size.unwrap_or(optimal_page_size_to_fit(&self.cells));
 
-            let mut page = Page::alloc_in_memory(0, size);
+            let mut page = Page::alloc(size);
             page.push_all(self.cells.clone());
 
             (page, self.cells)
@@ -2510,7 +2607,7 @@ mod tests {
         let overflow_cells = min_cells + 2;
         let payload_size = Page::ideal_max_payload_size(slotted_page_size, min_cells) as usize;
 
-        let mut page = PageZero::alloc_in_memory(0, full_page_size);
+        let mut page = PageZero::alloc(full_page_size);
         let mut cells = Vec::new();
 
         for i in 1..=overflow_cells {

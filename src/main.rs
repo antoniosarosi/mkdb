@@ -7,6 +7,7 @@
 #![feature(slice_ptr_get)]
 #![feature(get_many_mut)]
 #![feature(map_many_mut)]
+#![feature(trait_alias)]
 
 mod db;
 mod os;

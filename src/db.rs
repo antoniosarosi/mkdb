@@ -561,6 +561,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn insert_many() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -960,6 +961,7 @@ mod tests {
 
     /// Used mostly to test the possibilities of a BTree rooted at page zero,
     /// since that's a special case.
+    #[cfg(not(miri))]
     #[test]
     fn create_many_tables() -> Result<(), DbError> {
         let mut db = init_database()?;
