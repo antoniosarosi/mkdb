@@ -6,7 +6,7 @@ use crate::{
     db::{mkdb_meta_schema, Database, DbError, RowId, MKDB_META, MKDB_META_ROOT},
     paging::{self, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
-    storage::{page::Page, tuple, BTree, FixedSizeMemCmp},
+    storage::{tuple, BTree, FixedSizeMemCmp},
 };
 
 /// Executes a SQL statement that doesn't require a query plan.

@@ -176,6 +176,8 @@ pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 
 /// See the "Alignment" section of the [`Page`] documentation for alignment
 /// details.
+///
+/// Briefly, all pages must be aligned to 8 bytes for simplicity.
 pub(crate) const MEM_ALIGNMENT: usize = mem::align_of::<CellHeader>();
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
@@ -277,12 +279,9 @@ impl<H> BufferWithHeader<H> {
     ///
     /// # Safety
     ///
-    /// This function is marked as unsafe because the caller must ensure that
-    /// the given `pointer` is valid and well aligned.
-    ///
-    /// First of all, `pointer` must be able to fit the size of the header plus
-    /// one byte of content at minimum. Additional requirements depend on the
-    /// use case:
+    /// This function is marked as unsafe even though it checks some
+    /// preconditions because the caller must ensure that the destructors run
+    /// in the correct order. The requirements depend on the use case.
     ///
     /// ## Case 1: Fully Owned, Allocated Buffer
     ///
@@ -302,18 +301,25 @@ impl<H> BufferWithHeader<H> {
     /// 2. After the larger buffer or allocation is dropped, this inner buffer
     /// cannot be used anymore since that would be a use after free.
     ///
-    /// 3. The alignment in this case depends on what the buffer is used for.
-    /// The slotted [`Page`] or the [`Cell`] structures require an alignment of
-    /// [`MEM_ALIGNMENT`] while [`OverflowPage`] requires the same alignment as
-    /// its [`OverflowPageHeader`].
+    /// # Panics
+    ///
+    /// Panics if the pointer has insufficient length or is not aligned to
+    /// [`MEM_ALIGNMENT`].
     pub unsafe fn from_non_null(pointer: NonNull<[u8]>) -> Self {
-        debug_assert!(
+        assert!(
             pointer.len() > mem::size_of::<H>(),
             "attempt to construct {} from invalid pointer of size {} when size of {} is {}",
             any::type_name::<Self>(),
             pointer.len(),
             any::type_name::<H>(),
             mem::size_of::<H>(),
+        );
+
+        assert!(
+            pointer.is_aligned_to(MEM_ALIGNMENT),
+            "attempt to create {} from unaligned pointer {:?}",
+            any::type_name::<Self>(),
+            pointer
         );
 
         let content = NonNull::slice_from_raw_parts(
@@ -408,7 +414,7 @@ impl<H> BufferWithHeader<H> {
         unsafe { self.content.as_mut() }
     }
 
-    /// Returns a [`NonNull`] pointer to the in-memory buffer.
+    /// Returns a [`NonNull`] pointer to the entire in-memory buffer.
     fn as_non_null(&self) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(self.header.cast::<u8>(), self.size)
     }
@@ -1190,7 +1196,7 @@ impl Page {
     fn cell_at_slot(&self, index: SlotId) -> NonNull<Cell> {
         debug_assert!(
             index < self.header().num_slots,
-            "slot index {index} out of bounds for slot array length {}",
+            "slot index {index} out of bounds for slot array of length {}",
             self.header().num_slots
         );
 
@@ -1857,17 +1863,14 @@ impl<H> From<BufferWithHeader<H>> for PageZero {
             last_free_page: 0,
         };
 
-        // SAFETY: `BufferWithHeader::from_non_null` requires three guarantees
-        // which we meet as follows:
+        // SAFETY: `BufferWithHeader::from_non_null` requires 2 main guarantees
+        // for wrapped buffers which we meet as follows:
         //
-        // 1. The buffer size has already been checked when calling
-        // [`BufferWithHeader::for_page`].
+        // 1. The [`Drop`] implementation of the inner buffer will never run
+        // because `self.page` is contained within [`ManuallyDrop`] and we
+        // control exactly how the destructors run.
         //
-        // 2. The [`Drop`] implementation of the inner buffer will never run
-        // because page is contained within [`ManuallyDrop`] and we control
-        // exactly how the destructors run.
-        //
-        // 3. We don't use the inner buffer after the main allocated one is
+        // 2. We don't use the inner buffer after the main allocated one is
         // dropped. At least not in this struct, externally though it's
         // possible to destructure [`PageZero`], move out of all its fields and
         // attempt to use `self.page` after `self.buffer` is dropped, but... why

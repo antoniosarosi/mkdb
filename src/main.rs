@@ -8,6 +8,7 @@
 #![feature(get_many_mut)]
 #![feature(map_many_mut)]
 #![feature(trait_alias)]
+#![feature(pointer_is_aligned)]
 
 mod db;
 mod os;

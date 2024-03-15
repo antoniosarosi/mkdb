@@ -275,7 +275,7 @@ impl Builder {
     /// [`Cache::pin`] will return `false` once this percentage is reached.
     pub fn pin_percentage_limit(&mut self, pin_percentage_limit: f32) -> &mut Self {
         assert!(
-            0.0 <= pin_percentage_limit && pin_percentage_limit <= 100.0,
+            (0.0..=100.0).contains(&pin_percentage_limit),
             "pin_percentage_limit must a percentage (0..=100) and not {pin_percentage_limit}, in case that's not clear enough"
         );
 

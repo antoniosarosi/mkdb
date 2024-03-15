@@ -202,7 +202,7 @@ impl<I: Seek + Read + Write> Sort<I> {
     fn sort(&mut self) -> Result<(), DbError> {
         for tuple in self.source.collection.iter_mut() {
             for expr in &self.by {
-                let sort_key = vm::resolve_expression(&tuple, &self.schema, expr)?;
+                let sort_key = vm::resolve_expression(tuple, &self.schema, expr)?;
                 tuple.push(sort_key);
             }
         }
