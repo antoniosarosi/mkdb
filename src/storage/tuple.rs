@@ -96,9 +96,11 @@ pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
                     len
                 };
 
-                // TODO: Check if we should use from_ut8_lossy() or from_utf8()
+                // TODO: We need to validate somewhere that this is actually valid UTF-8
                 values.push(Value::String(
-                    String::from_utf8_lossy(&buf[index..(index + length)]).to_string(),
+                    std::str::from_utf8(&buf[index..(index + length)])
+                        .unwrap()
+                        .into(),
                 ));
                 index += length;
             }

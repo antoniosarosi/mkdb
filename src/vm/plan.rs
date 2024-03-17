@@ -9,11 +9,13 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, Projection, QueryResult, RowId, Schema, SqlError},
-    paging,
-    paging::pager::{PageNumber, Pager},
-    sql::statement::{Assignment, Expression, Value},
-    storage::{tuple, BTree, Cursor, FixedSizeMemCmp},
+    db::{DbError, Projection, QueryResult, RowId, Schema, SqlError, StringCmp},
+    paging::{
+        self,
+        pager::{PageNumber, Pager},
+    },
+    sql::statement::{Assignment, DataType, Expression, Value},
+    storage::{reassemble_payload, tuple, BTree, Cursor, FixedSizeMemCmp},
     vm,
 };
 
@@ -123,7 +125,7 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         };
 
         Ok(Some(tuple::deserialize_values(
-            &pager.get(page)?.cell(slot).content,
+            reassemble_payload(&mut pager, page, slot)?.as_ref(),
             &self.schema,
         )))
     }
@@ -252,6 +254,7 @@ pub(crate) struct Insert<I> {
     pub pager: Rc<RefCell<Pager<I>>>,
     pub source: Box<Plan<I>>,
     pub schema: Schema,
+    pub indexes: Vec<(String, PageNumber)>,
 }
 
 impl<I: Seek + Read + Write> Insert<I> {
@@ -261,9 +264,42 @@ impl<I: Seek + Read + Write> Insert<I> {
         };
 
         let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
+        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
         btree.insert(tuple::serialize_values(&self.schema, &tuple))?;
+
+        for (col, root) in &self.indexes {
+            let idx = self.schema.index_of(col).unwrap();
+
+            assert_eq!(self.schema.columns[0].name, "row_id");
+            let key_col = self.schema.columns[idx].clone();
+            let row_id_col = self.schema.columns[0].clone();
+
+            let key = tuple[idx].clone();
+            let row_id = tuple[0].clone();
+
+            let entry =
+                tuple::serialize_values(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
+
+            match self.schema.columns[idx].data_type {
+                DataType::Varchar(max) => {
+                    let length_bytes = if max <= 255 { 1 } else { 2 };
+                    let mut btree = BTree::new(&mut pager, *root, StringCmp(length_bytes));
+                    btree.insert(entry)?;
+                }
+
+                fixed => {
+                    let size = match fixed {
+                        DataType::BigInt | DataType::UnsignedBigInt => 8,
+                        DataType::Int | DataType::UnsignedInt => 4,
+                        _ => unreachable!(),
+                    };
+
+                    let mut btree = BTree::new(&mut pager, *root, FixedSizeMemCmp(size));
+                    btree.insert(entry)?;
+                }
+            }
+        }
 
         Ok(Some(vec![]))
     }

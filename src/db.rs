@@ -361,18 +361,34 @@ impl Database<File> {
     }
 }
 
-pub(crate) struct StringCmp {
-    pub schema: Schema,
-}
+pub(crate) struct StringCmp(pub usize);
 
 impl BytesCmp for StringCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
-        let a = tuple::deserialize_values(a, &self.schema);
-        let b = tuple::deserialize_values(b, &self.schema);
-        match (&a[0], &b[0]) {
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            _ => unreachable!(),
-        }
+        debug_assert!(
+            self.0 <= 2,
+            "currently strings longer than 65535 bytes are not supported"
+        );
+
+        let mut buf = [0; std::mem::size_of::<usize>()];
+
+        buf[..self.0].copy_from_slice(&a[..self.0]);
+
+        let len_a = usize::from_le_bytes(buf);
+
+        buf.fill(0);
+        buf[..self.0].copy_from_slice(&b[..self.0]);
+
+        let len_b = usize::from_le_bytes(buf);
+
+        // TODO: Not sure if unwrap() can actually panic here. When we insert
+        // data we have a valid [`String`] instance and we call String::as_bytes()
+        // to serialize it into binary. If unwrap() can't panic then we should
+        // use the unchecked version of from_utf8 that doesn't loop through the
+        // entire string to check that all bytes are valid UTF-8.
+        std::str::from_utf8(&a[self.0..self.0 + len_a])
+            .unwrap()
+            .cmp(std::str::from_utf8(&b[self.0..self.0 + len_b]).unwrap())
     }
 }
 
@@ -385,7 +401,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         }
 
         let query = self.exec(&format!(
-            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
+            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}' AND type = 'table';"
         ))?;
 
         if query.is_empty() {
@@ -411,6 +427,50 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         schema.prepend_row_id();
 
         Ok((schema, root))
+    }
+
+    pub fn indexes_of(&mut self, table: &str) -> Result<Vec<(String, PageNumber)>, DbError> {
+        let query = self.exec(&format!(
+            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}' AND type = 'index';"
+        ))?;
+
+        let mut indexes = Vec::new();
+
+        for i in 0..query.results.len() {
+            let root = match query.get(i, "root") {
+                Some(Value::Number(root)) => *root as PageNumber,
+                _ => unreachable!(),
+            };
+
+            let column = match query.get(i, "sql") {
+                Some(Value::String(sql)) => match Parser::new(sql).parse_statement()? {
+                    Statement::Create(Create::Index { column, .. }) => column,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            indexes.push((column, root));
+        }
+
+        Ok(indexes)
+    }
+
+    pub fn root_of_index(&mut self, index: &str) -> Result<PageNumber, DbError> {
+        let query = self.exec(&format!(
+            "SELECT root FROM {MKDB_META} where name = '{index}' AND type = 'index';"
+        ))?;
+
+        if query.is_empty() {
+            return Err(DbError::Sql(SqlError::Other(format!(
+                "index {index} does not exist"
+            ))));
+        }
+
+        match query.get(0, "root") {
+            Some(Value::Number(root)) => Ok(*root as PageNumber),
+            _ => unreachable!(),
+        }
     }
 
     pub(crate) fn next_row_id(&mut self, table: &str) -> Result<RowId, DbError> {
@@ -458,16 +518,28 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, io, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        io::{self, Read, Seek, Write},
+        rc::Rc,
+    };
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
+        ascii_table,
         db::{mkdb_meta_schema, Projection, Schema, SqlError, TypeError, VmDataType},
-        paging::{io::MemBuf, pager::Pager},
+        paging::{
+            self,
+            cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
+            io::MemBuf,
+            pager::Pager,
+        },
         sql::{
             parser::Parser,
             statement::{Column, Constraint, DataType, Expression, Value},
         },
+        storage::{reassemble_payload, tuple, Cursor},
     };
 
     impl PartialEq for DbError {
@@ -481,16 +553,32 @@ mod tests {
         }
     }
 
-    fn init_database() -> io::Result<Database<MemBuf>> {
-        let mut pager = Pager::new(
-            io::Cursor::new(Vec::<u8>::new()),
-            DEFAULT_PAGE_SIZE,
-            DEFAULT_PAGE_SIZE,
-        );
+    struct DbConf {
+        page_size: usize,
+        cache_size: usize,
+    }
 
+    fn init_database_with(conf: DbConf) -> io::Result<Database<MemBuf>> {
+        let cache = Cache::builder()
+            .page_size(conf.page_size)
+            .max_size(conf.cache_size)
+            .build();
+        let mut pager = Pager::with_cache(
+            io::Cursor::new(Vec::<u8>::new()),
+            conf.page_size,
+            conf.page_size,
+            cache,
+        );
         pager.init()?;
 
         Ok(Database::new(Rc::new(RefCell::new(pager))))
+    }
+
+    fn init_database() -> io::Result<Database<MemBuf>> {
+        init_database_with(DbConf {
+            cache_size: DEFAULT_MAX_CACHE_SIZE,
+            page_size: DEFAULT_PAGE_SIZE,
+        })
     }
 
     #[test]
@@ -518,7 +606,7 @@ mod tests {
                     Value::Number(2),
                     Value::String("users".into()),
                     Value::String(
-                        Parser::new("CREATE INDEX users_pk_index ON users(id);")
+                        Parser::new("CREATE UNIQUE INDEX users_pk_index ON users(id);")
                             .parse_statement()?
                             .to_string()
                     )
@@ -556,64 +644,6 @@ mod tests {
                 vec![Value::Number(1), Value::String("John Doe".into())],
                 vec![Value::Number(2), Value::String("Jane Doe".into())],
             ]
-        });
-
-        Ok(())
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn insert_many() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        let create_table = r#"
-            CREATE TABLE users (
-                id INT PRIMARY KEY,
-                name VARCHAR(255),
-                email VARCHAR(255) UNIQUE
-            );
-        "#;
-
-        db.exec(create_table)?;
-
-        let mut expected = Vec::new();
-
-        for i in 1..=100 {
-            let name = format!("User {i}");
-            let email = format!("user{i}@test.com");
-
-            expected.push(vec![
-                Value::Number(i),
-                Value::String(name.clone()),
-                Value::String(email.clone()),
-            ]);
-
-            db.exec(&format!(
-                "INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');"
-            ))?;
-        }
-
-        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
-
-        assert_eq!(query, Projection {
-            schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![],
-                },
-                Column {
-                    name: "email".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![Constraint::Unique],
-                }
-            ]),
-            results: expected
         });
 
         Ok(())
@@ -894,13 +924,13 @@ mod tests {
         let mut db = init_database()?;
 
         let t1 = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
-        let i1 = "CREATE INDEX users_pk_index ON users(id);";
+        let i1 = "CREATE UNIQUE INDEX users_pk_index ON users(id);";
 
         let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
-        let i2 = "CREATE INDEX tasks_pk_index ON tasks(id);";
+        let i2 = "CREATE UNIQUE INDEX tasks_pk_index ON tasks(id);";
 
         let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
-        let i3 = "CREATE INDEX products_pk_index ON products(id);";
+        let i3 = "CREATE UNIQUE INDEX products_pk_index ON products(id);";
 
         db.exec(t1)?;
         db.exec(t2)?;
@@ -975,7 +1005,7 @@ mod tests {
             let index_name = format!("{table_name}_pk_index");
 
             let table_sql = format!("CREATE TABLE {table_name} {schema};");
-            let index_sql = format!("CREATE INDEX {index_name} ON {table_name}(id);");
+            let index_sql = format!("CREATE UNIQUE INDEX {index_name} ON {table_name}(id);");
 
             db.exec(&table_sql)?;
 
@@ -1180,6 +1210,230 @@ mod tests {
                 ]
             ]
         });
+
+        Ok(())
+    }
+
+    fn assert_index_contains<I: Seek + Read + Write + paging::io::Sync>(
+        db: &mut Database<I>,
+        name: &str,
+        schema: Schema,
+        expected_entries: &[Vec<Value>],
+    ) -> Result<(), DbError> {
+        let root = db.root_of_index(name)?;
+
+        let mut pager = db.pager.borrow_mut();
+        let mut cursor = Cursor::new(root, 0);
+
+        let mut entries = Vec::new();
+
+        while let Some((page, slot)) = cursor.try_next(&mut pager)? {
+            let entry = reassemble_payload(&mut pager, page, slot)?;
+            entries.push(tuple::deserialize_values(entry.as_ref(), &schema));
+        }
+
+        assert_eq!(entries.len(), expected_entries.len());
+
+        for (entry, expected) in entries.iter().zip(expected_entries.iter()) {
+            assert_eq!(entry, expected);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_pk_index_on_insert() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (100, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (200, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (300, 'Some Dude', 24);")?;
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Schema::from(vec![
+                Column::new("id", DataType::Int),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &[
+                vec![Value::Number(100), Value::Number(1)],
+                vec![Value::Number(200), Value::Number(2)],
+                vec![Value::Number(300), Value::Number(3)],
+            ],
+        )
+    }
+
+    #[test]
+    fn update_multiple_indexes_on_insert() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, name VARCHAR(64));",
+        )?;
+        db.exec("CREATE UNIQUE INDEX name_idx ON users(name);")?;
+
+        db.exec("INSERT INTO users(id, name, email) VALUES (100, 'John Doe', 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (200, 'Jane Doe', 'jane@email.com');")?;
+        db.exec(
+            "INSERT INTO users(id, name, email) VALUES (300, 'Some Dude', 'some_dude@email.com');",
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Schema::from(vec![
+                Column::new("id", DataType::Int),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &[
+                vec![Value::Number(100), Value::Number(1)],
+                vec![Value::Number(200), Value::Number(2)],
+                vec![Value::Number(300), Value::Number(3)],
+            ],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Schema::from(vec![
+                Column::new("email", DataType::Varchar(255)),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &[
+                vec![Value::String("jane@email.com".into()), Value::Number(2)],
+                vec![Value::String("john@email.com".into()), Value::Number(1)],
+                vec![
+                    Value::String("some_dude@email.com".into()),
+                    Value::Number(3),
+                ],
+            ],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "name_idx",
+            Schema::from(vec![
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &[
+                vec![Value::String("Jane Doe".into()), Value::Number(2)],
+                vec![Value::String("John Doe".into()), Value::Number(1)],
+                vec![Value::String("Some Dude".into()), Value::Number(3)],
+            ],
+        )
+    }
+
+    /// This test really "tests" the limits of the underlying BTrees by using a
+    /// really small page size and variable length data that's going to force
+    /// the BTrees to allocate a bunch of overflow pages and rebalance many
+    /// times. The pager will allocate hundreds of both overflow and slotted
+    /// pages. On top of that, we set the cache size to a really small number
+    /// to force as many evictions as possible.
+    ///
+    /// If this one works then I guess we can go home...
+    #[cfg(not(miri))]
+    #[test]
+    fn insert_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 8,
+        })?;
+
+        let create_table = r#"
+            CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name VARCHAR(255),
+                email VARCHAR(255) UNIQUE
+            );
+        "#;
+
+        db.exec(create_table)?;
+
+        let mut expected_table_entries = Vec::new();
+        let mut expected_pk_index_entries = Vec::new();
+        let mut expected_email_uq_index_entries = Vec::new();
+
+        for i in 1..200 {
+            let name = format!("User {i}");
+            let email = format!("user{i}@test.com");
+
+            expected_table_entries.push(vec![
+                Value::Number(i),
+                Value::String(name.clone()),
+                Value::String(email.clone()),
+            ]);
+
+            expected_pk_index_entries.push(vec![Value::Number(i), Value::Number(i)]);
+
+            expected_email_uq_index_entries
+                .push(vec![Value::String(email.clone()), Value::Number(i)]);
+
+            db.exec(&format!(
+                "INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');"
+            ))?;
+        }
+
+        expected_email_uq_index_entries.sort_by(|a, b| {
+            let (Value::String(email_a), Value::String(email_b)) = (&a[0], &b[0]) else {
+                unreachable!();
+            };
+
+            email_a.cmp(email_b)
+        });
+
+        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
+
+        assert_eq!(&query, &Projection {
+            schema: Schema::from(vec![
+                Column {
+                    name: "id".into(),
+                    data_type: DataType::Int,
+                    constraints: vec![Constraint::PrimaryKey],
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: DataType::Varchar(255),
+                    constraints: vec![],
+                },
+                Column {
+                    name: "email".into(),
+                    data_type: DataType::Varchar(255),
+                    constraints: vec![Constraint::Unique],
+                }
+            ]),
+            results: expected_table_entries.clone()
+        });
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Schema::from(vec![
+                Column::new("id", DataType::Int),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &expected_pk_index_entries,
+        )?;
+
+        expected_table_entries.sort_by(|a, b| {
+            let (Value::String(email_a), Value::String(email_b)) = (&a[2], &b[2]) else {
+                unreachable!()
+            };
+
+            email_a.cmp(&email_b)
+        });
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Schema::from(vec![
+                Column::new("email", DataType::Varchar(255)),
+                Column::new("row_id", DataType::UnsignedBigInt),
+            ]),
+            &expected_email_uq_index_entries,
+        )?;
 
         Ok(())
     }

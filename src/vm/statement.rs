@@ -33,18 +33,28 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 Value::String(sql),
             ])?;
 
-            if let Some(primary_key) = columns
+            let indexes = columns
                 .into_iter()
-                .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
-            {
-                exec(
-                    Statement::Create(Create::Index {
-                        name: format!("{name}_pk_index"),
-                        table: name,
-                        column: primary_key.name,
-                    }),
-                    db,
-                )?;
+                .filter(|col| !col.constraints.is_empty())
+                .flat_map(|col| {
+                    let table_name = name.clone();
+                    col.constraints.into_iter().map(move |constraint| {
+                        let index_name = match constraint {
+                            Constraint::PrimaryKey => format!("{table_name}_pk_index"),
+                            Constraint::Unique => format!("{table_name}_{}_uq_index", &col.name),
+                        };
+
+                        Create::Index {
+                            name: index_name,
+                            table: table_name.clone(),
+                            column: col.name.clone(),
+                            unique: true,
+                        }
+                    })
+                });
+
+            for create_index in indexes {
+                exec(Statement::Create(create_index), db)?;
             }
         }
 

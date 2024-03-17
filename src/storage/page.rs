@@ -1627,6 +1627,13 @@ impl Page {
         let mut drain_index = start;
         let mut slot_index = start;
 
+        if let Some(ovf) = self.overflow.peek() {
+            debug_assert!(
+                start <= ovf.index as usize,
+                "doesn't work correctly in this case, better use a hash map or something"
+            );
+        }
+
         iter::from_fn(move || {
             // Copy cells until we reach the end.
             if drain_index < end {
@@ -1670,7 +1677,7 @@ impl Debug for Page {
             .field("slots", &self.slot_array())
             .field_with("cells", |f| {
                 let mut list = f.debug_list();
-                (0..self.len()).for_each(|slot| {
+                (0..self.header().num_slots).for_each(|slot| {
                     let cell = self.cell(slot);
                     let offset = self.slot_array()[slot as usize];
                     list.entry_with(|f| {

@@ -33,16 +33,20 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             values,
         } => {
             let (schema, root) = db.table_metadata(&into)?;
+
             let source = Box::new(Plan::Values(Values {
                 values,
                 done: false,
             }));
+
+            let indexes = db.indexes_of(&into)?;
 
             Plan::Insert(Insert {
                 pager: Rc::clone(&db.pager),
                 root,
                 schema,
                 source,
+                indexes,
             })
         }
 

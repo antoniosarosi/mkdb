@@ -178,20 +178,29 @@ impl<'i> Parser<'i> {
             }
 
             Keyword::Create => {
-                let keyword =
-                    self.expect_one_of(&[Keyword::Database, Keyword::Table, Keyword::Index])?;
-
-                let identifier = self.parse_identifier()?;
+                let keyword = self.expect_one_of(&[
+                    Keyword::Database,
+                    Keyword::Table,
+                    Keyword::Unique,
+                    Keyword::Index,
+                ])?;
 
                 Statement::Create(match keyword {
-                    Keyword::Database => Create::Database(identifier),
+                    Keyword::Database => Create::Database(self.parse_identifier()?),
 
                     Keyword::Table => Create::Table {
-                        name: identifier,
+                        name: self.parse_identifier()?,
                         columns: self.parse_column_definitions()?,
                     },
 
-                    Keyword::Index => {
+                    Keyword::Unique | Keyword::Index => {
+                        let unique = keyword == Keyword::Unique;
+
+                        if unique {
+                            self.expect_keyword(Keyword::Index)?;
+                        }
+
+                        let name = self.parse_identifier()?;
                         self.expect_keyword(Keyword::On)?;
                         let table = self.parse_identifier()?;
 
@@ -200,9 +209,10 @@ impl<'i> Parser<'i> {
                         self.expect_token(Token::RightParen)?;
 
                         Create::Index {
-                            name: identifier,
+                            name,
                             table,
                             column,
+                            unique,
                         }
                     }
 
@@ -924,6 +934,36 @@ mod tests {
                         constraints: vec![Constraint::Unique],
                     },
                 ]
+            }))
+        )
+    }
+
+    #[test]
+    fn parse_create_index() {
+        let sql = "CREATE INDEX test_idx ON test(some_column);";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Ok(Statement::Create(Create::Index {
+                name: "test_idx".into(),
+                table: "test".into(),
+                column: "some_column".into(),
+                unique: false,
+            }))
+        )
+    }
+
+    #[test]
+    fn parse_create_unique_index() {
+        let sql = "CREATE UNIQUE INDEX email_uq_idx ON users(email);";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Ok(Statement::Create(Create::Index {
+                name: "email_uq_idx".into(),
+                table: "users".into(),
+                column: "email".into(),
+                unique: true,
             }))
         )
     }

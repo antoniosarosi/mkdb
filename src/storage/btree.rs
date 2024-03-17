@@ -4,7 +4,7 @@
 
 use std::{
     cmp::{min, Ordering, Reverse},
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     io::{self, Read, Seek, Write},
     mem,
 };
@@ -79,6 +79,7 @@ struct Removal {
 /// back to this node.
 ///
 /// See [`BTree::load_siblings`] and [`BTree::balance`] for details.
+#[derive(Debug, Clone, Copy)]
 struct Sibling {
     /// Page number of this sibling node.
     page: PageNumber,
@@ -321,7 +322,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         match search.index {
             Err(_) => Ok(None),
-            Ok(index) => Ok(Some(self.reassemble_payload(search.page, index)?)),
+            Ok(index) => Ok(Some(reassemble_payload(self.pager, search.page, index)?)),
         }
     }
 
@@ -415,7 +416,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             // example, "a" is always less than "abcdefg", so there's no point
             // in reassembling the entire string.
             let payload = if cell.header.is_overflow {
-                match self.reassemble_payload(page, mid)? {
+                match reassemble_payload(self.pager, page, mid)? {
                     Payload::Reassembled(buf) => overflow_buf = buf,
                     _ => unreachable!(),
                 }
@@ -779,7 +780,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             return Ok(None);
         }
 
-        self.reassemble_payload(page, slot).map(Some)
+        reassemble_payload(self.pager, page, slot).map(Some)
     }
 
     /// B*-Tree balancing algorithm inspired by (or rather stolen from) SQLite
@@ -1469,13 +1470,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         // Root underflow.
         if is_root && is_underflow {
-            let child_page = node.header().right_child;
-
             // Root doesn't have children, can't do anything.
-            if child_page == 0 {
+            if node.is_leaf() {
                 return Ok(());
             }
 
+            let child_page = node.header().right_child;
             let necessary_space = self.pager.get(child_page)?.used_bytes();
 
             // Account for page zero having less space than the rest of pages.
@@ -1503,12 +1503,12 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             let new_page = self.pager.alloc_page::<Page>()?;
 
             let root = self.pager.get_mut(page)?;
-            let old_child = mem::replace(&mut root.header_mut().right_child, new_page);
+            let grandchild = mem::replace(&mut root.header_mut().right_child, new_page);
             let cells = root.drain(..).collect::<Vec<_>>();
 
             let new_child = self.pager.get_mut(new_page)?;
             cells.into_iter().for_each(|cell| new_child.push(cell));
-            new_child.header_mut().right_child = old_child;
+            new_child.header_mut().right_child = grandchild;
 
             parents.push(page);
             page = new_page;
@@ -1517,6 +1517,13 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         // Internal/Leaf node Overflow/Underlow.
         let parent_page = parents.remove(parents.len() - 1);
         let mut siblings = self.load_siblings(page, parent_page)?;
+
+        // Run into some nasty bug because of this and it was hard to spot so...
+        debug_assert_eq!(
+            HashSet::<PageNumber>::from_iter(siblings.iter().map(|s| s.page)).len(),
+            siblings.len(),
+            "siblings array contains duplicated pages: {siblings:?}"
+        );
 
         let mut cells = VecDeque::new();
         let divider_idx = siblings[0].index;
@@ -1595,6 +1602,20 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
             .enumerate()
             .for_each(|(i, Reverse(page))| siblings[i].page = *page);
 
+        // Fix children pointers.
+        let last_sibling = siblings[siblings.len() - 1];
+        self.pager
+            .get_mut(last_sibling.page)?
+            .header_mut()
+            .right_child = old_right_child;
+
+        let parent_node = self.pager.get_mut(parent_page)?;
+        if divider_idx == parent_node.len() {
+            parent_node.header_mut().right_child = last_sibling.page;
+        } else {
+            parent_node.cell_mut(divider_idx).header.left_child = last_sibling.page;
+        }
+
         // Begin redistribution.
         for (i, n) in number_of_cells_per_page.iter().enumerate() {
             let page = self.pager.get_mut(siblings[i].page)?;
@@ -1610,24 +1631,6 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
                     .get_mut(parent_page)?
                     .insert(siblings[i].index, divider);
             }
-        }
-
-        let last_sibling = siblings.last().unwrap();
-
-        // Fix children pointers.
-        self.pager
-            .get_mut(last_sibling.page)?
-            .header_mut()
-            .right_child = old_right_child;
-
-        if last_sibling.index == self.pager.get(parent_page)?.len() {
-            self.pager.get_mut(parent_page)?.header_mut().right_child = last_sibling.page;
-        } else {
-            self.pager
-                .get_mut(parent_page)?
-                .cell_mut(last_sibling.index)
-                .header
-                .left_child = last_sibling.page;
         }
 
         // Done, propagate upwards.
@@ -1671,7 +1674,9 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         let parent = self.pager.get(parent_page)?;
 
-        // TODO: Store this somewhere somehow.
+        // TODO: Store this somewhere somehow, probably in the "parents" Vec that
+        // we keep passing around. It's not a big deal anyway except for large
+        // pages with many cells.
         let index = parent.iter_children().position(|p| p == page).unwrap() as u16;
 
         if index == 0 || index == parent.len() {
@@ -1768,33 +1773,6 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
         Ok(())
     }
 
-    /// Joins a split payload back into one contiguous memory region.
-    ///
-    /// If the cell at the given slot is not "overflow" then this simply returns
-    /// a reference to its content.
-    fn reassemble_payload(&mut self, page: PageNumber, slot: SlotId) -> io::Result<Payload> {
-        let cell = self.pager.get(page)?.cell(slot);
-
-        // TODO: Check if we can circumvent Rust borrowing rules to use just
-        // `cell.content` here.
-        if !cell.header.is_overflow {
-            return Ok(Payload::PageRef(&self.pager.get(page)?.cell(slot).content));
-        }
-
-        let mut overflow_page = cell.overflow_page();
-
-        let mut payload =
-            Vec::from(&cell.content[..cell.content.len() - mem::size_of::<PageNumber>()]);
-
-        while overflow_page != 0 {
-            let page = self.pager.get_as::<OverflowPage>(overflow_page)?;
-            payload.extend_from_slice(page.payload());
-            overflow_page = page.header().next;
-        }
-
-        Ok(Payload::Reassembled(payload.into()))
-    }
-
     #[cfg(debug_assertions)]
     fn read_into_mem(
         &mut self,
@@ -1842,7 +1820,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
             assert!(
                 !page.is_overflow(),
-                "indexing overflow pages is not supported"
+                "page {number} is overflow and indexing overflow pages is not supported"
             );
 
             for i in 1..page.len() {
@@ -1866,6 +1844,36 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
 
         Ok(string)
     }
+}
+
+/// Joins a split payload back into one contiguous memory region.
+///
+/// If the cell at the given slot is not "overflow" then this simply returns a
+/// reference to its content.
+pub(crate) fn reassemble_payload<I: Seek + Read + Write>(
+    pager: &mut Pager<I>,
+    page: PageNumber,
+    slot: SlotId,
+) -> io::Result<Payload> {
+    let cell = pager.get(page)?.cell(slot);
+
+    // TODO: Check if we can circumvent Rust borrowing rules to use just
+    // `cell.content` here.
+    if !cell.header.is_overflow {
+        return Ok(Payload::PageRef(&pager.get(page)?.cell(slot).content));
+    }
+
+    let mut overflow_page = cell.overflow_page();
+
+    let mut payload = Vec::from(&cell.content[..cell.content.len() - mem::size_of::<PageNumber>()]);
+
+    while overflow_page != 0 {
+        let page = pager.get_as::<OverflowPage>(overflow_page)?;
+        payload.extend_from_slice(page.payload());
+        overflow_page = page.header().next;
+    }
+
+    Ok(Payload::Reassembled(payload.into()))
 }
 
 /// BTree cursor.
@@ -4008,6 +4016,72 @@ mod tests {
         btree.try_remove_all_keys(2..=31)?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1]));
+
+        Ok(())
+    }
+
+    /// Same as [`basic_insertion`] but inserting in reverse order.
+    #[test]
+    fn reverse_order_basic_insertion() -> io::Result<()> {
+        let btree = BTree::builder().keys(1..=15).try_build()?;
+
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 12],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10, 11]),
+                Node::leaf([13, 14, 15]),
+            ]
+        });
+
+        Ok(())
+    }
+
+    /// Same as [`propagate_split_to_root`] but reversing the order.
+    #[test]
+    fn reverse_order_insertion() -> io::Result<()> {
+        let btree = BTree::builder().keys((1..=16).rev()).try_build()?;
+
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![11],
+            children: vec![
+                Node {
+                    keys: vec![4, 8],
+                    children: vec![
+                        Node::leaf([1, 2, 3]),
+                        Node::leaf([5, 6, 7]),
+                        Node::leaf([9, 10]),
+                    ]
+                },
+                Node {
+                    keys: vec![14],
+                    children: vec![Node::leaf([12, 13]), Node::leaf([15, 16])]
+                }
+            ]
+        });
+
+        Ok(())
+    }
+
+    /// Same as [`basic_insertion`] but inserting more "randomly".
+    #[test]
+    fn random_order_basic_insertion() -> io::Result<()> {
+        let mut btree = BTree::builder().try_build()?;
+
+        btree.try_insert_all_keys([4, 2, 1, 3, 5])?;
+        btree.try_insert_all_keys([11, 15, 13, 12, 14])?;
+        btree.try_insert_all_keys([8, 6, 9, 7, 10])?;
+
+        assert_eq!(Node::try_from(btree)?, Node {
+            keys: vec![4, 8, 12],
+            children: vec![
+                Node::leaf([1, 2, 3]),
+                Node::leaf([5, 6, 7]),
+                Node::leaf([9, 10, 11]),
+                Node::leaf([13, 14, 15]),
+            ]
+        });
 
         Ok(())
     }

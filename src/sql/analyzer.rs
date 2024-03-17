@@ -34,7 +34,13 @@ pub(crate) fn analyze<I: Seek + Read + Write + paging::io::Sync>(
             }
         }
 
-        Statement::Create(Create::Index { table, .. }) => {
+        Statement::Create(Create::Index { table, unique, .. }) => {
+            if !unique {
+                return Err(DbError::Sql(SqlError::Other(
+                    "non-unique indexes are not supported".into(),
+                )));
+            }
+
             db.table_metadata(table)?;
         }
 

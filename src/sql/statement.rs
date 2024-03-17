@@ -131,6 +131,16 @@ pub(crate) struct Column {
     pub constraints: Vec<Constraint>,
 }
 
+impl Column {
+    pub fn new(name: &str, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            constraints: vec![],
+        }
+    }
+}
+
 /// `CREATE` statement.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Create {
@@ -143,6 +153,7 @@ pub(crate) enum Create {
         name: String,
         table: String,
         column: String,
+        unique: bool,
     },
 }
 
@@ -290,8 +301,10 @@ impl Display for Statement {
                     name,
                     table,
                     column,
+                    unique,
                 } => {
-                    write!(f, "CREATE INDEX {name} ON {table}({column})")?;
+                    let unique = if *unique { " UNIQUE " } else { " " };
+                    write!(f, "CREATE{unique}INDEX {name} ON {table}({column})")?;
                 }
             },
 
