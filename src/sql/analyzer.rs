@@ -23,6 +23,23 @@ pub(crate) enum AnalyzerError {
     MissingColumns,
     /// Multiple primary keys defined for the same table.
     MultiplePrimaryKeys,
+    /// Table or index already exists.
+    AlreadyExists(AlreadyExists),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum AlreadyExists {
+    Table(String),
+    Index(String),
+}
+
+impl Display for AlreadyExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Index(index) => write!(f, "index {index} already exists"),
+            Self::Table(table) => write!(f, "table {table} already exists"),
+        }
+    }
 }
 
 impl Display for AnalyzerError {
@@ -33,6 +50,7 @@ impl Display for AnalyzerError {
             Self::MissingColumns => {
                 f.write_str("default values are not supported, all columns must be specified")
             }
+            Self::AlreadyExists(already_exists) => write!(f, "{already_exists}"),
         }
     }
 }
@@ -45,7 +63,21 @@ pub(crate) fn analyze(
     ctx: &mut impl DatabaseContext,
 ) -> Result<(), DbError> {
     match statement {
-        Statement::Create(Create::Table { columns, .. }) => {
+        Statement::Create(Create::Table { columns, name }) => {
+            match ctx.table_metadata(name) {
+                Err(DbError::Sql(SqlError::InvalidTable(_))) => {
+                    // Table doesn't exist, we can create it.
+                }
+
+                Ok(_) => {
+                    return Err(DbError::from(AnalyzerError::AlreadyExists(
+                        AlreadyExists::Table(name.clone()),
+                    )));
+                }
+
+                Err(e) => return Err(e),
+            }
+
             let mut found_primary_key = false;
 
             for col in columns {
@@ -58,14 +90,28 @@ pub(crate) fn analyze(
             }
         }
 
-        Statement::Create(Create::Index { table, unique, .. }) => {
+        Statement::Create(Create::Index {
+            table,
+            unique,
+            name,
+            ..
+        }) => {
             if !unique {
                 return Err(DbError::Sql(SqlError::Other(
                     "non-unique indexes are not supported".into(),
                 )));
             }
 
-            ctx.table_metadata(table)?;
+            let metadata = ctx.table_metadata(table)?;
+
+            // TODO: We're only checking if the table has an index with the same
+            // name, but we should check all indexes. We don't have an index
+            // cache yet so we'll do this at least.
+            if metadata.indexes.iter().any(|index| &index.name == name) {
+                return Err(
+                    AnalyzerError::AlreadyExists(AlreadyExists::Index(name.clone())).into(),
+                );
+            }
         }
 
         Statement::Insert {
@@ -285,7 +331,7 @@ pub(crate) fn analyze_expression(
 
 #[cfg(test)]
 mod tests {
-    use super::AnalyzerError;
+    use super::{AlreadyExists, AnalyzerError};
     use crate::{
         db::{Context, DbError, SqlError},
         sql::{
@@ -406,6 +452,15 @@ mod tests {
                 expected: VmDataType::String,
                 found: Expression::Value(Value::Number(2))
             })),
+        })
+    }
+
+    #[test]
+    fn table_already_exists() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],
+            sql: "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+            expected: Err(DbError::from(AnalyzerError::AlreadyExists(AlreadyExists::Table("users".into())))),
         })
     }
 }

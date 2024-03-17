@@ -304,12 +304,12 @@ impl TryFrom<&[&str]> for Context {
                     let mut schema = Schema::from(columns.clone());
                     schema.prepend_row_id();
 
-                    context.insert(name.clone(), TableMetadata {
+                    let mut metadata = TableMetadata {
                         root,
                         row_id: 1,
                         schema,
                         indexes: vec![],
-                    });
+                    };
                     root += 1;
 
                     use crate::sql::statement::Constraint;
@@ -321,7 +321,7 @@ impl TryFrom<&[&str]> for Context {
                                 Constraint::Unique => format!("{name}_{}_uq_index", col.name),
                             };
 
-                            context.table_metadata(&name)?.indexes.push(IndexMetadata {
+                            metadata.indexes.push(IndexMetadata {
                                 column: col.name.clone(),
                                 name: index_name,
                                 root,
@@ -330,6 +330,8 @@ impl TryFrom<&[&str]> for Context {
                             root += 1;
                         }
                     }
+
+                    context.insert(name.clone(), metadata);
                 }
 
                 Statement::Create(Create::Index {
