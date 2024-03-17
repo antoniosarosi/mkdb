@@ -139,6 +139,22 @@ impl Column {
             constraints: vec![],
         }
     }
+
+    pub fn primary_key(name: &str, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            constraints: vec![Constraint::PrimaryKey],
+        }
+    }
+
+    pub fn unique(name: &str, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            constraints: vec![Constraint::Unique],
+        }
+    }
 }
 
 /// `CREATE` statement.

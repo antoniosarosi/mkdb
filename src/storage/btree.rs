@@ -27,6 +27,10 @@ use crate::paging::pager::{PageNumber, Pager};
 /// is up to the implementer to determine the [`Ordering`]. The format of `A`
 /// and `B` is also defined by the [`BTree`] user, since the [`BTree`] only
 /// receives binary buffers as parameters.
+///
+/// We provide a couple of reusable comparators in this module:
+/// - [`FixedSizeMemCmp`]
+/// - [`StringCmp`]
 pub(crate) trait BytesCmp {
     /// Compares two byte arrays and returns the corresponding [`Ordering`].
     ///
@@ -38,12 +42,25 @@ pub(crate) trait BytesCmp {
 }
 
 /// Compares the first `self.0` number of bytes using the good old `memcmp`.
-/// This is more useful than it seems at first glance because if we store keys
-/// at the beginning of the binary buffer in big endian format, then this is
-/// all we need to successfuly determine the [`Ordering`].
+/// This is more useful than it seems at first glance because if we store
+/// integer keys at the beginning of the binary buffer in big endian format,
+/// then this is all we need to successfuly determine the [`Ordering`].
 pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {
+    /// Creates a comparator for a certain type.
+    ///
+    /// ```no_run
+    /// let comparator = FixedSizeMemCmp::for_type::<u32>();
+    ///
+    /// let a = [1, 0, 0, 0, 0, 0, 0]
+    /// let b = [2, 0, 0, 0]
+    ///
+    /// assert_eq!(comparator.bytes_cmp(a, b), std::cmp::Ordering::Less);
+    /// ```
+    ///
+    /// Using this with structs or other complex data types probably doesn't
+    /// make sense.
     pub fn for_type<T>() -> Self {
         Self(mem::size_of::<T>())
     }
@@ -52,6 +69,56 @@ impl FixedSizeMemCmp {
 impl BytesCmp for FixedSizeMemCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
         a[..self.0].cmp(&b[..self.0])
+    }
+}
+
+/// Compares UTF-8 strings.
+///
+/// Assumes that the buffers have this format:
+///
+/// ```text
+/// self.0 bytes
+/// +---------+
+/// V         V
+/// +---------+--------+--------+--------+-------+
+/// | STR LEN | BYTE 0 | BYTE 1 | BYTE 2 |  ...  |
+/// +---------+--------+--------+--------+-------+
+///           ^                          ^
+///           +--------------------------+
+///             STR LEN of string bytes
+/// ```
+///
+/// Then computes the total length of the string in bytes by reading the first
+/// `self.0` bytes as a little endian integer and once the total length is known
+/// [`str`] instances can be created.
+pub(crate) struct StringCmp(pub usize);
+
+impl BytesCmp for StringCmp {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        debug_assert!(
+            self.0 <= 2,
+            "currently strings longer than 65535 bytes are not supported"
+        );
+
+        let mut buf = [0; std::mem::size_of::<usize>()];
+
+        buf[..self.0].copy_from_slice(&a[..self.0]);
+
+        let len_a = usize::from_le_bytes(buf);
+
+        buf.fill(0);
+        buf[..self.0].copy_from_slice(&b[..self.0]);
+
+        let len_b = usize::from_le_bytes(buf);
+
+        // TODO: Not sure if unwrap() can actually panic here. When we insert
+        // data we have a valid [`String`] instance and we call String::as_bytes()
+        // to serialize it into binary. If unwrap() can't panic then we should
+        // use the unchecked version of from_utf8 that doesn't loop through the
+        // entire string to check that all bytes are valid UTF-8.
+        std::str::from_utf8(&a[self.0..self.0 + len_a])
+            .unwrap()
+            .cmp(std::str::from_utf8(&b[self.0..self.0 + len_b]).unwrap())
     }
 }
 

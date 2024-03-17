@@ -6,15 +6,18 @@ use std::{
 };
 
 use crate::{
-    db::{Database, DbError, Schema, VmDataType},
-    paging::{self, pager::PageNumber},
+    db::{Database, DatabaseContext, DbError, Schema},
+    paging::{self},
     sql::{
         analyzer,
         statement::{Column, DataType, Expression, Statement},
     },
     storage::Cursor,
-    vm::plan::{
-        BufferedIter, Delete, Filter, Insert, Plan, Project, SeqScan, Sort, Update, Values,
+    vm::{
+        plan::{
+            BufferedIter, Delete, Filter, Insert, Plan, Project, SeqScan, Sort, Update, Values,
+        },
+        VmDataType,
     },
 };
 
@@ -32,21 +35,19 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             columns,
             values,
         } => {
-            let (schema, root) = db.table_metadata(&into)?;
+            let metadata = db.table_metadata(&into)?;
 
             let source = Box::new(Plan::Values(Values {
                 values,
                 done: false,
             }));
 
-            let indexes = db.indexes_of(&into)?;
-
             Plan::Insert(Insert {
-                pager: Rc::clone(&db.pager),
-                root,
-                schema,
+                root: metadata.root,
+                schema: metadata.schema.clone(),
                 source,
-                indexes,
+                indexes: metadata.indexes.clone(),
+                pager: Rc::clone(&db.pager),
             })
         }
 
@@ -56,13 +57,14 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             r#where,
             order_by,
         } => {
-            let (input_schema, root) = db.table_metadata(&from)?;
-            let mut source = generate_seq_scan_plan((input_schema.clone(), root), r#where, db)?;
+            let mut source = generate_seq_scan_plan(&from, r#where, db)?;
+
+            let metadata = db.table_metadata(&from)?;
 
             if !order_by.is_empty() {
                 source = Box::new(Plan::Sort(Sort {
                     by: order_by,
-                    schema: input_schema.clone(),
+                    schema: metadata.schema.clone(),
                     sorted: false,
                     source: BufferedIter::new(source),
                 }));
@@ -73,8 +75,9 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
 
             for (i, expr) in columns.iter().enumerate() {
                 match expr {
-                    Expression::Identifier(ident) => output_schema
-                        .push(input_schema.columns[input_schema.index_of(ident).unwrap()].clone()),
+                    Expression::Identifier(ident) => output_schema.push(
+                        metadata.schema.columns[metadata.schema.index_of(ident).unwrap()].clone(),
+                    ),
 
                     _ => {
                         output_schema.push(Column {
@@ -99,14 +102,14 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             // database after all :)
             for i in unknown_types {
                 if let VmDataType::Number =
-                    analyzer::analyze_expression(&input_schema, &columns[i]).unwrap()
+                    analyzer::analyze_expression(&metadata.schema, &columns[i]).unwrap()
                 {
                     output_schema.columns[i].data_type = DataType::BigInt;
                 }
             }
 
             Plan::Project(Project {
-                input_schema,
+                input_schema: metadata.schema.clone(),
                 output_schema,
                 projection: columns,
                 source,
@@ -118,27 +121,28 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             columns,
             r#where,
         } => {
-            let (schema, root) = db.table_metadata(&table)?;
-            let source = generate_seq_scan_plan((schema.clone(), root), r#where, db)?;
+            let source = generate_seq_scan_plan(&table, r#where, db)?;
+
+            let metadata = db.table_metadata(&table)?;
 
             Plan::Update(Update {
                 assignments: columns,
-                pager: Rc::clone(&db.pager),
-                root,
-                schema: schema.clone(),
+                root: metadata.root,
+                schema: metadata.schema.clone(),
                 source: BufferedIter::new(source),
+                pager: Rc::clone(&db.pager),
             })
         }
 
         Statement::Delete { from, r#where } => {
-            let (schema, root) = db.table_metadata(&from)?;
-            let source = generate_seq_scan_plan((schema.clone(), root), r#where, db)?;
+            let source = generate_seq_scan_plan(&from, r#where, db)?;
+            let metadata = db.table_metadata(&from)?;
 
             Plan::Delete(Delete {
-                pager: Rc::clone(&db.pager),
-                root,
-                schema,
+                root: metadata.root,
+                schema: metadata.schema.clone(),
                 source: BufferedIter::new(source),
+                pager: Rc::clone(&db.pager),
             })
         }
 
@@ -147,11 +151,14 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
 }
 
 pub(crate) fn generate_seq_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
-    metadata: (Schema, PageNumber),
+    table: &str,
     filter: Option<Expression>,
     db: &mut Database<I>,
 ) -> Result<Box<Plan<I>>, DbError> {
-    let (schema, root) = metadata;
+    let metadata = db.table_metadata(table)?;
+
+    let schema = metadata.schema.clone();
+    let root = metadata.root;
 
     let mut plan = Box::new(Plan::SeqScan(SeqScan {
         cursor: Cursor::new(root, 0),

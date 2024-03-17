@@ -287,7 +287,7 @@ impl<'i> Parser<'i> {
     /// works.
     ///
     /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
-    pub(super) fn parse_expression(&mut self) -> ParseResult<Expression> {
+    pub(crate) fn parse_expression(&mut self) -> ParseResult<Expression> {
         self.parse_expr(0)
     }
 
@@ -918,21 +918,9 @@ mod tests {
             Ok(Statement::Create(Create::Table {
                 name: "users".into(),
                 columns: vec![
-                    Column {
-                        name: "id".into(),
-                        data_type: DataType::Int,
-                        constraints: vec![Constraint::PrimaryKey],
-                    },
-                    Column {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(255),
-                        constraints: vec![],
-                    },
-                    Column {
-                        name: "email".into(),
-                        data_type: DataType::Varchar(255),
-                        constraints: vec![Constraint::Unique],
-                    },
+                    Column::primary_key("id", DataType::Int),
+                    Column::new("name", DataType::Varchar(255)),
+                    Column::unique("email", DataType::Varchar(255)),
                 ]
             }))
         )

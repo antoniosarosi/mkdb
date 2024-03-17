@@ -3,7 +3,7 @@
 use std::io::{self, Read, Seek, Write};
 
 use crate::{
-    db::{mkdb_meta_schema, Database, DbError, RowId, MKDB_META, MKDB_META_ROOT},
+    db::{mkdb_meta_schema, Database, DatabaseContext, DbError, RowId, MKDB_META, MKDB_META_ROOT},
     paging::{self, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
     storage::{tuple, BTree, FixedSizeMemCmp},
@@ -65,9 +65,11 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
                 Value::String(String::from("index")),
                 Value::String(name.clone()),
                 Value::Number(root.into()),
-                Value::String(table),
+                Value::String(table.clone()),
                 Value::String(sql),
             ])?;
+
+            db.context.invalidate(&table);
         }
 
         other => unreachable!("unhandled SQL statement: {other}"),
@@ -121,7 +123,10 @@ fn insert_into_mkdb_meta<I: Seek + Read + Write + paging::io::Sync>(
     let mut schema = mkdb_meta_schema();
     // TODO: Avoid shifting elements.
     schema.prepend_row_id();
-    values.insert(0, Value::Number(db.next_row_id(MKDB_META)?.into()));
+    values.insert(
+        0,
+        Value::Number(db.table_metadata(MKDB_META)?.next_row_id().into()),
+    );
 
     let mut pager = db.pager.borrow_mut();
     let mut btree = BTree::new(

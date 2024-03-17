@@ -18,4 +18,7 @@ mod expression;
 
 pub(crate) mod plan;
 pub(crate) mod statement;
-pub(crate) use expression::{eval_where, resolve_expression, resolve_literal_expression};
+
+pub(crate) use expression::{
+    eval_where, resolve_expression, resolve_literal_expression, TypeError, VmDataType, VmError,
+};

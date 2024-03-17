@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    cmp::Ordering,
     collections::HashMap,
     fmt::Display,
     fs::File,
@@ -19,15 +18,12 @@ use crate::{
     query,
     sql::{
         self,
+        analyzer::AnalyzerError,
         parser::{Parser, ParserError},
-        statement::{
-            BinaryOperator, Column, Constraint, Create, DataType, Expression, Statement,
-            UnaryOperator, Value,
-        },
+        statement::{Column, Create, DataType, Statement, Value},
     },
-    storage::{tuple, BTree, BytesCmp, FixedSizeMemCmp},
-    vm,
-    vm::plan::Plan,
+    storage::{tuple, BTree, FixedSizeMemCmp},
+    vm::{self, plan::Plan, TypeError, VmError},
 };
 
 /// Database file default page size.
@@ -45,7 +41,7 @@ pub(crate) type RowId = u64;
 
 pub(crate) struct Database<I> {
     pub pager: Rc<RefCell<Pager<I>>>,
-    row_ids: HashMap<String, u64>,
+    pub context: Context,
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,57 +50,27 @@ pub(crate) struct Projection {
     pub results: Vec<Vec<Value>>,
 }
 
-/// Generic data types used at runtime by [`crate::vm`] without SQL details
-/// such as `UNSIGNED` or `VARCHAR(max)`.
-///
-/// Basically the variants of [`Value`] but without inner data.
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum VmDataType {
-    Bool,
-    String,
-    Number,
-}
-
-impl Display for VmDataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Bool => "boolean",
-            Self::Number => "number",
-            Self::String => "string",
-        })
-    }
-}
-
-impl From<DataType> for VmDataType {
-    fn from(data_type: DataType) -> Self {
-        match data_type {
-            DataType::Varchar(_) => VmDataType::String,
-            DataType::Bool => VmDataType::Bool,
-            _ => VmDataType::Number,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum TypeError {
-    CannotApplyUnary {
-        operator: UnaryOperator,
-        value: Value,
-    },
-    CannotApplyBinary {
-        left: Expression,
-        operator: BinaryOperator,
-        right: Expression,
-    },
-    ExpectedType {
-        expected: VmDataType,
-        found: Expression,
-    },
-}
-
 impl From<TypeError> for SqlError {
     fn from(type_error: TypeError) -> Self {
         SqlError::TypeError(type_error)
+    }
+}
+
+impl From<AnalyzerError> for SqlError {
+    fn from(analyzer_error: AnalyzerError) -> Self {
+        SqlError::AnalyzerError(analyzer_error)
+    }
+}
+
+impl From<VmError> for SqlError {
+    fn from(vm_error: VmError) -> Self {
+        Self::VmError(vm_error)
+    }
+}
+
+impl<E: Into<SqlError>> From<E> for DbError {
+    fn from(err: E) -> Self {
+        DbError::Sql(err.into())
     }
 }
 
@@ -112,11 +78,9 @@ impl From<TypeError> for SqlError {
 pub(crate) enum SqlError {
     InvalidTable(String),
     InvalidColumn(String),
-    ColumnValueCountMismatch,
-    MissingColumns,
-    MultiplePrimaryKeys,
+    AnalyzerError(AnalyzerError),
     TypeError(TypeError),
-    DivisionByZero(i128, i128),
+    VmError(VmError),
     Other(String),
 }
 
@@ -125,33 +89,9 @@ impl Display for SqlError {
         match self {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
             Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
-            Self::ColumnValueCountMismatch => f.write_str("number of columns doesn't match values"),
-            Self::MultiplePrimaryKeys => f.write_str("only one primary key per table is allowed"),
-            Self::MissingColumns => {
-                f.write_str("default values are not supported, all columns must be specified")
-            }
-            Self::TypeError(type_error) => match type_error {
-                TypeError::CannotApplyUnary { operator, value } => {
-                    write!(f, "cannot apply unary operator '{operator}' to {value}")
-                }
-
-                TypeError::CannotApplyBinary {
-                    left,
-                    operator,
-                    right,
-                } => write!(
-                    f,
-                    "cannot binary operator '{operator}' to {left} and {right}"
-                ),
-
-                TypeError::ExpectedType { expected, found } => {
-                    write!(
-                        f,
-                        "expected type {expected} but expression resolved to {found}"
-                    )
-                }
-            },
-            Self::DivisionByZero(left, right) => write!(f, "division by zero: {left} / {right}"),
+            Self::AnalyzerError(analyzer_error) => write!(f, "{analyzer_error}"),
+            Self::VmError(vm_error) => write!(f, "{vm_error}"),
+            Self::TypeError(type_error) => write!(f, "{type_error}"),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -183,12 +123,6 @@ impl From<io::Error> for DbError {
 impl From<ParserError> for DbError {
     fn from(e: ParserError) -> Self {
         Self::Parser(e)
-    }
-}
-
-impl From<SqlError> for DbError {
-    fn from(e: SqlError) -> Self {
-        Self::Sql(e)
     }
 }
 
@@ -238,11 +172,7 @@ impl Schema {
     pub fn prepend_row_id(&mut self) {
         debug_assert!(self.columns[0].name != "row_id");
 
-        let col = Column {
-            name: String::from("row_id"),
-            data_type: DataType::UnsignedBigInt,
-            constraints: vec![],
-        };
+        let col = Column::new("row_id", DataType::UnsignedBigInt);
 
         self.columns.insert(0, col);
         self.index.values_mut().for_each(|idx| *idx += 1);
@@ -294,44 +224,151 @@ impl<I: Seek + Read + Write> TryFrom<Plan<I>> for Projection {
 pub(crate) fn mkdb_meta_schema() -> Schema {
     Schema::from(vec![
         // Either "index" or "table"
-        Column {
-            name: String::from("type"),
-            data_type: DataType::Varchar(255),
-            constraints: vec![],
-        },
+        Column::new("type", DataType::Varchar(255)),
         // Index or table name
-        Column {
-            name: String::from("name"),
-            data_type: DataType::Varchar(255),
-            constraints: vec![Constraint::Unique],
-        },
+        Column::new("name", DataType::Varchar(255)),
         // Root page
-        Column {
-            name: String::from("root"),
-            data_type: DataType::Int,
-            constraints: vec![Constraint::Unique],
-        },
+        Column::new("root", DataType::UnsignedInt),
         // Table name
-        Column {
-            name: String::from("table_name"),
-            data_type: DataType::Varchar(255),
-            constraints: vec![Constraint::Unique],
-        },
+        Column::new("table_name", DataType::Varchar(255)),
         // SQL used to create the index or table.
         // TODO: Implement and use some TEXT data type with higher length limits.
-        Column {
-            name: String::from("sql"),
-            data_type: DataType::Varchar(1000),
-            constraints: vec![],
-        },
+        Column::new("sql", DataType::Varchar(255)),
     ])
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexMetadata {
+    pub root: PageNumber,
+    pub name: String,
+    pub column: String,
+}
+
+pub(crate) struct TableMetadata {
+    pub root: PageNumber,
+    pub schema: Schema,
+    pub indexes: Vec<IndexMetadata>,
+    row_id: RowId,
+}
+
+impl TableMetadata {
+    pub fn next_row_id(&mut self) -> RowId {
+        let row_id = self.row_id;
+        self.row_id += 1;
+
+        row_id
+    }
+}
+
+pub(crate) trait DatabaseContext {
+    fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError>;
+}
+
+pub(crate) struct Context {
+    tables: HashMap<String, TableMetadata>,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+        }
+    }
+
+    pub fn contains(&self, table: &str) -> bool {
+        self.tables.contains_key(table)
+    }
+
+    pub fn insert(&mut self, table: String, metadata: TableMetadata) {
+        self.tables.insert(table, metadata);
+    }
+
+    pub fn invalidate(&mut self, table: &str) {
+        self.tables.remove(table);
+    }
+}
+
+#[cfg(test)]
+impl TryFrom<&[&str]> for Context {
+    type Error = DbError;
+
+    fn try_from(statements: &[&str]) -> Result<Self, Self::Error> {
+        let mut context = Self::new();
+        let mut root = 1;
+
+        for sql in statements {
+            let statement = Parser::new(sql).parse_statement()?;
+
+            match statement {
+                Statement::Create(Create::Table { name, columns }) => {
+                    let mut schema = Schema::from(columns.clone());
+                    schema.prepend_row_id();
+
+                    context.insert(name.clone(), TableMetadata {
+                        root,
+                        row_id: 1,
+                        schema,
+                        indexes: vec![],
+                    });
+                    root += 1;
+
+                    use crate::sql::statement::Constraint;
+
+                    for col in columns {
+                        for constraint in &col.constraints {
+                            let index_name = match constraint {
+                                Constraint::PrimaryKey => format!("{name}_pk_index"),
+                                Constraint::Unique => format!("{name}_{}_uq_index", col.name),
+                            };
+
+                            context.table_metadata(&name)?.indexes.push(IndexMetadata {
+                                column: col.name.clone(),
+                                name: index_name,
+                                root,
+                            });
+
+                            root += 1;
+                        }
+                    }
+                }
+
+                Statement::Create(Create::Index {
+                    name,
+                    column,
+                    unique,
+                    ..
+                }) if unique => {
+                    context.table_metadata(&name)?.indexes.push(IndexMetadata {
+                        column,
+                        name,
+                        root,
+                    });
+                    root += 1;
+                }
+
+                other => return Err(DbError::Sql(SqlError::Other(format!(
+                    "only CREATE TABLE and CREATE UNIQUE INDEX should be used to create a mock context but received {other}"
+                )))),
+            }
+        }
+
+        Ok(context)
+    }
+}
+
+impl DatabaseContext for Context {
+    fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::Sql(SqlError::InvalidTable(table.into())))
+    }
 }
 
 impl<I> Database<I> {
     pub fn new(pager: Rc<RefCell<Pager<I>>>) -> Self {
         Self {
             pager,
-            row_ids: HashMap::new(),
+            context: Context::new(),
         }
     }
 }
@@ -361,80 +398,60 @@ impl Database<File> {
     }
 }
 
-pub(crate) struct StringCmp(pub usize);
+impl<I: Seek + Read + Write + paging::io::Sync> DatabaseContext for Database<I> {
+    fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError> {
+        if !self.context.contains(table) {
+            let metadata = self.load_table_metadata(table)?;
+            self.context.insert(table.into(), metadata);
+        }
 
-impl BytesCmp for StringCmp {
-    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
-        debug_assert!(
-            self.0 <= 2,
-            "currently strings longer than 65535 bytes are not supported"
-        );
-
-        let mut buf = [0; std::mem::size_of::<usize>()];
-
-        buf[..self.0].copy_from_slice(&a[..self.0]);
-
-        let len_a = usize::from_le_bytes(buf);
-
-        buf.fill(0);
-        buf[..self.0].copy_from_slice(&b[..self.0]);
-
-        let len_b = usize::from_le_bytes(buf);
-
-        // TODO: Not sure if unwrap() can actually panic here. When we insert
-        // data we have a valid [`String`] instance and we call String::as_bytes()
-        // to serialize it into binary. If unwrap() can't panic then we should
-        // use the unchecked version of from_utf8 that doesn't loop through the
-        // entire string to check that all bytes are valid UTF-8.
-        std::str::from_utf8(&a[self.0..self.0 + len_a])
-            .unwrap()
-            .cmp(std::str::from_utf8(&b[self.0..self.0 + len_b]).unwrap())
+        self.context.table_metadata(table)
     }
 }
 
 impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
-    pub fn table_metadata(&mut self, table: &str) -> Result<(Schema, PageNumber), DbError> {
+    fn load_next_row_id(&mut self, root: PageNumber) -> Result<RowId, DbError> {
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = BTree::new(&mut pager, root, FixedSizeMemCmp::for_type::<RowId>());
+
+        let row_id = if let Some(max) = btree.max()? {
+            tuple::deserialize_row_id(max.as_ref()) + 1
+        } else {
+            1
+        };
+
+        Ok(row_id)
+    }
+
+    fn load_table_metadata(&mut self, table: &str) -> Result<TableMetadata, DbError> {
         if table == MKDB_META {
             let mut schema = mkdb_meta_schema();
             schema.prepend_row_id();
-            return Ok((schema, MKDB_META_ROOT));
+
+            return Ok(TableMetadata {
+                root: MKDB_META_ROOT,
+                row_id: self.load_next_row_id(MKDB_META_ROOT)?,
+                schema,
+                indexes: vec![],
+            });
         }
 
         let query = self.exec(&format!(
-            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}' AND type = 'table';"
+            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
         ))?;
 
         if query.is_empty() {
             return Err(DbError::Sql(SqlError::InvalidTable(table.into())));
         }
 
-        // TODO: Find some way to avoid parsing SQL every time. Probably a
-        // hash map of table name -> schema, we wouldn't even need to update it
-        // as we don't support ALTER table statements.
-        let mut schema = match query.get(0, "sql") {
-            Some(Value::String(sql)) => match Parser::new(sql).parse_statement()? {
-                Statement::Create(Create::Table { columns, .. }) => Schema::from(columns),
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
+        let mut metadata = TableMetadata {
+            root: 1,
+            row_id: 1,
+            schema: Schema::empty(),
+            indexes: Vec::new(),
         };
 
-        let root = match query.get(0, "root") {
-            Some(Value::Number(root)) => *root as PageNumber,
-            _ => unreachable!(),
-        };
-
-        schema.prepend_row_id();
-
-        Ok((schema, root))
-    }
-
-    pub fn indexes_of(&mut self, table: &str) -> Result<Vec<(String, PageNumber)>, DbError> {
-        let query = self.exec(&format!(
-            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}' AND type = 'index';"
-        ))?;
-
-        let mut indexes = Vec::new();
+        let mut found_table_definition = false;
 
         for i in 0..query.results.len() {
             let root = match query.get(i, "root") {
@@ -442,18 +459,34 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
                 _ => unreachable!(),
             };
 
-            let column = match query.get(i, "sql") {
+            match query.get(i, "sql") {
                 Some(Value::String(sql)) => match Parser::new(sql).parse_statement()? {
-                    Statement::Create(Create::Index { column, .. }) => column,
+                    Statement::Create(Create::Table { columns, .. }) => {
+                        assert!(
+                            !found_table_definition,
+                            "multiple definitions of table '{table}'"
+                        );
+
+                        metadata.root = root;
+                        metadata.schema = Schema::from(columns);
+                        metadata.row_id = self.load_next_row_id(root)?;
+
+                        metadata.schema.prepend_row_id();
+
+                        found_table_definition = true;
+                    }
+
+                    Statement::Create(Create::Index { column, name, .. }) => {
+                        metadata.indexes.push(IndexMetadata { column, name, root })
+                    }
+
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
             };
-
-            indexes.push((column, root));
         }
 
-        Ok(indexes)
+        Ok(metadata)
     }
 
     pub fn root_of_index(&mut self, index: &str) -> Result<PageNumber, DbError> {
@@ -471,27 +504,6 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
             Some(Value::Number(root)) => Ok(*root as PageNumber),
             _ => unreachable!(),
         }
-    }
-
-    pub(crate) fn next_row_id(&mut self, table: &str) -> Result<RowId, DbError> {
-        if let Some(row_id) = self.row_ids.get_mut(table) {
-            *row_id += 1;
-            return Ok(*row_id);
-        }
-
-        let (_, root) = self.table_metadata(table)?;
-
-        let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, root, FixedSizeMemCmp::for_type::<RowId>());
-
-        let row_id = if let Some(max) = btree.max()? {
-            tuple::deserialize_row_id(max.as_ref()) + 1
-        } else {
-            1
-        };
-
-        self.row_ids.insert(String::from(table), row_id);
-        Ok(row_id)
     }
 
     pub fn exec(&mut self, input: &str) -> QueryResult {
@@ -527,8 +539,7 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        ascii_table,
-        db::{mkdb_meta_schema, Projection, Schema, SqlError, TypeError, VmDataType},
+        db::{mkdb_meta_schema, Projection, Schema, SqlError, TypeError},
         paging::{
             self,
             cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
@@ -536,10 +547,12 @@ mod tests {
             pager::Pager,
         },
         sql::{
+            analyzer::AnalyzerError,
             parser::Parser,
-            statement::{Column, Constraint, DataType, Expression, Value},
+            statement::{Column, DataType, Expression, Value},
         },
         storage::{reassemble_payload, tuple, Cursor},
+        vm::VmDataType,
     };
 
     impl PartialEq for DbError {
@@ -629,16 +642,8 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
             ]),
             results: vec![
                 vec![Value::Number(1), Value::String("John Doe".into())],
@@ -661,21 +666,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![
                 vec![
@@ -706,21 +699,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "price".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                },
-                Column {
-                    name: "discount".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("price", DataType::Int),
+                Column::new("discount", DataType::Int),
             ]),
             results: vec![
                 vec![Value::Number(1), Value::Number(110), Value::Number(4),],
@@ -744,21 +725,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![
                 vec![
@@ -790,21 +759,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![
                 vec![
@@ -842,26 +799,10 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "is_admin".into(),
-                    data_type: DataType::Bool,
-                    constraints: vec![],
-                },
+                Column::new("age", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::primary_key("id", DataType::Int),
+                Column::new("is_admin", DataType::Bool),
             ]),
             results: vec![
                 vec![
@@ -894,21 +835,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "price / 10".into(),
-                    data_type: DataType::BigInt,
-                    constraints: vec![]
-                },
-                Column {
-                    name: "discount * 100".into(),
-                    data_type: DataType::BigInt,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("price / 10", DataType::BigInt),
+                Column::new("discount * 100", DataType::BigInt),
             ]),
             results: vec![
                 vec![Value::Number(1), Value::Number(10), Value::Number(500),],
@@ -1082,21 +1011,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![vec![
                 Value::Number(1),
@@ -1123,21 +1040,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![
                 vec![
@@ -1176,21 +1081,9 @@ mod tests {
 
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![]
-                },
-                Column {
-                    name: "age".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![]
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
             ]),
             results: vec![
                 vec![
@@ -1388,21 +1281,9 @@ mod tests {
 
         assert_eq!(&query, &Projection {
             schema: Schema::from(vec![
-                Column {
-                    name: "id".into(),
-                    data_type: DataType::Int,
-                    constraints: vec![Constraint::PrimaryKey],
-                },
-                Column {
-                    name: "name".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![],
-                },
-                Column {
-                    name: "email".into(),
-                    data_type: DataType::Varchar(255),
-                    constraints: vec![Constraint::Unique],
-                }
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
             ]),
             results: expected_table_entries.clone()
         });
@@ -1422,7 +1303,7 @@ mod tests {
                 unreachable!()
             };
 
-            email_a.cmp(&email_b)
+            email_a.cmp(email_b)
         });
 
         assert_index_contains(
@@ -1479,7 +1360,9 @@ mod tests {
 
         assert_eq!(
             db.exec("INSERT INTO users(id, name) VALUES (1, 'John Doe');"),
-            Err(DbError::Sql(SqlError::MissingColumns))
+            Err(DbError::Sql(SqlError::AnalyzerError(
+                AnalyzerError::MissingColumns
+            )))
         );
 
         Ok(())
@@ -1493,7 +1376,9 @@ mod tests {
 
         assert_eq!(
             db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe');"),
-            Err(DbError::Sql(SqlError::ColumnValueCountMismatch))
+            Err(DbError::Sql(SqlError::AnalyzerError(
+                AnalyzerError::ColumnValueCountMismatch
+            )))
         );
 
         Ok(())

@@ -13,6 +13,11 @@
 //! Doing this saves us from some "can't borrow as mutable more than once" and
 //! "can't borrow as mutable because also borrowed as immutable" errors. See
 //! the [`super::pager::Pager`] code for details.
+//!
+//! It's also important to provide an API for "allocating a page" in the cache.
+//! In other words, "give me a page where I can write stuff without having to
+//! allocate anything". We do this through [`Cache::map`] and that allows us to
+//! reuse all the allocated page buffers when reading from disk.
 
 use std::{
     collections::HashMap,
@@ -352,6 +357,7 @@ impl Cache {
         self.max_size
     }
 
+    /// Page size used to allocate pages when calling [`Self::map`].
     pub fn page_size(&self) -> usize {
         self.page_size
     }

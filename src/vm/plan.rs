@@ -9,13 +9,13 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, Projection, QueryResult, RowId, Schema, SqlError, StringCmp},
+    db::{DbError, IndexMetadata, Projection, QueryResult, RowId, Schema, SqlError},
     paging::{
         self,
         pager::{PageNumber, Pager},
     },
     sql::statement::{Assignment, DataType, Expression, Value},
-    storage::{reassemble_payload, tuple, BTree, Cursor, FixedSizeMemCmp},
+    storage::{reassemble_payload, tuple, BTree, Cursor, FixedSizeMemCmp, StringCmp},
     vm,
 };
 
@@ -254,7 +254,7 @@ pub(crate) struct Insert<I> {
     pub pager: Rc<RefCell<Pager<I>>>,
     pub source: Box<Plan<I>>,
     pub schema: Schema,
-    pub indexes: Vec<(String, PageNumber)>,
+    pub indexes: Vec<IndexMetadata>,
 }
 
 impl<I: Seek + Read + Write> Insert<I> {
@@ -268,8 +268,8 @@ impl<I: Seek + Read + Write> Insert<I> {
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
         btree.insert(tuple::serialize_values(&self.schema, &tuple))?;
 
-        for (col, root) in &self.indexes {
-            let idx = self.schema.index_of(col).unwrap();
+        for IndexMetadata { root, column, .. } in &self.indexes {
+            let idx = self.schema.index_of(column).unwrap();
 
             assert_eq!(self.schema.columns[0].name, "row_id");
             let key_col = self.schema.columns[idx].clone();

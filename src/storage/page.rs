@@ -117,7 +117,6 @@
 use std::{
     alloc::{self, Allocator, Layout},
     any,
-    cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     fmt::{self, Debug},
     iter,
