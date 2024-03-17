@@ -118,7 +118,7 @@ use std::{
     alloc::{self, Allocator, Layout},
     any,
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     fmt::{self, Debug},
     iter,
     mem::{self, ManuallyDrop},
@@ -749,38 +749,6 @@ impl ToOwned for Cell {
     }
 }
 
-/// Cell that didn't fit in the slotted page
-///
-///  This is stored in-memory and cannot be written to disk.
-#[derive(Debug, Clone)]
-struct OverflowCell {
-    /// Owned cell.
-    cell: Box<Cell>,
-    /// Index in the slot array where the cell should have been inserted.
-    index: SlotId,
-}
-
-impl PartialEq for OverflowCell {
-    fn eq(&self, other: &Self) -> bool {
-        self.index.eq(&other.index)
-    }
-}
-
-impl Eq for OverflowCell {}
-
-impl PartialOrd for OverflowCell {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OverflowCell {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is max-heap by default, make it min-heap.
-        self.index.cmp(&other.index).reverse()
-    }
-}
-
 /// Slotted page header.
 ///
 /// It is located at the beginning of each page and it does not contain variable
@@ -1015,19 +983,78 @@ impl PageHeader {
 /// space. Do not confuse this with [`OverflowPage`], which are used to store
 /// large binary contents on disk in a linked list of pages.
 ///
-/// To deal with [`Page`] overflow we maintain a list of cells that didn't fit
-/// in the slotted page and we store the index where they should have been
-/// inserted in the slotted array. Not all methods take overflow into account,
-/// most of them don't care because once the page overflows the BTree balancing
-/// algorithm will move all the cells out of the page and reorganize them across
-/// siblings. The only method that needs to work correctly is [`Page::drain`] as
-/// that's the one used to move the cells out.
+/// To deal with [`Page`] overflow we maintain a hash map of cells that didn't
+/// fit in the slotted page where we store the index where they should have been
+/// inserted in the slotted array.
+///
+/// ```text
+///   HEADER   SLOT ARRAY  FREE SPACE        USED CELLS
+///  +------+----+----+----+--------+--------+--------+--------+
+///  |      | O1 | O2 | O3 | ->  <- | CELL 3 | CELL 2 | CELL 1 |
+///  +------+----+----+----+--------+--------+--------+--------+
+///           |    |    |           ^        ^        ^
+///           |    |    |           |        |        |
+///           +----|----|-----------|--------|--------+
+///                |    |           |        |
+///                +----|-----------|--------+
+///                     |           |
+///                     +-----------+
+///
+///  +---------+
+///  | OVF MAP |
+///  +---------+
+///  |   |     |        +------------+
+///  | 1 | PTR | -----> | BOXED CELL |
+///  |   |     |        +------------+
+///  +---------+
+///  |   |     |        +------------+
+///  | 3 | PTR | -----> | BOXED CELL |
+///  |   |     |        +------------+
+///  +---+-----+
+/// ```
+///
+/// In the figure above, the contents of the overflow map indicate that slot
+/// indexes 1 and 3 correspond to the boxed cells that we are storing outside of
+/// the page.
+///
+/// Not all methods take overflow into account however, most of them don't care
+/// because once the page overflows the BTree balancing algorithm will move all
+/// the cells out of the page and reorganize them across siblings. The only
+/// method that needs to work correctly is [`Page::drain`] as that's the one
+/// used to move the cells out.
+///
+/// The idea of this approach is to avoid initializing an in-memory copy of the
+/// slot array every time we load a page into the buffer pool like SQLite
+/// does. See this [line].
+///
+/// [line]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L329
+///
+/// A similar implementation was tried in the past. See [here].
+///
+/// [here]: https://github.com/antoniosarosi/mkdb/blob/b20b37631351647cf89185e7710db10af0de2157/src/storage/page.rs#L806-L876
+///
+/// It was discarded mostly because it adds too much overhead for almost no
+/// benefit at all since we are not going to constantly work with overflow
+/// pages. Overflow pages are some sort of "exceptional" state.
+///
+/// So in the current implementation a page is loaded from disk "as is", without
+/// any additional initialization. The overflow overhead only kicks in when a
+/// page actually overflows.
+///
+/// # Notes
+///
+/// This struct contains a lot of boilerplate, better start by reading the most
+/// important methods which are [`Self::try_insert`], [`Self::defragment`],
+/// [`Self::try_replace`] and [`Self::remove`]. Those work on the fixed size
+/// slotted page and don't care about overflow. Then there are wrappers that
+/// account for the overflow state: [`Self::insert`] and [`Self::replace`].
+/// And the most important low level unsafe API is [`Self::cell_at_offset`].
 #[derive(Clone)]
 pub(crate) struct Page {
     /// Fixed size in-memory buffer that contains the data read from disk.
     buffer: BufferWithHeader<PageHeader>,
-    /// Overflow list.
-    overflow: BinaryHeap<OverflowCell>,
+    /// Overflow map.
+    overflow: HashMap<SlotId, Box<Cell>>,
 }
 
 // TODO: Technically two pages could have the exact same content but different
@@ -1061,7 +1088,7 @@ impl<H> From<BufferWithHeader<H>> for Page {
 
         Self {
             buffer,
-            overflow: BinaryHeap::new(),
+            overflow: HashMap::new(),
         }
     }
 }
@@ -1282,19 +1309,23 @@ impl Page {
 
     /// Inserts the `cell` at `index`, possibly overflowing.
     pub fn insert(&mut self, index: SlotId, cell: Box<Cell>) {
-        debug_assert!(
+        assert!(
             cell.content.len() <= self.max_allowed_payload_size() as usize,
             "attempt to store payload of size {} when max allowed payload size is {}",
             cell.content.len(),
             self.max_allowed_payload_size()
         );
 
-        if self.is_overflow() {
-            return self.overflow.push(OverflowCell { cell, index });
-        }
+        assert!(
+            index <= self.len(),
+            "index {index} out of bounds for page of length {}",
+            self.len()
+        );
 
-        if let Err(cell) = self.try_insert(index, cell) {
-            self.overflow.push(OverflowCell { cell, index });
+        if self.is_overflow() {
+            self.overflow.insert(index, cell);
+        } else if let Err(cell) = self.try_insert(index, cell) {
+            self.overflow.insert(index, cell);
         }
     }
 
@@ -1313,12 +1344,7 @@ impl Page {
 
             Err(new_cell) => {
                 let old_cell = self.remove(index);
-
-                self.overflow.push(OverflowCell {
-                    cell: new_cell,
-                    index,
-                });
-
+                self.overflow.insert(index, new_cell);
                 old_cell
             }
         }
@@ -1603,11 +1629,11 @@ impl Page {
         self.header_mut().last_used_offset = destination_offset as u16;
     }
 
-    /// Works just like [`Vec::drain`]. Removes the specified cells from this
-    /// page and returns an owned version of them.
+    /// Works just like [`Vec::drain`].
     ///
-    /// This function does account for [`Self::is_overflow`], so it's safe to
-    /// call on overflow pages.
+    /// Removes the specified cells from this page and returns an owned version
+    /// of them. This function does account for [`Self::is_overflow`], so it's
+    /// safe to call on overflow pages.
     pub fn drain(
         &mut self,
         range: impl RangeBounds<usize>,
@@ -1627,27 +1653,17 @@ impl Page {
         let mut drain_index = start;
         let mut slot_index = start;
 
-        if let Some(ovf) = self.overflow.peek() {
-            debug_assert!(
-                start <= ovf.index as usize,
-                "doesn't work correctly in this case, better use a hash map or something"
-            );
-        }
-
         iter::from_fn(move || {
             // Copy cells until we reach the end.
             if drain_index < end {
-                let cell = if self
+                let cell = self
                     .overflow
-                    .peek()
-                    .is_some_and(|overflow| overflow.index as usize == drain_index)
-                {
-                    self.overflow.pop().unwrap().cell
-                } else {
-                    let cell = self.owned_cell(slot_index as _);
-                    slot_index += 1;
-                    cell
-                };
+                    .remove(&(drain_index as u16))
+                    .unwrap_or_else(|| {
+                        let cell = self.owned_cell(slot_index as _);
+                        slot_index += 1;
+                        cell
+                    });
 
                 drain_index += 1;
 
@@ -1897,7 +1913,7 @@ impl<H> From<BufferWithHeader<H>> for PageZero {
 
         let page = ManuallyDrop::new(Page {
             buffer: page_buffer,
-            overflow: BinaryHeap::new(),
+            overflow: HashMap::new(),
         });
 
         Self { buffer, page }
