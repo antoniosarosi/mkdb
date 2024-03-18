@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, QueryResult, RowId, Schema, SqlError},
+    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
     paging::{
         self,
         pager::{PageNumber, Pager},
@@ -19,7 +19,9 @@ use crate::{
     vm,
 };
 
-pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(plan: Plan<I>) -> QueryResult {
+pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
+    plan: Plan<I>,
+) -> Result<Projection, DbError> {
     Projection::try_from(plan)
 }
 

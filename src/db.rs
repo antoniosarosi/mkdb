@@ -39,15 +39,51 @@ pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 /// beginning of each tuple.
 pub(crate) type RowId = u64;
 
+/// Main entry point to everything.
+///
+/// Provides the high level [`Database::exec`] API that receives SQL text and
+/// runs it.
 pub(crate) struct Database<I> {
+    /// The database owns the pager.
     pub pager: Rc<RefCell<Pager<I>>>,
+    /// Database context. See [`DatabaseContext`].
     pub context: Context,
 }
 
+impl Database<File> {
+    /// Initializes a [`Database`] instance from the given file.
+    pub fn init(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        let metadata = file.metadata()?;
+
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file"));
+        }
+
+        let block_size = Disk::from(&path).block_size()?;
+
+        let mut pager = Pager::new(file, DEFAULT_PAGE_SIZE, block_size);
+
+        pager.init()?;
+
+        Ok(Database::new(Rc::new(RefCell::new(pager))))
+    }
+}
+
 #[derive(Debug, PartialEq)]
-pub(crate) struct Projection {
-    pub schema: Schema,
-    pub results: Vec<Vec<Value>>,
+pub(crate) enum SqlError {
+    InvalidTable(String),
+    InvalidColumn(String),
+    AnalyzerError(AnalyzerError),
+    TypeError(TypeError),
+    VmError(VmError),
+    Other(String),
 }
 
 impl From<TypeError> for SqlError {
@@ -66,22 +102,6 @@ impl From<VmError> for SqlError {
     fn from(vm_error: VmError) -> Self {
         Self::VmError(vm_error)
     }
-}
-
-impl<E: Into<SqlError>> From<E> for DbError {
-    fn from(err: E) -> Self {
-        DbError::Sql(err.into())
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum SqlError {
-    InvalidTable(String),
-    InvalidColumn(String),
-    AnalyzerError(AnalyzerError),
-    TypeError(TypeError),
-    VmError(VmError),
-    Other(String),
 }
 
 impl Display for SqlError {
@@ -111,6 +131,12 @@ impl Display for DbError {
             Self::Parser(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl<E: Into<SqlError>> From<E> for DbError {
+    fn from(err: E) -> Self {
+        DbError::Sql(err.into())
     }
 }
 
@@ -186,7 +212,11 @@ impl From<Vec<Column>> for Schema {
     }
 }
 
-pub(crate) type QueryResult = Result<Projection, DbError>;
+#[derive(Debug, PartialEq)]
+pub(crate) struct Projection {
+    pub schema: Schema,
+    pub results: Vec<Vec<Value>>,
+}
 
 impl Projection {
     pub fn new(schema: Schema, results: Vec<Vec<Value>>) -> Self {
@@ -237,17 +267,26 @@ pub(crate) fn mkdb_meta_schema() -> Schema {
     ])
 }
 
+/// Data that we need to know about an index at runtime.
 #[derive(Debug, Clone)]
 pub(crate) struct IndexMetadata {
+    /// Root page of the index-
     pub root: PageNumber,
+    /// Index name.
     pub name: String,
+    /// Column name on which the index was created.
     pub column: String,
 }
 
+/// Data that we need to know about tables at runtime.
 pub(crate) struct TableMetadata {
+    /// Root page of the table.
     pub root: PageNumber,
+    /// Schema of the table as defined by the `CREATE TABLE` statement.
     pub schema: Schema,
+    /// All the indexes associated to this table.
     pub indexes: Vec<IndexMetadata>,
+    /// Next [`RowId`] for this table.
     row_id: RowId,
 }
 
@@ -260,18 +299,46 @@ impl TableMetadata {
     }
 }
 
+/// API to obtain data about the database itself.
 pub(crate) trait DatabaseContext {
+    /// Returns a [`TableMetadata`] object describing `table`.
     fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError>;
 }
 
+/// Default value for [`Context::max_size`].
+const DEFAULT_RELATION_CACHE_SIZE: usize = 512;
+
+/// Dead simple cache made for storing [`TableMetadata`] instances.
+///
+/// Unlike [`crate::paging::cache`], this one doesn't need to complicated since
+/// [`TableMetadata`] structs are just a handful of bytes depending on the
+/// schema and databases usually don't have thousands of tables like they do
+/// pages. So the eviction policy is pretty much random, we evict whatever the
+/// underlying [`HashMap`] decides that is the first element.
+///
+/// This struct is also used as some sort of mock for tests in [`crate::sql`].
+/// Some components like the analyzer need access to the database context but
+/// we don't want to create an entire [`Database`] struct just for that. The
+/// [`Database`] struct also need to parse SQL to obtain metadata about tables
+/// so it would call the [`crate::sql`] module again, and we don't want so much
+/// mutual recursion because it makes test debugging hard.
 pub(crate) struct Context {
     tables: HashMap<String, TableMetadata>,
+    max_size: Option<usize>,
 }
 
 impl Context {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            max_size: None,
+        }
+    }
+
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self {
+            tables: HashMap::with_capacity(max_size),
+            max_size: Some(max_size),
         }
     }
 
@@ -280,6 +347,11 @@ impl Context {
     }
 
     pub fn insert(&mut self, table: String, metadata: TableMetadata) {
+        if self.max_size.is_some_and(|size| self.tables.len() >= size) {
+            let evict = self.tables.keys().next().unwrap().clone();
+            self.tables.remove(&evict);
+        }
+
         self.tables.insert(table, metadata);
     }
 
@@ -292,6 +364,9 @@ impl Context {
 impl TryFrom<&[&str]> for Context {
     type Error = DbError;
 
+    /// Creates a context from raw SQL statements.
+    ///
+    /// Used for tests. See [`crate::sql::analyzer`] or [`crate::sql::prepare`].
     fn try_from(statements: &[&str]) -> Result<Self, Self::Error> {
         let mut context = Self::new();
         let mut root = 1;
@@ -370,33 +445,8 @@ impl<I> Database<I> {
     pub fn new(pager: Rc<RefCell<Pager<I>>>) -> Self {
         Self {
             pager,
-            context: Context::new(),
+            context: Context::with_max_size(DEFAULT_RELATION_CACHE_SIZE),
         }
-    }
-}
-
-impl Database<File> {
-    pub fn init(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-
-        let metadata = file.metadata()?;
-
-        if !metadata.is_file() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file"));
-        }
-
-        let block_size = Disk::from(&path).block_size()?;
-
-        let mut pager = Pager::new(file, DEFAULT_PAGE_SIZE, block_size);
-
-        pager.init()?;
-
-        Ok(Database::new(Rc::new(RefCell::new(pager))))
     }
 }
 
@@ -412,6 +462,12 @@ impl<I: Seek + Read + Write + paging::io::Sync> DatabaseContext for Database<I> 
 }
 
 impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
+    /// Loads the next row ID that should be used for the table rooted at
+    /// `root`.
+    ///
+    /// This is not so expensive since it traverses the BTree from the root
+    /// straight to a leaf node to find the max row ID, but it should be cached
+    /// to avoid IO next time.
     fn load_next_row_id(&mut self, root: PageNumber) -> Result<RowId, DbError> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, root, FixedSizeMemCmp::for_type::<RowId>());
@@ -425,6 +481,11 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         Ok(row_id)
     }
 
+    /// Loads all the metadata that we store about `table`.
+    ///
+    /// Right now the [`MKDB_META`] table doesn't use any indexes, so this
+    /// is basically a sequential scan. The metadata table shouldn't get too
+    /// big in most scenarios though.
     fn load_table_metadata(&mut self, table: &str) -> Result<TableMetadata, DbError> {
         if table == MKDB_META {
             let mut schema = mkdb_meta_schema();
@@ -491,7 +552,8 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         Ok(metadata)
     }
 
-    pub fn root_of_index(&mut self, index: &str) -> Result<PageNumber, DbError> {
+    /// Returns the root page of `index` if it exists.
+    fn root_of_index(&mut self, index: &str) -> Result<PageNumber, DbError> {
         let query = self.exec(&format!(
             "SELECT root FROM {MKDB_META} where name = '{index}' AND type = 'index';"
         ))?;
@@ -508,7 +570,10 @@ impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
         }
     }
 
-    pub fn exec(&mut self, input: &str) -> QueryResult {
+    /// Highest level API in the entire system.
+    ///
+    /// Receives a SQL string and executes it.
+    pub fn exec(&mut self, input: &str) -> Result<Projection, DbError> {
         let statement = sql::pipeline(input, self)?;
 
         // TODO: Rollback if it fails.
