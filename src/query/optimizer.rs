@@ -43,6 +43,9 @@ pub(crate) fn generate_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     })))
 }
 
+/// Creates a new cursor and positions it at the given key.
+///
+/// The cursor will return the given key when calling [`Cursor::try_next`].
 fn position_cursor_at_key<I: Seek + Read + Write>(
     key: &[u8],
     data_type: &DataType,
@@ -60,6 +63,8 @@ fn position_cursor_at_key<I: Seek + Read + Write>(
     }
 }
 
+/// Basically a constructor. We'll use this until we figure out exactly how to
+/// build stuff here.
 fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     table: &str,
     db: &mut Database<I>,
@@ -73,6 +78,11 @@ fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     })))
 }
 
+/// Attempts to generate an [`IndexScan`] plan.
+///
+/// It's only possible to do so if we find an expression that contains an
+/// indexed column and must always be executed. Otherwise we'll fallback to
+/// sequential scans.
 fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     table: &str,
     db: &mut Database<I>,
@@ -101,7 +111,6 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     };
 
     let table_root = metadata.root;
-
     let table_schema = metadata.schema.clone();
 
     let (key, col_def, index_root) = match (left.as_ref(), right.as_ref()) {
@@ -119,7 +128,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         _ => unreachable!(),
     };
 
-    let mut pager = &mut db.pager.borrow_mut();
+    let pager = &mut db.pager.borrow_mut();
 
     let (cursor, stop_when) = match (left.as_ref(), operator, right.as_ref()) {
         // Case 1:
@@ -127,17 +136,10 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         // SELECT * FROM t WHERE 5 = x;
         //
         // Position the cursor at key 5 and stop at the next key.
-        (Expression::Identifier(col), BinaryOperator::Eq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Eq, Expression::Identifier(col)) => {
+        (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
+        | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
             let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
-            (
-                cursor,
-                Some((
-                    key,
-                    BinaryOperator::Gt,
-                    Box::<dyn BytesCmp>::from(&col_def.data_type),
-                )),
-            )
+            (cursor, Some(BinaryOperator::Gt))
         }
 
         // Case 2:
@@ -146,8 +148,8 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         //
         // Position the cursor at key 5, assume it's initialized and consume key
         // 5 which will cause the cursor to move to the successor.
-        (Expression::Identifier(col), BinaryOperator::Gt, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Lt, Expression::Identifier(col)) => {
+        (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
+        | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
             let mut cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
             cursor.try_next(pager)?;
             (cursor, None)
@@ -157,19 +159,12 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         // SELECT * FROM t WHERE x < 5;
         // SELECT * FROM t WHERE 5 > x;
         //
-        // Position the cursor at key 5, assume it's initialized and consume key
-        // 5 which will cause the cursor to move to the successor.
-        (Expression::Identifier(col), BinaryOperator::Lt, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Gt, Expression::Identifier(col)) => {
+        // Allow the cursor to initialize normally (at the smallest key) and
+        // tell it to stop once it finds a key >= 5.
+        (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
+        | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
             let cursor = Cursor::new(index_root, 0);
-            (
-                cursor,
-                Some((
-                    key,
-                    BinaryOperator::GtEq,
-                    Box::<dyn BytesCmp>::from(&col_def.data_type),
-                )),
-            )
+            (cursor, Some(BinaryOperator::GtEq))
         }
 
         // Case 4:
@@ -178,8 +173,8 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         //
         // Position the cursor at key 5 and assume it's already initialized. The
         // cursor will then return key 5 and everything after.
-        (Expression::Identifier(col), BinaryOperator::GtEq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::LtEq, Expression::Identifier(col)) => {
+        (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
+        | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
             let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
             (cursor, None)
         }
@@ -190,17 +185,10 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         //
         // Allow the cursor to initialize normally (at the smallest key) and
         // tell it to stop once it finds a key > 5
-        (Expression::Identifier(col), BinaryOperator::LtEq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::GtEq, Expression::Identifier(col)) => {
+        (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
+        | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
             let cursor = Cursor::new(index_root, 0);
-            (
-                cursor,
-                Some((
-                    key,
-                    BinaryOperator::Gt,
-                    Box::<dyn BytesCmp>::from(&col_def.data_type),
-                )),
-            )
+            (cursor, Some(BinaryOperator::Gt))
         }
 
         _ => unreachable!(),
@@ -208,7 +196,8 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
 
     Ok(Some(Box::new(Plan::IndexScan(IndexScan {
         cursor,
-        stop_when,
+        stop_when: stop_when
+            .map(|operator| (key, operator, Box::<dyn BytesCmp>::from(&col_def.data_type))),
         done: false,
         index_root,
         table_root,

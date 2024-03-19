@@ -3,7 +3,8 @@
 //!
 //! After a statement has been successfuly analyzed by [`analyze`], it should
 //! execute with almost no runtime errors, except for stuff like integer
-//! overflow above [`i128::MAX`] or similar edge cases.
+//! overflow above [`i128::MAX`] (see [`Value`] for details), division by zero
+//! or similar edge cases.
 
 use std::fmt::Display;
 

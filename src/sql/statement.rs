@@ -97,25 +97,33 @@ pub(crate) enum DataType {
     Varchar(usize),
 }
 
-// TODO: We use i128 to store numbers since we don't know their exact type in
-// expressions like "SELECT 12 + 12 FROM table". And even if we knew their exact
-// type, we would still have to match over i32, u32, i64, u64... to operate on
-// them. So what's faster?
-// - A bunch of IF statements plus OP (+,-,*,/)
-// - Using i128
-// - Using some bigint library like https://docs.rs/num-bigint/
-// - Using a custom number type
-// It's a toy database anyway, not that anyone is gonna run into integer
-// overflow issues in production :)
-
 /// Resolved values from expressions.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Value {
-    Number(i128),
+    /// UTF-8 string.
     String(String),
+
+    /// Boolean, true or false.
     Bool(bool),
+
+    /// Generic integer type.
+    ///
+    /// TODO: We use [`i128`] to store numbers since we don't know their exact
+    /// type in expressions like "SELECT 12 + 12 FROM table". And even if we
+    /// knew their exact type, we would still have to match over [`i32`],
+    /// [`u32`], [`i64`], [`u64`]... to operate on them. So what's faster?
+    ///
+    /// - Jump tables to match the types plus cast plus OP instruction (+,-,*,/)
+    /// - Operating directly on [`i128`]
+    /// - Using some bigint library like https://docs.rs/num-bigint/
+    /// - Using a custom number type
+    ///
+    /// It's a toy database anyway, not that anyone is gonna run into integer
+    /// overflow issues in production :)
+    Number(i128),
 }
 
+/// Assignments found in `UPDATE` statements.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Assignment {
     pub identifier: String,
@@ -127,7 +135,6 @@ pub(crate) struct Assignment {
 pub(crate) struct Column {
     pub name: String,
     pub data_type: DataType,
-    // TODO: Vec of constraints. Not important for now.
     pub constraints: Vec<Constraint>,
 }
 
