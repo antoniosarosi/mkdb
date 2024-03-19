@@ -10,7 +10,10 @@ use std::{
 };
 
 use super::page::{Cell, OverflowPage, Page, SlotId};
-use crate::paging::pager::{PageNumber, Pager};
+use crate::{
+    paging::pager::{PageNumber, Pager},
+    sql::statement::DataType,
+};
 
 /// [`BTree`] key comparator. Entries are stored in binary, so we need a way to
 /// determine the correct [`Ordering`]. Whenever two entries need to be
@@ -119,6 +122,35 @@ impl BytesCmp for StringCmp {
         std::str::from_utf8(&a[self.0..self.0 + len_a])
             .unwrap()
             .cmp(std::str::from_utf8(&b[self.0..self.0 + len_b]).unwrap())
+    }
+}
+
+impl BytesCmp for Box<dyn BytesCmp> {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        self.as_ref().bytes_cmp(a, b)
+    }
+}
+
+impl From<&DataType> for Box<dyn BytesCmp> {
+    /// Easy way to obtain a [`BytesCmp`] impl at runtime based on SQL data
+    /// types.
+    fn from(data_type: &DataType) -> Self {
+        match data_type {
+            DataType::Varchar(max) => {
+                let length_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
+                Box::new(StringCmp(length_bytes))
+            }
+
+            fixed => {
+                let size = match fixed {
+                    DataType::BigInt | DataType::UnsignedBigInt => mem::size_of::<i64>(),
+                    DataType::Int | DataType::UnsignedInt => mem::size_of::<i32>(),
+                    _ => unreachable!(),
+                };
+
+                Box::new(FixedSizeMemCmp(size))
+            }
+        }
     }
 }
 
@@ -368,8 +400,8 @@ pub(crate) const DEFAULT_BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 /// Default value for [`BTree::minimum_keys`].
 pub(crate) const DEFAULT_MINIMUM_KEYS: usize = 4;
 
-impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
-    pub fn new(pager: &'c mut Pager<F>, root: PageNumber, comparator: C) -> Self {
+impl<'p, I, C: BytesCmp> BTree<'p, I, C> {
+    pub fn new(pager: &'p mut Pager<I>, root: PageNumber, comparator: C) -> Self {
         Self {
             pager,
             root,
@@ -380,7 +412,7 @@ impl<'c, F, C: BytesCmp> BTree<'c, F, C> {
     }
 }
 
-impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
+impl<'p, I: Seek + Read + Write, C: BytesCmp> BTree<'p, I, C> {
     /// Returns the value corresponding to the key.
     ///
     /// See [`Self::search`] for details.
@@ -2462,7 +2494,7 @@ mod tests {
         }
     }
 
-    impl<'c> BTree<'c, MemBuf, FixedSizeMemCmp> {
+    impl<'p> BTree<'p, MemBuf, FixedSizeMemCmp> {
         fn into_test_nodes(&mut self, root: PageNumber) -> io::Result<Node> {
             let page = self.pager.get(root)?;
 

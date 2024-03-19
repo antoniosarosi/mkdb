@@ -1,7 +1,6 @@
 // Generates optimized plans.
 
 use std::{
-    cmp::Ordering,
     collections::HashMap,
     io::{self, Read, Seek, Write},
     rc::Rc,
@@ -14,8 +13,8 @@ use crate::{
         pager::{PageNumber, Pager},
     },
     sql::statement::{BinaryOperator, Column, DataType, Expression},
-    storage::{tuple, BTree, Cursor},
-    vm::plan::{bytes_comparator_from, BytesComparator, Filter, IndexScan, Plan, SeqScan},
+    storage::{tuple, BTree, BytesCmp, Cursor},
+    vm::plan::{Filter, IndexScan, Plan, SeqScan},
 };
 
 /// Generates an optimized scan plan.
@@ -28,7 +27,7 @@ pub(crate) fn generate_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
     db: &mut Database<I>,
 ) -> Result<Box<Plan<I>>, DbError> {
     let Some(expr) = filter else {
-        return Ok(generate_sequential_scan_plan(table, db)?);
+        return generate_sequential_scan_plan(table, db);
     };
 
     let source = if let Some(index_scan) = generate_index_scan_plan(table, db, &expr)? {
@@ -52,16 +51,8 @@ fn position_cursor_at_key<I: Seek + Read + Write>(
 ) -> io::Result<Cursor> {
     let mut descent = Vec::new();
 
-    let search = match bytes_comparator_from(data_type) {
-        BytesComparator::MemCmp(mem_cmp) => {
-            let mut btree = BTree::new(pager, root, mem_cmp);
-            btree.search(root, key, &mut descent)?
-        }
-        BytesComparator::StrCmp(str_cmp) => {
-            let mut btree = BTree::new(pager, root, str_cmp);
-            btree.search(root, key, &mut descent)?
-        }
-    };
+    let mut btree = BTree::new(pager, root, Box::<dyn BytesCmp>::from(data_type));
+    let search = btree.search(root, key, &mut descent)?;
 
     match search.index {
         Ok(slot) => Ok(Cursor::initialized(search.page, slot, descent)),
@@ -144,7 +135,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
                 Some((
                     key,
                     BinaryOperator::Gt,
-                    bytes_comparator_from(&col_def.data_type),
+                    Box::<dyn BytesCmp>::from(&col_def.data_type),
                 )),
             )
         }
@@ -157,8 +148,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         // 5 which will cause the cursor to move to the successor.
         (Expression::Identifier(col), BinaryOperator::Gt, Expression::Value(value))
         | (Expression::Value(value), BinaryOperator::Lt, Expression::Identifier(col)) => {
-            let mut cursor =
-                position_cursor_at_key(&key, &col_def.data_type, index_root, &mut pager)?;
+            let mut cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
             cursor.try_next(pager)?;
             (cursor, None)
         }
@@ -177,7 +167,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
                 Some((
                     key,
                     BinaryOperator::GtEq,
-                    bytes_comparator_from(&col_def.data_type),
+                    Box::<dyn BytesCmp>::from(&col_def.data_type),
                 )),
             )
         }
@@ -190,7 +180,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         // cursor will then return key 5 and everything after.
         (Expression::Identifier(col), BinaryOperator::GtEq, Expression::Value(value))
         | (Expression::Value(value), BinaryOperator::LtEq, Expression::Identifier(col)) => {
-            let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, &mut pager)?;
+            let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
             (cursor, None)
         }
 
@@ -208,7 +198,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
                 Some((
                     key,
                     BinaryOperator::Gt,
-                    bytes_comparator_from(&col_def.data_type),
+                    Box::<dyn BytesCmp>::from(&col_def.data_type),
                 )),
             )
         }
@@ -222,11 +212,11 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
         done: false,
         index_root,
         table_root,
+        table_schema,
         index_schema: Schema::from(vec![
             col_def,
             Column::new("row_id", DataType::UnsignedBigInt),
         ]),
-        table_schema: table_schema,
         pager: Rc::clone(&db.pager),
     }))))
 }
@@ -293,7 +283,7 @@ fn find_indexed_expr<'e>(
             }
 
             _ if *operator == BinaryOperator::And => {
-                find_indexed_expr(indexes, &left).or_else(|| find_indexed_expr(indexes, &right))
+                find_indexed_expr(indexes, left).or_else(|| find_indexed_expr(indexes, right))
             }
 
             _ => None,

@@ -9,13 +9,13 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, TableMetadata},
+    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
     paging::{
         self,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{Assignment, BinaryOperator, DataType, Expression, Value},
-    storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp, StringCmp},
+    sql::statement::{Assignment, BinaryOperator, Expression, Value},
+    storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
 };
 
@@ -23,30 +23,6 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
     plan: Plan<I>,
 ) -> Result<Projection, DbError> {
     Projection::try_from(plan)
-}
-
-pub(crate) enum BytesComparator {
-    MemCmp(FixedSizeMemCmp),
-    StrCmp(StringCmp),
-}
-
-pub(crate) fn bytes_comparator_from(data_type: &DataType) -> BytesComparator {
-    match data_type {
-        DataType::Varchar(max) => {
-            let length_bytes = if *max <= 255 { 1 } else { 2 };
-            BytesComparator::StrCmp(StringCmp(length_bytes))
-        }
-
-        fixed => {
-            let size = match fixed {
-                DataType::BigInt | DataType::UnsignedBigInt => 8,
-                DataType::Int | DataType::UnsignedInt => 4,
-                _ => unreachable!(),
-            };
-
-            BytesComparator::MemCmp(FixedSizeMemCmp(size))
-        }
-    }
 }
 
 pub(crate) type Tuple = Vec<Value>;
@@ -165,7 +141,7 @@ pub(crate) struct IndexScan<I> {
     pub table_schema: Schema,
     pub table_root: PageNumber,
     pub index_root: PageNumber,
-    pub stop_when: Option<(Vec<u8>, BinaryOperator, BytesComparator)>,
+    pub stop_when: Option<(Vec<u8>, BinaryOperator, Box<dyn BytesCmp>)>,
     pub done: bool,
     pub pager: Rc<RefCell<Pager<I>>>,
     pub cursor: Cursor,
@@ -187,10 +163,7 @@ impl<I: Seek + Read + Write> IndexScan<I> {
         if let Some((key, operator, cmp)) = &self.stop_when {
             let entry = &pager.get(page)?.cell(slot).content;
 
-            let ordering = match cmp {
-                BytesComparator::MemCmp(mem_cmp) => mem_cmp.bytes_cmp(entry, &key),
-                BytesComparator::StrCmp(str_cmp) => str_cmp.bytes_cmp(entry, &key),
-            };
+            let ordering = cmp.bytes_cmp(entry, key);
 
             let stop = match operator {
                 BinaryOperator::Gt => ordering == Ordering::Greater,
@@ -385,16 +358,13 @@ impl<I: Seek + Read + Write> Insert<I> {
             let entry =
                 tuple::serialize_values(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
 
-            match bytes_comparator_from(&self.schema.columns[idx].data_type) {
-                BytesComparator::MemCmp(mem_cmp) => {
-                    let mut btree = BTree::new(&mut pager, *root, mem_cmp);
-                    btree.insert(entry)?;
-                }
-                BytesComparator::StrCmp(str_cmp) => {
-                    let mut btree = BTree::new(&mut pager, *root, str_cmp);
-                    btree.insert(entry)?;
-                }
-            }
+            let mut btree = BTree::new(
+                &mut pager,
+                *root,
+                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+            );
+
+            btree.insert(entry)?;
         }
 
         Ok(Some(vec![]))
@@ -455,16 +425,13 @@ impl<I: Seek + Read + Write> Delete<I> {
 
             let entry = tuple::serialize_values(&Schema::from(vec![key_col]), &[key]);
 
-            match bytes_comparator_from(&self.schema.columns[idx].data_type) {
-                BytesComparator::MemCmp(mem_cmp) => {
-                    let mut btree = BTree::new(&mut pager, *root, mem_cmp);
-                    btree.remove(&entry)?;
-                }
-                BytesComparator::StrCmp(str_cmp) => {
-                    let mut btree = BTree::new(&mut pager, *root, str_cmp);
-                    btree.remove(&entry)?;
-                }
-            }
+            let mut btree = BTree::new(
+                &mut pager,
+                *root,
+                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+            );
+
+            btree.remove(&entry)?;
         }
 
         Ok(Some(vec![]))
