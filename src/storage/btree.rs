@@ -123,13 +123,13 @@ impl BytesCmp for StringCmp {
 }
 
 /// The result of a search in the [`BTree`] structure.
-struct Search {
+pub(crate) struct Search {
     /// Page number of the node where the search ended.
-    page: PageNumber,
+    pub page: PageNumber,
 
     /// Contains an [`Ok`] value with the index where the search matched or an
     /// [`Err`] value with the index where the searched key should be located.
-    index: Result<u16, u16>,
+    pub index: Result<u16, u16>,
 }
 
 /// The result of a remove operation on the BTree.
@@ -437,7 +437,7 @@ impl<'c, F: Seek + Read + Write, C: BytesCmp> BTree<'c, F, C> {
     /// 1. Read page 5 into memory.
     /// 2. Binary search results in [`Ok(0)`].
     /// 3. Done, construct the [`Search`] result and return.
-    fn search(
+    pub fn search(
         &mut self,
         page: PageNumber,
         entry: &[u8],
@@ -1966,6 +1966,26 @@ impl Cursor {
             descent: vec![],
             init: false,
             done: false,
+        }
+    }
+
+    pub fn initialized(page: PageNumber, slot: SlotId, descent: Vec<PageNumber>) -> Self {
+        Self {
+            page,
+            slot,
+            descent,
+            init: true,
+            done: false,
+        }
+    }
+
+    pub fn done() -> Self {
+        Self {
+            page: 0,
+            slot: 0,
+            descent: vec![],
+            init: true,
+            done: true,
         }
     }
 

@@ -1,30 +1,31 @@
-//! Generates a query plan.
+//! Generates [`Plan`] trees.
 
 use std::{
     io::{Read, Seek, Write},
     rc::Rc,
 };
 
+use super::optimizer::generate_scan_plan;
 use crate::{
     db::{Database, DatabaseContext, DbError, Schema},
-    paging::{self},
+    paging,
     sql::{
         analyzer,
         statement::{Column, DataType, Expression, Statement},
     },
-    storage::Cursor,
     vm::{
-        plan::{
-            BufferedIter, Delete, Filter, Insert, Plan, Project, SeqScan, Sort, Update, Values,
-        },
+        plan::{BufferedIter, Delete, Insert, Plan, Project, Sort, Update, Values},
         VmDataType,
     },
 };
 
+/// Returns `true` if the given `statement` needs a query [`Plan`] to be
+/// executed.
 pub(crate) fn needs_plan(statement: &Statement) -> bool {
     !matches!(statement, Statement::Create(_))
 }
 
+/// Generates a query plan that's ready to execute by the VM.
 pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
     statement: Statement,
     db: &mut Database<I>,
@@ -57,7 +58,7 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             r#where,
             order_by,
         } => {
-            let mut source = generate_seq_scan_plan(&from, r#where, db)?;
+            let mut source = generate_scan_plan(&from, r#where, db)?;
 
             let metadata = db.table_metadata(&from)?;
 
@@ -121,7 +122,7 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
             columns,
             r#where,
         } => {
-            let source = generate_seq_scan_plan(&table, r#where, db)?;
+            let source = generate_scan_plan(&table, r#where, db)?;
 
             let metadata = db.table_metadata(&table)?;
 
@@ -135,12 +136,13 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
         }
 
         Statement::Delete { from, r#where } => {
-            let source = generate_seq_scan_plan(&from, r#where, db)?;
+            let source = generate_scan_plan(&from, r#where, db)?;
             let metadata = db.table_metadata(&from)?;
 
             Plan::Delete(Delete {
                 root: metadata.root,
                 schema: metadata.schema.clone(),
+                indexes: metadata.indexes.clone(),
                 source: BufferedIter::new(source),
                 pager: Rc::clone(&db.pager),
             })
@@ -148,31 +150,4 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
 
         other => todo!("unhandled statement {other}"),
     })
-}
-
-pub(crate) fn generate_seq_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
-    table: &str,
-    filter: Option<Expression>,
-    db: &mut Database<I>,
-) -> Result<Box<Plan<I>>, DbError> {
-    let metadata = db.table_metadata(table)?;
-
-    let schema = metadata.schema.clone();
-    let root = metadata.root;
-
-    let mut plan = Box::new(Plan::SeqScan(SeqScan {
-        cursor: Cursor::new(root, 0),
-        schema: schema.clone(),
-        pager: Rc::clone(&db.pager),
-    }));
-
-    if let Some(filter) = filter {
-        plan = Box::new(Plan::Filter(Filter {
-            filter,
-            schema,
-            source: plan,
-        }));
-    }
-
-    Ok(plan)
 }

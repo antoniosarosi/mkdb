@@ -9,13 +9,13 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
+    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, TableMetadata},
     paging::{
         self,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{Assignment, DataType, Expression, Value},
-    storage::{reassemble_payload, tuple, BTree, Cursor, FixedSizeMemCmp, StringCmp},
+    sql::statement::{Assignment, BinaryOperator, DataType, Expression, Value},
+    storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp, StringCmp},
     vm,
 };
 
@@ -25,11 +25,36 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
     Projection::try_from(plan)
 }
 
+pub(crate) enum BytesComparator {
+    MemCmp(FixedSizeMemCmp),
+    StrCmp(StringCmp),
+}
+
+pub(crate) fn bytes_comparator_from(data_type: &DataType) -> BytesComparator {
+    match data_type {
+        DataType::Varchar(max) => {
+            let length_bytes = if *max <= 255 { 1 } else { 2 };
+            BytesComparator::StrCmp(StringCmp(length_bytes))
+        }
+
+        fixed => {
+            let size = match fixed {
+                DataType::BigInt | DataType::UnsignedBigInt => 8,
+                DataType::Int | DataType::UnsignedInt => 4,
+                _ => unreachable!(),
+            };
+
+            BytesComparator::MemCmp(FixedSizeMemCmp(size))
+        }
+    }
+}
+
 pub(crate) type Tuple = Vec<Value>;
 
 pub(crate) enum Plan<I> {
     Values(Values),
     SeqScan(SeqScan<I>),
+    IndexScan(IndexScan<I>),
     Filter(Filter<I>),
     Project(Project<I>),
     Sort(Sort<I>),
@@ -41,12 +66,14 @@ pub(crate) enum Plan<I> {
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
 // [`enum_dispatch`](https://docs.rs/enum_dispatch/) here to automate the match
 // statement or switch to Box<dyn Iterator<Item = Result<Projection, DbError>>>
-// but that's even more verbose than this and requires I: 'static everywhere. So
+// but that's even more verbose than this and requires I: 'static everywhere. We
+// also woudn't know the type of a plan because dyn Trait doesn't have a tag. So
 // match it for now :)
 impl<I: Seek + Read + Write> Plan<I> {
     pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         match self {
-            Self::SeqScan(scan) => scan.try_next(),
+            Self::SeqScan(seq_scan) => seq_scan.try_next(),
+            Self::IndexScan(index_scan) => index_scan.try_next(),
             Self::Filter(filter) => filter.try_next(),
             Self::Project(project) => project.try_next(),
             Self::Values(values) => values.try_next(),
@@ -129,6 +156,81 @@ impl<I: Seek + Read + Write> SeqScan<I> {
         Ok(Some(tuple::deserialize_values(
             reassemble_payload(&mut pager, page, slot)?.as_ref(),
             &self.schema,
+        )))
+    }
+}
+
+pub(crate) struct IndexScan<I> {
+    pub index_schema: Schema,
+    pub table_schema: Schema,
+    pub table_root: PageNumber,
+    pub index_root: PageNumber,
+    pub stop_when: Option<(Vec<u8>, BinaryOperator, BytesComparator)>,
+    pub done: bool,
+    pub pager: Rc<RefCell<Pager<I>>>,
+    pub cursor: Cursor,
+}
+
+impl<I: Seek + Read + Write> IndexScan<I> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        if self.done {
+            return Ok(None);
+        };
+
+        let mut pager = self.pager.borrow_mut();
+
+        let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
+            self.done = true;
+            return Ok(None);
+        };
+
+        if let Some((key, operator, cmp)) = &self.stop_when {
+            let entry = &pager.get(page)?.cell(slot).content;
+
+            let ordering = match cmp {
+                BytesComparator::MemCmp(mem_cmp) => mem_cmp.bytes_cmp(entry, &key),
+                BytesComparator::StrCmp(str_cmp) => str_cmp.bytes_cmp(entry, &key),
+            };
+
+            let stop = match operator {
+                BinaryOperator::Gt => ordering == Ordering::Greater,
+                BinaryOperator::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
+                BinaryOperator::Lt => ordering == Ordering::Less,
+                BinaryOperator::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
+                _ => unreachable!(),
+            };
+
+            if stop {
+                self.done = true;
+                return Ok(None);
+            }
+        }
+
+        let index_entry =
+            tuple::deserialize_values(&pager.get(page)?.cell(slot).content, &self.index_schema);
+
+        let Value::Number(row_id) = index_entry[1] else {
+            panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
+        };
+
+        let mut btree = BTree::new(
+            &mut pager,
+            self.table_root,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        );
+
+        let table_entry = btree
+            .get(&tuple::serialize_row_id(row_id as RowId))?
+            .unwrap_or_else(|| {
+                panic!(
+                    "index at root {} maps to row ID {} that doesn't exist in table at root {}",
+                    self.index_root, row_id, self.table_root
+                )
+            });
+
+        Ok(Some(tuple::deserialize_values(
+            table_entry.as_ref(),
+            &self.table_schema,
         )))
     }
 }
@@ -283,21 +385,13 @@ impl<I: Seek + Read + Write> Insert<I> {
             let entry =
                 tuple::serialize_values(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
 
-            match self.schema.columns[idx].data_type {
-                DataType::Varchar(max) => {
-                    let length_bytes = if max <= 255 { 1 } else { 2 };
-                    let mut btree = BTree::new(&mut pager, *root, StringCmp(length_bytes));
+            match bytes_comparator_from(&self.schema.columns[idx].data_type) {
+                BytesComparator::MemCmp(mem_cmp) => {
+                    let mut btree = BTree::new(&mut pager, *root, mem_cmp);
                     btree.insert(entry)?;
                 }
-
-                fixed => {
-                    let size = match fixed {
-                        DataType::BigInt | DataType::UnsignedBigInt => 8,
-                        DataType::Int | DataType::UnsignedInt => 4,
-                        _ => unreachable!(),
-                    };
-
-                    let mut btree = BTree::new(&mut pager, *root, FixedSizeMemCmp(size));
+                BytesComparator::StrCmp(str_cmp) => {
+                    let mut btree = BTree::new(&mut pager, *root, str_cmp);
                     btree.insert(entry)?;
                 }
             }
@@ -340,18 +434,38 @@ pub(crate) struct Delete<I> {
     pub pager: Rc<RefCell<Pager<I>>>,
     pub source: BufferedIter<I>,
     pub schema: Schema,
+    pub indexes: Vec<IndexMetadata>,
 }
 
 impl<I: Seek + Read + Write> Delete<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(row) = self.source.try_next()? else {
+        let Some(tuple) = self.source.try_next()? else {
             return Ok(None);
         };
 
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        btree.remove(&tuple::serialize_values(&self.schema, &row))?;
+        btree.remove(&tuple::serialize_values(&self.schema, &tuple))?;
+
+        for IndexMetadata { root, column, .. } in &self.indexes {
+            let idx = self.schema.index_of(column).unwrap();
+            let key_col = self.schema.columns[idx].clone();
+            let key = tuple[idx].clone();
+
+            let entry = tuple::serialize_values(&Schema::from(vec![key_col]), &[key]);
+
+            match bytes_comparator_from(&self.schema.columns[idx].data_type) {
+                BytesComparator::MemCmp(mem_cmp) => {
+                    let mut btree = BTree::new(&mut pager, *root, mem_cmp);
+                    btree.remove(&entry)?;
+                }
+                BytesComparator::StrCmp(str_cmp) => {
+                    let mut btree = BTree::new(&mut pager, *root, str_cmp);
+                    btree.remove(&entry)?;
+                }
+            }
+        }
 
         Ok(Some(vec![]))
     }

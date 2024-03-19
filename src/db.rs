@@ -279,6 +279,7 @@ pub(crate) struct IndexMetadata {
 }
 
 /// Data that we need to know about tables at runtime.
+#[derive(Debug, Clone)]
 pub(crate) struct TableMetadata {
     /// Root page of the table.
     pub root: PageNumber,
@@ -1060,17 +1061,22 @@ mod tests {
 
         assert!(query.results.is_empty());
 
-        Ok(())
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Column::primary_key("id", DataType::Int),
+            &[],
+        )
     }
 
     #[test]
     fn delete_where() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
 
         db.exec("DELETE FROM users WHERE age > 18;")?;
 
@@ -1079,17 +1085,32 @@ mod tests {
         assert_eq!(query, Projection {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
             results: vec![vec![
                 Value::Number(1),
-                Value::String("John Doe".into()),
+                Value::String("john@email.com".into()),
                 Value::Number(18)
             ]]
         });
 
-        Ok(())
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Column::primary_key("id", DataType::Int),
+            &[vec![Value::Number(1), Value::Number(1)]],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Column::unique("email", DataType::Varchar(255)),
+            &[vec![
+                Value::String("john@email.com".into()),
+                Value::Number(1),
+            ]],
+        )
     }
 
     #[test]
@@ -1177,7 +1198,7 @@ mod tests {
     fn assert_index_contains<I: Seek + Read + Write + paging::io::Sync>(
         db: &mut Database<I>,
         name: &str,
-        schema: Schema,
+        key: Column,
         expected_entries: &[Vec<Value>],
     ) -> Result<(), DbError> {
         let root = db.root_of_index(name)?;
@@ -1189,14 +1210,16 @@ mod tests {
 
         while let Some((page, slot)) = cursor.try_next(&mut pager)? {
             let entry = reassemble_payload(&mut pager, page, slot)?;
-            entries.push(tuple::deserialize_values(entry.as_ref(), &schema));
+            entries.push(tuple::deserialize_values(
+                entry.as_ref(),
+                &Schema::from(vec![
+                    key.clone(),
+                    Column::new("row_id", DataType::UnsignedBigInt),
+                ]),
+            ));
         }
 
-        assert_eq!(entries.len(), expected_entries.len());
-
-        for (entry, expected) in entries.iter().zip(expected_entries.iter()) {
-            assert_eq!(entry, expected);
-        }
+        assert_eq!(entries, expected_entries);
 
         Ok(())
     }
@@ -1213,10 +1236,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_pk_index",
-            Schema::from(vec![
-                Column::new("id", DataType::Int),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("id", DataType::Int),
             &[
                 vec![Value::Number(100), Value::Number(1)],
                 vec![Value::Number(200), Value::Number(2)],
@@ -1243,10 +1263,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_pk_index",
-            Schema::from(vec![
-                Column::new("id", DataType::Int),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("id", DataType::Int),
             &[
                 vec![Value::Number(100), Value::Number(1)],
                 vec![Value::Number(200), Value::Number(2)],
@@ -1257,10 +1274,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_email_uq_index",
-            Schema::from(vec![
-                Column::new("email", DataType::Varchar(255)),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("email", DataType::Varchar(255)),
             &[
                 vec![Value::String("jane@email.com".into()), Value::Number(2)],
                 vec![Value::String("john@email.com".into()), Value::Number(1)],
@@ -1274,10 +1288,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "name_idx",
-            Schema::from(vec![
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("name", DataType::Varchar(255)),
             &[
                 vec![Value::String("Jane Doe".into()), Value::Number(2)],
                 vec![Value::String("John Doe".into()), Value::Number(1)],
@@ -1358,10 +1369,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_pk_index",
-            Schema::from(vec![
-                Column::new("id", DataType::Int),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("id", DataType::Int),
             &expected_pk_index_entries,
         )?;
 
@@ -1376,10 +1384,7 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_email_uq_index",
-            Schema::from(vec![
-                Column::new("email", DataType::Varchar(255)),
-                Column::new("row_id", DataType::UnsignedBigInt),
-            ]),
+            Column::new("email", DataType::Varchar(255)),
             &expected_email_uq_index_entries,
         )?;
 
@@ -1464,6 +1469,178 @@ mod tests {
                 found: Expression::Value(Value::String("String".into()))
             })))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_exact() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id = 2;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![vec![
+                Value::Number(2),
+                Value::String("Jane Doe".into()),
+                Value::Number(22)
+            ],]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_less_than() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id < 3;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_greather_than() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id > 2;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_less_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id <= 3;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_greather_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id >= 3;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
 
         Ok(())
     }
