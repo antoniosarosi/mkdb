@@ -1628,7 +1628,8 @@ impl Page {
         self.header_mut().last_used_offset = destination_offset as u16;
     }
 
-    /// Works just like [`Vec::drain`].
+    /// Works like [`Vec::drain`] execept it doesn't remove elements unless
+    /// consumed.
     ///
     /// Removes the specified cells from this page and returns an owned version
     /// of them. This function does account for [`Self::is_overflow`], so it's

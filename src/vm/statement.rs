@@ -15,7 +15,7 @@ use crate::{
 /// plan to create a table or index because we only have to insert some data
 /// into a BTree and we're not returning anything. We can do that with only
 /// the information provided by the [`Statement`] itself.
-pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
+pub(crate) fn exec<I: Seek + Read + Write + paging::io::FileOps>(
     statement: Statement,
     db: &mut Database<I>,
 ) -> Result<(), DbError> {
@@ -79,7 +79,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
 }
 
 /// Allocates a page on disk that can be used as a table root.
-fn alloc_root_page<I: Seek + Read + Write + paging::io::Sync>(
+fn alloc_root_page<I: Seek + Read + Write + paging::io::FileOps>(
     db: &mut Database<I>,
 ) -> io::Result<PageNumber> {
     let mut pager = db.pager.borrow_mut();
@@ -116,7 +116,7 @@ fn alloc_root_page<I: Seek + Read + Write + paging::io::Sync>(
 /// here:
 ///
 /// <https://github.com/antoniosarosi/mkdb/blob/cde9f31a7864549f64375ce4bfe69779bf33ab52/src/vm/executor.rs#L59-L74>
-fn insert_into_mkdb_meta<I: Seek + Read + Write + paging::io::Sync>(
+fn insert_into_mkdb_meta<I: Seek + Read + Write + paging::io::FileOps>(
     db: &mut Database<I>,
     mut values: Vec<Value>,
 ) -> Result<(), DbError> {

@@ -9,20 +9,58 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
     fmt::Debug,
-    io::{self, Read, Seek, Write},
+    io::{self, BufRead, BufReader, Read, Seek, Write},
+    mem,
+    path::PathBuf,
 };
 
-use super::{cache::Cache, io::BlockIo};
-use crate::storage::page::{
-    DbHeader, FreePage, MemPage, Page, PageTypeConversion, PageZero, MAGIC,
+use super::{
+    cache::Cache,
+    io::{BlockIo, FileOps},
+};
+use crate::{
+    db::{DbError, DEFAULT_PAGE_SIZE},
+    storage::page::{DbHeader, FreePage, MemPage, Page, PageTypeConversion, PageZero, MAGIC},
 };
 
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
 
+const JOURNAL_MAGIC: u64 = 0x9DD505F920A163D6;
+
+const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
+
 /// IO block device page manager.
+///
+/// # Journal Format
+///
+/// +-----------------+
+/// |   Magic Number  |
+/// +-----------------+
+/// |    Num Pages    |
+/// +-----------------+
+/// |   Page Num 0    |
+/// +-----------------+
+/// |       ...       |
+/// |  Page 0 Content |
+/// |       ...       |
+/// +-----------------+
+/// | Page 0 Checksum |
+/// +-----------------+
+/// |   Page Num 1    |
+/// +-----------------+
+/// |       ...       |
+/// |  Page 1 Content |
+/// |       ...       |
+/// +-----------------+
+/// | Page 1 Checksum |
+/// +-----------------+
+/// |       ...       |
+/// | Page 1 Content  |
+/// |       ...       |
+/// +-----------------+
 pub(crate) struct Pager<I> {
-    /// Wrapped IO resource handle.
+    /// Wrapped IO/file handle/descriptor.
     io: BlockIo<I>,
     /// Hardware block size or prefered IO read/write buffer size.
     pub block_size: usize,
@@ -32,47 +70,111 @@ pub(crate) struct Pager<I> {
     cache: Cache,
     /// Keeps track of modified pages.
     dirty_pages: HashSet<PageNumber>,
+    /// Keeps track of pages written to the journal file.
+    journal_pages: HashSet<PageNumber>,
+    /// Copies of pages are kept in memory until we actually need to write them.
+    journal_buffer: Vec<u8>,
+    /// Once the max size is reached we have to write to the journal file.
+    max_journal_buf_size: usize,
+    /// Journal path.
+    journal_file_path: PathBuf,
+    /// Journal file descriptor or handle.
+    journal: Option<I>,
 }
 
-impl<I> Pager<I> {
-    /// Creates a new pager on top of `io`.
-    ///
-    /// `block_size` should evenly divide `page_size` or viceversa. Ideally,
-    /// both should be powers of 2, but it's convinient to support any size for
-    /// testing.
-    pub fn new(io: I, page_size: usize, block_size: usize) -> Self {
+pub(crate) struct Builder {
+    block_size: Option<usize>,
+    page_size: usize,
+    cache: Option<Cache>,
+    journal_file_path: PathBuf,
+    max_journal_buffered_pages: usize,
+}
+
+impl Builder {
+    pub fn new() -> Self {
         Self {
-            io: BlockIo::new(io, page_size, block_size),
-            block_size,
-            page_size,
-            cache: Cache::with_page_size(page_size),
-            dirty_pages: HashSet::new(),
+            block_size: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            cache: None,
+            journal_file_path: PathBuf::new(),
+            max_journal_buffered_pages: DEFAULT_MAX_JOURNAL_BUFFERED_PAGES,
         }
     }
 
-    /// Same as [`Self::new`] but allows a custom cache instance.
-    pub fn with_cache(io: I, page_size: usize, block_size: usize, cache: Cache) -> Self {
-        assert_eq!(
-            cache.page_size(),
-            page_size,
-            "Cache::page_size must be the same as Pager::page_size"
-        );
+    pub fn page_size(mut self, page_size: usize) -> Self {
+        self.page_size = page_size;
+        self
+    }
 
-        Self {
-            io: BlockIo::new(io, page_size, block_size),
+    pub fn block_size(mut self, block_size: usize) -> Self {
+        self.block_size = Some(block_size);
+        self
+    }
+
+    pub fn cache(mut self, cache: Cache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn journal_file_path(mut self, journal_file_path: PathBuf) -> Self {
+        self.journal_file_path = journal_file_path;
+        self
+    }
+
+    pub fn max_journal_buffered_pages(mut self, max_journal_buffered_pages: usize) -> Self {
+        self.max_journal_buffered_pages = max_journal_buffered_pages;
+        self
+    }
+
+    pub fn wrap<I>(self, io: I) -> Pager<I> {
+        let Builder {
             block_size,
             page_size,
             cache,
+            journal_file_path,
+            max_journal_buffered_pages,
+        } = self;
+
+        let block_size = block_size.unwrap_or(page_size);
+
+        // This one allocates a bunch of stuff so we evaluate it lazily.
+        let cache = cache.unwrap_or_else(|| Cache::with_page_size(page_size));
+
+        assert_eq!(
+            page_size,
+            cache.page_size(),
+            "conflicting page sizes for cache and pager"
+        );
+
+        let journal_magic_size = mem::size_of_val(&JOURNAL_MAGIC);
+
+        // Magic number + num_pages size + (page num + page size + checksum size) * num_pages
+        let max_journal_buf_size = journal_magic_size
+            + mem::size_of::<u32>()
+            + (mem::size_of::<PageNumber>() + page_size + mem::size_of::<u32>())
+                * max_journal_buffered_pages;
+
+        let mut journal_buffer = Vec::from(JOURNAL_MAGIC.to_le_bytes());
+        journal_buffer.extend_from_slice(&0u32.to_le_bytes());
+
+        Pager {
+            io: BlockIo::new(io, self.page_size, block_size),
+            block_size,
+            page_size,
+            cache,
+            journal_file_path,
+            max_journal_buf_size,
             dirty_pages: HashSet::new(),
+            journal_pages: HashSet::new(),
+            journal_buffer,
+            journal: None,
         }
     }
 }
 
 impl<I> Pager<I> {
-    /// Appends the given page to the write queue.
-    fn push_to_write_queue(&mut self, page_number: PageNumber) {
-        self.cache.mark_dirty(page_number);
-        self.dirty_pages.insert(page_number);
+    pub fn builder() -> Builder {
+        Builder::new()
     }
 }
 
@@ -83,10 +185,88 @@ impl<I: Seek + Read> Pager<I> {
     }
 }
 
-impl<I: Seek + Write> Pager<I> {
+impl<I: Seek + Write + FileOps> Pager<I> {
     /// Manually write a page to disk.
     pub fn write(&mut self, page_number: PageNumber, buf: &[u8]) -> io::Result<usize> {
         self.io.write(page_number, buf)
+    }
+
+    /// Writes all the in-memory copies of original pages to disk and calls
+    /// `fsync()` or the equivalent syscall.
+    ///
+    /// This must be done before writing dirty pages to the DB file to ensure
+    /// we can recover them if we need to rollback.
+    fn sync_journal_buffer(&mut self) -> io::Result<()> {
+        // Journal buffer is empty, only the magic number is written.
+        if self.journal_buffer.len() <= mem::size_of_val(&JOURNAL_MAGIC) {
+            return Ok(());
+        }
+
+        // Create the journal file if it doesn't exist yet.
+        if self.journal.is_none() {
+            self.journal = Some(FileOps::create(&self.journal_file_path)?);
+        }
+
+        let journal = self.journal.as_mut().unwrap();
+
+        // Persist copies to disk.
+        journal.write(&self.journal_buffer)?;
+        journal.flush()?;
+        journal.sync()?;
+
+        // Clear the in-memory buffer.
+        self.journal_buffer
+            .drain(mem::size_of_val(&JOURNAL_MAGIC)..);
+        self.journal_buffer.extend_from_slice(&0u32.to_le_bytes());
+
+        Ok(())
+    }
+
+    /// Appends the given page to the write queue and writes to the journal if
+    /// it's not alrady written.
+    fn push_to_write_queue(&mut self, page_number: PageNumber, index: usize) -> io::Result<()> {
+        // Mark page as dirty.
+        self.cache.mark_dirty(page_number);
+        self.dirty_pages.insert(page_number);
+
+        // Already written to the journal, early return.
+        if self.journal_pages.contains(&page_number) {
+            return Ok(());
+        }
+
+        self.journal_pages.insert(page_number);
+
+        // Write page number
+        self.journal_buffer
+            .extend_from_slice(&page_number.to_le_bytes());
+
+        // Write page content.
+        self.journal_buffer
+            .extend_from_slice(self.cache[index].as_ref());
+
+        // TODO: We should generate a random number here but we can't without
+        // adding dependencies. If we must add dependencies we might as well
+        // compute a CRC checksum or something like that.
+        let checksum = (JOURNAL_MAGIC as u32).wrapping_add(page_number);
+
+        // Write "checksum" (if we can call this a "checksum").
+        self.journal_buffer
+            .extend_from_slice(&checksum.to_le_bytes());
+
+        let num_pages_range = mem::size_of_val(&JOURNAL_MAGIC)
+            ..mem::size_of_val(&JOURNAL_MAGIC) + mem::size_of::<u32>();
+
+        // Increase number of pages written to journal.
+        self.journal_buffer[num_pages_range]
+            .copy_from_slice(&(self.journal_pages.len() as u32).to_le_bytes());
+
+        // If the buffer is full we'll write it now. Otherwise we can wait
+        // until we either have to write dirty pages or the buffer becomes full.
+        if self.journal_buffer.len() >= self.max_journal_buf_size {
+            self.sync_journal_buffer()?;
+        }
+
+        Ok(())
     }
 
     /// Writes all the pages present in the dirty queue and marks them as clean.
@@ -94,6 +274,9 @@ impl<I: Seek + Write> Pager<I> {
     /// Changes might not be reflected unless [`Self::flush`] and [`Self::sync`]
     /// are called.
     pub fn write_dirty_pages(&mut self) -> io::Result<()> {
+        // Persist the original pages to disk first.
+        self.sync_journal_buffer()?;
+
         // Sequential IO bruh blazingly fast :)
         let page_numbers = BinaryHeap::from_iter(self.dirty_pages.iter().copied().map(Reverse));
 
@@ -109,6 +292,14 @@ impl<I: Seek + Write> Pager<I> {
 
         Ok(())
     }
+
+    pub fn commit(&mut self) -> io::Result<()> {
+        self.write_dirty_pages()?;
+        drop(self.journal.take());
+        self.journal_pages.clear();
+
+        I::destroy(&self.journal_file_path)
+    }
 }
 
 impl<I: Write> Pager<I> {
@@ -120,16 +311,16 @@ impl<I: Write> Pager<I> {
     }
 }
 
-impl<I: super::io::Sync> Pager<I> {
+impl<I: FileOps> Pager<I> {
     /// Ensure writes reach their destination.
     ///
-    /// See [`super::io::Sync`] for details.
+    /// See [`FileOps::sync`] for details.
     pub fn sync(&self) -> io::Result<()> {
         self.io.sync()
     }
 }
 
-impl<I: Seek + Read + Write> Pager<I> {
+impl<I: Seek + Read + Write + FileOps> Pager<I> {
     /// Initialize the database file.
     pub fn init(&mut self) -> io::Result<()> {
         // Manually read one block without involving the cache system, because
@@ -164,6 +355,88 @@ impl<I: Seek + Read + Write> Pager<I> {
         self.write(0, page_zero.as_ref())?;
 
         Ok(())
+    }
+
+    pub fn rollback(&mut self) -> Result<usize, DbError> {
+        // Try to open the journal file first. If we can't open it then we're
+        // going to create the file, dump the in-memory buffer and rollback
+        // after that. We should rollback from memory but... laziness. TODO.
+        if self.journal.is_none() {
+            self.journal = Some(
+                FileOps::open(&self.journal_file_path)
+                    .or_else(|_| FileOps::create(&self.journal_file_path))?,
+            );
+        }
+
+        // TODO: This sync call be optimized away by reading the remaining
+        // pages from the in-memory buffer once we're done with the file.
+        self.sync_journal_buffer()?;
+
+        let mut journal = self.journal.take().unwrap();
+        journal.rewind()?;
+
+        let mut reader = BufReader::new(journal);
+
+        let mut num_pages_rolled_back = 0;
+
+        let corrupted_error =
+            || DbError::Corrupted(String::from("journal file is corrupted or invalid"));
+
+        while reader.has_data_left()? {
+            let mut u64buf = [0; mem::size_of::<u64>()];
+            reader
+                .read_exact(&mut u64buf)
+                .map_err(|_| corrupted_error())?;
+
+            if u64::from_le_bytes(u64buf) != JOURNAL_MAGIC {
+                return Err(corrupted_error());
+            }
+
+            let mut u32buf = [0; mem::size_of::<u32>()];
+            reader.read_exact(&mut u32buf)?;
+
+            let num_pages = u32::from_le_bytes(u32buf);
+
+            for _ in 0..num_pages {
+                reader
+                    .read_exact(&mut u32buf)
+                    .map_err(|_| corrupted_error())?;
+
+                let page_number = PageNumber::from_le_bytes(u32buf);
+
+                let mut page_buf = vec![0; self.page_size];
+                reader.read_exact(&mut page_buf)?;
+                reader.read_exact(&mut u32buf)?;
+
+                let checksum = (JOURNAL_MAGIC as u32).wrapping_add(page_number);
+
+                // TODO: At this point we might already have written some
+                // pages back to the database. What do we do with those pages?
+                // Should we sync them?
+                if u32::from_le_bytes(u32buf) != checksum {
+                    return Err(corrupted_error());
+                }
+
+                self.cache.invalidate(page_number);
+                // TODO: Manual writes or go through the cache system and
+                // write everything at once?
+                self.write(page_number, &page_buf)?;
+
+                num_pages_rolled_back += 1;
+            }
+        }
+
+        // TODO: Should we sync at the end or should we sync after every page
+        // write? The second option seems inefficient.
+        self.sync()?;
+
+        // If we managed to sync the changes then the journal file no longer
+        // serves any purpose.
+        I::destroy(&self.journal_file_path)?;
+
+        self.journal_pages.clear();
+
+        Ok(num_pages_rolled_back)
     }
 
     /// Returns a page as a concrete type.
@@ -228,7 +501,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         <&'p mut P as TryFrom<&'p mut MemPage>>::Error: Debug,
     {
         let index = self.lookup::<P>(page_number)?;
-        self.push_to_write_queue(page_number);
+        self.push_to_write_queue(page_number, index)?;
 
         let mem_page = &mut self.cache[index];
 
@@ -264,9 +537,10 @@ impl<I: Seek + Read + Write> Pager<I> {
         // give us space, then once we have all the space we need figure out
         // which pages are not in memory, load them from disk and finally build
         // the mutable refs. Easier said than done :)
-        for page in &pages {
-            self.lookup::<Page>(*page)?;
-        }
+        let frames = pages
+            .iter()
+            .map(|page| self.lookup::<Page>(*page))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Couldn't cache all pages, bail out. Ideally we should use pin() and
         // then once we have all the space unpin() and return the refs, but that
@@ -275,8 +549,8 @@ impl<I: Seek + Read + Write> Pager<I> {
             return Ok(None);
         }
 
-        for page in pages {
-            self.push_to_write_queue(page);
+        for (page, frame) in pages.iter().zip(frames) {
+            self.push_to_write_queue(*page, frame)?;
         }
 
         Ok(self
@@ -395,7 +669,7 @@ impl<I: Seek + Read + Write> Pager<I> {
         let index = self.lookup::<FreePage>(page_number)?;
         self.cache[index].reinit_as::<FreePage>();
 
-        self.push_to_write_queue(page_number);
+        self.push_to_write_queue(page_number, index)?;
 
         let mut header = self.read_header()?;
 
@@ -433,33 +707,37 @@ impl<I: Seek + Read + Write> Pager<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, mem};
 
     use super::Pager;
     use crate::{
-        paging::{cache::Cache, io::MemBuf},
+        db::DbError,
+        paging::{
+            cache::Cache,
+            io::MemBuf,
+            pager::{PageNumber, DEFAULT_MAX_JOURNAL_BUFFERED_PAGES, JOURNAL_MAGIC},
+        },
         storage::page::{Cell, OverflowPage, Page},
     };
 
     fn init_pager_with_cache(cache: Cache) -> io::Result<Pager<MemBuf>> {
-        let mut pager = Pager::with_cache(
-            io::Cursor::new(Vec::new()),
-            cache.page_size(),
-            cache.page_size(),
-            cache,
-        );
+        let mut pager = Pager::<MemBuf>::builder()
+            .page_size(cache.page_size())
+            .cache(cache)
+            .wrap(io::Cursor::new(Vec::new()));
+
         pager.init()?;
 
         Ok(pager)
     }
 
-    fn init_pager() -> io::Result<Pager<MemBuf>> {
+    fn init_default_pager() -> io::Result<Pager<MemBuf>> {
         init_pager_with_cache(Cache::builder().page_size(64).max_size(64).build())
     }
 
     #[test]
     fn alloc_disk_page() -> io::Result<()> {
-        let mut pager = init_pager()?;
+        let mut pager = init_default_pager()?;
 
         for i in 1..=10 {
             assert_eq!(pager.alloc_disk_page()?, i);
@@ -477,7 +755,7 @@ mod tests {
 
     #[test]
     fn free_page() -> io::Result<()> {
-        let mut pager = init_pager()?;
+        let mut pager = init_default_pager()?;
 
         for _ in 1..=10 {
             pager.alloc_disk_page()?;
@@ -498,7 +776,7 @@ mod tests {
 
     #[test]
     fn write_queue() -> io::Result<()> {
-        let mut pager = init_pager()?;
+        let mut pager = init_default_pager()?;
 
         for i in 1..=10 {
             let mut page = Page::alloc(pager.page_size);
@@ -650,6 +928,104 @@ mod tests {
             expected.content_mut().fill(page_number as u8);
 
             assert_eq!(pager.get_as::<OverflowPage>(page_number)?, &expected);
+        }
+
+        Ok(())
+    }
+
+    fn expected_journal_len(page_size: usize, written_pages: usize) -> usize {
+        mem::size_of_val(&JOURNAL_MAGIC)
+            + mem::size_of::<u32>()
+            + (written_pages) * (mem::size_of::<u32>() + page_size + mem::size_of::<u32>())
+    }
+
+    #[test]
+    fn write_to_journal_before_writing_dirty_pages() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::builder().max_size(3).page_size(64).build())?;
+
+        let modified_pages = 3;
+
+        // We'll bypass page allocations to make sure the pager doesn't use
+        // page 0. That way we know exactly how many pages should be written to
+        // the journal.
+        for page_number in 1..=modified_pages {
+            pager.get_mut_as::<OverflowPage>(page_number)?;
+        }
+
+        // Should sync the journal.
+        pager.write_dirty_pages()?;
+
+        // We're not going to check the written content here basically because
+        // we'd have to reimplement the rollback algorithm. At that point we'd
+        // be getting into the "test the test" situation. We could decouple
+        // reading and rolling back... so... TODO.
+        assert!(pager.journal.is_some());
+        assert_eq!(
+            pager.journal.unwrap().into_inner().len(),
+            expected_journal_len(pager.page_size, modified_pages as usize)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_journal_pages_when_journal_buf_fills_up() -> io::Result<()> {
+        let mut pager = init_pager_with_cache(Cache::builder().max_size(64).page_size(64).build())?;
+
+        let modified_pages = DEFAULT_MAX_JOURNAL_BUFFERED_PAGES;
+
+        for page_number in 1..=modified_pages + 1 {
+            pager.get_mut_as::<OverflowPage>(page_number as PageNumber)?;
+        }
+
+        assert!(pager.journal.is_some());
+        assert_eq!(
+            pager.journal_buffer.len(),
+            expected_journal_len(pager.page_size, 1)
+        );
+        assert_eq!(
+            pager.journal.unwrap().into_inner().len(),
+            expected_journal_len(pager.page_size, modified_pages)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rollback() -> Result<(), DbError> {
+        let mut pager = init_pager_with_cache(Cache::builder().max_size(64).page_size(64).build())?;
+
+        let update_key = 170;
+
+        let mut expected_pages = Vec::new();
+
+        // Load initialized pages from disk into mem.
+        for page_number in 1..=10 {
+            let mut ovf_page = OverflowPage::alloc(pager.page_size);
+            ovf_page.content_mut().fill(page_number as u8);
+            expected_pages.push(ovf_page.clone());
+
+            pager.write(page_number as PageNumber, ovf_page.as_ref())?;
+            pager.get_as::<OverflowPage>(page_number)?;
+        }
+
+        for update_page in [5, 7, 9] {
+            pager
+                .get_mut_as::<OverflowPage>(update_page)?
+                .content_mut()
+                .fill(update_key);
+        }
+
+        pager.rollback()?;
+
+        assert!(pager.journal.is_none());
+        assert_eq!(
+            pager.journal_buffer.len(),
+            expected_journal_len(pager.page_size, 0)
+        );
+
+        for (page_number, expected_page) in (1..=10).zip(expected_pages.iter()) {
+            assert_eq!(pager.get_as::<OverflowPage>(page_number)?, expected_page);
         }
 
         Ok(())

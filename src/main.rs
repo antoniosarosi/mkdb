@@ -9,6 +9,7 @@
 #![feature(map_many_mut)]
 #![feature(trait_alias)]
 #![feature(pointer_is_aligned)]
+#![feature(buf_read_has_data_left)]
 
 mod db;
 mod os;

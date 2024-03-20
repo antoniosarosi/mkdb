@@ -26,7 +26,7 @@ pub(crate) fn needs_plan(statement: &Statement) -> bool {
 }
 
 /// Generates a query plan that's ready to execute by the VM.
-pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::Sync>(
+pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
     statement: Statement,
     db: &mut Database<I>,
 ) -> Result<Plan<I>, DbError> {

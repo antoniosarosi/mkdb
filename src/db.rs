@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     usize,
 };
@@ -13,6 +13,7 @@ use crate::{
     os::{Disk, HardwareBlockSize},
     paging::{
         self,
+        io::FileOps,
         pager::{PageNumber, Pager},
     },
     query,
@@ -48,6 +49,8 @@ pub(crate) struct Database<I> {
     pub pager: Rc<RefCell<Pager<I>>>,
     /// Database context. See [`DatabaseContext`].
     pub context: Context,
+    /// Working directory (the directory of the file).
+    pub work_dir: PathBuf,
 }
 
 impl Database<File> {
@@ -68,11 +71,19 @@ impl Database<File> {
 
         let block_size = Disk::from(&path).block_size()?;
 
-        let mut pager = Pager::new(file, DEFAULT_PAGE_SIZE, block_size);
+        let mut journal_file_path = path.as_ref().canonicalize()?;
+        journal_file_path.push(".journal");
+
+        let mut pager = Pager::<File>::builder()
+            .page_size(DEFAULT_PAGE_SIZE)
+            .block_size(block_size)
+            .wrap(file);
 
         pager.init()?;
 
-        Ok(Database::new(Rc::new(RefCell::new(pager))))
+        let work_dir = path.as_ref().parent().unwrap().canonicalize()?;
+
+        Ok(Database::new(Rc::new(RefCell::new(pager)), work_dir))
     }
 }
 
@@ -122,6 +133,7 @@ pub(crate) enum DbError {
     Io(io::Error),
     Parser(ParserError),
     Sql(SqlError),
+    Corrupted(String),
 }
 
 impl Display for DbError {
@@ -130,6 +142,7 @@ impl Display for DbError {
             Self::Io(e) => write!(f, "{e}"),
             Self::Parser(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
+            Self::Corrupted(message) => f.write_str(&message),
         }
     }
 }
@@ -239,7 +252,7 @@ impl Projection {
     }
 }
 
-impl<I: Seek + Read + Write> TryFrom<Plan<I>> for Projection {
+impl<I: Seek + Read + Write + FileOps> TryFrom<Plan<I>> for Projection {
     type Error = DbError;
 
     fn try_from(plan: Plan<I>) -> Result<Self, Self::Error> {
@@ -443,15 +456,16 @@ impl DatabaseContext for Context {
 }
 
 impl<I> Database<I> {
-    pub fn new(pager: Rc<RefCell<Pager<I>>>) -> Self {
+    pub fn new(pager: Rc<RefCell<Pager<I>>>, work_dir: PathBuf) -> Self {
         Self {
             pager,
+            work_dir,
             context: Context::with_max_size(DEFAULT_RELATION_CACHE_SIZE),
         }
     }
 }
 
-impl<I: Seek + Read + Write + paging::io::Sync> DatabaseContext for Database<I> {
+impl<I: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<I> {
     fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError> {
         if !self.context.contains(table) {
             let metadata = self.load_table_metadata(table)?;
@@ -462,7 +476,7 @@ impl<I: Seek + Read + Write + paging::io::Sync> DatabaseContext for Database<I> 
     }
 }
 
-impl<I: Seek + Read + Write + paging::io::Sync> Database<I> {
+impl<I: Seek + Read + Write + paging::io::FileOps> Database<I> {
     /// Loads the next row ID that should be used for the table rooted at
     /// `root`.
     ///
@@ -602,6 +616,7 @@ mod tests {
         cell::RefCell,
         collections::HashMap,
         io::{self, Read, Seek, Write},
+        path::PathBuf,
         rc::Rc,
     };
 
@@ -644,15 +659,15 @@ mod tests {
             .page_size(conf.page_size)
             .max_size(conf.cache_size)
             .build();
-        let mut pager = Pager::with_cache(
-            io::Cursor::new(Vec::<u8>::new()),
-            conf.page_size,
-            conf.page_size,
-            cache,
-        );
+
+        let mut pager = Pager::<MemBuf>::builder()
+            .page_size(conf.page_size)
+            .cache(cache)
+            .wrap(io::Cursor::new(Vec::<u8>::new()));
+
         pager.init()?;
 
-        Ok(Database::new(Rc::new(RefCell::new(pager))))
+        Ok(Database::new(Rc::new(RefCell::new(pager)), PathBuf::new()))
     }
 
     fn init_database() -> io::Result<Database<MemBuf>> {
@@ -1195,7 +1210,7 @@ mod tests {
         Ok(())
     }
 
-    fn assert_index_contains<I: Seek + Read + Write + paging::io::Sync>(
+    fn assert_index_contains<I: Seek + Read + Write + paging::io::FileOps>(
         db: &mut Database<I>,
         name: &str,
         key: Column,

@@ -1,27 +1,62 @@
 //! Block size based IO reading and writing.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::{
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 use super::pager::PageNumber;
 
-/// Provides a method to force buffered contents to be written to their
-/// destination.
-///
-/// On Unix systems there are two main ways to achieve this: `fflush()` and
-/// `fsync()`. Flushing is already implemented for us but it's not enough to
-/// write contents to disk. See this [StackOverflow question] for details:
-///
-/// [StackOverflow question]: https://stackoverflow.com/questions/2340610/difference-between-fflush-and-fsync
-pub(crate) trait Sync {
+/// Some common operations that we need to execute on files and are not provided
+/// traits in [`std::io`]
+pub(crate) trait FileOps {
+    /// Creates a file on the filesystem at the given `path`.
+    ///
+    /// If the file already exists it should be truncated.
+    fn create(path: impl AsRef<Path>) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    /// Opens the file "as is", no trunc.
+    fn open(path: impl AsRef<Path>) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    /// Removes the file located at `path`.
+    fn destroy(path: impl AsRef<Path>) -> io::Result<()>;
+
     /// Attempts to persist the data to its destination.
     ///
     /// For disk filesystems this should use the necessary syscalls to send
-    /// everything to the hardware.
+    /// everything to the hardware. On Unix systems there are two main ways to
+    /// achieve this: `fflush()` and `fsync()`. Flushing is already implemented
+    /// for us in [`Write`] but it's not enough to write contents to disk. See
+    /// this [StackOverflow question] for details:
+    ///
+    /// [StackOverflow question]: https://stackoverflow.com/questions/2340610/difference-between-fflush-and-fsync
     fn sync(&self) -> io::Result<()>;
 }
 
-// Luckily this time we don't have to dive into libc and start doing FFI.
-impl Sync for std::fs::File {
+impl FileOps for File {
+    fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+
+    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        File::options().read(true).write(false).open(path)
+    }
+
+    fn destroy(path: impl AsRef<Path>) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    // Luckily this time we don't have to dive into libc and start doing FFI.
     fn sync(&self) -> io::Result<()> {
         self.sync_all()
     }
@@ -33,9 +68,21 @@ impl Sync for std::fs::File {
 /// database.
 pub(crate) type MemBuf = io::Cursor<Vec<u8>>;
 
-// Syncing in memory doesn't do anything, but since most of our data structures
-// are generic over some IO implementation we need this to keep things simple.
-impl Sync for MemBuf {
+impl FileOps for MemBuf {
+    fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(io::Cursor::new(Vec::new()))
+    }
+
+    // TODO: HashMap of Path -> Cursor.
+    // That would allow us to simulate a file system for tests.
+    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(io::Cursor::new(Vec::new()))
+    }
+
+    fn destroy(path: impl AsRef<Path>) -> io::Result<()> {
+        Ok(())
+    }
+
     fn sync(&self) -> io::Result<()> {
         Ok(())
     }
@@ -244,7 +291,7 @@ impl<I: Write> BlockIo<I> {
     }
 }
 
-impl<I: Sync> BlockIo<I> {
+impl<I: FileOps> BlockIo<I> {
     /// See [`Sync`] for details.
     pub fn sync(&self) -> io::Result<()> {
         self.io.sync()

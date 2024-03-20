@@ -10,6 +10,7 @@ use crate::{
     db::{Database, DatabaseContext, DbError, Schema},
     paging::{
         self,
+        io::FileOps,
         pager::{PageNumber, Pager},
     },
     sql::statement::{BinaryOperator, Column, DataType, Expression},
@@ -21,7 +22,7 @@ use crate::{
 ///
 /// The generated plan will be either [`SeqScan`] or [`IndexScan`] with an
 /// optional [`Filter`] on top of it, depending on how the query looks like.
-pub(crate) fn generate_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
+pub(crate) fn generate_scan_plan<I: Seek + Read + Write + FileOps>(
     table: &str,
     filter: Option<Expression>,
     db: &mut Database<I>,
@@ -46,7 +47,7 @@ pub(crate) fn generate_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
 /// Creates a new cursor and positions it at the given key.
 ///
 /// The cursor will return the given key when calling [`Cursor::try_next`].
-fn position_cursor_at_key<I: Seek + Read + Write>(
+fn position_cursor_at_key<I: Seek + Read + Write + FileOps>(
     key: &[u8],
     data_type: &DataType,
     root: PageNumber,
@@ -65,7 +66,7 @@ fn position_cursor_at_key<I: Seek + Read + Write>(
 
 /// Basically a constructor. We'll use this until we figure out exactly how to
 /// build stuff here.
-fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
+fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
     table: &str,
     db: &mut Database<I>,
 ) -> Result<Box<Plan<I>>, DbError> {
@@ -83,7 +84,7 @@ fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
 /// It's only possible to do so if we find an expression that contains an
 /// indexed column and must always be executed. Otherwise we'll fallback to
 /// sequential scans.
-fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::Sync>(
+fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
     table: &str,
     db: &mut Database<I>,
     filter: &Expression,

@@ -11,7 +11,10 @@ use std::{
 
 use super::page::{Cell, OverflowPage, Page, SlotId};
 use crate::{
-    paging::pager::{PageNumber, Pager},
+    paging::{
+        io::FileOps,
+        pager::{PageNumber, Pager},
+    },
     sql::statement::DataType,
 };
 
@@ -412,7 +415,7 @@ impl<'p, I, C: BytesCmp> BTree<'p, I, C> {
     }
 }
 
-impl<'p, I: Seek + Read + Write, C: BytesCmp> BTree<'p, I, C> {
+impl<'p, I: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, I, C> {
     /// Returns the value corresponding to the key.
     ///
     /// See [`Self::search`] for details.
@@ -1949,7 +1952,7 @@ impl<'p, I: Seek + Read + Write, C: BytesCmp> BTree<'p, I, C> {
 ///
 /// If the cell at the given slot is not "overflow" then this simply returns a
 /// reference to its content.
-pub(crate) fn reassemble_payload<I: Seek + Read + Write>(
+pub(crate) fn reassemble_payload<I: Seek + Read + Write + FileOps>(
     pager: &mut Pager<I>,
     page: PageNumber,
     slot: SlotId,
@@ -2044,7 +2047,10 @@ impl Cursor {
     ///     self.page
     ///     ends here
     /// ```
-    fn move_to_leftmost<I: Seek + Read + Write>(&mut self, pager: &mut Pager<I>) -> io::Result<()> {
+    fn move_to_leftmost<I: Seek + Read + Write + FileOps>(
+        &mut self,
+        pager: &mut Pager<I>,
+    ) -> io::Result<()> {
         let mut node = pager.get(self.page)?;
 
         while !node.is_leaf() {
@@ -2245,7 +2251,7 @@ impl Cursor {
     /// SQLite 2. Take a look at the [original].
     ///
     /// [original]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L1630-L1677
-    pub fn try_next<I: Seek + Read + Write>(
+    pub fn try_next<I: Seek + Read + Write + FileOps>(
         &mut self,
         pager: &mut Pager<I>,
     ) -> io::Result<Option<(PageNumber, SlotId)>> {
@@ -2322,7 +2328,7 @@ impl Cursor {
     ///
     /// See [`Self::try_next`] for the actual code. This one just flips
     /// [`Result<Option>`] to make it [`Option<Result>`].
-    pub fn next<I: Seek + Read + Write>(
+    pub fn next<I: Seek + Read + Write + FileOps>(
         &mut self,
         pager: &mut Pager<I>,
     ) -> Option<io::Result<(PageNumber, SlotId)>> {
@@ -2462,15 +2468,16 @@ mod tests {
                 .unwrap_or(optimal_page_size_for_order(self.order));
             let buf = io::Cursor::new(Vec::new());
 
-            let mut pager = Pager::with_cache(
-                buf,
-                page_size,
-                page_size,
-                Cache::builder()
-                    .page_size(page_size)
-                    .max_size(self.cache_size)
-                    .build(),
-            );
+            let mut pager = Pager::<MemBuf>::builder()
+                .page_size(page_size)
+                .cache(
+                    Cache::builder()
+                        .page_size(page_size)
+                        .max_size(self.cache_size)
+                        .build(),
+                )
+                .wrap(buf);
+
             pager.init()?;
 
             let root = if self.root_at_zero {

@@ -12,6 +12,7 @@ use crate::{
     db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
     paging::{
         self,
+        io::FileOps,
         pager::{PageNumber, Pager},
     },
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
@@ -19,7 +20,7 @@ use crate::{
     vm,
 };
 
-pub(crate) fn exec<I: Seek + Read + Write + paging::io::Sync>(
+pub(crate) fn exec<I: Seek + Read + Write + paging::io::FileOps>(
     plan: Plan<I>,
 ) -> Result<Projection, DbError> {
     Projection::try_from(plan)
@@ -45,7 +46,7 @@ pub(crate) enum Plan<I> {
 // but that's even more verbose than this and requires I: 'static everywhere. We
 // also woudn't know the type of a plan because dyn Trait doesn't have a tag. So
 // match it for now :)
-impl<I: Seek + Read + Write> Plan<I> {
+impl<I: Seek + Read + Write + FileOps> Plan<I> {
     pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         match self {
             Self::SeqScan(seq_scan) => seq_scan.try_next(),
@@ -61,7 +62,7 @@ impl<I: Seek + Read + Write> Plan<I> {
     }
 }
 
-impl<I: Seek + Read + Write> Iterator for Plan<I> {
+impl<I: Seek + Read + Write + FileOps> Iterator for Plan<I> {
     type Item = Result<Tuple, DbError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -84,7 +85,7 @@ pub(crate) struct BufferedIter<I> {
     pub collected: bool,
 }
 
-impl<I: Seek + Read + Write> BufferedIter<I> {
+impl<I: Seek + Read + Write + FileOps> BufferedIter<I> {
     pub fn new(source: Box<Plan<I>>) -> Self {
         Self {
             source,
@@ -121,7 +122,7 @@ pub(crate) struct SeqScan<I> {
     pub cursor: Cursor,
 }
 
-impl<I: Seek + Read + Write> SeqScan<I> {
+impl<I: Seek + Read + Write + FileOps> SeqScan<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let mut pager = self.pager.borrow_mut();
 
@@ -147,7 +148,7 @@ pub(crate) struct IndexScan<I> {
     pub cursor: Cursor,
 }
 
-impl<I: Seek + Read + Write> IndexScan<I> {
+impl<I: Seek + Read + Write + FileOps> IndexScan<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         if self.done {
             return Ok(None);
@@ -214,7 +215,7 @@ pub(crate) struct Filter<I> {
     pub filter: Expression,
 }
 
-impl<I: Seek + Read + Write> Filter<I> {
+impl<I: Seek + Read + Write + FileOps> Filter<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         while let Some(tuple) = self.source.try_next()? {
             if vm::eval_where(&self.schema, &tuple, &self.filter)? {
@@ -233,7 +234,7 @@ pub(crate) struct Project<I> {
     pub projection: Vec<Expression>,
 }
 
-impl<I: Seek + Read + Write> Project<I> {
+impl<I: Seek + Read + Write + FileOps> Project<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(tuple) = self.source.try_next()? else {
             return Ok(None);
@@ -277,7 +278,7 @@ pub(crate) struct Sort<I> {
     pub sorted: bool,
 }
 
-impl<I: Seek + Read + Write> Sort<I> {
+impl<I: Seek + Read + Write + FileOps> Sort<I> {
     fn sort(&mut self) -> Result<(), DbError> {
         for tuple in self.source.collection.iter_mut() {
             for expr in &self.by {
@@ -334,7 +335,7 @@ pub(crate) struct Insert<I> {
     pub indexes: Vec<IndexMetadata>,
 }
 
-impl<I: Seek + Read + Write> Insert<I> {
+impl<I: Seek + Read + Write + FileOps> Insert<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(tuple) = self.source.try_next()? else {
             return Ok(None);
@@ -379,7 +380,7 @@ pub(crate) struct Update<I> {
     pub schema: Schema,
 }
 
-impl<I: Seek + Read + Write> Update<I> {
+impl<I: Seek + Read + Write + FileOps> Update<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(mut tuple) = self.source.try_next()? else {
             return Ok(None);
@@ -407,7 +408,7 @@ pub(crate) struct Delete<I> {
     pub indexes: Vec<IndexMetadata>,
 }
 
-impl<I: Seek + Read + Write> Delete<I> {
+impl<I: Seek + Read + Write + FileOps> Delete<I> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(tuple) = self.source.try_next()? else {
             return Ok(None);
