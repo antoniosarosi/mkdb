@@ -1,3 +1,11 @@
+/// A tuple is a single database row.
+///
+/// TODO: Right now we're "serializing" and "deserializing" rows which is not
+/// really needed. We already store the rows in such a format that we can
+/// interpret the bytes in them as numbers or strings without having to copy
+/// them into [`Value`] structures. Serializing and deserializing made it easy
+/// to develop in the beginning because it doesn't require any unsafe code, but
+/// it's probably the biggest performance hit because we do it many times.
 use std::mem;
 
 use crate::{

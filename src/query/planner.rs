@@ -19,12 +19,6 @@ use crate::{
     },
 };
 
-/// Returns `true` if the given `statement` needs a query [`Plan`] to be
-/// executed.
-pub(crate) fn needs_plan(statement: &Statement) -> bool {
-    !matches!(statement, Statement::Create(_))
-}
-
 /// Generates a query plan that's ready to execute by the VM.
 pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
     statement: Statement,

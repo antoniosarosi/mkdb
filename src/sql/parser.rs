@@ -267,6 +267,15 @@ impl<'i> Parser<'i> {
                 })
             }
 
+            Keyword::Start => {
+                self.expect_keyword(Keyword::Transaction)?;
+                Statement::StartTransaction
+            }
+
+            Keyword::Commit => Statement::Commit,
+
+            Keyword::Rollback => Statement::Rollback,
+
             _ => unreachable!(),
         };
 
@@ -718,6 +727,9 @@ impl<'i> Parser<'i> {
             Keyword::Insert,
             Keyword::Delete,
             Keyword::Drop,
+            Keyword::Start,
+            Keyword::Rollback,
+            Keyword::Commit,
         ]
     }
 

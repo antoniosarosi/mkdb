@@ -113,6 +113,12 @@ type FrameId = usize;
 
 /// Page read cache with clock eviction policy.
 ///
+/// Take a look at this [lecture] for the implementation idea.
+///
+/// [lecture]: https://youtu.be/_vRG1ksPlXs?si=OiHywLwSwuRzeRvh&t=2752
+///
+/// # Data Structure
+///
 /// Pages are loaded into a buffer pool until the buffer is full, then the clock
 /// algorithm kicks in. Each page is stored in a [`Frame`] inside the buffer
 /// pool, which holds additinal metadata such as reference bit and dirty flag.

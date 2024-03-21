@@ -40,6 +40,7 @@ pub(crate) trait FileOps {
 
 impl FileOps for File {
     fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        println!("{:?}", path.as_ref());
         File::options()
             .create(true)
             .truncate(true)

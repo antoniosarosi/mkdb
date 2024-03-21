@@ -58,6 +58,10 @@ pub(crate) enum Keyword {
     By,
     Index,
     On,
+    Start,
+    Transaction,
+    Rollback,
+    Commit,
     /// Not a keyword, used for convenience. See [`super::tokenizer::Tokenizer`].
     None,
 }
@@ -156,6 +160,10 @@ impl Display for Keyword {
             Self::By => "BY",
             Self::Index => "INDEX",
             Self::On => "ON",
+            Self::Start => "BEGIN",
+            Self::Transaction => "TRANSACTION",
+            Self::Rollback => "ROLLBACK",
+            Self::Commit => "COMMIT",
             Self::None => "_",
         })
     }

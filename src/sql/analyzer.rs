@@ -182,7 +182,9 @@ pub(crate) fn analyze(
             analyze_where(&metadata.schema, r#where)?;
         }
 
-        _ => todo!("rest of SQL statements"),
+        _ => {
+            // Rest of statements that we support don't require any analysis.
+        }
     };
 
     Ok(())

@@ -384,6 +384,10 @@ impl<'i> Tokenizer<'i> {
             "BY" => Keyword::By,
             "INDEX" => Keyword::Index,
             "ON" => Keyword::On,
+            "START" => Keyword::Start,
+            "TRANSACTION" => Keyword::Transaction,
+            "ROLLBACK" => Keyword::Rollback,
+            "COMMIT" => Keyword::Commit,
             _ => Keyword::None,
         };
 

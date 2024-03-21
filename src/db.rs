@@ -45,12 +45,15 @@ pub(crate) type RowId = u64;
 /// Provides the high level [`Database::exec`] API that receives SQL text and
 /// runs it.
 pub(crate) struct Database<I> {
-    /// The database owns the pager.
+    /// The database owns the pager. TODO: [`Rc<Refcell>`] is a temporary
+    /// solution until we make the pager multithreaded.
     pub pager: Rc<RefCell<Pager<I>>>,
     /// Database context. See [`DatabaseContext`].
     pub context: Context,
     /// Working directory (the directory of the file).
     pub work_dir: PathBuf,
+    /// `true` if we are currently in a transaction.
+    transaction_started: bool,
 }
 
 impl Database<File> {
@@ -71,17 +74,21 @@ impl Database<File> {
 
         let block_size = Disk::from(&path).block_size()?;
 
-        let mut journal_file_path = path.as_ref().canonicalize()?;
-        journal_file_path.push(".journal");
+        let full_db_file_path = path.as_ref().canonicalize()?;
+        let work_dir = full_db_file_path.parent().unwrap().to_path_buf();
+
+        let mut extension = full_db_file_path.extension().unwrap().to_os_string();
+        extension.push(".journal");
+
+        let journal_file_path = full_db_file_path.with_extension(extension);
 
         let mut pager = Pager::<File>::builder()
             .page_size(DEFAULT_PAGE_SIZE)
             .block_size(block_size)
+            .journal_file_path(journal_file_path)
             .wrap(file);
 
         pager.init()?;
-
-        let work_dir = path.as_ref().parent().unwrap().canonicalize()?;
 
         Ok(Database::new(Rc::new(RefCell::new(pager)), work_dir))
     }
@@ -155,6 +162,7 @@ impl<E: Into<SqlError>> From<E> for DbError {
 
 impl From<io::Error> for DbError {
     fn from(e: io::Error) -> Self {
+        println!("{}", std::backtrace::Backtrace::capture());
         Self::Io(e)
     }
 }
@@ -461,6 +469,7 @@ impl<I> Database<I> {
             pager,
             work_dir,
             context: Context::with_max_size(DEFAULT_RELATION_CACHE_SIZE),
+            transaction_started: false,
         }
     }
 }
@@ -591,22 +600,53 @@ impl<I: Seek + Read + Write + paging::io::FileOps> Database<I> {
     pub fn exec(&mut self, input: &str) -> Result<Projection, DbError> {
         let statement = sql::pipeline(input, self)?;
 
-        // TODO: Rollback if it fails.
-        let projection = if query::planner::needs_plan(&statement) {
-            let plan = query::planner::generate_plan(statement, self)?;
-            vm::plan::exec(plan)?
-        } else {
-            vm::statement::exec(statement, self)?;
-            Projection::empty()
+        if statement == Statement::StartTransaction && self.transaction_started {
+            return Err(DbError::Sql(SqlError::Other(String::from(
+                "There is already a transaction in progress",
+            ))));
+        }
+
+        let commit = statement == Statement::Commit
+            || statement != Statement::StartTransaction && !self.transaction_started;
+
+        let rollback = statement == Statement::Rollback;
+
+        if !self.transaction_started {
+            self.transaction_started = true;
+        }
+
+        let projection = match &statement {
+            Statement::Create(_) => {
+                vm::statement::exec(statement, self).map(|_| Projection::empty())
+            }
+
+            Statement::StartTransaction | Statement::Commit | Statement::Rollback => {
+                Ok(Projection::empty())
+            }
+
+            _ => query::planner::generate_plan(statement, self).and_then(vm::plan::exec),
         };
 
-        // TODO: Transactions.
         let mut pager = self.pager.borrow_mut();
-        pager.write_dirty_pages()?;
-        pager.flush()?;
-        pager.sync()?;
 
-        Ok(projection)
+        if commit {
+            self.transaction_started = false;
+            pager.commit()?;
+        } else if rollback || projection.is_err() {
+            self.transaction_started = false;
+
+            let rollback_result = pager.rollback();
+
+            if rollback_result.is_err() {
+                if projection.is_err() {
+                    panic!("database bruh moment: error {rollback_result:?} while processing query so we had to rollback, but then there was an error while rolling back: {projection:?}");
+                } else {
+                    return Err(rollback_result.unwrap_err());
+                }
+            }
+        }
+
+        projection
     }
 }
 

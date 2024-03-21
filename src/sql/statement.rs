@@ -30,6 +30,12 @@ pub(crate) enum Statement {
     },
 
     Drop(Drop),
+
+    StartTransaction,
+
+    Rollback,
+
+    Commit,
 }
 
 /// Expressions used in select, update, delete and insert statements.
@@ -382,6 +388,18 @@ impl Display for Statement {
                     Drop::Table(name) => write!(f, "DROP TABLE {name}")?,
                     Drop::Database(name) => write!(f, "DROP DATABASE {name}")?,
                 };
+            }
+
+            Statement::StartTransaction => {
+                f.write_str("START TRANSACTION");
+            }
+
+            Statement::Commit => {
+                f.write_str("COMMIT");
+            }
+
+            Statement::Rollback => {
+                f.write_str("ROLLBACK");
             }
         };
 
