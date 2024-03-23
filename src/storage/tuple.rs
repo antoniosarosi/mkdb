@@ -5,7 +5,7 @@
 /// interpret the bytes in them as numbers or strings without having to copy
 /// them into [`Value`] structures. Serializing and deserializing made it easy
 /// to develop in the beginning because it doesn't require any unsafe code, but
-/// it's probably the biggest performance hit because we do it many times.
+/// it's probably the biggest performance hit because we do it so many times.
 use std::mem;
 
 use crate::{
@@ -83,6 +83,19 @@ pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
             (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
 
             (integer_type, Value::Number(num)) => {
+                let bounds = match integer_type {
+                    DataType::Int => i32::MIN as i128..=i32::MAX as i128,
+                    DataType::UnsignedInt => 0..=u32::MAX as i128,
+                    DataType::BigInt => i64::MIN as i128..=i64::MAX as i128,
+                    DataType::UnsignedBigInt => 0..=u64::MAX as i128,
+                    _ => unreachable!(),
+                };
+
+                assert!(
+                    bounds.contains(num),
+                    "integer overflow while serializing number {num} into data type {integer_type:?}"
+                );
+
                 let byte_length = byte_length_of_integer_type(integer_type);
                 let big_endian_bytes = num.to_be_bytes();
                 buf.extend_from_slice(&big_endian_bytes[big_endian_bytes.len() - byte_length..]);
@@ -113,7 +126,8 @@ pub(crate) fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
 
                 let length = u16::from_le_bytes(length_buf) as usize;
 
-                // TODO: We need to validate somewhere that this is actually valid UTF-8
+                // TODO: We need to validate somewhere that this is actually
+                // valid UTF-8 (not here with unwrap(), before inserting into the DB).
                 values.push(Value::String(
                     std::str::from_utf8(&buf[index..index + length])
                         .unwrap()
