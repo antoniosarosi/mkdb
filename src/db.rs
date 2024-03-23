@@ -1041,7 +1041,7 @@ mod tests {
 
     /// Used mostly to test the possibilities of a BTree rooted at page zero,
     /// since that's a special case.
-    // #[cfg(not(miri))]
+    #[cfg(not(miri))]
     #[test]
     fn create_many_tables() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -1263,7 +1263,7 @@ mod tests {
 
         while let Some((page, slot)) = cursor.try_next(&mut pager)? {
             let entry = reassemble_payload(&mut pager, page, slot)?;
-            entries.push(tuple::deserialize_values(
+            entries.push(tuple::deserialize(
                 entry.as_ref(),
                 &Schema::from(vec![
                     key.clone(),
@@ -1358,7 +1358,7 @@ mod tests {
     /// to force as many evictions as possible.
     ///
     /// If this one works then I guess we can go home...
-    // #[cfg(not(miri))]
+    #[cfg(not(miri))]
     #[test]
     fn insert_many() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {

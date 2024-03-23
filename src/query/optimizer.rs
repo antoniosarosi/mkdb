@@ -120,8 +120,7 @@ fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
             let idx = metadata.schema.index_of(col).unwrap();
             let col_def = metadata.schema.columns[idx].clone();
 
-            let key =
-                tuple::serialize_values(&Schema::from(vec![col_def.clone()]), &[value.clone()]);
+            let key = tuple::serialize(&Schema::from(vec![col_def.clone()]), &[value.clone()]);
 
             (key, col_def, indexes[col])
         }

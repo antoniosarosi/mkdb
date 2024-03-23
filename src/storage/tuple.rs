@@ -21,19 +21,42 @@ pub(crate) fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
-macro_rules! serialize_big_endian {
-    ($num:expr, $int:ty) => {
-        TryInto::<$int>::try_into(*$num).unwrap().to_be_bytes()
-    };
+fn byte_length_of_integer_type(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Int | DataType::UnsignedInt => 4,
+        DataType::BigInt | DataType::UnsignedBigInt => 8,
+        _ => unreachable!("byte_length_of_integer_type() called with incorrect {data_type:?}"),
+    }
 }
 
-// TODO: Fix this nonsense. Or maybe find a way to make it even more
-// inefficient :)
-pub(crate) fn size_of(schema: &Schema, values: &[Value]) -> usize {
-    serialize_values(schema, values).len()
+pub(crate) fn size_of(schema: &Schema, tuple: &[Value]) -> usize {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| match col.data_type {
+            DataType::Bool => 1,
+
+            DataType::Varchar(max) => {
+                let length_bytes = if max <= u8::MAX as usize { 1 } else { 2 };
+
+                let Value::String(string) = &tuple[i] else {
+                    panic!(
+                        "expected data type {}, found value {}",
+                        DataType::Varchar(max),
+                        tuple[i]
+                    );
+                };
+
+                length_bytes + string.as_bytes().len()
+            }
+
+            integer_type => byte_length_of_integer_type(&integer_type),
+        })
+        .sum()
 }
 
-pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
+pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
     debug_assert_eq!(
         schema.len(),
         values.len(),
@@ -46,32 +69,24 @@ pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     for (col, val) in schema.columns.iter().zip(values) {
         match (&col.data_type, val) {
             (DataType::Varchar(max), Value::String(string)) => {
+                if string.as_bytes().len() > u16::MAX as usize {
+                    todo!("strings longer than 65535 bytes are not handled");
+                }
+
                 let length = string.len().to_le_bytes();
+                let length_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
 
-                // TODO: Strings longer than 65535 chars are not handled.
-                let n_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
-
-                buf.extend_from_slice(&length[..n_bytes]);
+                buf.extend_from_slice(&length[..length_bytes]);
                 buf.extend_from_slice(string.as_bytes());
             }
 
-            (DataType::Int, Value::Number(num)) => {
-                buf.extend_from_slice(&serialize_big_endian!(num, i32));
-            }
-
-            (DataType::UnsignedInt, Value::Number(num)) => {
-                buf.extend_from_slice(&serialize_big_endian!(num, u32));
-            }
-
-            (DataType::BigInt, Value::Number(num)) => {
-                buf.extend_from_slice(&serialize_big_endian!(num, i64));
-            }
-
-            (DataType::UnsignedBigInt, Value::Number(num)) => {
-                buf.extend_from_slice(&serialize_big_endian!(num, u64));
-            }
-
             (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
+
+            (integer_type, Value::Number(num)) => {
+                let byte_length = byte_length_of_integer_type(integer_type);
+                let big_endian_bytes = num.to_be_bytes();
+                buf.extend_from_slice(&big_endian_bytes[big_endian_bytes.len() - byte_length..]);
+            }
 
             _ => unreachable!("attempt to serialize {val} into {}", col.data_type),
         }
@@ -80,18 +95,7 @@ pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     buf
 }
 
-macro_rules! deserialize_big_endian {
-    ($buf:expr, $index:expr, $int:ty) => {
-        <$int>::from_be_bytes(
-            $buf[$index..$index + mem::size_of::<$int>()]
-                .try_into()
-                .unwrap(),
-        )
-        .into()
-    };
-}
-
-pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
+pub(crate) fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
     let mut values = Vec::new();
     let mut index = 0;
 
@@ -99,49 +103,39 @@ pub(crate) fn deserialize_values(buf: &[u8], schema: &Schema) -> Vec<Value> {
     for column in &schema.columns {
         match column.data_type {
             DataType::Varchar(max) => {
-                let length = if max <= u8::MAX as usize {
-                    let len = buf[index];
-                    index += 1;
-                    len as usize
-                } else {
-                    let len: usize =
-                        u16::from_le_bytes(buf[index..index + 2].try_into().unwrap()).into();
-                    index += 2;
-                    len
-                };
+                // TODO: We're only supporting strings of maximum length 65535
+                // in bytes (not characters).
+                let mut length_buf = [0; mem::size_of::<u16>()];
+                let length_bytes = if max <= u8::MAX as usize { 1 } else { 2 };
+
+                length_buf[..length_bytes].copy_from_slice(&buf[index..index + length_bytes]);
+                index += length_bytes;
+
+                let length = u16::from_le_bytes(length_buf) as usize;
 
                 // TODO: We need to validate somewhere that this is actually valid UTF-8
                 values.push(Value::String(
-                    std::str::from_utf8(&buf[index..(index + length)])
+                    std::str::from_utf8(&buf[index..index + length])
                         .unwrap()
                         .into(),
                 ));
                 index += length;
             }
 
-            DataType::Int => {
-                values.push(Value::Number(deserialize_big_endian!(buf, index, i32)));
-                index += mem::size_of::<i32>();
-            }
-
-            DataType::UnsignedInt => {
-                values.push(Value::Number(deserialize_big_endian!(buf, index, u32)));
-                index += mem::size_of::<u32>();
-            }
-
-            DataType::BigInt => {
-                values.push(Value::Number(deserialize_big_endian!(buf, index, i64)));
-                index += mem::size_of::<i64>();
-            }
-
-            DataType::UnsignedBigInt => {
-                values.push(Value::Number(deserialize_big_endian!(buf, index, u64)));
-                index += mem::size_of::<u64>();
-            }
-
             DataType::Bool => {
                 values.push(Value::Bool(buf[index] != 0));
-                index += mem::size_of::<bool>();
+                index += 1;
+            }
+
+            integer_type => {
+                let byte_length = byte_length_of_integer_type(&integer_type);
+                let mut big_endian_buf = [0; mem::size_of::<i128>()];
+
+                big_endian_buf[mem::size_of::<i128>() - byte_length..]
+                    .copy_from_slice(&buf[index..index + byte_length]);
+
+                values.push(Value::Number(i128::from_be_bytes(big_endian_buf)));
+                index += byte_length;
             }
         }
     }

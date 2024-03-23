@@ -10,22 +10,17 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, DEFAULT_PAGE_SIZE},
+    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
     paging::{
-        self,
         io::FileOps,
         pager::{PageNumber, Pager},
     },
     sql::statement::{Assignment, BinaryOperator, Column, DataType, Expression, Value},
-    storage::{
-        page::MAX_PAGE_SIZE, reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp,
-    },
+    storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
 };
 
-pub(crate) fn exec<F: Seek + Read + Write + paging::io::FileOps>(
-    plan: Plan<F>,
-) -> Result<Projection, DbError> {
+pub(crate) fn exec<F: Seek + Read + Write + FileOps>(plan: Plan<F>) -> Result<Projection, DbError> {
     Projection::try_from(plan)
 }
 
@@ -87,12 +82,12 @@ pub(crate) struct BufferedIter<F> {
     pub schema: Schema,
     pub mem_buf: Vec<u8>,
     pub max_size: usize,
+    pub max_buffered_tuple_size: usize,
+    pub collected: bool,
+    pub work_dir: PathBuf,
     pub file: Option<F>,
     pub reader: Option<BufReader<F>>,
-    pub work_dir: PathBuf,
-    pub collected: bool,
     pub file_path: PathBuf,
-    pub max_buffered_tuple_size: usize,
 }
 
 impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
@@ -103,14 +98,14 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         Self {
             source,
             schema,
-            work_dir,
-            collected: false,
             mem_buf: vec![],
             max_size: 256,
+            max_buffered_tuple_size: 0,
+            collected: false,
+            work_dir,
             file_path,
             file: None,
             reader: None,
-            max_buffered_tuple_size: 0,
         }
     }
 
@@ -136,7 +131,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
     // We need to write some unsafe to optimize this.
     pub fn collect(&mut self) -> Result<(), DbError> {
         while let Some(tuple) = self.source.try_next()? {
-            let mut serialized = tuple::serialize_values(&self.schema, &tuple);
+            let mut serialized = tuple::serialize(&self.schema, &tuple);
 
             if serialized.len() > self.max_buffered_tuple_size {
                 self.max_buffered_tuple_size = serialized.len();
@@ -175,7 +170,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
                 let mut serialized = vec![0; u32::from_le_bytes(size) as usize];
                 reader.read_exact(&mut serialized)?;
 
-                return Ok(Some(tuple::deserialize_values(&serialized, &self.schema)));
+                return Ok(Some(tuple::deserialize(&serialized, &self.schema)));
             } else {
                 drop(self.reader.take());
                 F::destroy(&self.file_path)?;
@@ -189,7 +184,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         // If there's no file or the file has been consumed, return from memory.
         let size = u32::from_le_bytes(self.mem_buf[..4].try_into().unwrap());
 
-        let tuple = tuple::deserialize_values(&self.mem_buf[4..4 + size as usize], &self.schema);
+        let tuple = tuple::deserialize(&self.mem_buf[4..4 + size as usize], &self.schema);
 
         self.mem_buf.drain(..4 + size as usize);
 
@@ -211,7 +206,7 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
             return Ok(None);
         };
 
-        Ok(Some(tuple::deserialize_values(
+        Ok(Some(tuple::deserialize(
             reassemble_payload(&mut pager, page, slot)?.as_ref(),
             &self.schema,
         )))
@@ -262,7 +257,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
         }
 
         let index_entry =
-            tuple::deserialize_values(&pager.get(page)?.cell(slot).content, &self.index_schema);
+            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index_schema);
 
         let Value::Number(row_id) = index_entry[1] else {
             panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
@@ -283,7 +278,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
                 )
             });
 
-        Ok(Some(tuple::deserialize_values(
+        Ok(Some(tuple::deserialize(
             table_entry.as_ref(),
             &self.table_schema,
         )))
@@ -508,7 +503,6 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         let mut output_page = Vec::new();
 
         while page_runs <= (input_pages + (input_pages % 2)) {
-            println!("PAGE RUNS {page_runs}\n");
             let mut output_pages = 0;
 
             let mut chunk = 0;
@@ -720,7 +714,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // tuple size + tuple content
         for i in 0..tuples.len() {
-            let serialized = tuple::serialize_values(schema, &tuples[i]);
+            let serialized = tuple::serialize(schema, &tuples[i]);
             file.write_all(&(serialized.len() as u32).to_le_bytes())?;
             file.write_all(&serialized)?;
 
@@ -751,7 +745,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             file.read_exact(&mut size)?;
             let mut tup = vec![0; u32::from_le_bytes(size) as usize];
             file.read_exact(&mut tup)?;
-            into.push(tuple::deserialize_values(&tup, schema));
+            into.push(tuple::deserialize(&tup, schema));
         }
 
         Ok(())
@@ -801,7 +795,7 @@ impl<I: Seek + Read + Write + FileOps> Insert<I> {
         let mut pager = self.pager.borrow_mut();
 
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
-        btree.insert(tuple::serialize_values(&self.schema, &tuple))?;
+        btree.insert(tuple::serialize(&self.schema, &tuple))?;
 
         for IndexMetadata { root, column, .. } in &self.indexes {
             let idx = self.schema.index_of(column).unwrap();
@@ -813,8 +807,7 @@ impl<I: Seek + Read + Write + FileOps> Insert<I> {
             let key = tuple[idx].clone();
             let row_id = tuple[0].clone();
 
-            let entry =
-                tuple::serialize_values(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
+            let entry = tuple::serialize(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
 
             let mut btree = BTree::new(
                 &mut pager,
@@ -851,7 +844,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        btree.insert(tuple::serialize_values(&self.schema, &tuple))?;
+        btree.insert(tuple::serialize(&self.schema, &tuple))?;
 
         Ok(Some(vec![]))
     }
@@ -874,14 +867,14 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        btree.remove(&tuple::serialize_values(&self.schema, &tuple))?;
+        btree.remove(&tuple::serialize(&self.schema, &tuple))?;
 
         for IndexMetadata { root, column, .. } in &self.indexes {
             let idx = self.schema.index_of(column).unwrap();
             let key_col = self.schema.columns[idx].clone();
             let key = tuple[idx].clone();
 
-            let entry = tuple::serialize_values(&Schema::from(vec![key_col]), &[key]);
+            let entry = tuple::serialize(&Schema::from(vec![key_col]), &[key]);
 
             let mut btree = BTree::new(
                 &mut pager,

@@ -137,7 +137,7 @@ fn insert_into_mkdb_meta<I: Seek + Read + Write + FileOps>(
         FixedSizeMemCmp::for_type::<RowId>(),
     );
 
-    btree.insert(tuple::serialize_values(&schema, &values))?;
+    btree.insert(tuple::serialize(&schema, &values))?;
 
     Ok(())
 }
