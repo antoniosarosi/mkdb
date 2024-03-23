@@ -149,7 +149,7 @@ impl Display for DbError {
             Self::Io(e) => write!(f, "{e}"),
             Self::Parser(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
-            Self::Corrupted(message) => f.write_str(&message),
+            Self::Corrupted(message) => f.write_str(message),
         }
     }
 }
@@ -635,13 +635,11 @@ impl<I: Seek + Read + Write + paging::io::FileOps> Database<I> {
         } else if rollback || projection.is_err() {
             self.transaction_started = false;
 
-            let rollback_result = pager.rollback();
-
-            if rollback_result.is_err() {
-                if projection.is_err() {
-                    panic!("database bruh moment: error {rollback_result:?} while processing query so we had to rollback, but then there was an error while rolling back: {projection:?}");
+            if let Err(rollback_err) = pager.rollback() {
+                if let Err(query_err) = projection {
+                    panic!("database bruh moment: found error {query_err:?} while processing query so we had to rollback, but then there was an error while rolling back: {rollback_err:?}");
                 } else {
-                    return Err(rollback_result.unwrap_err());
+                    return Err(rollback_err);
                 }
             }
         }
@@ -1043,7 +1041,7 @@ mod tests {
 
     /// Used mostly to test the possibilities of a BTree rooted at page zero,
     /// since that's a special case.
-    #[cfg(not(miri))]
+    // #[cfg(not(miri))]
     #[test]
     fn create_many_tables() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -1360,7 +1358,7 @@ mod tests {
     /// to force as many evictions as possible.
     ///
     /// If this one works then I guess we can go home...
-    #[cfg(not(miri))]
+    // #[cfg(not(miri))]
     #[test]
     fn insert_many() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {

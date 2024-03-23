@@ -2,6 +2,7 @@
 
 use std::{
     io::{Read, Seek, Write},
+    path::PathBuf,
     rc::Rc,
 };
 
@@ -54,14 +55,27 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
         } => {
             let mut source = generate_scan_plan(&from, r#where, db)?;
 
+            let page_size = db.pager.borrow().page_size;
+
+            let work_dir = db.work_dir.clone();
             let metadata = db.table_metadata(&from)?;
 
             if !order_by.is_empty() {
                 source = Box::new(Plan::Sort(Sort {
                     by: order_by,
+                    page_size,
                     schema: metadata.schema.clone(),
+                    schema_with_sort_keys: Schema::empty(),
                     sorted: false,
-                    source: BufferedIter::new(source),
+                    source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
+                    input_file: None,
+                    output_file: None,
+                    mem_buf: vec![],
+                    total_sorted_pages: 0,
+                    next_page: 0,
+                    sort_page_size: page_size,
+                    input_file_path: PathBuf::new(),
+                    output_file_path: PathBuf::new(),
                 }));
             }
 
@@ -117,6 +131,7 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
             r#where,
         } => {
             let source = generate_scan_plan(&table, r#where, db)?;
+            let work_dir = db.work_dir.clone();
 
             let metadata = db.table_metadata(&table)?;
 
@@ -124,20 +139,22 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
                 assignments: columns,
                 root: metadata.root,
                 schema: metadata.schema.clone(),
-                source: BufferedIter::new(source),
+                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
                 pager: Rc::clone(&db.pager),
             })
         }
 
         Statement::Delete { from, r#where } => {
             let source = generate_scan_plan(&from, r#where, db)?;
+            let work_dir = db.work_dir.clone();
+
             let metadata = db.table_metadata(&from)?;
 
             Plan::Delete(Delete {
                 root: metadata.root,
                 schema: metadata.schema.clone(),
                 indexes: metadata.indexes.clone(),
-                source: BufferedIter::new(source),
+                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
                 pager: Rc::clone(&db.pager),
             })
         }

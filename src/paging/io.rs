@@ -26,6 +26,8 @@ pub(crate) trait FileOps {
     /// Removes the file located at `path`.
     fn destroy(path: impl AsRef<Path>) -> io::Result<()>;
 
+    fn truncate(&mut self) -> io::Result<()>;
+
     /// Attempts to persist the data to its destination.
     ///
     /// For disk filesystems this should use the necessary syscalls to send
@@ -57,6 +59,10 @@ impl FileOps for File {
         fs::remove_file(path)
     }
 
+    fn truncate(&mut self) -> io::Result<()> {
+        self.set_len(0)
+    }
+
     // Luckily this time we don't have to dive into libc and start doing FFI.
     fn sync(&self) -> io::Result<()> {
         self.sync_all()
@@ -78,6 +84,13 @@ impl FileOps for MemBuf {
     // That would allow us to simulate a file system for tests.
     fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(io::Cursor::new(Vec::new()))
+    }
+
+    fn truncate(&mut self) -> io::Result<()> {
+        self.set_position(0);
+        self.get_mut().clear();
+
+        Ok(())
     }
 
     fn destroy(path: impl AsRef<Path>) -> io::Result<()> {

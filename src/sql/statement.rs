@@ -121,7 +121,7 @@ pub(crate) enum Value {
     ///
     /// - Jump tables to match the types plus cast plus OP instruction (+,-,*,/)
     /// - Operating directly on [`i128`]
-    /// - Using some bigint library like https://docs.rs/num-bigint/
+    /// - Using some bigint library like <https://docs.rs/num-bigint/>
     /// - Using a custom number type
     ///
     /// It's a toy database anyway, not that anyone is gonna run into integer
@@ -391,15 +391,15 @@ impl Display for Statement {
             }
 
             Statement::StartTransaction => {
-                f.write_str("START TRANSACTION");
+                f.write_str("START TRANSACTION")?;
             }
 
             Statement::Commit => {
-                f.write_str("COMMIT");
+                f.write_str("COMMIT")?;
             }
 
             Statement::Rollback => {
-                f.write_str("ROLLBACK");
+                f.write_str("ROLLBACK")?;
             }
         };
 

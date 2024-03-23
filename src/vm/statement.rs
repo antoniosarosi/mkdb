@@ -4,7 +4,7 @@ use std::io::{self, Read, Seek, Write};
 
 use crate::{
     db::{mkdb_meta_schema, Database, DatabaseContext, DbError, RowId, MKDB_META, MKDB_META_ROOT},
-    paging::{self, pager::PageNumber},
+    paging::{io::FileOps, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
     storage::{tuple, BTree, FixedSizeMemCmp},
 };
@@ -15,7 +15,7 @@ use crate::{
 /// plan to create a table or index because we only have to insert some data
 /// into a BTree and we're not returning anything. We can do that with only
 /// the information provided by the [`Statement`] itself.
-pub(crate) fn exec<I: Seek + Read + Write + paging::io::FileOps>(
+pub(crate) fn exec<I: Seek + Read + Write + FileOps>(
     statement: Statement,
     db: &mut Database<I>,
 ) -> Result<(), DbError> {
@@ -59,6 +59,8 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::FileOps>(
         }
 
         Statement::Create(Create::Index { name, table, .. }) => {
+            // TODO: Insert keys into index if the table is not empty.
+
             let root = alloc_root_page(db)?;
 
             insert_into_mkdb_meta(db, vec![
@@ -79,7 +81,7 @@ pub(crate) fn exec<I: Seek + Read + Write + paging::io::FileOps>(
 }
 
 /// Allocates a page on disk that can be used as a table root.
-fn alloc_root_page<I: Seek + Read + Write + paging::io::FileOps>(
+fn alloc_root_page<I: Seek + Read + Write + FileOps>(
     db: &mut Database<I>,
 ) -> io::Result<PageNumber> {
     let mut pager = db.pager.borrow_mut();
@@ -116,7 +118,7 @@ fn alloc_root_page<I: Seek + Read + Write + paging::io::FileOps>(
 /// here:
 ///
 /// <https://github.com/antoniosarosi/mkdb/blob/cde9f31a7864549f64375ce4bfe69779bf33ab52/src/vm/executor.rs#L59-L74>
-fn insert_into_mkdb_meta<I: Seek + Read + Write + paging::io::FileOps>(
+fn insert_into_mkdb_meta<I: Seek + Read + Write + FileOps>(
     db: &mut Database<I>,
     mut values: Vec<Value>,
 ) -> Result<(), DbError> {

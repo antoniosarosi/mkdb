@@ -137,9 +137,9 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 /// a syscall every single time we want to write a page to the journal file,
 /// which should make this more efficient. But without any benchmarks to prove
 /// it you can call it yet another useless micro-optimization :)
-pub(crate) struct Pager<I> {
+pub(crate) struct Pager<F> {
     /// Wrapped IO/file handle/descriptor.
-    io: BlockIo<I>,
+    io: BlockIo<F>,
     /// Hardware block size or prefered IO read/write buffer size.
     pub block_size: usize,
     /// High level page size.
@@ -159,7 +159,7 @@ pub(crate) struct Pager<I> {
     /// Journal path.
     journal_file_path: PathBuf,
     /// Journal file descriptor or handle.
-    journal: Option<I>,
+    journal: Option<F>,
 }
 
 /// Builder for [`Pager`].
@@ -267,14 +267,14 @@ impl Builder {
     }
 }
 
-impl<I> Pager<I> {
+impl<F> Pager<F> {
     /// Choose your own adventure.
     pub fn builder() -> Builder {
         Builder::new()
     }
 }
 
-impl<I: Seek + Read> Pager<I> {
+impl<F: Seek + Read> Pager<F> {
     /// Manually read a page from disk.
     ///
     /// The cache system is not involved at all, this goes straight to disk.
@@ -283,7 +283,7 @@ impl<I: Seek + Read> Pager<I> {
     }
 }
 
-impl<I: Seek + Write + FileOps> Pager<I> {
+impl<F: Seek + Write + FileOps> Pager<F> {
     /// Manually write a page to disk.
     ///
     /// Unlike normal writes there is no use of the cache/buffer pool. The page
@@ -311,7 +311,7 @@ impl<I: Seek + Write + FileOps> Pager<I> {
         let journal = self.journal.as_mut().unwrap();
 
         // Persist copies to disk.
-        journal.write(&self.journal_buffer)?;
+        journal.write_all(&self.journal_buffer)?;
 
         // Clear the in-memory buffer.
         self.journal_buffer
@@ -432,20 +432,20 @@ impl<I: Seek + Write + FileOps> Pager<I> {
         self.journal_pages.clear();
 
         // Commit is confirmed when the journal file is deleted.
-        I::destroy(&self.journal_file_path)
+        F::destroy(&self.journal_file_path)
     }
 }
 
-impl<I: Write> Pager<I> {
+impl<F: Write> Pager<F> {
     /// Flush buffered writes.
     ///
-    /// See [`super::io::Sync`] for details.
+    /// See [`FileOps::sync`] for details.
     pub fn flush(&mut self) -> io::Result<()> {
         self.io.flush()
     }
 }
 
-impl<I: FileOps> Pager<I> {
+impl<F: FileOps> Pager<F> {
     /// Ensure writes reach their destination.
     ///
     /// See [`FileOps::sync`] for details.
@@ -454,7 +454,7 @@ impl<I: FileOps> Pager<I> {
     }
 }
 
-impl<I: Seek + Read + Write + FileOps> Pager<I> {
+impl<F: Seek + Read + Write + FileOps> Pager<F> {
     /// Initialize the database file.
     pub fn init(&mut self) -> io::Result<()> {
         // Manually read one block without involving the cache system, because
@@ -566,7 +566,7 @@ impl<I: Seek + Read + Write + FileOps> Pager<I> {
 
         // If we managed to sync the changes then the journal file no longer
         // serves any purpose.
-        I::destroy(&self.journal_file_path)?;
+        F::destroy(&self.journal_file_path)?;
 
         self.journal_pages.clear();
 

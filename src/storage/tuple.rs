@@ -27,6 +27,12 @@ macro_rules! serialize_big_endian {
     };
 }
 
+// TODO: Fix this nonsense. Or maybe find a way to make it even more
+// inefficient :)
+pub(crate) fn size_of(schema: &Schema, values: &[Value]) -> usize {
+    serialize_values(schema, values).len()
+}
+
 pub(crate) fn serialize_values(schema: &Schema, values: &[Value]) -> Vec<u8> {
     debug_assert_eq!(
         schema.len(),
