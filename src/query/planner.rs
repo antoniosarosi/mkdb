@@ -21,10 +21,10 @@ use crate::{
 };
 
 /// Generates a query plan that's ready to execute by the VM.
-pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
+pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
     statement: Statement,
-    db: &mut Database<I>,
-) -> Result<Plan<I>, DbError> {
+    db: &mut Database<F>,
+) -> Result<Plan<F>, DbError> {
     Ok(match statement {
         Statement::Insert {
             into,

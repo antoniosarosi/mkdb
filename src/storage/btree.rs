@@ -403,8 +403,8 @@ pub(crate) const DEFAULT_BALANCE_SIBLINGS_PER_SIDE: usize = 1;
 /// Default value for [`BTree::minimum_keys`].
 pub(crate) const DEFAULT_MINIMUM_KEYS: usize = 4;
 
-impl<'p, I, C: BytesCmp> BTree<'p, I, C> {
-    pub fn new(pager: &'p mut Pager<I>, root: PageNumber, comparator: C) -> Self {
+impl<'p, F, C: BytesCmp> BTree<'p, F, C> {
+    pub fn new(pager: &'p mut Pager<F>, root: PageNumber, comparator: C) -> Self {
         Self {
             pager,
             root,
@@ -415,7 +415,7 @@ impl<'p, I, C: BytesCmp> BTree<'p, I, C> {
     }
 }
 
-impl<'p, I: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, I, C> {
+impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
     /// Returns the value corresponding to the key.
     ///
     /// See [`Self::search`] for details.
@@ -1952,8 +1952,8 @@ impl<'p, I: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, I, C> {
 ///
 /// If the cell at the given slot is not "overflow" then this simply returns a
 /// reference to its content.
-pub(crate) fn reassemble_payload<I: Seek + Read + Write + FileOps>(
-    pager: &mut Pager<I>,
+pub(crate) fn reassemble_payload<F: Seek + Read + Write + FileOps>(
+    pager: &mut Pager<F>,
     page: PageNumber,
     slot: SlotId,
 ) -> io::Result<Payload> {
@@ -2047,9 +2047,9 @@ impl Cursor {
     ///     self.page
     ///     ends here
     /// ```
-    fn move_to_leftmost<I: Seek + Read + Write + FileOps>(
+    fn move_to_leftmost<F: Seek + Read + Write + FileOps>(
         &mut self,
-        pager: &mut Pager<I>,
+        pager: &mut Pager<F>,
     ) -> io::Result<()> {
         let mut node = pager.get(self.page)?;
 
@@ -2251,9 +2251,9 @@ impl Cursor {
     /// SQLite 2. Take a look at the [original].
     ///
     /// [original]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/btree.c#L1630-L1677
-    pub fn try_next<I: Seek + Read + Write + FileOps>(
+    pub fn try_next<F: Seek + Read + Write + FileOps>(
         &mut self,
-        pager: &mut Pager<I>,
+        pager: &mut Pager<F>,
     ) -> io::Result<Option<(PageNumber, SlotId)>> {
         // Wish everything was as easy as this.
         if self.done {
@@ -2328,9 +2328,9 @@ impl Cursor {
     ///
     /// See [`Self::try_next`] for the actual code. This one just flips
     /// [`Result<Option>`] to make it [`Option<Result>`].
-    pub fn next<I: Seek + Read + Write + FileOps>(
+    pub fn next<F: Seek + Read + Write + FileOps>(
         &mut self,
-        pager: &mut Pager<I>,
+        pager: &mut Pager<F>,
     ) -> Option<io::Result<(PageNumber, SlotId)>> {
         self.try_next(pager).transpose()
     }

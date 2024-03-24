@@ -220,7 +220,7 @@ impl Builder {
 
     /// Takes ownership of the file handle/descriptor and returns the final
     /// instance of [`Pager`].
-    pub fn wrap<I>(self, io: I) -> Pager<I> {
+    pub fn wrap<F>(self, io: F) -> Pager<F> {
         let Builder {
             block_size,
             page_size,

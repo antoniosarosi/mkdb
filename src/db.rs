@@ -44,10 +44,10 @@ pub(crate) type RowId = u64;
 ///
 /// Provides the high level [`Database::exec`] API that receives SQL text and
 /// runs it.
-pub(crate) struct Database<I> {
+pub(crate) struct Database<F> {
     /// The database owns the pager. TODO: [`Rc<Refcell>`] is a temporary
     /// solution until we make the pager multithreaded.
-    pub pager: Rc<RefCell<Pager<I>>>,
+    pub pager: Rc<RefCell<Pager<F>>>,
     /// Database context. See [`DatabaseContext`].
     pub context: Context,
     /// Working directory (the directory of the file).
@@ -259,10 +259,10 @@ impl Projection {
     }
 }
 
-impl<I: Seek + Read + Write + FileOps> TryFrom<Plan<I>> for Projection {
+impl<F: Seek + Read + Write + FileOps> TryFrom<Plan<F>> for Projection {
     type Error = DbError;
 
-    fn try_from(plan: Plan<I>) -> Result<Self, Self::Error> {
+    fn try_from(plan: Plan<F>) -> Result<Self, Self::Error> {
         let schema = plan.schema().unwrap_or(Schema::empty());
         let results = plan.collect::<Result<Vec<_>, DbError>>()?;
 
@@ -462,8 +462,8 @@ impl DatabaseContext for Context {
     }
 }
 
-impl<I> Database<I> {
-    pub fn new(pager: Rc<RefCell<Pager<I>>>, work_dir: PathBuf) -> Self {
+impl<F> Database<F> {
+    pub fn new(pager: Rc<RefCell<Pager<F>>>, work_dir: PathBuf) -> Self {
         Self {
             pager,
             work_dir,
@@ -473,7 +473,7 @@ impl<I> Database<I> {
     }
 }
 
-impl<I: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<I> {
+impl<F: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<F> {
     fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError> {
         if !self.context.contains(table) {
             let metadata = self.load_table_metadata(table)?;
@@ -484,7 +484,7 @@ impl<I: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<
     }
 }
 
-impl<I: Seek + Read + Write + paging::io::FileOps> Database<I> {
+impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
     /// Loads the next row ID that should be used for the table rooted at
     /// `root`.
     ///
@@ -1247,8 +1247,8 @@ mod tests {
         Ok(())
     }
 
-    fn assert_index_contains<I: Seek + Read + Write + paging::io::FileOps>(
-        db: &mut Database<I>,
+    fn assert_index_contains<F: Seek + Read + Write + paging::io::FileOps>(
+        db: &mut Database<F>,
         name: &str,
         key: Column,
         expected_entries: &[Vec<Value>],

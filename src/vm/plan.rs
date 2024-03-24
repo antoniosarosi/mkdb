@@ -1,5 +1,48 @@
 //! Code that executes [`Plan`] trees.
-
+//!
+//! The basic idea for the implementation of this module comes from this
+//! [lecture].
+//!
+//! [lecture]: https://youtu.be/vmI72W-vgYI?si=xhO1CbX-DJZ5mkjb&t=377
+//!
+//! # Iterator Model
+//!
+//! The idea is to build some sort of "pipeline" where each [`Plan`] node is an
+//! iterator that returns tuples and has an optional "source". The source is
+//! just another [`Plan`] that does its own processing to the tuples before
+//! returning them. For example, picture this query:
+//!
+//! ```sql
+//! SELECT name, age FROM users WHERE age > 20 ORDER BY age;
+//! ```
+//!
+//! The [`crate::query::planner`] would generate a [`Plan`] that looks like
+//! this:
+//!
+//! ```text
+//! Table Scan on users -> Filter by age -> Sort by age -> Project (name, age)
+//! ```
+//!
+//! That way we can process tuples one at a time and each plan does one thing
+//! only, which makes it easier to reason about the code. If some plan has
+//! multiple sources then instead of a simple pipeline we'd have a tree. A
+//! basic example is the `JOIN` statement which is not yet implemented.
+//!
+//! Another important details which makes the code here more complicated is that
+//! some plans cannot work with a single tuple, they need all the tuples in
+//! order to execute their code. One example is the [`Sort`] plan which needs
+//! all the tuples before it can sort them. Other examples are the [`Update`] or
+//! [`Delete`] plans which cannot make any changes to the underlying BTree until
+//! the scan plan that is reading tuples from the BTree has finished reading.
+//! That's because the scan plan holds an internal cursor and updating or
+//! deleting from the BTree would invalidate that cursor.
+//!
+//! So, in order to deal with such cases, there's a special type of iterator
+//! which is the [`BufferedIter`]. The [`BufferedIter`] contains an in-memory
+//! buffer of configurable size that is written to a file once it fills up.
+//! That way the [`BufferedIter`] can collect as many tuples as necessary
+//! without memory concerns. Once all the tuples are collected, they are
+//! returned one by one just like any other normal iterator would return them.
 use std::{
     cell::RefCell,
     cmp::Ordering,
@@ -17,7 +60,7 @@ use crate::{
         io::FileOps,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{Assignment, BinaryOperator, Column, DataType, Expression, Value},
+    sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
 };
@@ -28,22 +71,41 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(plan: Plan<F>) -> Result<Pr
 
 pub(crate) type Tuple = Vec<Value>;
 
+/// Plan node.
+///
+/// Each plan contains a tag (type of plan) and the structure that runs the plan
+/// code. This is inspired by Postgres' query planner. See [createplan.c].
+///
+/// [createplan.c]: https://github.com/postgres/postgres/blob/master/src/backend/optimizer/plan/createplan.c
+///
+/// Technically we could make this work with traits and [`Box<dyn Trait>`] but
+/// no clear benefit was found on previous attempts. See the comment below on
+/// the [`Self::try_next`] impl block.
 pub(crate) enum Plan<F> {
+    /// Returns raw values from `INSERT INTO` statements.
     Values(Values),
+    /// Runs a sequential scan on a table and returns the rows one by one.
     SeqScan(SeqScan<F>),
+    /// Uses an index to scan the table instead of doing it sequentially.
     IndexScan(IndexScan<F>),
+    /// Executes `WHERE` clauses and filters rows.
     Filter(Filter<F>),
+    /// Final projection of a plan. Usually the columns of `SELECT` statements.
     Project(Project<F>),
+    /// Executes `ORDER BY` clauses.
     Sort(Sort<F>),
+    /// Executes assignment expressions from `UPDATE` statements.
     Update(Update<F>),
+    /// Inserts data into tables.
     Insert(Insert<F>),
+    /// Deletes data from tables.
     Delete(Delete<F>),
 }
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
 // [`enum_dispatch`](https://docs.rs/enum_dispatch/) here to automate the match
 // statement or switch to Box<dyn Iterator<Item = Result<Projection, DbError>>>
-// but that's even more verbose than this and requires I: 'static everywhere. We
+// but that's even more verbose than this and requires F: 'static everywhere. We
 // also woudn't know the type of a plan because dyn Trait doesn't have a tag. So
 // match it for now :)
 impl<F: Seek + Read + Write + FileOps> Plan<F> {
@@ -71,6 +133,9 @@ impl<F: Seek + Read + Write + FileOps> Iterator for Plan<F> {
 }
 
 impl<F> Plan<F> {
+    /// Returns the final schema of this plan.
+    ///
+    /// For now this is always going to be the columns of `SELECT` statements.
     pub fn schema(&self) -> Option<Schema> {
         match self {
             Self::Project(project) => Some(project.output_schema.clone()),
@@ -79,13 +144,84 @@ impl<F> Plan<F> {
     }
 }
 
+/// In-memory tuple buffer.
+///
+/// This structure stores [`Tuple`] instances (AKA rows) and can be written to
+/// a file once it reaches a certain preconfigured threshold. The
+/// [`TupleBuffer`] can be used in two different modes: packed and not packed.
+///
+/// Packing affects how the buffer is written to files. If packed, then
+/// in-memory tuples will be written to the file in one single continuous
+/// sequence of bytes that follows this format:
+///
+/// ```text
+/// +-----------------+ <---+
+/// |   Tuple 0 Size  |     |
+/// +-----------------+     |
+/// |       ...       |     |
+/// | Tuple 0 Content |     |
+/// |       ...       |     |
+/// +-----------------+     | VARIABLE SIZE
+/// |   Tuple 1 Size  |     |
+/// +-----------------+     |
+/// |       ...       |     |
+/// | Tuple 1 Content |     |
+/// |       ...       |     |
+/// +-----------------+ <---+
+/// ```
+///
+/// This is useful for simply collecting a huge amount of tuples and then
+/// returning them back, which is what the [`BufferedIter`] does. However, the
+/// [`Sort`] plan needs to work with fixed size pages, so it will use the
+/// [`TupleBuffer`] without packing. In that case, only one page at a time is
+/// written using this format:
+///
+/// ```text
+/// +-----------------+ <---+
+/// |    Num Tuples   |     |
+/// +-----------------+     |
+/// |   Tuple 0 Size  |     |
+/// +-----------------+     |
+/// |       ...       |     |
+/// | Tuple 0 Content |     |
+/// |       ...       |     |
+/// +-----------------+     |
+/// |   Tuple 1 Size  |     | PAGE SIZE
+/// +-----------------+     |
+/// |       ...       |     |
+/// | Tuple 1 Content |     |
+/// |       ...       |     |
+/// +-----------------+     |
+/// |       ...       |     |
+/// |     Padding     |     |
+/// |       ...       |     |
+/// +-----------------+ <---+
+/// ```
+///
+/// Both the number of tuples and the tuple sizes are stored using 4 byte little
+/// endian integers.
 #[derive(Debug)]
 pub(crate) struct TupleBuffer {
+    /// Maximum size of this buffer in bytes.
     page_size: usize,
+
+    /// Current size of the buffer in bytes.
     current_size: usize,
+
+    /// Size in bytes of the largest tuple that has ever been stored in this
+    /// buffer.
+    ///
+    /// This number is not updated if tuples are removed from the buffer, it
+    /// simply stores the maximum size that has been recorded.
     largest_tuple_size: usize,
+
+    /// See the [`TupleBuffer`] documentation.
     packed: bool,
+
+    /// Schema of the tuples in this buffer.
     schema: Schema,
+
+    /// Tuple FIFO queue.
     tuples: VecDeque<Tuple>,
 }
 
@@ -98,6 +234,10 @@ impl Index<usize> for TupleBuffer {
 }
 
 impl TupleBuffer {
+    /// Creates an empty buffer that doesn't serve any purpose.
+    ///
+    /// Used to move buffers out using [`mem::replace`] just like
+    /// [`Option::take`] moves values out.
     pub fn empty() -> Self {
         Self {
             page_size: 0,
@@ -109,7 +249,8 @@ impl TupleBuffer {
         }
     }
 
-    fn new(page_size: usize, schema: Schema, packed: bool) -> Self {
+    /// Creates a new buffer. Doesn't allocate anything yet.
+    pub fn new(page_size: usize, schema: Schema, packed: bool) -> Self {
         Self {
             page_size,
             schema,
@@ -120,6 +261,8 @@ impl TupleBuffer {
         }
     }
 
+    /// Returns `true` if the given `tuple` can be appended to this buffer
+    /// without incrementing its size past [`Self::page_size`].
     pub fn can_fit(&self, tuple: &Tuple) -> bool {
         let tuple_size = tuple::size_of(&tuple, &self.schema);
         let total_tuple_size = mem::size_of::<u32>() + tuple_size;
@@ -127,6 +270,14 @@ impl TupleBuffer {
         self.current_size + total_tuple_size <= self.page_size
     }
 
+    /// Appends the given `tuple` to the buffer.
+    ///
+    /// It doesn't panic or return any error if the buffer overflows
+    /// [`Self::page_size`], this function won't fail. This is useful because
+    /// the [`BufferedIter`] needs to be able to process tuples of any size even
+    /// if they are larger than the maximum buffer size. The [`Sort`] plan has
+    /// its own tricks to avoid working with tuples that wouldn't fit in the
+    /// buffer.
     pub fn push(&mut self, tuple: Tuple) {
         let tuple_size = tuple::size_of(&tuple, &self.schema);
         let total_tuple_size = mem::size_of::<u32>() + tuple_size;
@@ -139,21 +290,29 @@ impl TupleBuffer {
         self.tuples.push_back(tuple);
     }
 
+    /// Removes the first tuple in this buffer and returns it.
     pub fn pop_front(&mut self) -> Option<Tuple> {
         self.tuples.pop_front().inspect(|tuple| {
             self.current_size -= mem::size_of::<u32>() + tuple::size_of(tuple, &self.schema);
         })
     }
 
+    /// `true` if there are no tuples stored in this buffer.
     pub fn is_empty(&self) -> bool {
         self.tuples.is_empty()
     }
 
+    /// Resets the state of the buffer to "empty".
     pub fn clear(&mut self) {
         self.tuples.clear();
-        self.current_size = mem::size_of::<u32>();
+        self.current_size = if self.packed {
+            0
+        } else {
+            mem::size_of::<u32>()
+        };
     }
 
+    /// Serializes this buffer into a byte array that can be written to a file.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.page_size);
 
@@ -174,10 +333,19 @@ impl TupleBuffer {
         buf
     }
 
+    /// Writes the contents of this buffer to the given `file`.
+    ///
+    /// The buffer is not modified in any way, call [`Self::clear`] to delete
+    /// the tuples from it.
     pub fn write_to(&self, file: &mut impl Write) -> io::Result<()> {
         file.write_all(&self.serialize())
     }
 
+    /// Reads one page from the given file into memory.
+    ///
+    /// Only works with fixed size buffers (not packed) that are already empty
+    /// and the underlying file cursor **must already be positioned** at the
+    /// beginning of a page.
     pub fn read_from(&mut self, file: &mut impl Read) -> io::Result<()> {
         assert!(
             self.is_empty() && !self.packed,
@@ -206,12 +374,22 @@ impl TupleBuffer {
         Ok(())
     }
 
+    /// Same as [`Self::read_from`] but positions the file cursor at the
+    /// beginning of the given page number.
     pub fn read_page(&mut self, file: &mut (impl Seek + Read), page: usize) -> io::Result<()> {
         file.seek(io::SeekFrom::Start((self.page_size * page) as u64))?;
         self.read_from(file)
     }
 
+    /// Returns the minimum power of two that could fit at least one tuple of
+    /// the given size.
+    ///
+    /// This is computed for fixed size buffers (not packed).
     pub fn page_size_needed_for(tuple_size: usize) -> usize {
+        // Bit hack that computes the next power of two for 32 bit integers
+        // (although we're using usize for convinience to avoid casting).
+        // See here:
+        // https://stackoverflow.com/questions/466204/rounding-up-to-next-power-of-2
         let mut page_size = mem::size_of::<u32>() * 2 + tuple_size;
         page_size -= 1;
         page_size |= page_size >> 1;
@@ -386,6 +564,7 @@ pub(crate) struct IndexScan<F> {
     pub cursor: Cursor,
 }
 
+// TODO: Sort tuples by row_id to improve sequential IO.
 impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         if self.done {
@@ -850,6 +1029,7 @@ pub(crate) struct Sort<F> {
     pub output_file_path: PathBuf,
 }
 
+/// Compares two tuples and returns the [`Ordering`].
 fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
     for (a, b) in t1.iter().zip(t2) {
         match a.partial_cmp(b) {
@@ -892,7 +1072,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         self.mem_buf = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
-        // One page runs. Sort pages and spill to disk.
+        // One page runs. Sort pages and write them to disk.
         let mut tuples = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
@@ -1064,7 +1244,7 @@ pub(crate) struct Insert<F> {
     pub indexes: Vec<IndexMetadata>,
 }
 
-impl<I: Seek + Read + Write + FileOps> Insert<I> {
+impl<F: Seek + Read + Write + FileOps> Insert<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(tuple) = self.source.try_next()? else {
             return Ok(None);

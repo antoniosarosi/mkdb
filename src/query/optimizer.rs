@@ -22,11 +22,11 @@ use crate::{
 ///
 /// The generated plan will be either [`SeqScan`] or [`IndexScan`] with an
 /// optional [`Filter`] on top of it, depending on how the query looks like.
-pub(crate) fn generate_scan_plan<I: Seek + Read + Write + FileOps>(
+pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     filter: Option<Expression>,
-    db: &mut Database<I>,
-) -> Result<Box<Plan<I>>, DbError> {
+    db: &mut Database<F>,
+) -> Result<Box<Plan<F>>, DbError> {
     let Some(expr) = filter else {
         return generate_sequential_scan_plan(table, db);
     };
@@ -47,11 +47,11 @@ pub(crate) fn generate_scan_plan<I: Seek + Read + Write + FileOps>(
 /// Creates a new cursor and positions it at the given key.
 ///
 /// The cursor will return the given key when calling [`Cursor::try_next`].
-fn position_cursor_at_key<I: Seek + Read + Write + FileOps>(
+fn position_cursor_at_key<F: Seek + Read + Write + FileOps>(
     key: &[u8],
     data_type: &DataType,
     root: PageNumber,
-    pager: &mut Pager<I>,
+    pager: &mut Pager<F>,
 ) -> io::Result<Cursor> {
     let mut descent = Vec::new();
 
@@ -66,10 +66,10 @@ fn position_cursor_at_key<I: Seek + Read + Write + FileOps>(
 
 /// Basically a constructor. We'll use this until we figure out exactly how to
 /// build stuff here.
-fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
+fn generate_sequential_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
     table: &str,
-    db: &mut Database<I>,
-) -> Result<Box<Plan<I>>, DbError> {
+    db: &mut Database<F>,
+) -> Result<Box<Plan<F>>, DbError> {
     let metadata = db.table_metadata(table)?;
 
     Ok(Box::new(Plan::SeqScan(SeqScan {
@@ -84,11 +84,11 @@ fn generate_sequential_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
 /// It's only possible to do so if we find an expression that contains an
 /// indexed column and must always be executed. Otherwise we'll fallback to
 /// sequential scans.
-fn generate_index_scan_plan<I: Seek + Read + Write + paging::io::FileOps>(
+fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
     table: &str,
-    db: &mut Database<I>,
+    db: &mut Database<F>,
     filter: &Expression,
-) -> Result<Option<Box<Plan<I>>>, DbError> {
+) -> Result<Option<Box<Plan<F>>>, DbError> {
     let metadata = db.table_metadata(table)?;
 
     if metadata.indexes.is_empty() {
