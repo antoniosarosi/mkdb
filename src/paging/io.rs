@@ -24,7 +24,7 @@ pub(crate) trait FileOps {
         Self: Sized;
 
     /// Removes the file located at `path`.
-    fn destroy(path: impl AsRef<Path>) -> io::Result<()>;
+    fn remove(path: impl AsRef<Path>) -> io::Result<()>;
 
     fn truncate(&mut self) -> io::Result<()>;
 
@@ -42,7 +42,6 @@ pub(crate) trait FileOps {
 
 impl FileOps for File {
     fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        println!("{:?}", path.as_ref());
         File::options()
             .create(true)
             .truncate(true)
@@ -55,7 +54,7 @@ impl FileOps for File {
         File::options().read(true).write(false).open(path)
     }
 
-    fn destroy(path: impl AsRef<Path>) -> io::Result<()> {
+    fn remove(path: impl AsRef<Path>) -> io::Result<()> {
         fs::remove_file(path)
     }
 
@@ -93,7 +92,7 @@ impl FileOps for MemBuf {
         Ok(())
     }
 
-    fn destroy(path: impl AsRef<Path>) -> io::Result<()> {
+    fn remove(path: impl AsRef<Path>) -> io::Result<()> {
         Ok(())
     }
 

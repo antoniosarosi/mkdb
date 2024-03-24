@@ -432,7 +432,7 @@ impl<F: Seek + Write + FileOps> Pager<F> {
         self.journal_pages.clear();
 
         // Commit is confirmed when the journal file is deleted.
-        F::destroy(&self.journal_file_path)
+        F::remove(&self.journal_file_path)
     }
 }
 
@@ -566,7 +566,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
 
         // If we managed to sync the changes then the journal file no longer
         // serves any purpose.
-        F::destroy(&self.journal_file_path)?;
+        F::remove(&self.journal_file_path)?;
 
         self.journal_pages.clear();
 

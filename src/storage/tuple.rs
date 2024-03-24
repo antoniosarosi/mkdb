@@ -5,7 +5,7 @@
 /// interpret the bytes in them as numbers or strings without having to copy
 /// them into [`Value`] structures. Serializing and deserializing made it easy
 /// to develop in the beginning because it doesn't require any unsafe code, but
-/// it's probably the biggest performance hit because we do it so many times.
+/// it's probably the biggest performance hit not counting unoptimized IO.
 use std::mem;
 
 use crate::{
@@ -29,7 +29,7 @@ fn byte_length_of_integer_type(data_type: &DataType) -> usize {
     }
 }
 
-pub(crate) fn size_of(schema: &Schema, tuple: &[Value]) -> usize {
+pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
     schema
         .columns
         .iter()

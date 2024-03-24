@@ -162,7 +162,6 @@ impl<E: Into<SqlError>> From<E> for DbError {
 
 impl From<io::Error> for DbError {
     fn from(e: io::Error) -> Self {
-        println!("{}", std::backtrace::Backtrace::capture());
         Self::Io(e)
     }
 }
@@ -1358,7 +1357,7 @@ mod tests {
     /// to force as many evictions as possible.
     ///
     /// If this one works then I guess we can go home...
-    #[cfg(not(miri))]
+    // #[cfg(not(miri))]
     #[test]
     fn insert_many() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {

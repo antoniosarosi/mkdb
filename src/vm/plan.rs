@@ -3,8 +3,10 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
+    collections::VecDeque,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
+    ops::Index,
     path::PathBuf,
     rc::Rc,
 };
@@ -77,76 +79,233 @@ impl<F> Plan<F> {
     }
 }
 
-pub(crate) struct BufferedIter<F> {
-    pub source: Box<Plan<F>>,
-    pub schema: Schema,
-    pub mem_buf: Vec<u8>,
-    pub max_size: usize,
-    pub max_buffered_tuple_size: usize,
-    pub collected: bool,
-    pub work_dir: PathBuf,
-    pub file: Option<F>,
-    pub reader: Option<BufReader<F>>,
-    pub file_path: PathBuf,
+#[derive(Debug)]
+pub(crate) struct TupleBuffer {
+    page_size: usize,
+    current_size: usize,
+    largest_tuple_size: usize,
+    packed: bool,
+    schema: Schema,
+    tuples: VecDeque<Tuple>,
 }
 
-impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
-    pub fn new(source: Box<Plan<F>>, work_dir: PathBuf, schema: Schema) -> Self {
-        // TODO: Use uuid or tempfile or something.
-        let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
+impl Index<usize> for TupleBuffer {
+    type Output = Tuple;
 
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.tuples[index]
+    }
+}
+
+impl TupleBuffer {
+    fn new(page_size: usize, schema: Schema, packed: bool) -> Self {
         Self {
-            source,
+            page_size,
             schema,
-            mem_buf: vec![],
-            max_size: 256,
-            max_buffered_tuple_size: 0,
-            collected: false,
-            work_dir,
-            file_path,
-            file: None,
-            reader: None,
+            packed,
+            current_size: if packed { 0 } else { mem::size_of::<u32>() },
+            largest_tuple_size: 0,
+            tuples: VecDeque::new(),
         }
     }
 
-    pub fn write_buffer_to_file(&mut self) -> io::Result<()> {
-        if self.mem_buf.is_empty() {
-            return Ok(());
+    pub fn can_fit(&self, tuple: &Tuple) -> bool {
+        let tuple_size = tuple::size_of(&tuple, &self.schema);
+        let total_tuple_size = mem::size_of::<u32>() + tuple_size;
+
+        self.current_size + total_tuple_size <= self.page_size
+    }
+
+    pub fn push(&mut self, tuple: Tuple) {
+        let tuple_size = tuple::size_of(&tuple, &self.schema);
+        let total_tuple_size = mem::size_of::<u32>() + tuple_size;
+
+        if tuple_size > self.largest_tuple_size {
+            self.largest_tuple_size = tuple_size;
         }
 
-        if self.file.is_none() {
-            self.file = Some(F::create(&self.file_path)?);
+        self.current_size += total_tuple_size;
+        self.tuples.push_back(tuple);
+    }
+
+    pub fn pop_front(&mut self) -> Option<Tuple> {
+        self.tuples.pop_front().inspect(|tuple| {
+            self.current_size -= mem::size_of::<u32>() + tuple::size_of(tuple, &self.schema);
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tuples.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.tuples.clear();
+        self.current_size = mem::size_of::<u32>();
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.page_size);
+
+        if !self.packed {
+            buf.extend_from_slice(&(self.tuples.len() as u32).to_le_bytes());
         }
 
-        self.file.as_mut().unwrap().write_all(&self.mem_buf)?;
+        for tuple in &self.tuples {
+            let serialized = tuple::serialize(&self.schema, &tuple);
+            buf.extend_from_slice(&(serialized.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&serialized);
+        }
 
-        self.mem_buf.clear();
+        if !self.packed {
+            buf.resize(self.page_size, 0);
+        }
+
+        buf
+    }
+
+    pub fn write_to(&self, file: &mut impl Write) -> io::Result<()> {
+        file.write_all(&self.serialize())
+    }
+
+    pub fn read_from(&mut self, file: &mut impl Read) -> io::Result<()> {
+        assert!(
+            self.is_empty() && !self.packed,
+            "read_from() only works with fixed size empty buffers"
+        );
+
+        let mut buf = vec![0; self.page_size];
+        file.read_exact(&mut buf)?;
+
+        let number_of_tuples = u32::from_le_bytes(buf[..mem::size_of::<u32>()].try_into().unwrap());
+        let mut index = mem::size_of::<u32>();
+
+        for _ in 0..number_of_tuples {
+            let size = u32::from_le_bytes(
+                buf[index..index + mem::size_of::<u32>()]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+
+            index += mem::size_of::<u32>();
+
+            self.push(tuple::deserialize(&buf[index..index + size], &self.schema));
+            index += size;
+        }
 
         Ok(())
     }
 
-    // TODO: This is extremely inefficient right now due to constantly
-    // serializing and deserializing. We don't need to do that, tuples are
-    // stored in a binary format that can be interpreted using raw pointers.
-    // We need to write some unsafe to optimize this.
-    pub fn collect(&mut self) -> Result<(), DbError> {
-        while let Some(tuple) = self.source.try_next()? {
-            let mut serialized = tuple::serialize(&self.schema, &tuple);
+    pub fn read_page(&mut self, file: &mut (impl Seek + Read), page: usize) -> io::Result<()> {
+        file.seek(io::SeekFrom::Start((self.page_size * page) as u64))?;
+        self.read_from(file)
+    }
 
-            if serialized.len() > self.max_buffered_tuple_size {
-                self.max_buffered_tuple_size = serialized.len();
+    pub fn page_size_needed_for(tuple_size: usize) -> usize {
+        let mut page_size = mem::size_of::<u32>() * 2 + tuple_size;
+        page_size -= 1;
+        page_size |= page_size >> 1;
+        page_size |= page_size >> 2;
+        page_size |= page_size >> 4;
+        page_size |= page_size >> 8;
+        page_size |= page_size >> 16;
+        page_size += 1;
+
+        page_size
+    }
+}
+
+/// Similar to [`io::BufReader`] and [`io::BufWriter`].
+///
+/// This structure consumes all the tuples from its source through the
+/// [`Self::collect`] operation and writes them to a "collection" file if they
+/// don't fit in memory. Once tuples have been successfully collected,
+/// [`BufferedIter`] acts like a normal iterator that returns tuples one at a
+/// time. If the collected tuples fit in memory there is no IO, so that's the
+/// best case scenario.
+pub(crate) struct BufferedIter<F> {
+    /// Tuple source. This is where we collect from.
+    pub source: Box<Plan<F>>,
+    /// Tuple schema.
+    pub schema: Schema,
+    /// `true` if [`Self::collect`] completed successfully.
+    pub collected: bool,
+    /// In-memory buffer that stores tuples from the source.
+    pub mem_buf: TupleBuffer,
+    /// File handle/descriptor in case we had to create the collection file.
+    pub file: Option<F>,
+    /// Buffered reader in case we created the file and have to read from it.
+    pub reader: Option<BufReader<F>>,
+    /// Path of the collection file.
+    pub file_path: PathBuf,
+    /// Executes the expressions and appends the results to each tuple.
+    pub append_exprs: Vec<Expression>,
+}
+
+impl<F: FileOps> BufferedIter<F> {
+    /// Drops the IO resource and deletes it from the file system.
+    fn drop_file(&mut self) -> io::Result<()> {
+        drop(self.file.take());
+        drop(self.reader.take());
+        F::remove(&self.file_path)
+    }
+}
+
+// TODO: Requires defining the struct as BufferdIter<F: FileOps>
+// impl<F: FileOps> Drop for BufferedIter<F> {
+//     fn drop(&mut self) {
+//         if self.file.is_some() {
+//             self.drop_file();
+//         }
+//     }
+// }
+
+impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
+    pub fn new(
+        source: Box<Plan<F>>,
+        work_dir: PathBuf,
+        schema: Schema,
+        append_exprs: Vec<Expression>,
+    ) -> Self {
+        // TODO: Use uuid or tempfile or something. This is poor man's random
+        // file name.
+        let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
+
+        Self {
+            source,
+            mem_buf: TupleBuffer::new(256, schema.clone(), true),
+            schema,
+            collected: false,
+            file_path,
+            file: None,
+            reader: None,
+            append_exprs,
+        }
+    }
+
+    /// Collects all the tuples from [`Self::source`].
+    fn collect(&mut self) -> Result<(), DbError> {
+        // Buffer tuples in-memory until we have no space left. At that point
+        // create the file if it doesn't exist, write the buffer to disk and
+        // repeat until there are no more tuples.
+        while let Some(mut tuple) = self.source.try_next()? {
+            for expr in &self.append_exprs {
+                tuple.push(vm::resolve_expression(&tuple, &self.schema, expr)?);
             }
 
-            if self.mem_buf.len() + mem::size_of::<u32>() + serialized.len() > self.max_size {
-                self.write_buffer_to_file()?
+            if !self.mem_buf.can_fit(&tuple) {
+                if self.file.is_none() {
+                    self.file = Some(F::create(&self.file_path)?);
+                }
+                self.mem_buf.write_to(self.file.as_mut().unwrap())?;
+                self.mem_buf.clear();
             }
 
-            self.mem_buf
-                .extend_from_slice(&(serialized.len() as u32).to_le_bytes());
-
-            self.mem_buf.append(&mut serialized);
+            self.mem_buf.push(tuple);
         }
 
+        // If we ended up creating a file and writing to it we must set the
+        // cursor position back to the first byte in order to read from it
+        // later.
         if let Some(mut file) = self.file.take() {
             file.rewind()?;
             self.reader = Some(BufReader::new(file));
@@ -161,7 +320,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
             self.collected = true;
         }
 
-        // While there's stuff written to the file, return from there.
+        // While there's stuff written to the file return from there.
         if let Some(reader) = self.reader.as_mut() {
             if reader.has_data_left()? {
                 let mut size = [0; mem::size_of::<u32>()];
@@ -171,24 +330,16 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
                 reader.read_exact(&mut serialized)?;
 
                 return Ok(Some(tuple::deserialize(&serialized, &self.schema)));
-            } else {
-                drop(self.reader.take());
-                F::destroy(&self.file_path)?;
             }
+
+            // Reader is done, drop the file.
+            self.drop_file()?;
         }
 
-        if self.mem_buf.is_empty() {
-            return Ok(None);
-        }
-
-        // If there's no file or the file has been consumed, return from memory.
-        let size = u32::from_le_bytes(self.mem_buf[..4].try_into().unwrap());
-
-        let tuple = tuple::deserialize(&self.mem_buf[4..4 + size as usize], &self.schema);
-
-        self.mem_buf.drain(..4 + size as usize);
-
-        Ok(Some(tuple))
+        // If there's no file or the file has been consumed return from memory.
+        // Tuples that were not written to the file because it wasn't necessary
+        // are also returned here.
+        Ok(self.mem_buf.pop_front())
     }
 }
 
@@ -350,157 +501,113 @@ impl Values {
 pub(crate) struct Sort<F> {
     pub source: BufferedIter<F>,
     pub schema: Schema,
-    pub schema_with_sort_keys: Schema,
-    pub by: Vec<Expression>,
+    pub sort_schema: Schema,
     pub sorted: bool,
     pub page_size: usize,
-    pub sort_page_size: usize,
     pub input_file: Option<F>,
     pub output_file: Option<F>,
     pub mem_buf: Vec<Tuple>,
     pub total_sorted_pages: usize,
     pub next_page: usize,
+    pub work_dir: PathBuf,
     pub input_file_path: PathBuf,
     pub output_file_path: PathBuf,
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
+    fn cmp_tuples(&self, t1: &[Value], t2: &[Value]) -> Ordering {
+        let sort_keys_start_index = self.schema.len();
+
+        for (a, b) in t1[sort_keys_start_index..]
+            .iter()
+            .zip(&t2[sort_keys_start_index..])
+        {
+            match a.partial_cmp(b) {
+                Some(ordering) => {
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                None => {
+                    if mem::discriminant(a) != mem::discriminant(b) {
+                        unreachable!("it should be impossible to run into type errors at this point: cmp() {a} against {b}");
+                    }
+                }
+            }
+        }
+
+        Ordering::Equal
+    }
+
+    fn sort_tuples(&self, tuples: &mut [Tuple]) {
+        tuples.sort_by(|t1, t2| self.cmp_tuples(t1, t2));
+    }
+
     fn sort(&mut self) -> Result<(), DbError> {
-        // mem only sorting, didn't need files
+        // Mem only sorting, didn't need files.
         if self.source.reader.is_none() {
             let mut tuples = Vec::new();
-            while let Some(mut tuple) = self.source.try_next()? {
-                for expr in &self.by {
-                    let sort_key = vm::resolve_expression(&tuple, &self.schema, expr)?;
-                    tuple.push(sort_key);
-                }
-
+            while let Some(tuple) = self.source.try_next()? {
                 tuples.push(tuple);
             }
 
-            let sort_keys = self.schema.len();
-            sort_tuples(&mut tuples, sort_keys);
+            self.sort_tuples(&mut tuples);
 
             self.mem_buf = tuples;
             return Ok(());
         }
 
         // Needs files.
-        let page_size = {
-            let mut t = mem::size_of::<u32>() * 2 + self.source.max_buffered_tuple_size;
-            // WTF? XD?
-            t -= 1;
-            t |= t >> 1;
-            t |= t >> 2;
-            t |= t >> 4;
-            t |= t >> 8;
-            t |= t >> 16;
-            t += 1;
-
-            if t <= self.page_size {
-                self.page_size
-            } else {
-                t
-            }
-        };
-
-        self.sort_page_size = page_size;
+        self.page_size = std::cmp::max(
+            TupleBuffer::page_size_needed_for(self.source.mem_buf.largest_tuple_size),
+            self.page_size,
+        );
 
         // One page runs. Sort pages and spill to disk.
-        let mut tuples: Vec<Tuple> = Vec::new();
-
-        let sort_keys_start_idx = self.schema.len();
-        let mut schema_with_sort_keys = self.schema.clone();
+        let mut tuples = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
-        let mut total_mem_page_size = 4; // 4 bytes to store num tuples
-        while let Some(mut tuple) = self.source.try_next()? {
-            for expr in &self.by {
-                let sort_key = vm::resolve_expression(&tuple, &self.schema, expr)?;
-                tuple.push(sort_key);
-            }
-
-            // Update schema to deseriliaze later.
-            if schema_with_sort_keys.len() == self.schema.len() {
-                let mut i = 0;
-                for v in &tuple[self.schema.len()..] {
-                    let mut col = Column::new(&format!("sort_key_{i}"), DataType::BigInt);
-                    match v {
-                        Value::Bool(_) => col.data_type = DataType::Bool,
-                        Value::String(_) => col.data_type = DataType::Varchar(65535),
-                        _ => {}
-                    }
-                    i += 1;
-                    schema_with_sort_keys.push(col);
-                }
-                self.schema_with_sort_keys = schema_with_sort_keys.clone();
-            }
-
-            let tuple_size = tuple::size_of(&schema_with_sort_keys, &tuple);
-            let total_tuple_size = 4 + tuple_size;
-
+        while let Some(tuple) = self.source.try_next()? {
             // Write page if page is full
-            if total_mem_page_size + total_tuple_size > page_size {
+            if !tuples.can_fit(&tuple) {
                 // Create files
                 if self.input_file.is_none() {
-                    let input_file = self
-                        .source
+                    self.input_file_path = self
                         .work_dir
                         .join(format!("{}.mkdb.sort", &self.source as *const _ as usize));
-                    let output_file = self
-                        .source
+                    self.output_file_path = self
                         .work_dir
                         .join(format!("{}.mkdb.sort", &self.mem_buf as *const _ as usize));
-                    self.input_file = Some(F::create(&input_file)?);
-                    self.output_file = Some(F::create(&output_file)?);
-                    self.input_file_path = input_file;
-                    self.output_file_path = output_file;
+                    self.input_file = Some(F::create(&self.input_file_path)?);
+                    self.output_file = Some(F::create(&self.output_file_path)?);
                 }
 
-                // sort em
-                sort_tuples(&mut tuples, sort_keys_start_idx);
+                self.sort_tuples(tuples.tuples.make_contiguous());
+                tuples.write_to(self.input_file.as_mut().unwrap())?;
 
-                // write em
-                Self::write_page(
-                    self.input_file.as_mut().unwrap(),
-                    &schema_with_sort_keys,
-                    &tuples,
-                    page_size,
-                )?;
-
-                // Reset everything.
                 tuples.clear();
-                total_mem_page_size = 4;
                 input_pages += 1;
             }
 
-            total_mem_page_size += total_tuple_size;
             tuples.push(tuple);
         }
 
         // Last page.
         if !tuples.is_empty() {
-            // sort em
-            let sort_keys = self.schema.len();
-            sort_tuples(&mut tuples, sort_keys);
-            // write em!
-            Self::write_page(
-                self.input_file.as_mut().unwrap(),
-                &schema_with_sort_keys,
-                &tuples,
-                page_size,
-            )?;
-            input_pages += 1;
+            self.sort_tuples(&mut tuples.tuples.make_contiguous());
+            tuples.write_to(self.input_file.as_mut().unwrap())?;
+
             tuples.clear();
+            input_pages += 1;
         }
 
         // One page run sort algorithm done. Now do the "merge" runs till fully
         // sorted.
         let mut page_runs = 2;
 
-        let mut input_page1 = Vec::new();
-        let mut input_page2 = Vec::new();
-        let mut output_page = Vec::new();
+        let mut input_page1 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        let mut input_page2 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        let mut output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         while page_runs <= (input_pages + (input_pages % 2)) {
             let mut output_pages = 0;
@@ -512,138 +619,61 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 let mut cursor2 = cursor1 + page_runs / 2;
 
                 if cursor1 < input_pages {
-                    Self::read_page(
-                        self.input_file.as_mut().unwrap(),
-                        &mut input_page1,
-                        &schema_with_sort_keys,
-                        cursor1,
-                        page_size,
-                    )?;
+                    input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
                 }
                 cursor1 += 1;
                 if cursor2 < input_pages {
-                    Self::read_page(
-                        self.input_file.as_mut().unwrap(),
-                        &mut input_page2,
-                        &schema_with_sort_keys,
-                        cursor2,
-                        page_size,
-                    )?;
+                    input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
                 }
                 cursor2 += 1;
 
                 // Merge
-                total_mem_page_size = 4;
                 while !input_page1.is_empty() || !input_page2.is_empty() {
-                    let next_tuple = if !input_page1.is_empty() && !input_page2.is_empty() {
-                        let cmp = cmp_tuples(&input_page1[0], &input_page2[0], sort_keys_start_idx);
+                    let tuple = if !input_page1.is_empty() && !input_page2.is_empty() {
+                        let cmp = self.cmp_tuples(&input_page1[0], &input_page2[0]);
                         if matches!(cmp, Ordering::Less | Ordering::Equal) {
-                            let t = input_page1.remove(0);
-
-                            if input_page1.is_empty()
-                                && cursor1 < input_pages
-                                && cursor1 < (chunk + page_runs / 2)
-                            {
-                                Self::read_page(
-                                    self.input_file.as_mut().unwrap(),
-                                    &mut input_page1,
-                                    &schema_with_sort_keys,
-                                    cursor1,
-                                    page_size,
-                                )?;
-                                cursor1 += 1;
-                            }
-
-                            t
+                            input_page1.pop_front().unwrap()
                         } else {
-                            let t = input_page2.remove(0);
-
-                            if input_page2.is_empty() && cursor2 < chunk + page_runs {
-                                Self::read_page(
-                                    self.input_file.as_mut().unwrap(),
-                                    &mut input_page2,
-                                    &schema_with_sort_keys,
-                                    cursor2,
-                                    page_size,
-                                )?;
-                                cursor2 += 1;
-                            }
-
-                            t
+                            input_page2.pop_front().unwrap()
                         }
                     } else if input_page2.is_empty() {
-                        let t = input_page1.remove(0);
-
-                        if input_page1.is_empty()
-                            && cursor1 < input_pages
-                            && cursor1 < (chunk + page_runs / 2)
-                        {
-                            Self::read_page(
-                                self.input_file.as_mut().unwrap(),
-                                &mut input_page1,
-                                &schema_with_sort_keys,
-                                cursor1,
-                                page_size,
-                            )?;
-                            cursor1 += 1;
-                        }
-
-                        t
+                        input_page1.pop_front().unwrap()
                     } else {
-                        let t = input_page2.remove(0);
-
-                        if input_page2.is_empty()
-                            && cursor2 < chunk + page_runs
-                            && cursor2 < input_pages
-                        {
-                            Self::read_page(
-                                self.input_file.as_mut().unwrap(),
-                                &mut input_page2,
-                                &schema_with_sort_keys,
-                                cursor2,
-                                page_size,
-                            )?;
-                            cursor2 += 1;
-                        }
-
-                        t
+                        input_page2.pop_front().unwrap()
                     };
 
-                    let tuple_size = tuple::size_of(&schema_with_sort_keys, &next_tuple);
-                    let total_tuple_size = 4 + tuple_size;
-
-                    if total_mem_page_size + total_tuple_size > page_size {
-                        println!("{output_page:?}");
-                        Self::write_page(
-                            self.output_file.as_mut().unwrap(),
-                            &schema_with_sort_keys,
-                            &output_page,
-                            page_size,
-                        )?;
-                        output_pages += 1;
-                        total_mem_page_size = 4;
-                        output_page.clear();
+                    if input_page1.is_empty()
+                        && cursor1 < input_pages
+                        && cursor1 < (chunk + page_runs / 2)
+                    {
+                        input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
+                        cursor1 += 1;
                     }
 
-                    output_page.push(next_tuple);
-                    total_mem_page_size += total_tuple_size;
+                    if input_page2.is_empty()
+                        && cursor2 < chunk + page_runs
+                        && cursor2 < input_pages
+                    {
+                        input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
+                        cursor2 += 1;
+                    }
+
+                    if !output_page.can_fit(&tuple) {
+                        output_page.write_to(self.output_file.as_mut().unwrap())?;
+                        output_page.clear();
+                        output_pages += 1;
+                    }
+
+                    output_page.push(tuple);
                 }
 
                 if !output_page.is_empty() {
-                    println!("{output_page:?}");
-
-                    Self::write_page(
-                        self.output_file.as_mut().unwrap(),
-                        &schema_with_sort_keys,
-                        &output_page,
-                        page_size,
-                    )?;
-                    output_pages += 1;
+                    output_page.write_to(self.output_file.as_mut().unwrap())?;
                     output_page.clear();
+                    output_pages += 1;
                 }
 
                 chunk += page_runs;
-                println!("\n\n")
             }
 
             // Now swap
@@ -677,17 +707,17 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     Self::read_page(
                         input_file,
                         &mut self.mem_buf,
-                        &self.schema_with_sort_keys,
+                        &self.sort_schema,
                         self.next_page,
-                        self.sort_page_size,
+                        self.page_size,
                     )?;
                     self.next_page += 1;
                 } else {
                     // TODO: Drop if iter not consumed.
                     drop(self.input_file.take());
                     drop(self.output_file.take());
-                    F::destroy(&self.input_file_path)?;
-                    F::destroy(&self.output_file_path)?;
+                    F::remove(&self.input_file_path)?;
+                    F::remove(&self.output_file_path)?;
                 }
             }
         }
@@ -750,32 +780,6 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         Ok(())
     }
-}
-
-fn sort_tuples(tuples: &mut Vec<Vec<Value>>, sort_keys_start_idx: usize) {
-    tuples.sort_by(|t1, t2| cmp_tuples(t1, t2, sort_keys_start_idx));
-}
-
-fn cmp_tuples(t1: &Tuple, t2: &Tuple, sort_keys_start_idx: usize) -> Ordering {
-    for (a, b) in t1[sort_keys_start_idx..]
-        .iter()
-        .zip(&t2[sort_keys_start_idx..])
-    {
-        match a.partial_cmp(b) {
-            Some(ordering) => {
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            None => {
-                if mem::discriminant(a) != mem::discriminant(b) {
-                    unreachable!("it should be impossible to run into type errors at this point: cmp() {a} against {b}");
-                }
-            }
-        }
-    }
-
-    Ordering::Equal
 }
 
 pub(crate) struct Insert<F> {
