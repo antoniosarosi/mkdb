@@ -509,49 +509,369 @@ impl Values {
     }
 }
 
+/// External 2-way merge sort implementation.
+///
+/// Check this [lecture] for the basic idea:
+///
+/// [lecture]: https://youtu.be/DOu7SVUbuuM?si=gQM_rf1BESUmSdLo&t=1517
+///
+/// # Algorithm
+///
+/// Variable length data makes this algorithm a little bit more complicated than
+/// the lecture suggests but the core concepts are the same. The first thing we
+/// do is we collect all the tuples from the source and generate the "sort keys"
+/// for them. Sort keys are basically the results of the `ORDER BY` expressions.
+/// For example:
+///
+/// ```sql
+/// CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), price INT, discount INT);
+///
+/// SELECT * FROM products ORDER BY price * discount, price;
+/// ```
+///
+/// The "sort keys" for each tuple in the query above would be the values
+/// generated for the expressions `price * discount` and `price`. These sort
+/// keys are computed before the [`BufferedIter`] writes the tuple to a file or
+/// an in-memory buffer and they are appended to the end of the tuple after all
+/// its other columns.
+///
+/// The reason we need to generate the sort keys so early is because they change
+/// the length in bytes of the tuple and we need to know the length of the
+/// largest tuple that we are going to work with in order to compute the exact
+/// page size that we need for the 2-way external merge sort.
+///
+/// Note that there is no overflow at this level, tuples that are distributed
+/// across overflow pages are already merged together back into one contiguous
+/// buffer by the scan plan. So we only work with complete data here.
+///
+/// Once the [`BufferedIter`] has successfully collected all the tuples and
+/// generated the sort keys for them we can finally start sorting.
+///
+/// There are two main cases:
+///
+/// 1. The [`BufferedIter`] did not use any files because all the tuples fit
+/// in its in-memory buffer. In that case, move the buffer out of the
+/// [`BufferedIter`] into the [`Sort`] plan and just do an in-memory sorting.
+/// No IO required.
+///
+/// 2. The [`BufferedIter`] had to create a file in order to collect all
+/// tuples. This is the complicated case.
+///
+/// # External Merge Sort With Variable Length Data
+///
+/// As mentioned earlier, we keep track of the largest tuple in order to compute
+/// the page size that we need for sorting. The page size is either that of the
+/// [`Pager`] or the closest power of two that can fit the largest tuple.
+///
+/// Once we know the exact page size we can start the "pass 0" or "1 page runs".
+/// In this step we collect tuples into one page, sort them in-memory, write the
+/// page to a file, fill the page again, sort it, write it to the file again and
+/// so on until there are no more tuples. The file ends up looking roughly like
+/// this:
+///
+/// ```text
+///       40     20        20    20    20         30      30               60
+///     bytes   bytes     bytes bytes bytes      bytes   bytes            bytes
+/// +-------------------+--------------------+--------------------+--------------------+
+/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
+/// | |   T3   | T5 |   | | T1 | T7 | T8 |   | |  T4   |  T6  |   | |      T2      |   |
+/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
+/// +-------------------+--------------------+--------------------+--------------------+
+///        PAGE 0               PAGE 1               PAGE 2               PAGE 3
+///       64 bytes             64 bytes             64 bytes             64 bytes
+/// ```
+///
+/// As you can see, tuples are sorted within every page but they are not sorted
+/// as a whole, so there is still a lot of work to do. After pass 0 is done we
+/// don't actually need to do any more "sorting" per se, we only need to "merge"
+/// pages together.
+///
+/// ## The Merge Sub-algorithm
+///
+/// Once we've completed the "1 page runs" we do the "2 page runs". Basically
+/// we load two pages into memory, and since they are already sorted on their
+/// own we can create a new set of pages that are fully sorted from start to
+/// finish. Continuing with the example above, we start by loading page 0 and
+/// page 1 into memory and merging them together:
+///
+/// ```text
+///       40     20
+///     bytes   bytes
+/// +--------------------+
+/// | +--------+----+    |
+/// | |   T3   | T5 |    | ------+
+/// | +--------+----+    |       |            20       40
+/// +--------------------+       |           bytes    bytes
+///        PAGE 0                |         +--------------------+
+///       64 bytes               |         | +----+---------+   |
+///                              +-------> | | T1 |    T3   |   |
+///    20    20    20            |         | +----+---------+   |
+///   bytes bytes bytes          |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 0
+/// | +----+----+----+   |       |                64 bytes
+/// | | T1 | T7 | T8 |   | ------+
+/// | +----+----+----+   |
+/// +--------------------+
+///         PAGE 1
+///        64 bytes
+/// ```
+///
+/// Now that the first merged page is full, we write it to a new file and
+/// continue merging the rest of tuples:
+///
+/// ```text
+///     20
+///   bytes
+/// +--------------------+
+/// | +----+             |
+/// | | T5 |             | ------+
+/// | +----+             |       |            20    20    20
+/// +--------------------+       |           bytes bytes bytes
+///        PAGE 0                |         +--------------------+
+///       64 bytes               |         | +----+----+----+   |
+///                              +-------> | | T5 | T7 | T8 |   |
+///    20    20                  |         | +----+----+----+   |
+///   bytes bytes                |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 1
+/// | +----+----+        |       |                64 bytes
+/// | | T7 | T8 |        | ------+
+/// | +----+----+        |
+/// +--------------------+
+///         PAGE 1
+///        64 bytes
+/// ```
+///
+/// Pages 0 and 1 are now completely merged into two sorted pages. This is how
+/// the new file looks like so far:
+///
+/// ```text
+///     20       40          20    20    20
+///    bytes    bytes       bytes bytes bytes
+///  +--------------------+--------------------+
+///  | +----+---------+   | +----+----+----+   |
+///  | | T1 |    T3   |   | | T5 | T7 | T8 |   |
+///  | +----+---------+   | +----+----+----+   |
+///  +--------------------+--------------------+
+///       MERGED PAGE 0        MERGED PAGE 1
+///         64 bytes             64 bytes
+/// ```
+///
+/// As you can see, we have 2 pages that are fully sorted from start to finish.
+/// That's why this step is called a "2 page run". However, merging 2 pages
+/// won't always result in exactly 2 new pages due to the nature of variable
+/// length data, but we'll discuss that later. Now we load the next two pages in
+/// memory and repeat the process. We end up with this new file:
+///
+/// ```text
+///     20       40          20    20    20             60               30      30
+///    bytes    bytes       bytes bytes bytes          bytes            bytes   bytes
+///  +--------------------+--------------------+--------------------+--------------------+
+///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
+///  | | T1 |    T3   |   | | T5 | T7 | T8 |   | |      T2      |   | |  T4   |  T6  |   |
+///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
+///  +--------------------+--------------------+--------------------+--------------------+
+///       MERGED PAGE 0        MERGED PAGE 1       MERGED PAGE 2         MERGED PAGE 3
+///         64 bytes             64 bytes             64 bytes             64 bytes
+/// ```
+///
+/// ## Dealing With Variable Length Data
+///
+/// The new file has the same number of pages as the original "1 page runs"
+/// file. However, that is not always the case due to how variable length data
+/// fits in fixed size pages. There's a clear example in the next step of the
+/// algorithm: the "4 page runs". Now instead of taking 2 pages and merging
+/// them together we take 4 pages. We still load 2 pages at a time in memory,
+/// but we do so until we've merged 4 pages instead of 2. So we'll use two
+/// cursors for this task:
+///
+/// ```text
+///     20       40          20    20    20             60               30      30
+///    bytes    bytes       bytes bytes bytes          bytes            bytes   bytes
+///  +--------------------+--------------------+--------------------+--------------------+
+///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
+///  | | T1 |    T3   |   | | T5 | T7 | T8 |   | |      T2      |   | |  T4   |  T6  |   |
+///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
+///  +--------------------+--------------------+--------------------+--------------------+
+///       MERGED PAGE 0        MERGED PAGE 1       MERGED PAGE 2         MERGED PAGE 3
+///         64 bytes             64 bytes             64 bytes             64 bytes
+///
+///            ^                                         ^
+///            |                                         |
+///         CURSOR 1                                 CURSOR 2
+/// ```
+///
+/// Cursor one starts pointing at 0 and cursor two points at 2. We start by
+/// merging pages 0 and 2 and then we move to pages 1 and 3. So, 0 and 2 first:
+///
+/// ```text
+///    20       40
+///   bytes    bytes
+/// +--------------------+
+/// | +----+---------+   |
+/// | | T1 |    T3   |   | ------+
+/// | +----+---------+   |       |            20
+/// +--------------------+       |           bytes
+///      MERGED PAGE 0           |         +--------------------+
+///        64 bytes              |         | +----+             |
+///                              +-------> | | T1 |             |
+///          60                  |         | +----+             |
+///         bytes                |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 0
+/// | +--------------+   |       |                64 bytes
+/// | |      T2      |   | ------+
+/// | +--------------+   |
+/// +--------------------+
+///     MERGED PAGE 2
+///        64 bytes
+/// ```
+///
+/// Notice how the first page that we produce can only fit tuple 1 because
+/// tuple 2 is 60 bytes in size and won't fit in the 64 byte page. So we write
+/// page 0 as is, with only one tuple, and produce the next one:
+///
+/// ```text
+///       40
+///      bytes
+/// +--------------------+
+/// | +---------+        |
+/// | |    T3   |        | ------+
+/// | +---------+        |       |                  60
+/// +--------------------+       |                 bytes
+///      MERGED PAGE 0           |         +--------------------+
+///        64 bytes              |         | +--------------+   |
+///                              +-------> | |      T2      |   |
+///          60                  |         | +--------------+   |
+///         bytes                |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 1
+/// | +--------------+   |       |                64 bytes
+/// | |      T2      |   | ------+
+/// | +--------------+   |
+/// +--------------------+
+///     MERGED PAGE 2
+///        64 bytes
+/// ```
+///
+/// The second page we've produced is full again. So write it to the output file
+/// and produce the next one. Page 2 is also empty, it doesn't have any more
+/// tuples, so we'll move cursor two and load page 3 in its place:
+///
+///
+/// ```text
+///       40
+///      bytes
+/// +--------------------+
+/// | +---------+        |
+/// | |    T3   |        | ------+
+/// | +---------+        |       |               40
+/// +--------------------+       |              bytes
+///      MERGED PAGE 0           |         +--------------------+
+///        64 bytes              |         | +---------+        |
+///                              +-------> | |    T3   |        |
+///      30      30              |         | +---------+        |
+///     bytes   bytes            |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 2
+/// | +-------+------+   |       |                64 bytes
+/// | |  T4   |  T6  |   | ------+
+/// | +-------+------+   |
+/// +--------------------+
+///      MERGED PAGE 3
+///        64 bytes
+/// ```
+///
+/// See how we're facing the same issue again where the output page won't be
+/// able to fit tuple 4. No problem, just write the output page to the output
+/// file and continue repeating the process. Once we've written tuple 3 page 0
+/// becomes empty, so we'll shift its cursor to page 1:
+///
+/// ```text
+///    20    20    20
+///   bytes bytes bytes
+/// +--------------------+
+/// | +----+----+----+   |
+/// | | T5 | T7 | T8 |   | ------+
+/// | +----+----+----+   |       |             30      20
+/// +--------------------+       |            bytes   bytes
+///      MERGED PAGE 1           |         +--------------------+
+///        64 bytes              |         | +-------+----+     |
+///                              +-------> | |  T4   | T5 |     |
+///      30      30              |         | +-------+----+     |
+///     bytes   bytes            |         +--------------------+
+/// +--------------------+       |              MERGED PAGE 3
+/// | +-------+------+   |       |                64 bytes
+/// | |  T4   |  T6  |   | ------+
+/// | +-------+------+   |
+/// +--------------------+
+///      MERGED PAGE 3
+///        64 bytes
+/// ```
+///
+/// We managed to squeeze tuples 4 and 5 into page 3. Now we still have to merge
+/// the rest of them. At the end, we'll end up with this new file:
+///
+/// ```text
+///     20                         60                40                 30      20           30      20          20
+///    bytes                      bytes             bytes              bytes   bytes        bytes   bytes       bytes
+///  +--------------------+--------------------+--------------------+--------------------+--------------------+--------------------+
+///  | +----+             | +--------------+   | +---------+        | +-------+----+     | +-------+----+     | +----+             |
+///  | | T1 |             | |      T2      |   | |    T3   |        | |  T4   | T5 |     | |  T6   | T7 |     | | T8 |             |
+///  | +----+             | +--------------+   | +---------+        | +-------+----+     | +-------+----+     | +----+             |
+///  +--------------------+--------------------+--------------------+--------------------+--------------------+--------------------+
+///       MERGED PAGE 0       MERGED PAGE 1         MERGED PAGE 2        MERGED PAGE 3        MERGED PAGE 4        MERGED PAGE 5
+///         64 bytes             64 bytes             64 bytes             64 bytes             64 bytes             64 bytes
+/// ```
+///
+/// In theory, we should have produced 4 pages, that's why it'c called a
+/// "4 page run". But variable length data makes everything more interesting
+/// doesn't it? Anyway, if the original input file had more than 4 pages, we'd
+/// continue the 4 page run by shifting the cursor to pages 4-8. We'd merge 4
+/// and 6, then 5 and 7. And so on until there are no more pages. After that we
+/// duplicate the page runs every time. So after the "4 page runs" we'd do the
+/// "8 page runs", which is not necessary in this case because we don't even
+/// have 8 pages to begin with and everything is already sorted.
+///
+/// But that's the idea, we keep duplicating the page runs until we're done. It
+/// doesn't matter whether the amount of pages changes or not in the process,
+/// the algorithm still works. The only caveat is that we need two files. We
+/// have an input file from which we read from and an output file where we write
+/// to. Once we've completed an entire pass, we swap the files so that the
+/// previous output file becomes the new input file and the previous input file
+/// is truncated and becomes the new output file.
 pub(crate) struct Sort<F> {
     pub source: BufferedIter<F>,
     pub schema: Schema,
     pub sort_schema: Schema,
     pub sorted: bool,
     pub page_size: usize,
+    pub mem_buf: TupleBuffer,
+    pub work_dir: PathBuf,
     pub input_file: Option<F>,
     pub output_file: Option<F>,
-    pub mem_buf: TupleBuffer,
-    pub total_sorted_pages: usize,
-    pub next_page: usize,
-    pub work_dir: PathBuf,
     pub input_file_path: PathBuf,
     pub output_file_path: PathBuf,
 }
 
-impl<F: Seek + Read + Write + FileOps> Sort<F> {
-    fn cmp_tuples(&self, t1: &[Value], t2: &[Value]) -> Ordering {
-        let sort_keys_start_index = self.schema.len();
-
-        for (a, b) in t1[sort_keys_start_index..]
-            .iter()
-            .zip(&t2[sort_keys_start_index..])
-        {
-            match a.partial_cmp(b) {
-                Some(ordering) => {
-                    if ordering != Ordering::Equal {
-                        return ordering;
-                    }
+fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
+    for (a, b) in t1.iter().zip(t2) {
+        match a.partial_cmp(b) {
+            Some(ordering) => {
+                if ordering != Ordering::Equal {
+                    return ordering;
                 }
-                None => {
-                    if mem::discriminant(a) != mem::discriminant(b) {
-                        unreachable!("it should be impossible to run into type errors at this point: cmp() {a} against {b}");
-                    }
+            }
+            None => {
+                if mem::discriminant(a) != mem::discriminant(b) {
+                    unreachable!("it should be impossible to run into type errors at this point: cmp() {a} against {b}");
                 }
             }
         }
-
-        Ordering::Equal
     }
 
+    Ordering::Equal
+}
+
+impl<F: Seek + Read + Write + FileOps> Sort<F> {
     fn sort_tuples(&self, tuples: &mut [Tuple]) {
-        tuples.sort_by(|t1, t2| self.cmp_tuples(t1, t2));
+        tuples.sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
     }
 
     fn sort(&mut self) -> Result<(), DbError> {
@@ -581,12 +901,14 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             if !tuples.can_fit(&tuple) {
                 // Create files
                 if self.input_file.is_none() {
-                    self.input_file_path = self
-                        .work_dir
-                        .join(format!("{}.mkdb.sort", &self.source as *const _ as usize));
-                    self.output_file_path = self
-                        .work_dir
-                        .join(format!("{}.mkdb.sort", &self.mem_buf as *const _ as usize));
+                    let input_file_name =
+                        format!("{}.mkdb.sort", &self.source as *const _ as usize);
+                    let output_file_name =
+                        format!("{}.mkdb.sort", &self.mem_buf as *const _ as usize);
+
+                    self.input_file_path = self.work_dir.join(input_file_name);
+                    self.output_file_path = self.work_dir.join(output_file_name);
+
                     self.input_file = Some(F::create(&self.input_file_path)?);
                     self.output_file = Some(F::create(&self.output_file_path)?);
                 }
@@ -639,7 +961,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 // Merge
                 while !input_page1.is_empty() || !input_page2.is_empty() {
                     let tuple = if !input_page1.is_empty() && !input_page2.is_empty() {
-                        let cmp = self.cmp_tuples(&input_page1[0], &input_page2[0]);
+                        let cmp = cmp_tuples(&input_page1[0], &input_page2[0]);
                         if matches!(cmp, Ordering::Less | Ordering::Equal) {
                             input_page1.pop_front().unwrap()
                         } else {
@@ -698,7 +1020,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             input_pages = output_pages;
         }
 
-        self.total_sorted_pages = input_pages;
+        // Put the cursor back to the beginning for reading.
+        self.input_file.as_mut().unwrap().rewind()?;
 
         Ok(())
     }
@@ -712,27 +1035,24 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         if self.mem_buf.is_empty() {
             if let Some(input_file) = self.input_file.as_mut() {
-                if self.next_page < self.total_sorted_pages {
-                    self.mem_buf.read_page(input_file, self.next_page)?;
-                    self.next_page += 1;
-                } else {
-                    // TODO: Drop if iter not consumed.
-                    drop(self.input_file.take());
-                    drop(self.output_file.take());
-                    F::remove(&self.input_file_path)?;
-                    F::remove(&self.output_file_path)?;
+                if let Err(e) = self.mem_buf.read_from(input_file) {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        drop(self.input_file.take());
+                        drop(self.output_file.take());
+                        F::remove(&self.input_file_path)?;
+                        F::remove(&self.output_file_path)?;
+                    } else {
+                        return Err(e.into());
+                    }
                 }
             }
         }
 
-        if self.mem_buf.is_empty() {
-            return Ok(None);
-        }
-
-        let mut tuple = self.mem_buf.pop_front().unwrap();
-        tuple.drain(self.schema.len()..);
-
-        Ok(Some(tuple))
+        // Remove sort keys when returning to the next plan node.
+        Ok(self.mem_buf.pop_front().map(|mut tuple| {
+            tuple.drain(self.schema.len()..);
+            tuple
+        }))
     }
 }
 

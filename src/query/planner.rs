@@ -88,8 +88,6 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
                     input_file: None,
                     output_file: None,
                     mem_buf: TupleBuffer::empty(),
-                    total_sorted_pages: 0,
-                    next_page: 0,
                     input_file_path: PathBuf::new(),
                     output_file_path: PathBuf::new(),
                 }));
