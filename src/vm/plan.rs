@@ -1021,7 +1021,7 @@ pub(crate) struct Sort<F> {
     pub sort_schema: Schema,
     pub sorted: bool,
     pub page_size: usize,
-    pub mem_buf: TupleBuffer,
+    pub output_page: TupleBuffer,
     pub work_dir: PathBuf,
     pub input_file: Option<F>,
     pub output_file: Option<F>,
@@ -1050,41 +1050,41 @@ fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
-    fn sort_tuples(&self, tuples: &mut [Tuple]) {
-        tuples.sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
+    fn sort_output_page(&mut self) {
+        self.output_page
+            .tuples
+            .make_contiguous()
+            .sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
     }
 
     fn sort(&mut self) -> Result<(), DbError> {
-        // Mem only sorting, didn't need files.
+        // Mem only sorting, didn't need files. Easy stuff ends here :(
         if self.source.reader.is_none() {
-            let mut mem_buf = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
-            self.sort_tuples(mem_buf.tuples.make_contiguous());
-            self.mem_buf = mem_buf;
+            self.output_page = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
+            self.sort_output_page();
 
             return Ok(());
         }
 
-        // Needs files.
+        // We need files to sort. Figure out the page size.
         self.page_size = std::cmp::max(
             TupleBuffer::page_size_needed_for(self.source.mem_buf.largest_tuple_size),
             self.page_size,
         );
 
-        self.mem_buf = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
-
         // One page runs. Sort pages and write them to disk.
-        let mut tuples = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        self.output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
         while let Some(tuple) = self.source.try_next()? {
             // Write page if page is full
-            if !tuples.can_fit(&tuple) {
+            if !self.output_page.can_fit(&tuple) {
                 // Create files
                 if self.input_file.is_none() {
                     let input_file_name =
                         format!("{}.mkdb.sort", &self.source as *const _ as usize);
                     let output_file_name =
-                        format!("{}.mkdb.sort", &self.mem_buf as *const _ as usize);
+                        format!("{}.mkdb.sort", &self.output_page as *const _ as usize);
 
                     self.input_file_path = self.work_dir.join(input_file_name);
                     self.output_file_path = self.work_dir.join(output_file_name);
@@ -1093,22 +1093,22 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     self.output_file = Some(F::create(&self.output_file_path)?);
                 }
 
-                self.sort_tuples(tuples.tuples.make_contiguous());
-                tuples.write_to(self.input_file.as_mut().unwrap())?;
-
-                tuples.clear();
+                self.sort_output_page();
+                self.output_page
+                    .write_to(self.input_file.as_mut().unwrap())?;
+                self.output_page.clear();
                 input_pages += 1;
             }
 
-            tuples.push(tuple);
+            self.output_page.push(tuple);
         }
 
         // Last page.
-        if !tuples.is_empty() {
-            self.sort_tuples(&mut tuples.tuples.make_contiguous());
-            tuples.write_to(self.input_file.as_mut().unwrap())?;
-
-            tuples.clear();
+        if !self.output_page.is_empty() {
+            self.sort_output_page();
+            self.output_page
+                .write_to(self.input_file.as_mut().unwrap())?;
+            self.output_page.clear();
             input_pages += 1;
         }
 
@@ -1118,7 +1118,6 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         let mut input_page1 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
         let mut input_page2 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
-        let mut output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         while page_runs <= (input_pages + (input_pages % 2)) {
             let mut output_pages = 0;
@@ -1169,18 +1168,20 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                         cursor2 += 1;
                     }
 
-                    if !output_page.can_fit(&tuple) {
-                        output_page.write_to(self.output_file.as_mut().unwrap())?;
-                        output_page.clear();
+                    if !self.output_page.can_fit(&tuple) {
+                        self.output_page
+                            .write_to(self.output_file.as_mut().unwrap())?;
+                        self.output_page.clear();
                         output_pages += 1;
                     }
 
-                    output_page.push(tuple);
+                    self.output_page.push(tuple);
                 }
 
-                if !output_page.is_empty() {
-                    output_page.write_to(self.output_file.as_mut().unwrap())?;
-                    output_page.clear();
+                if !self.output_page.is_empty() {
+                    self.output_page
+                        .write_to(self.output_file.as_mut().unwrap())?;
+                    self.output_page.clear();
                     output_pages += 1;
                 }
 
@@ -1213,9 +1214,9 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.sorted = true;
         }
 
-        if self.mem_buf.is_empty() {
+        if self.output_page.is_empty() {
             if let Some(input_file) = self.input_file.as_mut() {
-                if let Err(e) = self.mem_buf.read_from(input_file) {
+                if let Err(e) = self.output_page.read_from(input_file) {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
                         drop(self.input_file.take());
                         drop(self.output_file.take());
@@ -1229,7 +1230,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }
 
         // Remove sort keys when returning to the next plan node.
-        Ok(self.mem_buf.pop_front().map(|mut tuple| {
+        Ok(self.output_page.pop_front().map(|mut tuple| {
             tuple.drain(self.schema.len()..);
             tuple
         }))
