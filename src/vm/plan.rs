@@ -98,6 +98,17 @@ impl Index<usize> for TupleBuffer {
 }
 
 impl TupleBuffer {
+    pub fn empty() -> Self {
+        Self {
+            page_size: 0,
+            schema: Schema::empty(),
+            packed: false,
+            current_size: 0,
+            largest_tuple_size: 0,
+            tuples: VecDeque::new(),
+        }
+    }
+
     fn new(page_size: usize, schema: Schema, packed: bool) -> Self {
         Self {
             page_size,
@@ -506,7 +517,7 @@ pub(crate) struct Sort<F> {
     pub page_size: usize,
     pub input_file: Option<F>,
     pub output_file: Option<F>,
-    pub mem_buf: Vec<Tuple>,
+    pub mem_buf: TupleBuffer,
     pub total_sorted_pages: usize,
     pub next_page: usize,
     pub work_dir: PathBuf,
@@ -546,14 +557,10 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
     fn sort(&mut self) -> Result<(), DbError> {
         // Mem only sorting, didn't need files.
         if self.source.reader.is_none() {
-            let mut tuples = Vec::new();
-            while let Some(tuple) = self.source.try_next()? {
-                tuples.push(tuple);
-            }
+            let mut mem_buf = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
+            self.sort_tuples(mem_buf.tuples.make_contiguous());
+            self.mem_buf = mem_buf;
 
-            self.sort_tuples(&mut tuples);
-
-            self.mem_buf = tuples;
             return Ok(());
         }
 
@@ -562,6 +569,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             TupleBuffer::page_size_needed_for(self.source.mem_buf.largest_tuple_size),
             self.page_size,
         );
+
+        self.mem_buf = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         // One page runs. Sort pages and spill to disk.
         let mut tuples = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
@@ -704,13 +713,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         if self.mem_buf.is_empty() {
             if let Some(input_file) = self.input_file.as_mut() {
                 if self.next_page < self.total_sorted_pages {
-                    Self::read_page(
-                        input_file,
-                        &mut self.mem_buf,
-                        &self.sort_schema,
-                        self.next_page,
-                        self.page_size,
-                    )?;
+                    self.mem_buf.read_page(input_file, self.next_page)?;
                     self.next_page += 1;
                 } else {
                     // TODO: Drop if iter not consumed.
@@ -726,59 +729,10 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             return Ok(None);
         }
 
-        let mut tuple = self.mem_buf.remove(0);
+        let mut tuple = self.mem_buf.pop_front().unwrap();
         tuple.drain(self.schema.len()..);
 
         Ok(Some(tuple))
-    }
-
-    fn write_page(
-        file: &mut F,
-        schema: &Schema,
-        tuples: &Vec<Tuple>,
-        page_size: usize,
-    ) -> io::Result<()> {
-        // num tuples
-        file.write_all(&(tuples.len() as u32).to_le_bytes())?;
-        let mut bytes_written = 4;
-
-        // tuple size + tuple content
-        for i in 0..tuples.len() {
-            let serialized = tuple::serialize(schema, &tuples[i]);
-            file.write_all(&(serialized.len() as u32).to_le_bytes())?;
-            file.write_all(&serialized)?;
-
-            bytes_written += 4 + serialized.len();
-        }
-        // Rest of page if not 100% full
-        file.write_all(&vec![0; page_size - bytes_written])?;
-
-        Ok(())
-    }
-
-    fn read_page(
-        file: &mut F,
-        into: &mut Vec<Tuple>,
-        schema: &Schema,
-        page: usize,
-        page_size: usize,
-    ) -> io::Result<()> {
-        file.seek(io::SeekFrom::Start((page_size * page) as u64))?;
-
-        let mut n_tuples = [0; 4];
-        file.read_exact(&mut n_tuples)?;
-
-        let n_tuples = u32::from_le_bytes(n_tuples);
-
-        for _ in 0..n_tuples {
-            let mut size = [0; 4];
-            file.read_exact(&mut size)?;
-            let mut tup = vec![0; u32::from_le_bytes(size) as usize];
-            file.read_exact(&mut tup)?;
-            into.push(tuple::deserialize(&tup, schema));
-        }
-
-        Ok(())
     }
 }
 

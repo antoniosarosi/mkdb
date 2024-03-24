@@ -15,7 +15,7 @@ use crate::{
         statement::{Column, DataType, Expression, Statement},
     },
     vm::{
-        plan::{BufferedIter, Delete, Insert, Plan, Project, Sort, Update, Values},
+        plan::{BufferedIter, Delete, Insert, Plan, Project, Sort, TupleBuffer, Update, Values},
         VmDataType,
     },
 };
@@ -87,7 +87,7 @@ pub(crate) fn generate_plan<I: Seek + Read + Write + paging::io::FileOps>(
                     sorted: false,
                     input_file: None,
                     output_file: None,
-                    mem_buf: vec![],
+                    mem_buf: TupleBuffer::empty(),
                     total_sorted_pages: 0,
                     next_page: 0,
                     input_file_path: PathBuf::new(),
