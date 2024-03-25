@@ -1409,12 +1409,12 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             while run < input_pages {
                 // Initialize the cursors and load the first page for each
                 // buffer.
-                for (i, (input_page, cursor)) in
+                for (i, (input_buffer, cursor)) in
                     input_buffers.iter_mut().zip(cursors.iter_mut()).enumerate()
                 {
                     *cursor = run + page_runs / self.input_buffers * i;
                     if *cursor < input_pages {
-                        input_page.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
+                        input_buffer.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
                         *cursor += 1;
                     }
                 }
