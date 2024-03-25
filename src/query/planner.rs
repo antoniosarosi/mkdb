@@ -1,4 +1,7 @@
 //! Generates [`Plan`] trees.
+//!
+//! See the module level documentation of [`crate::vm::plan`] to understand
+//! what exactly we're "generating here".
 
 use std::{
     io::{Read, Seek, Write},
@@ -31,15 +34,11 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             columns,
             values,
         } => {
-            let metadata = db.table_metadata(&into)?;
-
             let source = Box::new(Plan::Values(Values { values }));
 
             Plan::Insert(Insert {
-                root: metadata.root,
-                schema: metadata.schema.clone(),
                 source,
-                indexes: metadata.indexes.clone(),
+                table: db.table_metadata(&into)?.clone(),
                 pager: Rc::clone(&db.pager),
             })
         }
@@ -62,6 +61,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
                 for (i, expr) in order_by.iter().enumerate() {
                     let mut col = Column::new(&format!("sort_key_{i}"), DataType::BigInt);
+
                     match analyzer::analyze_expression(&metadata.schema, expr)? {
                         VmDataType::Bool => col.data_type = DataType::Bool,
                         // TODO: What should we do with strings longer than u16::MAX?
@@ -147,9 +147,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             let metadata = db.table_metadata(&table)?;
 
             Plan::Update(Update {
+                table: metadata.clone(),
                 assignments: columns,
-                root: metadata.root,
-                schema: metadata.schema.clone(),
                 source: BufferedIter::new(source, work_dir, metadata.schema.clone(), vec![]),
                 pager: Rc::clone(&db.pager),
             })
@@ -162,9 +161,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             let metadata = db.table_metadata(&from)?;
 
             Plan::Delete(Delete {
-                root: metadata.root,
-                schema: metadata.schema.clone(),
-                indexes: metadata.indexes.clone(),
+                table: metadata.clone(),
                 source: BufferedIter::new(source, work_dir, metadata.schema.clone(), vec![]),
                 pager: Rc::clone(&db.pager),
             })

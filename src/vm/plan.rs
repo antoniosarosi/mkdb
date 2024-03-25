@@ -1,4 +1,4 @@
-//! Code that executes [`Plan`] trees.
+//! Code that executes [`Plan`] trees. This is where real stuff happens :)
 //!
 //! The basic idea for the implementation of this module comes from this
 //! [lecture].
@@ -55,7 +55,7 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError},
+    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, TableMetadata},
     paging::{
         io::FileOps,
         pager::{PageNumber, Pager},
@@ -151,7 +151,7 @@ impl<F> Plan<F> {
 ///
 /// See [`Cursor::try_next`] for details.
 pub(crate) struct SeqScan<F> {
-    pub schema: Schema,
+    pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub cursor: Cursor,
 }
@@ -166,7 +166,7 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
 
         Ok(Some(tuple::deserialize(
             reassemble_payload(&mut pager, page, slot)?.as_ref(),
-            &self.schema,
+            &self.table.schema,
         )))
     }
 }
@@ -176,10 +176,8 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
 /// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
 /// all the row IDs we need without scanning sequentially.
 pub(crate) struct IndexScan<F> {
-    pub index_schema: Schema,
-    pub table_schema: Schema,
-    pub table_root: PageNumber,
-    pub index_root: PageNumber,
+    pub index: IndexMetadata,
+    pub table: TableMetadata,
     pub stop_when: Option<(Vec<u8>, BinaryOperator, Box<dyn BytesCmp>)>,
     pub done: bool,
     pub pager: Rc<RefCell<Pager<F>>>,
@@ -220,7 +218,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
         }
 
         let index_entry =
-            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index_schema);
+            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index.schema());
 
         let Value::Number(row_id) = index_entry[1] else {
             panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
@@ -228,7 +226,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         let mut btree = BTree::new(
             &mut pager,
-            self.table_root,
+            self.table.root,
             FixedSizeMemCmp::for_type::<RowId>(),
         );
 
@@ -237,13 +235,13 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             .unwrap_or_else(|| {
                 panic!(
                     "index at root {} maps to row ID {} that doesn't exist in table at root {}",
-                    self.index_root, row_id, self.table_root
+                    self.index.root, row_id, self.table.root
                 )
             });
 
         Ok(Some(tuple::deserialize(
             table_entry.as_ref(),
-            &self.table_schema,
+            &self.table.schema,
         )))
     }
 }
@@ -326,11 +324,9 @@ impl<F: Seek + Read + Write + FileOps> Project<F> {
 
 /// Inserts data into a table and upates indexes.
 pub(crate) struct Insert<F> {
-    pub root: PageNumber,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
-    pub schema: Schema,
-    pub indexes: Vec<IndexMetadata>,
+    pub table: TableMetadata,
 }
 
 impl<F: Seek + Read + Write + FileOps> Insert<F> {
@@ -341,25 +337,27 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 
         let mut pager = self.pager.borrow_mut();
 
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
-        btree.insert(tuple::serialize(&self.schema, &tuple))?;
+        let mut btree = BTree::new(
+            &mut pager,
+            self.table.root,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        );
 
-        for IndexMetadata { root, column, .. } in &self.indexes {
-            let idx = self.schema.index_of(column).unwrap();
+        btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
 
-            assert_eq!(self.schema.columns[0].name, "row_id");
-            let key_col = self.schema.columns[idx].clone();
-            let row_id_col = self.schema.columns[0].clone();
+        for index in &self.table.indexes {
+            let col_idx = self.table.schema.index_of(&index.column.name).unwrap();
+            assert_eq!(self.table.schema.columns[0].name, "row_id");
 
-            let key = tuple[idx].clone();
+            let key = tuple[col_idx].clone();
             let row_id = tuple[0].clone();
 
-            let entry = tuple::serialize(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
+            let entry = tuple::serialize(&index.schema(), &[key, row_id]);
 
             let mut btree = BTree::new(
                 &mut pager,
-                *root,
-                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+                index.root,
+                Box::<dyn BytesCmp>::from(&index.column.data_type),
             );
 
             btree.insert(entry)?;
@@ -371,11 +369,10 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 
 /// Assigns values to columns.
 pub(crate) struct Update<F> {
-    pub root: PageNumber,
+    pub table: TableMetadata,
     pub assignments: Vec<Assignment>,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: BufferedIter<F>,
-    pub schema: Schema,
 }
 
 impl<F: Seek + Read + Write + FileOps> Update<F> {
@@ -385,14 +382,19 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
         };
 
         for assignment in &self.assignments {
-            let idx = self.schema.index_of(&assignment.identifier).unwrap();
-            tuple[idx] = vm::resolve_expression(&tuple, &self.schema, &assignment.value)?;
+            let idx = self.table.schema.index_of(&assignment.identifier).unwrap();
+            tuple[idx] = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
         }
 
         let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
 
-        btree.insert(tuple::serialize(&self.schema, &tuple))?;
+        let mut btree = BTree::new(
+            &mut pager,
+            self.table.root,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        );
+
+        btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
 
         Ok(Some(vec![]))
     }
@@ -400,11 +402,9 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
 
 /// Removes values from a table BTree and from all the necessary index BTrees.
 pub(crate) struct Delete<F> {
-    pub root: PageNumber,
+    pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: BufferedIter<F>,
-    pub schema: Schema,
-    pub indexes: Vec<IndexMetadata>,
 }
 
 impl<F: Seek + Read + Write + FileOps> Delete<F> {
@@ -414,21 +414,24 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         };
 
         let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
+        let mut btree = BTree::new(
+            &mut pager,
+            self.table.root,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        );
 
-        btree.remove(&tuple::serialize(&self.schema, &tuple))?;
+        btree.remove(&tuple::serialize(&self.table.schema, &tuple))?;
 
-        for IndexMetadata { root, column, .. } in &self.indexes {
-            let idx = self.schema.index_of(column).unwrap();
-            let key_col = self.schema.columns[idx].clone();
-            let key = tuple[idx].clone();
+        for index in &self.table.indexes {
+            let col_idx = self.table.schema.index_of(&index.column.name).unwrap();
+            let key = tuple[col_idx].clone();
 
-            let entry = tuple::serialize(&Schema::from(vec![key_col]), &[key]);
+            let entry = tuple::serialize(&Schema::from(vec![index.column.clone()]), &[key]);
 
             let mut btree = BTree::new(
                 &mut pager,
-                *root,
-                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+                index.root,
+                Box::<dyn BytesCmp>::from(&index.column.data_type),
             );
 
             btree.remove(&entry)?;
@@ -558,7 +561,7 @@ impl TupleBuffer {
     /// Returns `true` if the given `tuple` can be appended to this buffer
     /// without incrementing its size past [`Self::page_size`].
     pub fn can_fit(&self, tuple: &Tuple) -> bool {
-        let tuple_size = tuple::size_of(&tuple, &self.schema);
+        let tuple_size = tuple::size_of(tuple, &self.schema);
         let total_tuple_size = mem::size_of::<u32>() + tuple_size;
 
         self.current_size + total_tuple_size <= self.page_size
@@ -615,7 +618,7 @@ impl TupleBuffer {
         }
 
         for tuple in &self.tuples {
-            let serialized = tuple::serialize(&self.schema, &tuple);
+            let serialized = tuple::serialize(&self.schema, tuple);
             buf.extend_from_slice(&(serialized.len() as u32).to_le_bytes());
             buf.extend_from_slice(&serialized);
         }

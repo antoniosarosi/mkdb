@@ -7,13 +7,12 @@ use std::{
 };
 
 use crate::{
-    db::{Database, DatabaseContext, DbError, Schema},
+    db::{Database, DatabaseContext, DbError, IndexMetadata, Schema},
     paging::{
-        self,
         io::FileOps,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{BinaryOperator, Column, DataType, Expression},
+    sql::statement::{BinaryOperator, DataType, Expression},
     storage::{tuple, BTree, BytesCmp, Cursor},
     vm::plan::{Filter, IndexScan, Plan, SeqScan},
 };
@@ -66,7 +65,7 @@ fn position_cursor_at_key<F: Seek + Read + Write + FileOps>(
 
 /// Basically a constructor. We'll use this until we figure out exactly how to
 /// build stuff here.
-fn generate_sequential_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
+fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     db: &mut Database<F>,
 ) -> Result<Box<Plan<F>>, DbError> {
@@ -74,7 +73,7 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
     Ok(Box::new(Plan::SeqScan(SeqScan {
         cursor: Cursor::new(metadata.root, 0),
-        schema: metadata.schema.clone(),
+        table: metadata.clone(),
         pager: Rc::clone(&db.pager),
     })))
 }
@@ -84,7 +83,7 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
 /// It's only possible to do so if we find an expression that contains an
 /// indexed column and must always be executed. Otherwise we'll fallback to
 /// sequential scans.
-fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
+fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     db: &mut Database<F>,
     filter: &Expression,
@@ -95,13 +94,15 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         return Ok(None);
     }
 
+    // Build index map (column name -> index metadata)
     let indexes = HashMap::from_iter(
         metadata
             .indexes
             .iter()
-            .map(|index| (index.column.clone(), index.root)),
+            .map(|index| (index.column.name.clone(), index.clone())),
     );
 
+    // Find expression that's using an indexed column.
     let Some(Expression::BinaryOperation {
         left,
         operator,
@@ -111,23 +112,22 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         return Ok(None);
     };
 
-    let table_root = metadata.root;
-    let table_schema = metadata.schema.clone();
+    // Grab some metadata
+    let table = metadata.clone();
 
-    let (key, col_def, index_root) = match (left.as_ref(), right.as_ref()) {
+    let (key, index) = match (left.as_ref(), right.as_ref()) {
         (Expression::Identifier(col), Expression::Value(value))
         | (Expression::Value(value), Expression::Identifier(col)) => {
-            let idx = metadata.schema.index_of(col).unwrap();
-            let col_def = metadata.schema.columns[idx].clone();
+            let index = indexes[col].clone();
+            let key = tuple::serialize(&Schema::from(vec![index.column.clone()]), &[value.clone()]);
 
-            let key = tuple::serialize(&Schema::from(vec![col_def.clone()]), &[value.clone()]);
-
-            (key, col_def, indexes[col])
+            (key, index)
         }
 
         _ => unreachable!(),
     };
 
+    // Now do the magic.
     let pager = &mut db.pager.borrow_mut();
 
     let (cursor, stop_when) = match (left.as_ref(), operator, right.as_ref()) {
@@ -138,7 +138,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         // Position the cursor at key 5 and stop at the next key.
         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
+            let cursor = position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
             (cursor, Some(BinaryOperator::Gt))
         }
 
@@ -150,7 +150,8 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         // 5 which will cause the cursor to move to the successor.
         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-            let mut cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
+            let mut cursor =
+                position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
             cursor.try_next(pager)?;
             (cursor, None)
         }
@@ -163,7 +164,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         // tell it to stop once it finds a key >= 5.
         (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
-            let cursor = Cursor::new(index_root, 0);
+            let cursor = Cursor::new(index.root, 0);
             (cursor, Some(BinaryOperator::GtEq))
         }
 
@@ -175,7 +176,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         // cursor will then return key 5 and everything after.
         (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-            let cursor = position_cursor_at_key(&key, &col_def.data_type, index_root, pager)?;
+            let cursor = position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
             (cursor, None)
         }
 
@@ -187,7 +188,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
         // tell it to stop once it finds a key > 5
         (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
-            let cursor = Cursor::new(index_root, 0);
+            let cursor = Cursor::new(index.root, 0);
             (cursor, Some(BinaryOperator::Gt))
         }
 
@@ -196,16 +197,16 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
     Ok(Some(Box::new(Plan::IndexScan(IndexScan {
         cursor,
-        stop_when: stop_when
-            .map(|operator| (key, operator, Box::<dyn BytesCmp>::from(&col_def.data_type))),
+        stop_when: stop_when.map(|operator| {
+            (
+                key,
+                operator,
+                Box::<dyn BytesCmp>::from(&index.column.data_type),
+            )
+        }),
+        table,
+        index,
         done: false,
-        index_root,
-        table_root,
-        table_schema,
-        index_schema: Schema::from(vec![
-            col_def,
-            Column::new("row_id", DataType::UnsignedBigInt),
-        ]),
         pager: Rc::clone(&db.pager),
     }))))
 }
@@ -247,7 +248,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + paging::io::FileOps>(
 /// be better than others for a certain query. This is a toy database so ain't
 /// nobody gonna worry about that :)
 fn find_indexed_expr<'e>(
-    indexes: &HashMap<String, PageNumber>,
+    indexes: &HashMap<String, IndexMetadata>,
     expr: &'e Expression,
 ) -> Option<&'e Expression> {
     match expr {

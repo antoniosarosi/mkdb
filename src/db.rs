@@ -294,8 +294,17 @@ pub(crate) struct IndexMetadata {
     pub root: PageNumber,
     /// Index name.
     pub name: String,
-    /// Column name on which the index was created.
-    pub column: String,
+    /// Column on which the index was created.
+    pub column: Column,
+}
+
+impl IndexMetadata {
+    pub fn schema(&self) -> Schema {
+        Schema::new(vec![
+            self.column.clone(),
+            Column::new("row_id", DataType::UnsignedBigInt),
+        ])
+    }
 }
 
 /// Data that we need to know about tables at runtime.
@@ -303,6 +312,8 @@ pub(crate) struct IndexMetadata {
 pub(crate) struct TableMetadata {
     /// Root page of the table.
     pub root: PageNumber,
+    /// Table name.
+    pub name: String,
     /// Schema of the table as defined by the `CREATE TABLE` statement.
     pub schema: Schema,
     /// All the indexes associated to this table.
@@ -402,6 +413,7 @@ impl TryFrom<&[&str]> for Context {
 
                     let mut metadata = TableMetadata {
                         root,
+                        name: name.clone(),
                         row_id: 1,
                         schema,
                         indexes: vec![],
@@ -410,15 +422,15 @@ impl TryFrom<&[&str]> for Context {
 
                     use crate::sql::statement::Constraint;
 
-                    for col in columns {
-                        for constraint in &col.constraints {
+                    for column in columns {
+                        for constraint in &column.constraints {
                             let index_name = match constraint {
                                 Constraint::PrimaryKey => format!("{name}_pk_index"),
-                                Constraint::Unique => format!("{name}_{}_uq_index", col.name),
+                                Constraint::Unique => format!("{name}_{}_uq_index", column.name),
                             };
 
                             metadata.indexes.push(IndexMetadata {
-                                column: col.name.clone(),
+                                column: column.clone(),
                                 name: index_name,
                                 root,
                             });
@@ -436,8 +448,11 @@ impl TryFrom<&[&str]> for Context {
                     unique,
                     ..
                 }) if unique => {
-                    context.table_metadata(&name)?.indexes.push(IndexMetadata {
-                        column,
+                    let table = context.table_metadata(&name)?;
+                    let col_idx = table.schema.index_of(&column).unwrap();
+
+                    table.indexes.push(IndexMetadata {
+                        column: table.schema.columns[col_idx].clone(),
                         name,
                         root,
                     });
@@ -516,6 +531,7 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
 
             return Ok(TableMetadata {
                 root: MKDB_META_ROOT,
+                name: String::from(table),
                 row_id: self.load_next_row_id(MKDB_META_ROOT)?,
                 schema,
                 indexes: vec![],
@@ -532,6 +548,7 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
 
         let mut metadata = TableMetadata {
             root: 1,
+            name: String::from(table),
             row_id: 1,
             schema: Schema::empty(),
             indexes: Vec::new(),
@@ -563,7 +580,21 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
                     }
 
                     Statement::Create(Create::Index { column, name, .. }) => {
-                        metadata.indexes.push(IndexMetadata { column, name, root })
+                        // The table schema should be loaded by this time
+                        // because it's impossible to define an index unless the
+                        // table exists and the results are returned sorted by
+                        // row_id.
+                        let col_idx = metadata.schema.index_of(&column).ok_or(
+                            SqlError::Other(format!(
+                                "could not find index column {column} in the definition of table {table}"
+                            )),
+                        )?;
+
+                        metadata.indexes.push(IndexMetadata {
+                            column: metadata.schema.columns[col_idx].clone(),
+                            name,
+                            root,
+                        });
                     }
 
                     _ => unreachable!(),
