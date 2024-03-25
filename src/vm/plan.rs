@@ -1240,10 +1240,14 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 ///        64 bytes
 /// ```
 ///
-/// And so we'd produce the entire sorted file in one single run. The number
-/// of input buffers is configured through [`Self::input_buffers`]. Check the
-/// [lecture] mentioned at the beginning for the IO complexity analysis, but
-/// basically the more buffers we have the less IO we have to do.
+/// And so we'd produce the entire sorted file in one single run. The next run
+/// would be able to produce 16 pages because we already have segments of 4
+/// pages that are sorted. With a K-way algorithm each run multiplies the number
+/// or pages by K instead of doubling it, which results in fewer overall passes
+/// through the file and thus less IO. Check the [lecture] mentioned at the
+/// beginning for the IO complexity analysis and formulas, but basically the
+/// more buffers we have the less IO we have to do. The number of input buffers
+/// is configured through [`Self::input_buffers`].
 pub(crate) struct Sort<F> {
     /// Tuple input.
     pub source: BufferedIter<F>,
@@ -1327,8 +1331,8 @@ impl<F: FileOps> Sort<F> {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
-    /// Executes the K-way external merge sort algorithm described in the
-    /// documentation of [`Sort`]
+    /// Iterative implementation of the K-way external merge sort algorithm
+    /// described in the documentation of [`Sort`].
     fn sort(&mut self) -> Result<(), DbError> {
         // Mem only sorting, didn't need files. Early return wishing that
         // everything was as simple as this.
@@ -1356,6 +1360,14 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // "Pass 0" or "1 page runs". Sort pages in memory and write them to the
         // "input" file.
+        //
+        // TODO: We don't actually need a "1 page run" here, we can fill all
+        // the input buffers, sort them individually and merge them to skip
+        // not only "Pass 0" but also "Pass 1". It's not hard to do but requires
+        // figuring out exactly how to extract the "merge" behaviour written
+        // below into its own function considering that the first pass we would
+        // do here doesn't need to fill the input buffers from a file but
+        // rather from the buffered iterator source.
         self.output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
@@ -1394,9 +1406,11 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         let mut cursors = vec![0; input_buffers.len()];
 
-        // Once the number of pages we have to process is greater or equal to
-        // the total number pages in the input file we're done.
-        while page_runs < (input_pages + (input_pages % self.input_buffers)) {
+        // page_runs / input_buffers is the number of pages we processed in the
+        // previous iteration. If we processed all the pages then we won't go
+        // into another iteration. This is basically a hack for do while loops,
+        // it saves us from writing an "if break" block 100 lines later.
+        while page_runs / self.input_buffers < input_pages {
             // Number of output pages.
             let mut output_pages = 0;
 
@@ -1498,7 +1512,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.input_file = Some(output_file);
             self.output_file = Some(input_file);
 
-            page_runs *= 2;
+            page_runs *= self.input_buffers;
             input_pages = output_pages;
         }
 

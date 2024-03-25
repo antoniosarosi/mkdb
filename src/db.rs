@@ -936,6 +936,38 @@ mod tests {
         Ok(())
     }
 
+    // Force the external merge sort algorithm to do some real work.
+    #[cfg(not(miri))]
+    #[test]
+    fn select_order_by_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (name VARCHAR(255));")?;
+
+        let mut expected = Vec::new();
+
+        for i in 1..=500 {
+            let name = format!("User{i:03}");
+            expected.push(vec![Value::String(name)]);
+        }
+
+        for user in expected.iter().rev() {
+            db.exec(&format!("INSERT INTO users(name) VALUES ({});", user[0]))?;
+        }
+
+        let query = db.exec("SELECT * FROM users ORDER BY name;")?;
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![Column::new("name", DataType::Varchar(255)),]),
+            results: expected,
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn select_disordered_columns() -> Result<(), DbError> {
         let mut db = init_database()?;
