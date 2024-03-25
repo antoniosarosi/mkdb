@@ -52,6 +52,7 @@ use std::{
     ops::Index,
     path::PathBuf,
     rc::Rc,
+    usize,
 };
 
 use crate::{
@@ -844,7 +845,7 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
     }
 }
 
-/// External 2-way merge sort implementation.
+/// External K-way merge sort implementation.
 ///
 /// Check this [lecture] for the basic idea:
 ///
@@ -854,9 +855,9 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 ///
 /// Variable length data makes this algorithm a little bit more complicated than
 /// the lecture suggests but the core concepts are the same. The first thing we
-/// do is we collect all the tuples from the source and generate the "sort keys"
-/// for them. Sort keys are basically the results of the `ORDER BY` expressions.
-/// For example:
+/// do is we generate the "sort keys" for all the tuples and collect them into
+/// a file or in-memory buffer if we're lucky enough and they fit. Sort keys are
+/// basically the results of the `ORDER BY` expressions. For example:
 ///
 /// ```sql
 /// CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), price INT, discount INT);
@@ -866,21 +867,21 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 ///
 /// The "sort keys" for each tuple in the query above would be the values
 /// generated for the expressions `price * discount` and `price`. These sort
-/// keys are computed before the [`BufferedIter`] writes the tuple to a file or
-/// an in-memory buffer and they are appended to the end of the tuple after all
-/// its other columns.
+/// keys are computed by [`SortKeysGen`] before the [`BufferedIter`] writes the
+/// tuple to a file or an in-memory buffer and they are appended to the end of
+/// the tuple after all its other columns.
 ///
 /// The reason we need to generate the sort keys so early is because they change
 /// the length in bytes of the tuple and we need to know the length of the
 /// largest tuple that we are going to work with in order to compute the exact
-/// page size that we need for the 2-way external merge sort.
+/// page size that we need for the K-way external merge sort.
 ///
 /// Note that there is no overflow at this level, tuples that are distributed
 /// across overflow pages are already merged together back into one contiguous
 /// buffer by the scan plan. So we only work with complete data here.
 ///
-/// Once the [`BufferedIter`] has successfully collected all the tuples and
-/// generated the sort keys for them we can finally start sorting.
+/// Once the [`BufferedIter`] has successfully collected all the tuples modified
+/// by [`SortKeysGen`] we can finally start sorting.
 ///
 /// There are two main cases:
 ///
@@ -892,7 +893,7 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 /// 2. The [`BufferedIter`] had to create a file in order to collect all
 /// tuples. This is the complicated case.
 ///
-/// # External Merge Sort With Variable Length Data
+/// # External 2-Way Merge Sort With Variable Length Data
 ///
 /// As mentioned earlier, we keep track of the largest tuple in order to compute
 /// the page size that we need for sorting. The page size is either that of the
@@ -1171,6 +1172,78 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 /// to. Once we've completed an entire pass, we swap the files so that the
 /// previous output file becomes the new input file and the previous input file
 /// is truncated and becomes the new output file.
+///
+/// # K-Way Merge
+///
+/// The algorithm described above is a 2-way merge where we only use two input
+/// buffers or input pages and one output buffer. However, we can use more than
+/// two input buffers and generalize the algorithm to work for K buffers. In
+/// that case, after we do the 1 page runs to sort pages, we don't do a "2 page
+/// run", we do a "K page run" because we can load K pages at a time in memory.
+///
+/// Again, starting from the sorted file after we do the "1 page runs":
+///
+/// ```text
+///       40     20        20    20    20         30      30               60
+///     bytes   bytes     bytes bytes bytes      bytes   bytes            bytes
+/// +-------------------+--------------------+--------------------+--------------------+
+/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
+/// | |   T3   | T5 |   | | T1 | T7 | T8 |   | |  T4   |  T6  |   | |      T2      |   |
+/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
+/// +-------------------+--------------------+--------------------+--------------------+
+///        PAGE 0               PAGE 1               PAGE 2               PAGE 3
+///       64 bytes             64 bytes             64 bytes             64 bytes
+/// ```
+///
+/// If we have 4 buffers instead of 2 we can load all these 4 pages into memory
+/// and merge them:
+///
+/// ```text
+///       40     20
+///     bytes   bytes
+/// +--------------------+
+/// | +--------+----+    |
+/// | |   T3   | T5 |    | ------+
+/// | +--------+----+    |       |
+/// +--------------------+       |
+///        PAGE 0                |
+///       64 bytes               |
+///                              |
+///    20    20    20            |
+///   bytes bytes bytes          |
+/// +--------------------+       |
+/// | +----+----+----+   |       |
+/// | | T1 | T7 | T8 |   | ------+
+/// | +----+----+----+   |       |            20
+/// +--------------------+       |           bytes
+///         PAGE 1               |         +-------------------+
+///        64 bytes              |         | +----+            |
+///                              +-------> | | T1 |            |
+///      30      30              |         | +----+            |
+///     bytes   bytes            |         +-------------------+
+/// +--------------------+       |             MERGED PAGE 0
+/// | +-------+------+   |       |                64 bytes
+/// | |  T4   |  T6  |   | ------+
+/// | +-------+------+   |       |
+/// +--------------------+       |
+///         PAGE 2               |
+///        64 bytes              |
+///                              |
+///          60                  |
+///         bytes                |
+/// +--------------------+       |
+/// | +--------------+   |       |
+/// | |      T2      |   | ------+
+/// | +--------------+   |
+/// +--------------------+
+///         PAGE 2
+///        64 bytes
+/// ```
+///
+/// And so we'd produce the entire sorted file in one single run. The number
+/// of input buffers is configured through [`Self::input_buffers`]. Check the
+/// [lecture] mentioned at the beginning for the IO complexity analysis, but
+/// basically the more buffers we have the less IO we have to do.
 pub(crate) struct Sort<F> {
     /// Tuple input.
     pub source: BufferedIter<F>,
@@ -1182,6 +1255,8 @@ pub(crate) struct Sort<F> {
     pub sorted: bool,
     /// Page size used by the [`Pager`].
     pub page_size: usize,
+    /// How many buffers to use for sorting.
+    pub input_buffers: usize,
     /// Page used to sort tuples, write them to files and them buffer reads when
     /// returning the results.
     pub output_page: TupleBuffer,
@@ -1252,7 +1327,7 @@ impl<F: FileOps> Sort<F> {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
-    /// Executes the 2-way external merge sort algorithm described in the
+    /// Executes the K-way external merge sort algorithm described in the
     /// documentation of [`Sort`]
     fn sort(&mut self) -> Result<(), DbError> {
         // Mem only sorting, didn't need files. Early return wishing that
@@ -1279,8 +1354,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.page_size,
         );
 
-        // One page runs. Sort pages in memory and write them to the "input"
-        // file.
+        // "Pass 0" or "1 page runs". Sort pages in memory and write them to the
+        // "input" file.
         self.output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
@@ -1306,63 +1381,91 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             input_pages += 1;
         }
 
-        // One page runs sort algorithm done. Now do the "merge" runs till fully
-        // sorted.
-        let mut page_runs = 2;
+        // Pass 0 completed, 1 page runs sort algorithm done. Now do the "merge"
+        // runs till fully sorted.
+        let mut page_runs = self.input_buffers;
 
-        let mut input_page1 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
-        let mut input_page2 = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        let mut input_buffers = Vec::from_iter(
+            std::iter::repeat_with(|| {
+                TupleBuffer::new(self.page_size, self.sort_schema.clone(), false)
+            })
+            .take(self.input_buffers),
+        );
 
-        while page_runs <= (input_pages + (input_pages % 2)) {
+        let mut cursors = vec![0; input_buffers.len()];
+
+        // Once the number of pages we have to process is greater or equal to
+        // the total number pages in the input file we're done.
+        while page_runs < (input_pages + (input_pages % self.input_buffers)) {
+            // Number of output pages.
             let mut output_pages = 0;
+
+            // Beginning of the current "chunk" or "segment". If we do 2 page
+            // runs then this is gonna be 0, 2, 4... If we do 4 page runs it's
+            // gonna be 0, 4, 8... etc
             let mut run = 0;
 
+            // Loops through the page segments until we reach the end.
             while run < input_pages {
-                let mut cursor1 = run;
-                let mut cursor2 = cursor1 + page_runs / 2;
-
-                if cursor1 < input_pages {
-                    input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
-                    cursor1 += 1;
+                // Initialize the cursors and load the first page for each
+                // buffer.
+                for (i, (input_page, cursor)) in
+                    input_buffers.iter_mut().zip(cursors.iter_mut()).enumerate()
+                {
+                    *cursor = run + page_runs / self.input_buffers * i;
+                    if *cursor < input_pages {
+                        input_page.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
+                        *cursor += 1;
+                    }
                 }
-                if cursor2 < input_pages {
-                    input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
-                    cursor2 += 1;
-                }
 
-                // Merge
-                while !input_page1.is_empty() || !input_page2.is_empty() {
-                    let tuple = if !input_page1.is_empty() && !input_page2.is_empty() {
+                // Now start merging. When the output page fills up we write it
+                // to a file. If one of the input pages is emptied we try to
+                // load the next one. We repeat until there are no more pages
+                // available in this run.
+                while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
+                    // Find the input buffer that contains the smallest tuple.
+                    // That's gonna be the next tuple that we push into the
+                    // output buffer.
+                    let mut min = input_buffers
+                        .iter()
+                        .position(|buffer| !buffer.is_empty())
+                        .unwrap();
+
+                    for (i, input_buffer) in (min + 1..).zip(&input_buffers[min + 1..]) {
+                        if input_buffer.is_empty() {
+                            continue;
+                        }
+
                         let cmp = cmp_tuples(
-                            &input_page1[0][self.schema.len()..],
-                            &input_page2[0][self.schema.len()..],
+                            &input_buffers[i][0][self.schema.len()..],
+                            &input_buffers[min][0][self.schema.len()..],
                         );
 
-                        if matches!(cmp, Ordering::Less | Ordering::Equal) {
-                            input_page1.pop_front().unwrap()
-                        } else {
-                            input_page2.pop_front().unwrap()
+                        if cmp == Ordering::Less {
+                            min = i;
                         }
-                    } else if input_page2.is_empty() {
-                        input_page1.pop_front().unwrap()
-                    } else {
-                        input_page2.pop_front().unwrap()
-                    };
-
-                    if input_page1.is_empty()
-                        && cursor1 < input_pages
-                        && cursor1 < (run + page_runs / 2)
-                    {
-                        input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
-                        cursor1 += 1;
                     }
 
-                    if input_page2.is_empty() && cursor2 < run + page_runs && cursor2 < input_pages
+                    // Remove the tuple from the input page.
+                    let tuple = input_buffers[min].pop_front().unwrap();
+
+                    // Now check for empty pages. Load the next one if there
+                    // are more pages in the current run.
+                    for (i, (input_buffer, cursor)) in
+                        input_buffers.iter_mut().zip(cursors.iter_mut()).enumerate()
                     {
-                        input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
-                        cursor2 += 1;
+                        if input_buffer.is_empty()
+                            && *cursor < input_pages
+                            && *cursor < run + page_runs / self.input_buffers * (i + 1)
+                        {
+                            input_buffer.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
+                            *cursor += 1;
+                        }
                     }
 
+                    // Write the output page if full. Otherwise just push the
+                    // tuple.
                     if !self.output_page.can_fit(&tuple) {
                         self.output_page
                             .write_to(self.output_file.as_mut().unwrap())?;
@@ -1373,6 +1476,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     self.output_page.push(tuple);
                 }
 
+                // Write last page.
                 if !self.output_page.is_empty() {
                     self.output_page
                         .write_to(self.output_file.as_mut().unwrap())?;
@@ -1380,10 +1484,12 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     output_pages += 1;
                 }
 
+                // Now move to the next segment and repeat.
                 run += page_runs;
             }
 
-            // Now swap
+            // Now swap the files. Previous output becomes the input for the
+            // next pass and the previous input becomes the output.
             let mut input_file = self.input_file.take().unwrap();
             let output_file = self.output_file.take().unwrap();
 
