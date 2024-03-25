@@ -82,24 +82,24 @@ pub(crate) type Tuple = Vec<Value>;
 /// no clear benefit was found on previous attempts. See the comment below on
 /// the [`Self::try_next`] impl block.
 pub(crate) enum Plan<F> {
-    /// Returns raw values from `INSERT INTO` statements.
-    Values(Values),
     /// Runs a sequential scan on a table and returns the rows one by one.
     SeqScan(SeqScan<F>),
     /// Uses an index to scan the table instead of doing it sequentially.
     IndexScan(IndexScan<F>),
+    /// Returns raw values from `INSERT INTO` statements.
+    Values(Values),
     /// Executes `WHERE` clauses and filters rows.
     Filter(Filter<F>),
     /// Final projection of a plan. Usually the columns of `SELECT` statements.
     Project(Project<F>),
-    /// Executes `ORDER BY` clauses.
-    Sort(Sort<F>),
-    /// Executes assignment expressions from `UPDATE` statements.
-    Update(Update<F>),
     /// Inserts data into tables.
     Insert(Insert<F>),
+    /// Executes assignment expressions from `UPDATE` statements.
+    Update(Update<F>),
     /// Deletes data from tables.
     Delete(Delete<F>),
+    /// Executes `ORDER BY` clauses.
+    Sort(Sort<F>),
 }
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
@@ -113,13 +113,13 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
         match self {
             Self::SeqScan(seq_scan) => seq_scan.try_next(),
             Self::IndexScan(index_scan) => index_scan.try_next(),
+            Self::Values(values) => values.try_next(),
             Self::Filter(filter) => filter.try_next(),
             Self::Project(project) => project.try_next(),
-            Self::Values(values) => values.try_next(),
-            Self::Sort(sort) => sort.try_next(),
-            Self::Update(update) => update.try_next(),
             Self::Insert(insert) => insert.try_next(),
+            Self::Update(update) => update.try_next(),
             Self::Delete(delete) => delete.try_next(),
+            Self::Sort(sort) => sort.try_next(),
         }
     }
 }
@@ -141,6 +141,300 @@ impl<F> Plan<F> {
             Self::Project(project) => Some(project.output_schema.clone()),
             _ => None,
         }
+    }
+}
+
+/// Sequential scan plan.
+///
+/// This is not 100% sequential because we're not using a B+Tree but a normal
+/// BTree.
+///
+/// See [`Cursor::try_next`] for details.
+pub(crate) struct SeqScan<F> {
+    pub schema: Schema,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub cursor: Cursor,
+}
+
+impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let mut pager = self.pager.borrow_mut();
+
+        let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(tuple::deserialize(
+            reassemble_payload(&mut pager, page, slot)?.as_ref(),
+            &self.schema,
+        )))
+    }
+}
+
+/// Index scan uses an indexed column to retrieve data from a table.
+///
+/// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
+/// all the row IDs we need without scanning sequentially.
+pub(crate) struct IndexScan<F> {
+    pub index_schema: Schema,
+    pub table_schema: Schema,
+    pub table_root: PageNumber,
+    pub index_root: PageNumber,
+    pub stop_when: Option<(Vec<u8>, BinaryOperator, Box<dyn BytesCmp>)>,
+    pub done: bool,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub cursor: Cursor,
+}
+
+// TODO: Sort index entries by row_id to improve sequential IO.
+impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        if self.done {
+            return Ok(None);
+        };
+
+        let mut pager = self.pager.borrow_mut();
+
+        let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
+            self.done = true;
+            return Ok(None);
+        };
+
+        if let Some((key, operator, cmp)) = &self.stop_when {
+            let entry = &pager.get(page)?.cell(slot).content;
+
+            let ordering = cmp.bytes_cmp(entry, key);
+
+            let stop = match operator {
+                BinaryOperator::Gt => ordering == Ordering::Greater,
+                BinaryOperator::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
+                BinaryOperator::Lt => ordering == Ordering::Less,
+                BinaryOperator::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
+                _ => unreachable!(),
+            };
+
+            if stop {
+                self.done = true;
+                return Ok(None);
+            }
+        }
+
+        let index_entry =
+            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index_schema);
+
+        let Value::Number(row_id) = index_entry[1] else {
+            panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
+        };
+
+        let mut btree = BTree::new(
+            &mut pager,
+            self.table_root,
+            FixedSizeMemCmp::for_type::<RowId>(),
+        );
+
+        let table_entry = btree
+            .get(&tuple::serialize_row_id(row_id as RowId))?
+            .unwrap_or_else(|| {
+                panic!(
+                    "index at root {} maps to row ID {} that doesn't exist in table at root {}",
+                    self.index_root, row_id, self.table_root
+                )
+            });
+
+        Ok(Some(tuple::deserialize(
+            table_entry.as_ref(),
+            &self.table_schema,
+        )))
+    }
+}
+
+/// Raw values from `INSERT INTO table (c1, c2) VALUES (v1, v2)`.
+pub(crate) struct Values {
+    pub values: Vec<Expression>,
+}
+
+impl Values {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        if self.values.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            self.values
+                .drain(..)
+                .map(|expr| vm::resolve_literal_expression(&expr))
+                .collect::<Result<Vec<Value>, SqlError>>()?,
+        ))
+    }
+}
+
+/// Applies a filter [`Expression`] to its source returning only tuples that
+/// evaluate to `true`.
+///
+/// Used for `WHERE` clauses in `SELECT`, `DELETE` and `UPDATE` statements.
+pub(crate) struct Filter<F> {
+    pub source: Box<Plan<F>>,
+    pub schema: Schema,
+    pub filter: Expression,
+}
+
+impl<F: Seek + Read + Write + FileOps> Filter<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        while let Some(tuple) = self.source.try_next()? {
+            if vm::eval_where(&self.schema, &tuple, &self.filter)? {
+                return Ok(Some(tuple));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Applies a projection to a tuple.
+///
+/// In simple words, it "selects" columns from a row. For example:
+///
+/// ```sql
+/// CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);
+///
+/// SELECT id, age FROM users;
+/// ```
+///
+/// The projection in this case would be the "id" and "age columns". The name
+/// is discarded.
+pub(crate) struct Project<F> {
+    pub source: Box<Plan<F>>,
+    pub input_schema: Schema,
+    pub output_schema: Schema,
+    pub projection: Vec<Expression>,
+}
+
+impl<F: Seek + Read + Write + FileOps> Project<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(tuple) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        Ok(Some(
+            self.projection
+                .iter()
+                .map(|expr| vm::resolve_expression(&tuple, &self.input_schema, expr))
+                .collect::<Result<Tuple, _>>()?,
+        ))
+    }
+}
+
+/// Inserts data into a table and upates indexes.
+pub(crate) struct Insert<F> {
+    pub root: PageNumber,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub source: Box<Plan<F>>,
+    pub schema: Schema,
+    pub indexes: Vec<IndexMetadata>,
+}
+
+impl<F: Seek + Read + Write + FileOps> Insert<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(tuple) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        let mut pager = self.pager.borrow_mut();
+
+        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
+        btree.insert(tuple::serialize(&self.schema, &tuple))?;
+
+        for IndexMetadata { root, column, .. } in &self.indexes {
+            let idx = self.schema.index_of(column).unwrap();
+
+            assert_eq!(self.schema.columns[0].name, "row_id");
+            let key_col = self.schema.columns[idx].clone();
+            let row_id_col = self.schema.columns[0].clone();
+
+            let key = tuple[idx].clone();
+            let row_id = tuple[0].clone();
+
+            let entry = tuple::serialize(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
+
+            let mut btree = BTree::new(
+                &mut pager,
+                *root,
+                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+            );
+
+            btree.insert(entry)?;
+        }
+
+        Ok(Some(vec![]))
+    }
+}
+
+/// Assigns values to columns.
+pub(crate) struct Update<F> {
+    pub root: PageNumber,
+    pub assignments: Vec<Assignment>,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub source: BufferedIter<F>,
+    pub schema: Schema,
+}
+
+impl<F: Seek + Read + Write + FileOps> Update<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(mut tuple) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        for assignment in &self.assignments {
+            let idx = self.schema.index_of(&assignment.identifier).unwrap();
+            tuple[idx] = vm::resolve_expression(&tuple, &self.schema, &assignment.value)?;
+        }
+
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
+
+        btree.insert(tuple::serialize(&self.schema, &tuple))?;
+
+        Ok(Some(vec![]))
+    }
+}
+
+/// Removes values from a table BTree and from all the necessary index BTrees.
+pub(crate) struct Delete<F> {
+    pub root: PageNumber,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub source: BufferedIter<F>,
+    pub schema: Schema,
+    pub indexes: Vec<IndexMetadata>,
+}
+
+impl<F: Seek + Read + Write + FileOps> Delete<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(tuple) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
+
+        btree.remove(&tuple::serialize(&self.schema, &tuple))?;
+
+        for IndexMetadata { root, column, .. } in &self.indexes {
+            let idx = self.schema.index_of(column).unwrap();
+            let key_col = self.schema.columns[idx].clone();
+            let key = tuple[idx].clone();
+
+            let entry = tuple::serialize(&Schema::from(vec![key_col]), &[key]);
+
+            let mut btree = BTree::new(
+                &mut pager,
+                *root,
+                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
+            );
+
+            btree.remove(&entry)?;
+        }
+
+        Ok(Some(vec![]))
     }
 }
 
@@ -532,162 +826,6 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
     }
 }
 
-pub(crate) struct SeqScan<F> {
-    pub schema: Schema,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub cursor: Cursor,
-}
-
-impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let mut pager = self.pager.borrow_mut();
-
-        let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
-            return Ok(None);
-        };
-
-        Ok(Some(tuple::deserialize(
-            reassemble_payload(&mut pager, page, slot)?.as_ref(),
-            &self.schema,
-        )))
-    }
-}
-
-pub(crate) struct IndexScan<F> {
-    pub index_schema: Schema,
-    pub table_schema: Schema,
-    pub table_root: PageNumber,
-    pub index_root: PageNumber,
-    pub stop_when: Option<(Vec<u8>, BinaryOperator, Box<dyn BytesCmp>)>,
-    pub done: bool,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub cursor: Cursor,
-}
-
-// TODO: Sort tuples by row_id to improve sequential IO.
-impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        if self.done {
-            return Ok(None);
-        };
-
-        let mut pager = self.pager.borrow_mut();
-
-        let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
-            self.done = true;
-            return Ok(None);
-        };
-
-        if let Some((key, operator, cmp)) = &self.stop_when {
-            let entry = &pager.get(page)?.cell(slot).content;
-
-            let ordering = cmp.bytes_cmp(entry, key);
-
-            let stop = match operator {
-                BinaryOperator::Gt => ordering == Ordering::Greater,
-                BinaryOperator::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
-                BinaryOperator::Lt => ordering == Ordering::Less,
-                BinaryOperator::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
-                _ => unreachable!(),
-            };
-
-            if stop {
-                self.done = true;
-                return Ok(None);
-            }
-        }
-
-        let index_entry =
-            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index_schema);
-
-        let Value::Number(row_id) = index_entry[1] else {
-            panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
-        };
-
-        let mut btree = BTree::new(
-            &mut pager,
-            self.table_root,
-            FixedSizeMemCmp::for_type::<RowId>(),
-        );
-
-        let table_entry = btree
-            .get(&tuple::serialize_row_id(row_id as RowId))?
-            .unwrap_or_else(|| {
-                panic!(
-                    "index at root {} maps to row ID {} that doesn't exist in table at root {}",
-                    self.index_root, row_id, self.table_root
-                )
-            });
-
-        Ok(Some(tuple::deserialize(
-            table_entry.as_ref(),
-            &self.table_schema,
-        )))
-    }
-}
-
-pub(crate) struct Filter<F> {
-    pub source: Box<Plan<F>>,
-    pub schema: Schema,
-    pub filter: Expression,
-}
-
-impl<F: Seek + Read + Write + FileOps> Filter<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        while let Some(tuple) = self.source.try_next()? {
-            if vm::eval_where(&self.schema, &tuple, &self.filter)? {
-                return Ok(Some(tuple));
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-pub(crate) struct Project<F> {
-    pub source: Box<Plan<F>>,
-    pub input_schema: Schema,
-    pub output_schema: Schema,
-    pub projection: Vec<Expression>,
-}
-
-impl<F: Seek + Read + Write + FileOps> Project<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(tuple) = self.source.try_next()? else {
-            return Ok(None);
-        };
-
-        Ok(Some(
-            self.projection
-                .iter()
-                .map(|expr| vm::resolve_expression(&tuple, &self.input_schema, expr))
-                .collect::<Result<Tuple, _>>()?,
-        ))
-    }
-}
-
-pub(crate) struct Values {
-    pub values: Vec<Expression>,
-    pub done: bool,
-}
-
-impl Values {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        if self.done {
-            return Ok(None);
-        }
-
-        self.done = true;
-
-        Ok(Some(
-            self.values
-                .iter()
-                .map(vm::resolve_literal_expression)
-                .collect::<Result<Vec<Value>, SqlError>>()?,
-        ))
-    }
-}
-
 /// External 2-way merge sort implementation.
 ///
 /// Check this [lecture] for the basic idea:
@@ -1050,6 +1188,20 @@ fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
+    fn drop_files(&mut self) -> io::Result<()> {
+        if let Some(input_file) = self.input_file.take() {
+            drop(input_file);
+            F::remove(&self.input_file_path)?;
+        }
+
+        if let Some(output_file) = self.output_file.take() {
+            drop(output_file);
+            F::remove(&self.output_file_path)?;
+        }
+
+        Ok(())
+    }
+
     fn sort_output_page(&mut self) {
         self.output_page
             .tuples
@@ -1058,7 +1210,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
     }
 
     fn sort(&mut self) -> Result<(), DbError> {
-        // Mem only sorting, didn't need files. Easy stuff ends here :(
+        // Mem only sorting, didn't need files. Early return wishing that
+        // everything was as simple as this.
         if self.source.reader.is_none() {
             self.output_page = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
             self.sort_output_page();
@@ -1066,33 +1219,29 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             return Ok(());
         }
 
-        // We need files to sort. Figure out the page size.
+        // We need files to sort.
+        let input_file_name = format!("{}.mkdb.sort", &self.source as *const _ as usize);
+        self.input_file_path = self.work_dir.join(input_file_name);
+        self.input_file = Some(F::create(&self.input_file_path)?);
+
+        let output_file_name = format!("{}.mkdb.sort", &self.output_page as *const _ as usize);
+        self.output_file_path = self.work_dir.join(output_file_name);
+        self.output_file = Some(F::create(&self.output_file_path)?);
+
+        // Figure out the page size.
         self.page_size = std::cmp::max(
             TupleBuffer::page_size_needed_for(self.source.mem_buf.largest_tuple_size),
             self.page_size,
         );
 
-        // One page runs. Sort pages and write them to disk.
+        // One page runs. Sort pages in memory and write them to the "input"
+        // file.
         self.output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
         while let Some(tuple) = self.source.try_next()? {
-            // Write page if page is full
+            // Write output page if full.
             if !self.output_page.can_fit(&tuple) {
-                // Create files
-                if self.input_file.is_none() {
-                    let input_file_name =
-                        format!("{}.mkdb.sort", &self.source as *const _ as usize);
-                    let output_file_name =
-                        format!("{}.mkdb.sort", &self.output_page as *const _ as usize);
-
-                    self.input_file_path = self.work_dir.join(input_file_name);
-                    self.output_file_path = self.work_dir.join(output_file_name);
-
-                    self.input_file = Some(F::create(&self.input_file_path)?);
-                    self.output_file = Some(F::create(&self.output_file_path)?);
-                }
-
                 self.sort_output_page();
                 self.output_page
                     .write_to(self.input_file.as_mut().unwrap())?;
@@ -1112,7 +1261,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             input_pages += 1;
         }
 
-        // One page run sort algorithm done. Now do the "merge" runs till fully
+        // One page runs sort algorithm done. Now do the "merge" runs till fully
         // sorted.
         let mut page_runs = 2;
 
@@ -1121,26 +1270,29 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         while page_runs <= (input_pages + (input_pages % 2)) {
             let mut output_pages = 0;
+            let mut run = 0;
 
-            let mut chunk = 0;
-
-            while chunk < input_pages {
-                let mut cursor1 = chunk;
+            while run < input_pages {
+                let mut cursor1 = run;
                 let mut cursor2 = cursor1 + page_runs / 2;
 
                 if cursor1 < input_pages {
                     input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
+                    cursor1 += 1;
                 }
-                cursor1 += 1;
                 if cursor2 < input_pages {
                     input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
+                    cursor2 += 1;
                 }
-                cursor2 += 1;
 
                 // Merge
                 while !input_page1.is_empty() || !input_page2.is_empty() {
                     let tuple = if !input_page1.is_empty() && !input_page2.is_empty() {
-                        let cmp = cmp_tuples(&input_page1[0], &input_page2[0]);
+                        let cmp = cmp_tuples(
+                            &input_page1[0][self.schema.len()..],
+                            &input_page2[0][self.schema.len()..],
+                        );
+
                         if matches!(cmp, Ordering::Less | Ordering::Equal) {
                             input_page1.pop_front().unwrap()
                         } else {
@@ -1154,15 +1306,13 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                     if input_page1.is_empty()
                         && cursor1 < input_pages
-                        && cursor1 < (chunk + page_runs / 2)
+                        && cursor1 < (run + page_runs / 2)
                     {
                         input_page1.read_page(self.input_file.as_mut().unwrap(), cursor1)?;
                         cursor1 += 1;
                     }
 
-                    if input_page2.is_empty()
-                        && cursor2 < chunk + page_runs
-                        && cursor2 < input_pages
+                    if input_page2.is_empty() && cursor2 < run + page_runs && cursor2 < input_pages
                     {
                         input_page2.read_page(self.input_file.as_mut().unwrap(), cursor2)?;
                         cursor2 += 1;
@@ -1185,7 +1335,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     output_pages += 1;
                 }
 
-                chunk += page_runs;
+                run += page_runs;
             }
 
             // Now swap
@@ -1204,6 +1354,10 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         // Put the cursor back to the beginning for reading.
         self.input_file.as_mut().unwrap().rewind()?;
 
+        // Drop the output file.
+        drop(self.output_file.take());
+        F::remove(&self.output_file_path)?;
+
         Ok(())
     }
 
@@ -1218,10 +1372,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             if let Some(input_file) = self.input_file.as_mut() {
                 if let Err(e) = self.output_page.read_from(input_file) {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
-                        drop(self.input_file.take());
-                        drop(self.output_file.take());
-                        F::remove(&self.input_file_path)?;
-                        F::remove(&self.output_file_path)?;
+                        self.drop_files()?;
                     } else {
                         return Err(e.into());
                     }
@@ -1234,116 +1385,5 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             tuple.drain(self.schema.len()..);
             tuple
         }))
-    }
-}
-
-pub(crate) struct Insert<F> {
-    pub root: PageNumber,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub source: Box<Plan<F>>,
-    pub schema: Schema,
-    pub indexes: Vec<IndexMetadata>,
-}
-
-impl<F: Seek + Read + Write + FileOps> Insert<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(tuple) = self.source.try_next()? else {
-            return Ok(None);
-        };
-
-        let mut pager = self.pager.borrow_mut();
-
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
-        btree.insert(tuple::serialize(&self.schema, &tuple))?;
-
-        for IndexMetadata { root, column, .. } in &self.indexes {
-            let idx = self.schema.index_of(column).unwrap();
-
-            assert_eq!(self.schema.columns[0].name, "row_id");
-            let key_col = self.schema.columns[idx].clone();
-            let row_id_col = self.schema.columns[0].clone();
-
-            let key = tuple[idx].clone();
-            let row_id = tuple[0].clone();
-
-            let entry = tuple::serialize(&Schema::from(vec![key_col, row_id_col]), &[key, row_id]);
-
-            let mut btree = BTree::new(
-                &mut pager,
-                *root,
-                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
-            );
-
-            btree.insert(entry)?;
-        }
-
-        Ok(Some(vec![]))
-    }
-}
-
-pub(crate) struct Update<F> {
-    pub root: PageNumber,
-    pub assignments: Vec<Assignment>,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub source: BufferedIter<F>,
-    pub schema: Schema,
-}
-
-impl<F: Seek + Read + Write + FileOps> Update<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(mut tuple) = self.source.try_next()? else {
-            return Ok(None);
-        };
-
-        for assignment in &self.assignments {
-            let idx = self.schema.index_of(&assignment.identifier).unwrap();
-            tuple[idx] = vm::resolve_expression(&tuple, &self.schema, &assignment.value)?;
-        }
-
-        let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
-
-        btree.insert(tuple::serialize(&self.schema, &tuple))?;
-
-        Ok(Some(vec![]))
-    }
-}
-
-pub(crate) struct Delete<F> {
-    pub root: PageNumber,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub source: BufferedIter<F>,
-    pub schema: Schema,
-    pub indexes: Vec<IndexMetadata>,
-}
-
-impl<F: Seek + Read + Write + FileOps> Delete<F> {
-    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(tuple) = self.source.try_next()? else {
-            return Ok(None);
-        };
-
-        let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(&mut pager, self.root, FixedSizeMemCmp::for_type::<RowId>());
-
-        btree.remove(&tuple::serialize(&self.schema, &tuple))?;
-
-        for IndexMetadata { root, column, .. } in &self.indexes {
-            let idx = self.schema.index_of(column).unwrap();
-            let key_col = self.schema.columns[idx].clone();
-            let key = tuple[idx].clone();
-
-            let entry = tuple::serialize(&Schema::from(vec![key_col]), &[key]);
-
-            let mut btree = BTree::new(
-                &mut pager,
-                *root,
-                Box::<dyn BytesCmp>::from(&self.schema.columns[idx].data_type),
-            );
-
-            btree.remove(&entry)?;
-        }
-
-        Ok(Some(vec![]))
     }
 }

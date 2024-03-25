@@ -33,10 +33,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
         } => {
             let metadata = db.table_metadata(&into)?;
 
-            let source = Box::new(Plan::Values(Values {
-                values,
-                done: false,
-            }));
+            let source = Box::new(Plan::Values(Values { values }));
 
             Plan::Insert(Insert {
                 root: metadata.root,
