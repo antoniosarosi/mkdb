@@ -9,7 +9,7 @@ use std::{
 use super::pager::PageNumber;
 
 /// Some common operations that we need to execute on files and are not provided
-/// traits in [`std::io`]
+/// by traits in [`std::io`]
 pub(crate) trait FileOps {
     /// Creates a file on the filesystem at the given `path`.
     ///
@@ -26,6 +26,7 @@ pub(crate) trait FileOps {
     /// Removes the file located at `path`.
     fn remove(path: impl AsRef<Path>) -> io::Result<()>;
 
+    /// Truncates the file to 0 length.
     fn truncate(&mut self) -> io::Result<()>;
 
     /// Attempts to persist the data to its destination.
@@ -75,13 +76,13 @@ impl FileOps for File {
 pub(crate) type MemBuf = io::Cursor<Vec<u8>>;
 
 impl FileOps for MemBuf {
-    fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+    fn create(_path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(io::Cursor::new(Vec::new()))
     }
 
     // TODO: HashMap of Path -> Cursor.
     // That would allow us to simulate a file system for tests.
-    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    fn open(_path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(io::Cursor::new(Vec::new()))
     }
 
@@ -92,7 +93,7 @@ impl FileOps for MemBuf {
         Ok(())
     }
 
-    fn remove(path: impl AsRef<Path>) -> io::Result<()> {
+    fn remove(_path: impl AsRef<Path>) -> io::Result<()> {
         Ok(())
     }
 

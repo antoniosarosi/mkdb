@@ -10,13 +10,13 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
     fmt::Debug,
-    io::{self, BufRead, BufReader, Read, Seek, Write},
+    io::{self, Read, Seek, Write},
     mem,
     path::PathBuf,
 };
 
 use super::{
-    cache::Cache,
+    cache::{Cache, FrameId},
     io::{BlockIo, FileOps},
 };
 use crate::{
@@ -27,10 +27,7 @@ use crate::{
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
 
-/// Journal file magic number. See [`Pager`].
-const JOURNAL_MAGIC: u64 = 0x9DD505F920A163D6;
-
-/// Default value for calculating [`Pager::max_journal_buf_size`].
+/// Default value for calculating [`Journal::max_size`].
 const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 
 /// IO page manager that operates on top of a "block device" or disk.
@@ -39,11 +36,10 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 ///
 /// [SQLite 2.8.1 pager]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/src/pager.c
 ///
-/// This structure is built on top of [`BlockIo`] and [`Cache`] and provides a
-/// high level API to access disk pages. The user calls [`Pager::get`] or
-/// [`Pager::get_mut`] with a page number and they can read and write the
-/// contents of that page without being concerned about when and how the page
-/// will be read from or written to disk.
+/// This structure is built on top of [`BlockIo`], [`Cache`] and [`Journal`].
+/// The [`Pager`] provides a high level API to access disk pages by simply
+/// calling [`Pager::get`] or [`Pager::get_mut`] without being concerned about
+/// when and how the page will be read from or written to disk.
 ///
 /// Commit and rollback operations are also implemented through a "journal"
 /// file. This is the exact same approach that SQLite 2.X.X takes. The journal
@@ -53,93 +49,10 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 /// If the user wants to "commit" the changes, then we simply delete the journal
 /// file. Otherwise, if the user wants to "rollback" the changes, we copy the
 /// original pages back to the database file, leaving it in the same state as
-/// it was prior to modification.
-///
-/// # Journal File Format
-///
-/// The journal file format is almost the same as the one described in
-/// [SQLite 2.8.1 docs].
-///
-/// [SQLite 2.8.1 docs]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/www/fileformat.tcl#L74
-///
-/// It has some important differences though. Mainly, we don't store the number
-/// of pages that the database file had before we started modifying it and we
-/// don't store the total amount of pages in the journal file either. Instead,
-/// the journal file is made of "chunks" that look like this:
-///
-/// ```text
-/// +--------------------+
-/// |     Magic Number   | 8 bytes
-/// +--------------------+
-/// | Num Pages In Chunk | 4 bytes
-/// +--------------------+
-/// |    Page 0 Number   | 4 bytes
-/// +--------------------+
-/// |         ...        |
-/// |   Page 0 Content   | PAGE SIZE bytes
-/// |         ...        |
-/// +--------------------+
-/// |   Page 0 Checksum  | 4 bytes
-/// +--------------------+
-/// |    Page 1 Number   | 4 bytes
-/// +--------------------+
-/// |         ...        |
-/// |   Page 1 Content   | PAGE SIZE bytes
-/// |         ...        |
-/// +--------------------+
-/// |   Page 1 Checksum  | 4 bytes
-/// +--------------------+
-/// ```
-///
-/// Each chunk has a "header" that stores the magic number, ([`JOURNAL_MAGIC`],
-/// which is the same value that SQLite 2 uses) and the number of pages in that
-/// individual chunk. Let's call such number N. The header is then followed by
-/// N instances of page metadata blocks. Each block stores one single page using
-/// this format:
-///
-///
-/// ```text
-/// +------------------+
-/// |    Page Number   | 4 bytes
-/// +------------------+
-/// |        ...       |
-/// |   Page Content   | PAGE SIZE bytes
-/// |        ...       |
-/// +------------------+
-/// |   Page Checksum  | 4 bytes
-/// +------------------+
-/// ```
-///
-/// The "checksum" is not actually a real checksum. In our case it's simply the
-/// sum of the first 4 bytes of [`JOURNAL_MAGIC`] and the page number. SQLite 2
-/// uses a random number that's stored at the beginning of the journal file to
-/// do the additions, so each journal file would have different checksums for
-/// the same page. That's definitely somewhat better than our useless aproach,
-/// but it's still not a real checksum.
-///
-/// The reason we're not using random numbers is because we'd have to bring in
-/// some third party dependency (this project is free of dependencies), link to
-/// libc and use FFI or fallback to poor man's random numbers, namely, using
-/// Unix timestamps as random numbers, using memory addresses from pointers as
-/// random numbers, etc.
-///
-/// At that point we might as well just use some library that can compute a real
-/// checksum. But anway, this is a toy database, you get the idea, want a
-/// checksum? You can store it after the page content.
-///
-/// Going back to the file format, the reason we're storing multiple chunks is
-/// because we have an in-memory buffer where we make copies of pages using the
-/// format described above until it fills up and then simply dump the buffer to
-/// the file. That way we don't have to rewind() or seek back to the start of
-/// the file to update the total number of pages and then seek to the end of the
-/// file again to keep writing new pages. We can just keep writing to the file
-/// continously until we're done. The in-memory buffer also saves us from making
-/// a syscall every single time we want to write a page to the journal file,
-/// which should make this more efficient. But without any benchmarks to prove
-/// it you can call it yet another useless micro-optimization :)
+/// it was prior to modification. See [`Journal`] for more details.
 pub(crate) struct Pager<F> {
     /// Wrapped IO/file handle/descriptor.
-    io: BlockIo<F>,
+    file: BlockIo<F>,
     /// Hardware block size or prefered IO read/write buffer size.
     pub block_size: usize,
     /// High level page size.
@@ -148,18 +61,10 @@ pub(crate) struct Pager<F> {
     cache: Cache,
     /// Keeps track of modified pages.
     dirty_pages: HashSet<PageNumber>,
+    /// Transaction journal.
+    journal: Journal<F>,
     /// Keeps track of pages written to the journal file.
     journal_pages: HashSet<PageNumber>,
-    /// Copies of pages are kept in memory until we actually need to write them.
-    journal_buffer: Vec<u8>,
-    /// Once the max size is reached we have to write to the journal file.
-    max_journal_buf_size: usize,
-    /// Number of pages in [`Self::journal_buffer`].
-    buffered_journal_pages: u32,
-    /// Journal path.
-    journal_file_path: PathBuf,
-    /// Journal file descriptor or handle.
-    journal: Option<F>,
 }
 
 /// Builder for [`Pager`].
@@ -220,7 +125,7 @@ impl Builder {
 
     /// Takes ownership of the file handle/descriptor and returns the final
     /// instance of [`Pager`].
-    pub fn wrap<F>(self, io: F) -> Pager<F> {
+    pub fn wrap<F>(self, file: F) -> Pager<F> {
         let Builder {
             block_size,
             page_size,
@@ -240,29 +145,18 @@ impl Builder {
             "conflicting page sizes for cache and pager"
         );
 
-        let journal_magic_size = mem::size_of_val(&JOURNAL_MAGIC);
-
-        // Magic number + num_pages size + (page num + page size + checksum size) * num_pages
-        let max_journal_buf_size = journal_magic_size
-            + mem::size_of::<u32>()
-            + (mem::size_of::<PageNumber>() + page_size + mem::size_of::<u32>())
-                * max_journal_buffered_pages;
-
-        let mut journal_buffer = Vec::from(JOURNAL_MAGIC.to_le_bytes());
-        journal_buffer.extend_from_slice(&0u32.to_le_bytes());
-
         Pager {
-            io: BlockIo::new(io, self.page_size, block_size),
+            file: BlockIo::new(file, self.page_size, block_size),
             block_size,
             page_size,
             cache,
-            journal_file_path,
-            max_journal_buf_size,
             dirty_pages: HashSet::new(),
             journal_pages: HashSet::new(),
-            journal_buffer,
-            buffered_journal_pages: 0,
-            journal: None,
+            journal: Journal::new(JournalConfig {
+                file_path: journal_file_path,
+                max_pages: max_journal_buffered_pages,
+                page_size,
+            }),
         }
     }
 }
@@ -279,122 +173,48 @@ impl<F: Seek + Read> Pager<F> {
     ///
     /// The cache system is not involved at all, this goes straight to disk.
     pub fn read(&mut self, page_number: PageNumber, buf: &mut [u8]) -> io::Result<usize> {
-        self.io.read(page_number, buf)
+        self.file.read(page_number, buf)
     }
 }
 
-impl<F: Seek + Write + FileOps> Pager<F> {
+impl<F: Seek + Write> Pager<F> {
     /// Manually write a page to disk.
     ///
     /// Unlike normal writes there is no use of the cache/buffer pool. The page
     /// is written directly to disk.
     pub fn write(&mut self, page_number: PageNumber, buf: &[u8]) -> io::Result<usize> {
-        self.io.write(page_number, buf)
+        self.file.write(page_number, buf)
     }
+}
 
-    /// Writes all the in-memory copies of original pages to disk but does not
-    /// `fsync()`.
-    ///
-    /// The OS will probably buffer the writes. [`Self::sync_journal`] should be
-    /// called when we need to make sure everything reaches the disk.
-    fn write_journal_buffer(&mut self) -> io::Result<()> {
-        // Journal buffer is empty, only the magic number is written.
-        if self.journal_buffer.len() <= mem::size_of_val(&JOURNAL_MAGIC) {
-            return Ok(());
-        }
-
-        // Create the journal file if it doesn't exist yet.
-        if self.journal.is_none() {
-            self.journal = Some(FileOps::create(&self.journal_file_path)?);
-        }
-
-        let journal = self.journal.as_mut().unwrap();
-
-        // Persist copies to disk.
-        journal.write_all(&self.journal_buffer)?;
-
-        // Clear the in-memory buffer.
-        self.journal_buffer
-            .drain(mem::size_of_val(&JOURNAL_MAGIC)..);
-        self.journal_buffer.extend_from_slice(&0u32.to_le_bytes());
-        self.buffered_journal_pages = 0;
-
-        Ok(())
-    }
-
-    /// Makes sure that everything we've written to the journal so far reaches
-    /// the disk.
-    fn sync_journal(&mut self) -> io::Result<()> {
-        self.write_journal_buffer()?;
-
-        let journal = self.journal.as_mut().unwrap();
-
-        journal.flush()?;
-        journal.sync()
-    }
-
+impl<F: Write + FileOps> Pager<F> {
     /// Appends the given page to the write queue and writes it to the journal
     /// if it's not alrady written.
-    ///
-    /// See the journal file format described in the documentation of [`Pager`]
-    /// to understand what's going on here.
-    fn push_to_write_queue(&mut self, page_number: PageNumber, index: usize) -> io::Result<()> {
-        // Mark page as dirty.
+    fn push_to_write_queue(&mut self, page_number: PageNumber, index: FrameId) -> io::Result<()> {
         self.cache.mark_dirty(page_number);
         self.dirty_pages.insert(page_number);
 
-        // Already written to the journal, early return.
-        if self.journal_pages.contains(&page_number) {
-            return Ok(());
-        }
-
-        self.journal_pages.insert(page_number);
-
-        // Write page number
-        self.journal_buffer
-            .extend_from_slice(&page_number.to_le_bytes());
-
-        // Write page content.
-        self.journal_buffer
-            .extend_from_slice(self.cache[index].as_ref());
-
-        // TODO: We should generate a random number here but we can't without
-        // adding dependencies. If we must add dependencies we might as well
-        // compute a CRC checksum or something like that.
-        let checksum = (JOURNAL_MAGIC as u32).wrapping_add(page_number);
-
-        // Write "checksum" (if we can call this a "checksum").
-        self.journal_buffer
-            .extend_from_slice(&checksum.to_le_bytes());
-
-        let num_pages_range = mem::size_of_val(&JOURNAL_MAGIC)
-            ..mem::size_of_val(&JOURNAL_MAGIC) + mem::size_of::<u32>();
-
-        // Increase number of pages written to journal.
-        self.buffered_journal_pages += 1;
-        self.journal_buffer[num_pages_range]
-            .copy_from_slice(&self.buffered_journal_pages.to_le_bytes());
-
-        // If the buffer is full we'll write it now. Otherwise we can wait
-        // until we either have to write dirty pages or the buffer becomes full.
-        if self.journal_buffer.len() >= self.max_journal_buf_size {
-            self.write_journal_buffer()?;
+        if !self.journal_pages.contains(&page_number) {
+            self.journal.push(page_number, &self.cache[index])?;
+            self.journal_pages.insert(page_number);
         }
 
         Ok(())
     }
+}
 
+impl<F: Seek + Write + FileOps> Pager<F> {
     /// Writes all the pages present in the dirty queue and marks them as clean.
     ///
-    /// Changes might not be reflected unless [`Self::flush`] and [`Self::sync`]
-    /// are called.
+    /// Changes will most likely not be persisted to disk until [`Self::commit`]
+    /// is called.
     pub fn write_dirty_pages(&mut self) -> io::Result<()> {
         if self.dirty_pages.is_empty() {
             return Ok(());
         }
 
         // Persist the original pages to disk first.
-        self.sync_journal()?;
+        self.journal.persist()?;
 
         // Sequential IO bruh blazingly fast :)
         let page_numbers = BinaryHeap::from_iter(self.dirty_pages.iter().copied().map(Reverse));
@@ -404,7 +224,7 @@ impl<F: Seek + Write + FileOps> Pager<F> {
             // unwrapping should be safe here.
             let index = self.cache.get(page_number).unwrap();
             let page = &self.cache[index];
-            self.io.write(page_number, page.as_ref())?;
+            self.file.write(page_number, page.as_ref())?;
             self.cache.mark_clean(page_number);
             self.dirty_pages.remove(&page_number);
         }
@@ -415,33 +235,31 @@ impl<F: Seek + Write + FileOps> Pager<F> {
     /// If this succeeds then we can tell the client/user that data is
     /// persisted on disk.
     pub fn commit(&mut self) -> io::Result<()> {
+        // If there are no pages in the journal it means we didn't modify
+        // anything. The transaction was read-only.
         if self.journal_pages.is_empty() {
             return Ok(());
         }
 
-        // Make sure everything goes to disk. This includes both the journal
-        // and the DB pages, since write_dirty_pages() calls sync_journal().
+        // Make sure everything goes to disk.
         self.write_dirty_pages()?;
-        self.flush()?;
-        self.sync()?;
-
-        // Move the journal file out and drop it.
-        drop(self.journal.take());
+        self.file.flush()?;
+        self.file.sync()?;
 
         // Clear the journal hash set.
         self.journal_pages.clear();
 
         // Commit is confirmed when the journal file is deleted.
-        F::remove(&self.journal_file_path)
+        self.journal.invalidate()
     }
 }
 
 impl<F: Write> Pager<F> {
     /// Flush buffered writes.
     ///
-    /// See [`FileOps::sync`] for details.
+    /// See [`FileOps`] for details.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.io.flush()
+        self.file.flush()
     }
 }
 
@@ -450,7 +268,7 @@ impl<F: FileOps> Pager<F> {
     ///
     /// See [`FileOps::sync`] for details.
     pub fn sync(&self) -> io::Result<()> {
-        self.io.sync()
+        self.file.sync()
     }
 }
 
@@ -496,79 +314,20 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     /// See the journal file format in the documentation of [`Pager`] to have
     /// an understanding of what's going on here.
     pub fn rollback(&mut self) -> Result<usize, DbError> {
-        // Try to open the journal file first. If we can't open it then we're
-        // going to create the file, dump the in-memory buffer and rollback
-        // after that. We should rollback from memory but... laziness. TODO.
-        if self.journal.is_none() {
-            self.journal = Some(
-                FileOps::open(&self.journal_file_path)
-                    .or_else(|_| FileOps::create(&self.journal_file_path))?,
-            );
-        }
-
-        // TODO: This sync call be optimized away by reading the remaining
-        // pages from the in-memory buffer once we're done with the file.
-        self.sync_journal()?;
-
-        let mut journal = self.journal.take().unwrap();
-        journal.rewind()?;
-
-        let mut reader = BufReader::new(journal);
-
         let mut num_pages_rolled_back = 0;
 
-        let corrupted_error =
-            || DbError::Corrupted(String::from("journal file is corrupted or invalid"));
+        let mut journal_pages = self.journal.iter()?;
 
-        while reader.has_data_left()? {
-            let mut u64buf = [0; mem::size_of::<u64>()];
-            reader.read_exact(&mut u64buf)?;
-
-            if u64::from_le_bytes(u64buf) != JOURNAL_MAGIC {
-                return Err(corrupted_error());
-            }
-
-            let mut u32buf = [0; mem::size_of::<u32>()];
-            reader.read_exact(&mut u32buf)?;
-
-            let num_pages = u32::from_le_bytes(u32buf);
-
-            for _ in 0..num_pages {
-                reader.read_exact(&mut u32buf)?;
-
-                let page_number = PageNumber::from_le_bytes(u32buf);
-
-                let mut page_buf = vec![0; self.page_size];
-                reader.read_exact(&mut page_buf)?;
-                reader.read_exact(&mut u32buf)?;
-
-                let checksum = (JOURNAL_MAGIC as u32).wrapping_add(page_number);
-
-                // TODO: At this point we might already have written some
-                // pages back to the database. What do we do with those pages?
-                // Should we sync them?
-                if u32::from_le_bytes(u32buf) != checksum {
-                    return Err(corrupted_error());
-                }
-
-                self.cache.invalidate(page_number);
-                // TODO: Manual writes or go through the cache system and
-                // write everything at once?
-                self.write(page_number, &page_buf)?;
-
-                num_pages_rolled_back += 1;
-            }
+        while let Some((page_number, content)) = journal_pages.try_next()? {
+            self.file.write(page_number, content)?;
+            self.cache.invalidate(page_number);
+            num_pages_rolled_back += 1;
         }
 
-        // TODO: Should we sync at the end or should we sync after every page
-        // write? The second option seems inefficient.
-        self.sync()?;
+        self.file.flush()?;
+        self.file.sync()?;
 
-        // If we managed to sync the changes then the journal file no longer
-        // serves any purpose.
-        F::remove(&self.journal_file_path)?;
-
-        self.journal_pages.clear();
+        self.journal.invalidate()?;
 
         Ok(num_pages_rolled_back)
     }
@@ -732,7 +491,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
         page_number: PageNumber,
     ) -> io::Result<()> {
         let index = self.map_page::<P>(page_number)?;
-        self.io.read(page_number, self.cache[index].as_mut())?;
+        self.file.read(page_number, self.cache[index].as_mut())?;
 
         Ok(())
     }
@@ -839,17 +598,413 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     }
 }
 
+/// Type of the journal magic number. See [`Journal`].
+type JournalMagic = u64;
+
+/// Type used to write page numbers of total number of pages in a journal chunk.
+type JournalPageNum = u32;
+
+/// Type of the journal page checksum.
+type JournalChecksum = u32;
+
+/// Journal file magic number. See [`Journal`].
+const JOURNAL_MAGIC: JournalMagic = 0x9DD505F920A163D6;
+
+/// Size of [`JOURNAL_MAGIC`].
+const JOURNAL_MAGIC_SIZE: usize = mem::size_of::<JournalMagic>();
+
+/// Size of [`JournalPageNum`].
+const JOURNAL_PAGE_NUM_SIZE: usize = mem::size_of::<JournalPageNum>();
+
+/// Size of [`JournalChecksum`].
+const JOURNAL_CHECKSUM_SIZE: usize = mem::size_of::<JournalChecksum>();
+
+/// Total size of a journal chunk header.
+const JOURNAL_HEADER_SIZE: usize = JOURNAL_MAGIC_SIZE + JOURNAL_PAGE_NUM_SIZE;
+
+/// The journal is a file used to implement "commit" and "rollback" operations.
+///
+/// See the documentation of [`Pager`] for the basic idea.
+///
+/// # Journal File Format
+///
+/// The journal file format is almost the same as the one described in
+/// [SQLite 2.8.1 docs].
+///
+/// [SQLite 2.8.1 docs]: https://github.com/antoniosarosi/sqlite2-btree-visualizer/blob/master/www/fileformat.tcl#L74
+///
+/// It has some important differences though. Mainly, we don't store the number
+/// of pages that the database file had before we started modifying it and we
+/// don't store the total amount of pages in the journal file either. Instead,
+/// the journal file is made of "chunks" that look like this:
+///
+/// ```text
+/// +--------------------+
+/// |     Magic Number   | 8 bytes
+/// +--------------------+
+/// | Num Pages In Chunk | 4 bytes
+/// +--------------------+
+/// |    Page 0 Number   | 4 bytes
+/// +--------------------+
+/// |         ...        |
+/// |   Page 0 Content   | PAGE SIZE bytes
+/// |         ...        |
+/// +--------------------+
+/// |   Page 0 Checksum  | 4 bytes
+/// +--------------------+
+/// |    Page 1 Number   | 4 bytes
+/// +--------------------+
+/// |         ...        |
+/// |   Page 1 Content   | PAGE SIZE bytes
+/// |         ...        |
+/// +--------------------+
+/// |   Page 1 Checksum  | 4 bytes
+/// +--------------------+
+/// ```
+///
+/// Each chunk has a "header" that stores the magic number, ([`JOURNAL_MAGIC`],
+/// which is the same value that SQLite 2 uses) and the number of pages in that
+/// individual chunk. Let's call such number N. The header is then followed by
+/// N instances of page metadata blocks. Each block stores one single page using
+/// this format:
+///
+///
+/// ```text
+/// +------------------+
+/// |    Page Number   | 4 bytes
+/// +------------------+
+/// |        ...       |
+/// |   Page Content   | PAGE SIZE bytes
+/// |        ...       |
+/// +------------------+
+/// |   Page Checksum  | 4 bytes
+/// +------------------+
+/// ```
+///
+/// The "checksum" is not actually a real checksum. In our case it's simply the
+/// sum of the first 4 bytes of [`JOURNAL_MAGIC`] and the page number. SQLite 2
+/// uses a random number that's stored at the beginning of the journal file to
+/// do the additions, so each journal file would have different checksums for
+/// the same page. That's definitely somewhat better than our useless aproach,
+/// but it's still not a real checksum.
+///
+/// The reason we're not using random numbers is because we'd have to bring in
+/// some third party dependency (this project is free of dependencies), link to
+/// libc and use FFI or fallback to poor man's random numbers, namely, using
+/// Unix timestamps as random numbers, using memory addresses from pointers as
+/// random numbers, etc.
+///
+/// At that point we might as well just use some library that can compute a real
+/// checksum. But anway, this is a toy database, you get the idea, want a
+/// checksum? You can store it after the page content.
+///
+/// Going back to the file format, the reason we're storing multiple chunks is
+/// because we have an in-memory buffer where we make copies of pages using the
+/// format described above until it fills up and then simply dump the buffer to
+/// the file. That way we don't have to rewind() or seek back to the start of
+/// the file to update the total number of pages and then seek to the end of the
+/// file again to keep writing new pages. We can just keep writing to the file
+/// continously until we're done. The in-memory buffer also saves us from making
+/// a syscall every single time we want to write a page to the journal file,
+/// which should make this more efficient. But without any benchmarks to prove
+/// it you can call it yet another useless micro-optimization :)
+struct Journal<F> {
+    /// In-memory page buffer.
+    buffer: Vec<u8>,
+    /// Max size of [`Self::buffer`] in bytes.
+    max_size: usize,
+    /// Size of each page without including checksums and page numbers.
+    page_size: usize,
+    /// Number of pages currently stored in [`Self::buffer`].
+    buffered_pages: u32,
+    /// Path of the journal file.
+    file_path: PathBuf,
+    /// File handle/descriptor.
+    file: Option<F>,
+}
+
+/// Wrote some many "builders" at this point that we have to try something new.
+struct JournalConfig {
+    page_size: usize,
+    max_pages: usize,
+    file_path: PathBuf,
+}
+
+impl<F> Journal<F> {
+    /// Creates a new empty journal.
+    pub fn new(
+        JournalConfig {
+            page_size,
+            max_pages,
+            file_path,
+        }: JournalConfig,
+    ) -> Self {
+        let max_size = JOURNAL_MAGIC_SIZE
+            + JOURNAL_PAGE_NUM_SIZE
+            + (JOURNAL_PAGE_NUM_SIZE + page_size + JOURNAL_CHECKSUM_SIZE) * max_pages;
+
+        let mut buffer = Vec::with_capacity(max_size);
+
+        buffer.extend_from_slice(&JOURNAL_MAGIC.to_le_bytes());
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+
+        Self {
+            buffer,
+            max_size,
+            file_path,
+            page_size,
+            buffered_pages: 0,
+            file: None,
+        }
+    }
+
+    /// Clears the in-memory page buffer.
+    pub fn clear(&mut self) {
+        self.buffer.drain(JOURNAL_MAGIC_SIZE..);
+        self.buffer.extend_from_slice(&[0; JOURNAL_PAGE_NUM_SIZE]);
+        self.buffered_pages = 0;
+    }
+}
+
+impl<F: Write> Journal<F> {
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().unwrap().flush()
+    }
+}
+
+impl<F: FileOps> Journal<F> {
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.file.as_mut().unwrap().sync()
+    }
+}
+
+impl<F: Write + FileOps> Journal<F> {
+    /// Writes the in-memory buffer to the journal file and clears everything.
+    ///
+    /// The journal will be able to buffer pages in memory again after this
+    /// function succeeds.
+    pub fn write(&mut self) -> io::Result<()> {
+        if self.buffer.len() < JOURNAL_HEADER_SIZE {
+            return Ok(());
+        }
+
+        // Create the journal file if it doesn't exist yet.
+        if self.file.is_none() {
+            self.file = Some(FileOps::create(&self.file_path)?);
+        }
+
+        // Persist copies to disk.
+        self.file.as_mut().unwrap().write_all(&self.buffer)?;
+
+        // Clear the in-memory buffer.
+        self.clear();
+
+        Ok(())
+    }
+
+    /// Ads the given page to this buffer.
+    ///
+    /// The [`Journal`] acts like a [`io::BufWriter`], buffering pages until
+    /// the in-memory buffer is full. At that point, the memory buffer is
+    /// written to the journal file and cleared so that it can buffer pages on
+    /// subsequent calls. Therefore, IO is only required when the given `page`
+    /// fills up the memory buffer.
+    pub fn push(&mut self, page_number: PageNumber, page: impl AsRef<[u8]>) -> io::Result<()> {
+        // Write page number
+        self.buffer.extend_from_slice(&page_number.to_le_bytes());
+
+        // Write page content.
+        self.buffer.extend_from_slice(page.as_ref());
+
+        // TODO: We should generate a random number here but we can't without
+        // adding dependencies. If we must add dependencies we might as well
+        // compute a CRC checksum or something like that.
+        let checksum = (JOURNAL_MAGIC as u32).wrapping_add(page_number);
+
+        // Write "checksum" (if we can call this a "checksum").
+        self.buffer.extend_from_slice(&checksum.to_le_bytes());
+
+        let num_pages_range = mem::size_of_val(&JOURNAL_MAGIC)
+            ..mem::size_of_val(&JOURNAL_MAGIC) + mem::size_of::<u32>();
+
+        // Increase number of pages written to journal.
+        self.buffered_pages += 1;
+        self.buffer[num_pages_range].copy_from_slice(&self.buffered_pages.to_le_bytes());
+
+        // If the buffer is full we'll write it now. Otherwise we can wait
+        // until we either have to write dirty pages or the buffer becomes full.
+        if self.buffer.len() >= self.max_size {
+            self.write()?;
+        }
+
+        Ok(())
+    }
+
+    /// Makes sure that all the data written so far to the journal reaches the
+    /// disk.
+    pub fn persist(&mut self) -> io::Result<()> {
+        self.write()?;
+        self.flush()?;
+        self.sync()?;
+
+        Ok(())
+    }
+
+    /// Deletes the journal files and resets the journal state to empty.
+    pub fn invalidate(&mut self) -> io::Result<()> {
+        self.clear();
+
+        if let Some(file) = self.file.take() {
+            drop(file);
+            F::remove(&self.file_path)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<F: Seek + Read> Journal<F> {
+    /// Returns a fallible iterator over the journal pages.
+    ///
+    /// The iterator does not return pages in FIFO order given that the memory
+    /// buffer might still contain pages that were not written to disk. In that
+    /// case, the in-memory pages are returned first and then the rest of pages
+    /// in the journal file are returned in FIFO order.
+    ///
+    /// Order doesn't matter because we only need to write the pages back.
+    /// Ideally we should do it sequentially to avoid random IO, but that's an
+    /// optimization for another day.
+    ///
+    /// Another important detail is that consuming the iterator will reuse the
+    /// [`Journal::buffer`] for buffered reads, but that doesn't matter since
+    /// a single transaction will either rollback or commit, it can't rollback
+    /// and later commit, so it's safe to discard values in the journal when
+    /// rolling back.
+    fn iter<'j>(&'j mut self) -> io::Result<JournalPagesIter<'j, F>> {
+        if let Some(file) = self.file.as_mut() {
+            file.rewind()?;
+        };
+
+        Ok(JournalPagesIter {
+            journal: self,
+            cursor: JOURNAL_HEADER_SIZE,
+            eof: false,
+        })
+    }
+}
+
+/// See [`Journal::iter`].
+///
+/// This acts like a smart version of [`io::BufReader`] that is aware of the
+/// journal file format. It only needs 2 IO operations for each journal chunk
+/// and one memory buffer whereas using [`io::BufReader`] would require two
+/// buffers, the internal buffer of the reader and our external buffer where we
+/// actually read stuff. [`io::BufReader`] would probably require more IO
+/// operations as well depending on the configured capacity. The capacity of
+/// the [`JournalPagesIter`] is always one entire journal chunk.
+struct JournalPagesIter<'j, F> {
+    /// Journal instance.
+    journal: &'j mut Journal<F>,
+    /// Points to the beginning of a page in [`Journal::buffer`].
+    cursor: usize,
+    /// `true` if we reached EOF or there are no more pages otherwise.
+    eof: bool,
+}
+
+impl<'j, F: Read> JournalPagesIter<'j, F> {
+    /// Returns the next page in the journal.
+    ///
+    /// See [`Journal::iter`] for page order details.
+    pub fn try_next(&mut self) -> Result<Option<(PageNumber, &[u8])>, DbError> {
+        // Reached EOF, no more data.
+        if self.eof {
+            return Ok(None);
+        }
+
+        let corrupted_error =
+            || DbError::Corrupted(String::from("journal file is corrupted or invalid"));
+
+        // Returned all data from memory, read the next chunk in the file.
+        if self.cursor >= self.journal.buffer.len() {
+            let Some(file) = self.journal.file.as_mut() else {
+                self.eof = true;
+                return Ok(None);
+            };
+
+            let mut header_buf = [0; JOURNAL_HEADER_SIZE];
+            let bytes = file.read(&mut header_buf)?;
+
+            if bytes == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+
+            if bytes != header_buf.len() {
+                return Err(corrupted_error());
+            }
+
+            let magic =
+                JournalMagic::from_le_bytes(header_buf[..JOURNAL_MAGIC_SIZE].try_into().unwrap());
+
+            if magic != JOURNAL_MAGIC {
+                return Err(corrupted_error());
+            }
+
+            let num_pages =
+                JournalPageNum::from_le_bytes(header_buf[JOURNAL_MAGIC_SIZE..].try_into().unwrap());
+
+            let total_bytes =
+                (JOURNAL_PAGE_NUM_SIZE + self.journal.page_size + JOURNAL_CHECKSUM_SIZE)
+                    * num_pages as usize;
+
+            self.journal
+                .buffer
+                .resize(JOURNAL_HEADER_SIZE + total_bytes, 0);
+
+            if file.read(&mut self.journal.buffer[JOURNAL_HEADER_SIZE..])? != total_bytes {
+                return Err(corrupted_error());
+            }
+
+            self.cursor = JOURNAL_HEADER_SIZE;
+        }
+
+        // Return pages from memory until we're done with this chunk.
+        let page_number = u32::from_le_bytes(
+            self.journal.buffer[self.cursor..self.cursor + JOURNAL_PAGE_NUM_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        self.cursor += JOURNAL_PAGE_NUM_SIZE;
+
+        let page_buf = &self.journal.buffer[self.cursor..self.cursor + self.journal.page_size];
+        self.cursor += self.journal.page_size;
+
+        let checksum = u32::from_le_bytes(
+            self.journal.buffer[self.cursor..self.cursor + JOURNAL_CHECKSUM_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        self.cursor += JOURNAL_CHECKSUM_SIZE;
+
+        if checksum != (JOURNAL_MAGIC as u32).wrapping_add(page_number) {
+            return Err(corrupted_error());
+        }
+
+        Ok(Some((page_number, page_buf)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{io, mem};
+    use std::io;
 
-    use super::Pager;
+    use super::{Pager, JOURNAL_CHECKSUM_SIZE, JOURNAL_MAGIC_SIZE, JOURNAL_PAGE_NUM_SIZE};
     use crate::{
         db::DbError,
         paging::{
             cache::Cache,
             io::MemBuf,
-            pager::{PageNumber, DEFAULT_MAX_JOURNAL_BUFFERED_PAGES, JOURNAL_MAGIC},
+            pager::{PageNumber, DEFAULT_MAX_JOURNAL_BUFFERED_PAGES},
         },
         storage::page::{Cell, OverflowPage, Page},
     };
@@ -1068,9 +1223,9 @@ mod tests {
     }
 
     fn expected_journal_len(page_size: usize, written_pages: usize) -> usize {
-        mem::size_of_val(&JOURNAL_MAGIC)
-            + mem::size_of::<u32>()
-            + (written_pages) * (mem::size_of::<u32>() + page_size + mem::size_of::<u32>())
+        JOURNAL_MAGIC_SIZE
+            + JOURNAL_PAGE_NUM_SIZE
+            + (written_pages) * (JOURNAL_PAGE_NUM_SIZE + page_size + JOURNAL_CHECKSUM_SIZE)
     }
 
     #[test]
@@ -1093,9 +1248,9 @@ mod tests {
         // we'd have to reimplement the rollback algorithm. At that point we'd
         // be getting into the "test the test" situation. We could decouple
         // reading and rolling back... so... TODO.
-        assert!(pager.journal.is_some());
+        assert!(pager.journal.file.is_some());
         assert_eq!(
-            pager.journal.unwrap().into_inner().len(),
+            pager.journal.file.unwrap().into_inner().len(),
             expected_journal_len(pager.page_size, modified_pages as usize)
         );
 
@@ -1112,13 +1267,13 @@ mod tests {
             pager.get_mut_as::<OverflowPage>(page_number as PageNumber)?;
         }
 
-        assert!(pager.journal.is_some());
+        assert!(pager.journal.file.is_some());
         assert_eq!(
-            pager.journal_buffer.len(),
+            pager.journal.buffer.len(),
             expected_journal_len(pager.page_size, 1)
         );
         assert_eq!(
-            pager.journal.unwrap().into_inner().len(),
+            pager.journal.file.unwrap().into_inner().len(),
             expected_journal_len(pager.page_size, modified_pages)
         );
 
@@ -1152,9 +1307,9 @@ mod tests {
 
         pager.rollback()?;
 
-        assert!(pager.journal.is_none());
+        assert!(pager.journal.file.is_none());
         assert_eq!(
-            pager.journal_buffer.len(),
+            pager.journal.buffer.len(),
             expected_journal_len(pager.page_size, 0)
         );
 

@@ -5,7 +5,7 @@
 //! public API is [`pager::Pager`], which abstracts away both the disk and the
 //! cache subsystem.
 
-pub(super) mod cache;
 pub(super) mod io;
 
+pub(crate) mod cache;
 pub(crate) mod pager;

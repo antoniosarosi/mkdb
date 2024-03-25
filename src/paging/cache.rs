@@ -109,7 +109,7 @@ impl Frame {
 }
 
 /// Frames are identified by their index in [`Cache::buffer`].
-type FrameId = usize;
+pub(crate) type FrameId = usize;
 
 /// Page read cache with clock eviction policy.
 ///
