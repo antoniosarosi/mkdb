@@ -56,10 +56,7 @@ use std::{
 
 use crate::{
     db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, TableMetadata},
-    paging::{
-        io::FileOps,
-        pager::{PageNumber, Pager},
-    },
+    paging::{io::FileOps, pager::Pager},
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
@@ -100,6 +97,8 @@ pub(crate) enum Plan<F> {
     Delete(Delete<F>),
     /// Executes `ORDER BY` clauses.
     Sort(Sort<F>),
+    /// Helper for the main [`Plan::Sort`] plan.
+    SortKeysGen(SortKeysGen<F>),
 }
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
@@ -120,6 +119,7 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
             Self::Update(update) => update.try_next(),
             Self::Delete(delete) => delete.try_next(),
             Self::Sort(sort) => sort.try_next(),
+            Self::SortKeysGen(sort_keys_gen) => sort_keys_gen.try_next(),
         }
     }
 }
@@ -723,8 +723,6 @@ pub(crate) struct BufferedIter<F> {
     pub reader: Option<BufReader<F>>,
     /// Path of the collection file.
     pub file_path: PathBuf,
-    /// Executes the expressions and appends the results to each tuple.
-    pub append_exprs: Vec<Expression>,
 }
 
 impl<F: FileOps> BufferedIter<F> {
@@ -746,12 +744,8 @@ impl<F: FileOps> BufferedIter<F> {
 // }
 
 impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
-    pub fn new(
-        source: Box<Plan<F>>,
-        work_dir: PathBuf,
-        schema: Schema,
-        append_exprs: Vec<Expression>,
-    ) -> Self {
+    // TODO: Create a builder or something.
+    pub fn new(source: Box<Plan<F>>, work_dir: PathBuf, schema: Schema) -> Self {
         // TODO: Use uuid or tempfile or something. This is poor man's random
         // file name.
         let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
@@ -764,7 +758,6 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
             file_path,
             file: None,
             reader: None,
-            append_exprs,
         }
     }
 
@@ -773,11 +766,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         // Buffer tuples in-memory until we have no space left. At that point
         // create the file if it doesn't exist, write the buffer to disk and
         // repeat until there are no more tuples.
-        while let Some(mut tuple) = self.source.try_next()? {
-            for expr in &self.append_exprs {
-                tuple.push(vm::resolve_expression(&tuple, &self.schema, expr)?);
-            }
-
+        while let Some(tuple) = self.source.try_next()? {
             if !self.mem_buf.can_fit(&tuple) {
                 if self.file.is_none() {
                     self.file = Some(F::create(&self.file_path)?);
@@ -826,6 +815,32 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         // Tuples that were not written to the file because it wasn't necessary
         // are also returned here.
         Ok(self.mem_buf.pop_front())
+    }
+}
+
+/// Generates sort keys.
+///
+/// This is a helper for the main [`Sort`] plan that basically evaluates the
+/// `ORDER BY` expressions and appends the results to each tuple.
+///
+/// See the documentation of [`Sort`] for more details.
+pub(crate) struct SortKeysGen<F> {
+    pub source: Box<Plan<F>>,
+    pub schema: Schema,
+    pub order_by: Vec<Expression>,
+}
+
+impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
+    pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(mut tuple) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        for expr in &self.order_by {
+            tuple.push(vm::resolve_expression(&tuple, &self.schema, expr)?);
+        }
+
+        Ok(Some(tuple))
     }
 }
 
@@ -1157,16 +1172,28 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
 /// previous output file becomes the new input file and the previous input file
 /// is truncated and becomes the new output file.
 pub(crate) struct Sort<F> {
+    /// Tuple input.
     pub source: BufferedIter<F>,
+    /// Original schema of the tuples.
     pub schema: Schema,
+    /// Schema that includes the sort keys.
     pub sort_schema: Schema,
+    /// `true` if we already sorted the tuples.
     pub sorted: bool,
+    /// Page size used by the [`Pager`].
     pub page_size: usize,
+    /// Page used to sort tuples, write them to files and them buffer reads when
+    /// returning the results.
     pub output_page: TupleBuffer,
+    /// Working directory to create temporary files.
     pub work_dir: PathBuf,
+    /// File used to read tuples.
     pub input_file: Option<F>,
+    /// File used to write tuples to.
     pub output_file: Option<F>,
+    /// Path of [`Self::input_file`].
     pub input_file_path: PathBuf,
+    /// Path of [`Self::output_file`].
     pub output_file_path: PathBuf,
 }
 
@@ -1190,7 +1217,25 @@ fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
     Ordering::Equal
 }
 
-impl<F: Seek + Read + Write + FileOps> Sort<F> {
+impl<F> Sort<F> {
+    /// Sorts the tuples in [`Self::output_page`].
+    fn sort_output_page(&mut self) {
+        self.output_page
+            .tuples
+            .make_contiguous()
+            .sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
+    }
+}
+
+// TODO: Requires defining the struct as Sort<F: FileOps>.
+// impl<F: FileOps> Drop for Sort<F> {
+//     fn drop(&mut self) {
+//         self.drop_files();
+//     }
+// }
+
+impl<F: FileOps> Sort<F> {
+    /// Removes the files used by this [`Sort`] instance.
     fn drop_files(&mut self) -> io::Result<()> {
         if let Some(input_file) = self.input_file.take() {
             drop(input_file);
@@ -1204,14 +1249,11 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         Ok(())
     }
+}
 
-    fn sort_output_page(&mut self) {
-        self.output_page
-            .tuples
-            .make_contiguous()
-            .sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
-    }
-
+impl<F: Seek + Read + Write + FileOps> Sort<F> {
+    /// Executes the 2-way external merge sort algorithm described in the
+    /// documentation of [`Sort`]
     fn sort(&mut self) -> Result<(), DbError> {
         // Mem only sorting, didn't need files. Early return wishing that
         // everything was as simple as this.

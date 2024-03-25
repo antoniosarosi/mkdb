@@ -18,7 +18,10 @@ use crate::{
         statement::{Column, DataType, Expression, Statement},
     },
     vm::{
-        plan::{BufferedIter, Delete, Insert, Plan, Project, Sort, TupleBuffer, Update, Values},
+        plan::{
+            BufferedIter, Delete, Insert, Plan, Project, Sort, SortKeysGen, TupleBuffer, Update,
+            Values,
+        },
         VmDataType,
     },
 };
@@ -79,7 +82,15 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                     page_size,
                     work_dir: work_dir.clone(),
                     schema: metadata.schema.clone(),
-                    source: BufferedIter::new(source, work_dir, sort_schema.clone(), order_by),
+                    source: BufferedIter::new(
+                        Box::new(Plan::SortKeysGen(SortKeysGen {
+                            source,
+                            order_by,
+                            schema: metadata.schema.clone(),
+                        })),
+                        work_dir,
+                        sort_schema.clone(),
+                    ),
                     sort_schema,
                     sorted: false,
                     input_file: None,
@@ -149,7 +160,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             Plan::Update(Update {
                 table: metadata.clone(),
                 assignments: columns,
-                source: BufferedIter::new(source, work_dir, metadata.schema.clone(), vec![]),
+                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
                 pager: Rc::clone(&db.pager),
             })
         }
@@ -162,7 +173,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
             Plan::Delete(Delete {
                 table: metadata.clone(),
-                source: BufferedIter::new(source, work_dir, metadata.schema.clone(), vec![]),
+                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
                 pager: Rc::clone(&db.pager),
             })
         }

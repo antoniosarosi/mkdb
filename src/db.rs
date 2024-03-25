@@ -1388,7 +1388,7 @@ mod tests {
     /// to force as many evictions as possible.
     ///
     /// If this one works then I guess we can go home...
-    #[cfg(not(miri))]
+    // #[cfg(not(miri))]
     #[test]
     fn insert_many() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {
