@@ -96,7 +96,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                     input_file: None,
                     output_file: None,
                     input_buffers: 4,
-                    output_page: TupleBuffer::empty(),
+                    output_buffer: TupleBuffer::empty(),
                     input_file_path: PathBuf::new(),
                     output_file_path: PathBuf::new(),
                 }));

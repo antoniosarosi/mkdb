@@ -1259,11 +1259,10 @@ pub(crate) struct Sort<F> {
     pub sorted: bool,
     /// Page size used by the [`Pager`].
     pub page_size: usize,
-    /// How many buffers to use for sorting.
+    /// How many input buffers to use for the K-way algorithm. This is "K".
     pub input_buffers: usize,
-    /// Page used to sort tuples, write them to files and them buffer reads when
-    /// returning the results.
-    pub output_page: TupleBuffer,
+    /// K-way output buffer. Used also for sorting in memory and returning tuples.
+    pub output_buffer: TupleBuffer,
     /// Working directory to create temporary files.
     pub work_dir: PathBuf,
     /// File used to read tuples.
@@ -1298,8 +1297,8 @@ fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
 
 impl<F> Sort<F> {
     /// Sorts the tuples in [`Self::output_page`].
-    fn sort_output_page(&mut self) {
-        self.output_page
+    fn sort_output_buffer(&mut self) {
+        self.output_buffer
             .tuples
             .make_contiguous()
             .sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
@@ -1337,8 +1336,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         // Mem only sorting, didn't need files. Early return wishing that
         // everything was as simple as this.
         if self.source.reader.is_none() {
-            self.output_page = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
-            self.sort_output_page();
+            self.output_buffer = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
+            self.sort_output_buffer();
 
             return Ok(());
         }
@@ -1348,7 +1347,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         self.input_file_path = self.work_dir.join(input_file_name);
         self.input_file = Some(F::create(&self.input_file_path)?);
 
-        let output_file_name = format!("{}.mkdb.sort", &self.output_page as *const _ as usize);
+        let output_file_name = format!("{}.mkdb.sort", &self.output_buffer as *const _ as usize);
         self.output_file_path = self.work_dir.join(output_file_name);
         self.output_file = Some(F::create(&self.output_file_path)?);
 
@@ -1368,28 +1367,28 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         // below into its own function considering that the first pass we would
         // do here doesn't need to fill the input buffers from a file but
         // rather from the buffered iterator source.
-        self.output_page = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        self.output_buffer = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
 
         let mut input_pages = 0;
         while let Some(tuple) = self.source.try_next()? {
             // Write output page if full.
-            if !self.output_page.can_fit(&tuple) {
-                self.sort_output_page();
-                self.output_page
+            if !self.output_buffer.can_fit(&tuple) {
+                self.sort_output_buffer();
+                self.output_buffer
                     .write_to(self.input_file.as_mut().unwrap())?;
-                self.output_page.clear();
+                self.output_buffer.clear();
                 input_pages += 1;
             }
 
-            self.output_page.push(tuple);
+            self.output_buffer.push(tuple);
         }
 
         // Last page.
-        if !self.output_page.is_empty() {
-            self.sort_output_page();
-            self.output_page
+        if !self.output_buffer.is_empty() {
+            self.sort_output_buffer();
+            self.output_buffer
                 .write_to(self.input_file.as_mut().unwrap())?;
-            self.output_page.clear();
+            self.output_buffer.clear();
             input_pages += 1;
         }
 
@@ -1480,21 +1479,21 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                     // Write the output page if full. Otherwise just push the
                     // tuple.
-                    if !self.output_page.can_fit(&tuple) {
-                        self.output_page
+                    if !self.output_buffer.can_fit(&tuple) {
+                        self.output_buffer
                             .write_to(self.output_file.as_mut().unwrap())?;
-                        self.output_page.clear();
+                        self.output_buffer.clear();
                         output_pages += 1;
                     }
 
-                    self.output_page.push(tuple);
+                    self.output_buffer.push(tuple);
                 }
 
                 // Write last page.
-                if !self.output_page.is_empty() {
-                    self.output_page
+                if !self.output_buffer.is_empty() {
+                    self.output_buffer
                         .write_to(self.output_file.as_mut().unwrap())?;
-                    self.output_page.clear();
+                    self.output_buffer.clear();
                     output_pages += 1;
                 }
 
@@ -1533,9 +1532,9 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.sorted = true;
         }
 
-        if self.output_page.is_empty() {
+        if self.output_buffer.is_empty() {
             if let Some(input_file) = self.input_file.as_mut() {
-                if let Err(e) = self.output_page.read_from(input_file) {
+                if let Err(e) = self.output_buffer.read_from(input_file) {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
                         self.drop_files()?;
                     } else {
@@ -1546,7 +1545,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }
 
         // Remove sort keys when returning to the next plan node.
-        Ok(self.output_page.pop_front().map(|mut tuple| {
+        Ok(self.output_buffer.pop_front().map(|mut tuple| {
             tuple.drain(self.schema.len()..);
             tuple
         }))
