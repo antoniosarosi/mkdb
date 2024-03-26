@@ -331,6 +331,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
         self.file.flush()?;
         self.file.sync()?;
 
+        self.journal_pages.clear();
         self.journal.invalidate()?;
 
         Ok(num_pages_rolled_back)
@@ -564,9 +565,13 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
         // Initialize last free page.
         let index = self.lookup::<FreePage>(page_number)?;
-        self.cache[index].reinit_as::<FreePage>();
 
+        // We have to push the page to the write queue before modifying it so
+        // that the journal gets its original contents.
         self.push_to_write_queue(page_number, index)?;
+
+        // Now reinitialize the page as a free page.
+        self.cache[index].reinit_as::<FreePage>();
 
         let mut header = self.read_header()?;
 
@@ -746,7 +751,7 @@ impl<F> Journal<F> {
         let mut buffer = Vec::with_capacity(journal_chunk_size(page_size, max_pages));
 
         buffer.extend_from_slice(&JOURNAL_MAGIC.to_le_bytes());
-        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(&[0; JOURNAL_PAGE_NUM_SIZE]);
 
         Self {
             buffer,
