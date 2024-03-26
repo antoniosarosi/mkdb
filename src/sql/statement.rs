@@ -1,3 +1,8 @@
+//! SQL statements or AST.
+//!
+//! The only actual "trees" are [`Expression`] trees. [`Statement`] instances
+//! themselves are not "trees".
+
 use std::fmt::{self, Display, Write};
 
 /// SQL statement.

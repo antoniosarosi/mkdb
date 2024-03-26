@@ -1,3 +1,5 @@
+//! SQL parsers. Produces [`Statement`] variants from UTF-8 strings.
+
 use core::iter::Peekable;
 use std::fmt::Display;
 

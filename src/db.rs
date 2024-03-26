@@ -1,3 +1,8 @@
+//! This is where the actual code starts executing.
+//!
+//! The [`Database`] struct owns everything and delegates work to the other
+//! modules.
+
 use std::{
     cell::RefCell,
     collections::HashMap,

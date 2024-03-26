@@ -1,3 +1,5 @@
+//! SQL token definitions.
+
 use std::fmt::{self, Display, Write};
 
 /// SQL tokens.

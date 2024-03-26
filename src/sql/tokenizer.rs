@@ -1,3 +1,5 @@
+//! SQL tokenizer that produces [`Token`] instances.
+
 use std::{fmt::Display, iter::Peekable, str::Chars};
 
 use super::token::{Keyword, Token, Whitespace};
