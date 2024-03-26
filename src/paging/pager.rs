@@ -276,7 +276,13 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
         // if the DB file already exists we might have to set the page size to
         // that defined in the file.
         let mut page_zero = PageZero::alloc(self.page_size);
+
+        // alloc() initializes the page headers, zero the buffer to leave it
+        // uninit.
+        //
+        // TODO: create another function alloc_zeroed() or something.
         page_zero.as_mut().fill(0);
+
         self.file.read(0, page_zero.as_mut())?;
 
         let magic = page_zero.header().magic;
@@ -284,6 +290,9 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
 
         // Magic number is written in the file, we'll assume that it is already
         // initialized.
+        //
+        // TODO: This is getting out of hand, we need a centralized place
+        // to access the page size (and ideally not a global variable).
         if magic == MAGIC {
             self.page_size = page_size;
             self.cache.page_size = page_size;

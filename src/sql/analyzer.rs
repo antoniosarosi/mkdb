@@ -26,6 +26,8 @@ pub(crate) enum AnalyzerError {
     MultiplePrimaryKeys,
     /// Table or index already exists.
     AlreadyExists(AlreadyExists),
+    /// Number of characters exceeds `VARCHAR(max)`.
+    ValueTooLong(String, usize),
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,6 +54,9 @@ impl Display for AnalyzerError {
                 f.write_str("default values are not supported, all columns must be specified")
             }
             Self::AlreadyExists(already_exists) => write!(f, "{already_exists}"),
+            Self::ValueTooLong(string, max) => {
+                write!(f, "string '{string}' too long for type VARCHAR({max})")
+            }
         }
     }
 }
@@ -230,6 +235,16 @@ fn analyze_assignment(
             expected: expected_data_type,
             found: value.clone(),
         }));
+    }
+
+    if let DataType::Varchar(max) = schema.columns[index].data_type {
+        let Expression::Value(Value::String(string)) = value else {
+            unreachable!();
+        };
+
+        if string.chars().count() > max {
+            return Err(AnalyzerError::ValueTooLong(string.clone(), max).into());
+        }
     }
 
     Ok(())
@@ -464,6 +479,18 @@ mod tests {
             ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],
             sql: "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
             expected: Err(DbError::from(AnalyzerError::AlreadyExists(AlreadyExists::Table("users".into())))),
+        })
+    }
+
+    #[test]
+    fn value_too_long() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT, name VARCHAR(8));"],
+            sql: "INSERT INTO users (id, name) VALUES (1, '123456789');",
+            expected: Err(DbError::from(AnalyzerError::ValueTooLong(
+                "123456789".into(),
+                8,
+            ))),
         })
     }
 }

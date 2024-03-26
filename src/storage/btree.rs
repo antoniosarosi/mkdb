@@ -9,7 +9,10 @@ use std::{
     mem,
 };
 
-use super::page::{Cell, OverflowPage, Page, SlotId};
+use super::{
+    page::{Cell, OverflowPage, Page, SlotId},
+    tuple::byte_length_of_integer_type,
+};
 use crate::{
     paging::{
         io::FileOps,
@@ -91,7 +94,7 @@ impl BytesCmp for FixedSizeMemCmp {
 /// +---------+--------+--------+--------+-------+
 ///           ^                          ^
 ///           +--------------------------+
-///             STR LEN of string bytes
+///          STR LEN amount of string bytes
 /// ```
 ///
 /// Then computes the total length of the string in bytes by reading the first
@@ -102,26 +105,27 @@ pub(crate) struct StringCmp(pub usize);
 impl BytesCmp for StringCmp {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
         debug_assert!(
-            self.0 <= 2,
-            "currently strings longer than 65535 bytes are not supported"
+            self.0 <= 4,
+            "strings longer than {} bytes are not supported",
+            u32::MAX
         );
 
         let mut buf = [0; std::mem::size_of::<usize>()];
 
         buf[..self.0].copy_from_slice(&a[..self.0]);
-
         let len_a = usize::from_le_bytes(buf);
 
         buf.fill(0);
-        buf[..self.0].copy_from_slice(&b[..self.0]);
 
+        buf[..self.0].copy_from_slice(&b[..self.0]);
         let len_b = usize::from_le_bytes(buf);
 
-        // TODO: Not sure if unwrap() can actually panic here. When we insert
-        // data we have a valid [`String`] instance and we call String::as_bytes()
-        // to serialize it into binary. If unwrap() can't panic then we should
-        // use the unchecked version of from_utf8 that doesn't loop through the
-        // entire string to check that all bytes are valid UTF-8.
+        // TODO: Not 100% sure if unwrap() can actually panic here. When we
+        // insert data we already have a valid [`String`] instance which is
+        // supposed to be UTF-8 encoded and we call String::as_bytes() to
+        // serialize it into binary. If unwrap() can't panic then we should
+        // use the unchecked version of from_utf8() that doesn't loop through
+        // the entire string to check that all bytes are valid UTF-8.
         std::str::from_utf8(&a[self.0..self.0 + len_a])
             .unwrap()
             .cmp(std::str::from_utf8(&b[self.0..self.0 + len_b]).unwrap())
@@ -139,20 +143,8 @@ impl From<&DataType> for Box<dyn BytesCmp> {
     /// types.
     fn from(data_type: &DataType) -> Self {
         match data_type {
-            DataType::Varchar(max) => {
-                let length_bytes = if *max <= u8::MAX as usize { 1 } else { 2 };
-                Box::new(StringCmp(length_bytes))
-            }
-
-            fixed => {
-                let size = match fixed {
-                    DataType::BigInt | DataType::UnsignedBigInt => mem::size_of::<i64>(),
-                    DataType::Int | DataType::UnsignedInt => mem::size_of::<i32>(),
-                    _ => unreachable!(),
-                };
-
-                Box::new(FixedSizeMemCmp(size))
-            }
+            DataType::Varchar(_) => Box::new(StringCmp(mem::size_of::<u32>())),
+            fixed => Box::new(FixedSizeMemCmp(byte_length_of_integer_type(fixed))),
         }
     }
 }
