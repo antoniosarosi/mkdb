@@ -104,6 +104,7 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 column: metadata.schema.columns[col].clone(),
                 name: name.clone(),
                 root,
+                unique,
             };
 
             let mut scan = Plan::SeqScan(SeqScan {
@@ -129,14 +130,9 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
 
                 let entry = tuple::serialize(&index.schema(), &[key.clone(), row_id]);
 
-                // TODO: try_insert() API.
-                if btree.get(&entry)?.is_some() {
-                    return Err(DbError::Sql(SqlError::Other(format!(
-                        "could not create unique index '{name}' because key {key} is duplicated",
-                    ))));
-                }
-
-                btree.insert(entry)?;
+                btree
+                    .try_insert(entry)?
+                    .map_err(|_| SqlError::DuplicatedKey(key))?;
             }
 
             // Invalidate the table so that the next time it is loaded it

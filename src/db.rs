@@ -101,6 +101,7 @@ impl Database<File> {
 pub(crate) enum SqlError {
     InvalidTable(String),
     InvalidColumn(String),
+    DuplicatedKey(Value),
     AnalyzerError(AnalyzerError),
     TypeError(TypeError),
     VmError(VmError),
@@ -130,6 +131,7 @@ impl Display for SqlError {
         match self {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
             Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
+            Self::DuplicatedKey(key) => write!(f, "duplicated key {key}"),
             Self::AnalyzerError(analyzer_error) => write!(f, "{analyzer_error}"),
             Self::VmError(vm_error) => write!(f, "{vm_error}"),
             Self::TypeError(type_error) => write!(f, "{type_error}"),
@@ -299,6 +301,8 @@ pub(crate) struct IndexMetadata {
     pub name: String,
     /// Column on which the index was created.
     pub column: Column,
+    /// Always `true` because non-unique indexes are not implemented.
+    pub unique: bool,
 }
 
 impl IndexMetadata {
@@ -436,6 +440,7 @@ impl TryFrom<&[&str]> for Context {
                                 column: column.clone(),
                                 name: index_name,
                                 root,
+                                unique: true,
                             });
 
                             root += 1;
@@ -458,6 +463,7 @@ impl TryFrom<&[&str]> for Context {
                         column: table.schema.columns[col_idx].clone(),
                         name,
                         root,
+                        unique,
                     });
                     root += 1;
                 }
@@ -582,7 +588,12 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
                         found_table_definition = true;
                     }
 
-                    Statement::Create(Create::Index { column, name, .. }) => {
+                    Statement::Create(Create::Index {
+                        column,
+                        name,
+                        unique,
+                        ..
+                    }) => {
                         // The table schema should be loaded by this time
                         // because it's impossible to define an index unless the
                         // table exists and the results are returned sorted by
@@ -597,6 +608,7 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
                             column: metadata.schema.columns[col_idx].clone(),
                             name,
                             root,
+                            unique,
                         });
                     }
 
@@ -662,10 +674,7 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
 
         let mut pager = self.pager.borrow_mut();
 
-        if commit {
-            self.transaction_started = false;
-            pager.commit()?;
-        } else if rollback || projection.is_err() {
+        if rollback || projection.is_err() {
             self.transaction_started = false;
 
             if let Err(rollback_err) = pager.rollback() {
@@ -675,6 +684,9 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
                     return Err(rollback_err);
                 }
             }
+        } else if commit {
+            self.transaction_started = false;
+            pager.commit()?;
         }
 
         projection
@@ -1658,6 +1670,90 @@ mod tests {
                 found: Expression::Value(Value::String("String".into()))
             })))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_duplicated_keys() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+
+        let dup = db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Dup Key', 24);");
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(
+            dup,
+            Err(DbError::Sql(SqlError::DuplicatedKey(Value::Number(2))))
+        );
+
+        assert_eq!(query, Projection {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            results: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_unique_index_with_duplicated_keys() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let create_table = "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));";
+        let create_pk_idx = "CREATE UNIQUE INDEX users_pk_index ON users(id);";
+
+        db.exec(create_table)?;
+        db.exec("INSERT INTO users(id, email) VALUES (1, 'john@doe.com');")?;
+        db.exec("INSERT INTO users(id, email) VALUES (2, 'dup@email.com');")?;
+        db.exec("INSERT INTO users(id, email) VALUES (3, 'dup@email.com');")?;
+
+        let dup = db.exec("CREATE UNIQUE INDEX email_uq ON users(email);");
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
+
+        assert_eq!(
+            dup,
+            Err(DbError::Sql(SqlError::DuplicatedKey(Value::String(
+                "dup@email.com".into()
+            ))))
+        );
+
+        assert_eq!(query, Projection {
+            schema: mkdb_meta_schema(),
+            results: vec![
+                vec![
+                    Value::String("table".into()),
+                    Value::String("users".into()),
+                    Value::Number(1),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(create_table).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("users_pk_index".into()),
+                    Value::Number(2),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(create_pk_idx).parse_statement()?.to_string())
+                ],
+            ]
+        });
 
         Ok(())
     }

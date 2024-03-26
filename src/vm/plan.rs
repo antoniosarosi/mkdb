@@ -331,7 +331,7 @@ pub(crate) struct Insert<F> {
 
 impl<F: Seek + Read + Write + FileOps> Insert<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(tuple) = self.source.try_next()? else {
+        let Some(mut tuple) = self.source.try_next()? else {
             return Ok(None);
         };
 
@@ -360,7 +360,9 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
                 Box::<dyn BytesCmp>::from(&index.column.data_type),
             );
 
-            btree.insert(entry)?;
+            btree
+                .try_insert(entry)?
+                .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(col)))?;
         }
 
         Ok(Some(vec![]))
@@ -415,10 +417,12 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
                     &[old_key],
                 ))?;
 
-                btree.insert(tuple::serialize(&index.schema(), &[
-                    new_key,
-                    tuple[0].clone(),
-                ]))?;
+                btree
+                    .try_insert(tuple::serialize(&index.schema(), &[
+                        new_key.clone(),
+                        tuple[0].clone(),
+                    ]))?
+                    .map_err(|_| SqlError::DuplicatedKey(new_key))?;
             }
         }
 

@@ -621,6 +621,26 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
         self.balance(search.page, &mut parents)
     }
 
+    /// Same as [`Self::insert`] but doesn't update the key if it already
+    /// exists.
+    ///
+    /// It returns its location as an error instead.
+    pub fn try_insert(&mut self, entry: Vec<u8>) -> io::Result<Result<(), Search>> {
+        let mut parents = Vec::new();
+        let search = self.search(self.root, &entry, &mut parents)?;
+
+        let Err(index) = search.index else {
+            return Ok(Err(search));
+        };
+
+        let cell = self.alloc_cell(entry)?;
+        self.pager.get_mut(search.page)?.insert(index, cell);
+
+        self.balance(search.page, &mut parents)?;
+
+        Ok(Ok(()))
+    }
+
     /// Removes the entry corresponding to the given key if it exists.
     ///
     /// # Deletion algorithm
@@ -1010,7 +1030,7 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    ///
+    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
