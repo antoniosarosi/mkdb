@@ -370,12 +370,12 @@ impl<'s> AsRef<[u8]> for Payload<'s> {
 /// the current node. Left child is stored in the cell header and points to
 /// the child that has keys less than the one in the cell. For the slotted page
 /// details and omitted fields see the documentation of [`super::page`] module.
-pub(crate) struct BTree<'c, F, C> {
+pub(crate) struct BTree<'p, F, C> {
     /// Root page.
     root: PageNumber,
 
     /// Pager instance.
-    pager: &'c mut Pager<F>,
+    pager: &'p mut Pager<F>,
 
     /// Bytes comparator used to obtain [`Ordering`] instances from binary data.
     comparator: C,
@@ -2413,7 +2413,7 @@ mod tests {
         }
     }
 
-    /// Test builder for [`BTree<'c, MemBuf, FixedSizeCmp>`].
+    /// Test builder for [`BTree<'p, MemBuf, FixedSizeCmp>`].
     struct Builder {
         keys: Vec<Key>,
         order: usize,
@@ -2470,7 +2470,7 @@ mod tests {
             self
         }
 
-        fn try_build<'c>(self) -> io::Result<BTree<'c, MemBuf, FixedSizeMemCmp>> {
+        fn try_build<'p>(self) -> io::Result<BTree<'p, MemBuf, FixedSizeMemCmp>> {
             let page_size = self
                 .page_size
                 .unwrap_or(optimal_page_size_for_order(self.order));
@@ -2578,7 +2578,7 @@ mod tests {
         align_upwards(total_size as usize, MEM_ALIGNMENT)
     }
 
-    impl<'c> TryFrom<BTree<'c, MemBuf, FixedSizeMemCmp>> for Node {
+    impl<'p> TryFrom<BTree<'p, MemBuf, FixedSizeMemCmp>> for Node {
         type Error = io::Error;
 
         fn try_from(mut btree: BTree<MemBuf, FixedSizeMemCmp>) -> Result<Self, Self::Error> {
