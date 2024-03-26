@@ -71,11 +71,13 @@ fn main() -> Result<(), DbError> {
 
             if byte == b';' {
                 let _ = match db.exec(&statement) {
-                    Ok(result) => {
-                        if !result.is_empty() {
-                            stream.write_all(ascii_table(result).as_bytes())
+                    Ok(projection) => {
+                        if projection.schema.columns.is_empty() {
+                            let rows_affected = projection.results.len();
+                            stream
+                                .write_all(format!("OK, {rows_affected} rows affected").as_bytes())
                         } else {
-                            stream.write_all("OK".as_bytes())
+                            stream.write_all(ascii_table(projection).as_bytes())
                         }
                     }
 

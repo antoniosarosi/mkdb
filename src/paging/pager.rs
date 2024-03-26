@@ -16,7 +16,7 @@ use std::{
 };
 
 use super::{
-    cache::{self, Cache, FrameId},
+    cache::{Cache, FrameId},
     io::{BlockIo, FileOps},
 };
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
 /// Are we gonna have more than 4 billion pages? Probably not ¯\_(ツ)_/¯
 pub(crate) type PageNumber = u32;
 
-/// Default value for calculating [`Journal::max_size`].
+/// Default value for [`Journal::max_pages`].
 const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 
 /// IO page manager that operates on top of a "block device" or disk.
@@ -715,12 +715,12 @@ const JOURNAL_HEADER_SIZE: usize = JOURNAL_MAGIC_SIZE + JOURNAL_PAGE_NUM_SIZE;
 struct Journal<F> {
     /// In-memory page buffer.
     buffer: Vec<u8>,
-    /// Max size of [`Self::buffer`] in bytes.
-    max_size: usize,
     /// Size of each page without including checksums and page numbers.
     page_size: usize,
     /// Number of pages currently stored in [`Self::buffer`].
     buffered_pages: u32,
+    /// Maximum number of pages that can be buffered in memory.
+    max_pages: usize,
     /// Path of the journal file.
     file_path: PathBuf,
     /// File handle/descriptor.
@@ -743,18 +743,14 @@ impl<F> Journal<F> {
             file_path,
         }: JournalConfig,
     ) -> Self {
-        let max_size = JOURNAL_MAGIC_SIZE
-            + JOURNAL_PAGE_NUM_SIZE
-            + (JOURNAL_PAGE_NUM_SIZE + page_size + JOURNAL_CHECKSUM_SIZE) * max_pages;
-
-        let mut buffer = Vec::with_capacity(max_size);
+        let mut buffer = Vec::with_capacity(journal_chunk_size(page_size, max_pages));
 
         buffer.extend_from_slice(&JOURNAL_MAGIC.to_le_bytes());
         buffer.extend_from_slice(&0u32.to_le_bytes());
 
         Self {
             buffer,
-            max_size,
+            max_pages,
             file_path,
             page_size,
             buffered_pages: 0,
@@ -795,10 +791,17 @@ impl<F: FileOps> Journal<F> {
     }
 }
 
+/// Computes the size in bytes of a journal chunk that contains `num_pages`.
+///
+/// See the file format described in [`Journal`] for details.
 fn journal_chunk_size(page_size: usize, num_pages: usize) -> usize {
     JOURNAL_MAGIC_SIZE + JOURNAL_PAGE_NUM_SIZE + (num_pages) * journal_page_size(page_size)
 }
 
+/// Computes the size that a page takes on the journal file considering its
+/// metadata.
+///
+/// See the file format described in [`Journal`] for details.
 fn journal_page_size(page_size: usize) -> usize {
     JOURNAL_PAGE_NUM_SIZE + page_size + JOURNAL_CHECKSUM_SIZE
 }
@@ -837,7 +840,7 @@ impl<F: Write + FileOps> Journal<F> {
     pub fn push(&mut self, page_number: PageNumber, page: impl AsRef<[u8]>) -> io::Result<()> {
         // If the buffer is full write it and clear it before pushing the new
         // page.
-        if self.buffer.len() >= self.max_size {
+        if self.buffered_pages as usize >= self.max_pages {
             self.write()?;
         }
 
@@ -987,6 +990,7 @@ impl<'j, F: Read> JournalPagesIter<'j, F> {
                 return Err(corrupted_error());
             }
 
+            self.journal.buffered_pages = 0;
             self.cursor = JOURNAL_HEADER_SIZE;
         }
 
@@ -1020,13 +1024,13 @@ impl<'j, F: Read> JournalPagesIter<'j, F> {
 mod tests {
     use std::io;
 
-    use super::{Builder, Pager, JOURNAL_CHECKSUM_SIZE, JOURNAL_MAGIC_SIZE, JOURNAL_PAGE_NUM_SIZE};
+    use super::{Builder, Pager};
     use crate::{
         db::DbError,
         paging::{
             cache::Cache,
             io::MemBuf,
-            pager::{journal_chunk_size, PageNumber, DEFAULT_MAX_JOURNAL_BUFFERED_PAGES},
+            pager::{journal_chunk_size, PageNumber},
         },
         storage::page::{Cell, OverflowPage, Page},
     };

@@ -46,13 +46,12 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
     ops::Index,
     path::PathBuf,
     rc::Rc,
-    usize,
 };
 
 use crate::{
@@ -347,10 +346,10 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
         btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
 
         for index in &self.table.indexes {
-            let col_idx = self.table.schema.index_of(&index.column.name).unwrap();
+            let col = self.table.schema.index_of(&index.column.name).unwrap();
             assert_eq!(self.table.schema.columns[0].name, "row_id");
 
-            let key = tuple[col_idx].clone();
+            let key = tuple[col].clone();
             let row_id = tuple[0].clone();
 
             let entry = tuple::serialize(&index.schema(), &[key, row_id]);
@@ -382,9 +381,15 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             return Ok(None);
         };
 
+        let mut updated_index_cols = HashMap::new();
+
         for assignment in &self.assignments {
-            let idx = self.table.schema.index_of(&assignment.identifier).unwrap();
-            tuple[idx] = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
+            let col = self.table.schema.index_of(&assignment.identifier).unwrap();
+            let new_value = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
+            let old_value = tuple[col].clone();
+            tuple[col] = new_value.clone();
+
+            updated_index_cols.insert(assignment.identifier.clone(), (old_value, new_value));
         }
 
         let mut pager = self.pager.borrow_mut();
@@ -396,6 +401,26 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
         );
 
         btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
+
+        for index in &self.table.indexes {
+            if let Some((old_key, new_key)) = updated_index_cols.remove(&index.column.name) {
+                let mut btree = BTree::new(
+                    &mut pager,
+                    index.root,
+                    Box::<dyn BytesCmp>::from(&index.column.data_type),
+                );
+
+                btree.remove(&tuple::serialize(
+                    &Schema::from(vec![index.column.clone()]),
+                    &[old_key],
+                ))?;
+
+                btree.insert(tuple::serialize(&index.schema(), &[
+                    new_key,
+                    tuple[0].clone(),
+                ]))?;
+            }
+        }
 
         Ok(Some(vec![]))
     }

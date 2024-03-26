@@ -1410,6 +1410,58 @@ mod tests {
         )
     }
 
+    #[test]
+    fn update_indexed_columns_on_sql_update_statement() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, name VARCHAR(64));",
+        )?;
+        db.exec("CREATE UNIQUE INDEX name_idx ON users(name);")?;
+
+        db.exec("INSERT INTO users(id, name, email) VALUES (100, 'John Doe', 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (200, 'Jane Doe', 'jane@email.com');")?;
+        db.exec(
+            "INSERT INTO users(id, name, email) VALUES (300, 'Some Dude', 'some_dude@email.com');",
+        )?;
+
+        db.exec("UPDATE users SET id = 3, email = 'some@dude.com' WHERE id = 300;")?;
+        db.exec("UPDATE users SET email = 'updated@email.com' WHERE id = 200;")?;
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Column::new("id", DataType::Int),
+            &[
+                vec![Value::Number(3), Value::Number(3)],
+                vec![Value::Number(100), Value::Number(1)],
+                vec![Value::Number(200), Value::Number(2)],
+            ],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Column::new("email", DataType::Varchar(255)),
+            &[
+                vec![Value::String("john@email.com".into()), Value::Number(1)],
+                vec![Value::String("some@dude.com".into()), Value::Number(3)],
+                vec![Value::String("updated@email.com".into()), Value::Number(2)],
+            ],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "name_idx",
+            Column::new("name", DataType::Varchar(255)),
+            &[
+                vec![Value::String("Jane Doe".into()), Value::Number(2)],
+                vec![Value::String("John Doe".into()), Value::Number(1)],
+                vec![Value::String("Some Dude".into()), Value::Number(3)],
+            ],
+        )
+    }
+
     /// This test really "tests" the limits of the underlying BTrees by using a
     /// really small page size and variable length data that's going to force
     /// the BTrees to allocate a bunch of overflow pages and rebalance many
