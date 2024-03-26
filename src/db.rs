@@ -286,7 +286,7 @@ pub(crate) fn mkdb_meta_schema() -> Schema {
         Column::new("table_name", DataType::Varchar(255)),
         // SQL used to create the index or table.
         // TODO: Implement and use some TEXT data type with higher length limits.
-        Column::new("sql", DataType::Varchar(255)),
+        Column::new("sql", DataType::Varchar(65535)),
     ])
 }
 
@@ -1458,6 +1458,30 @@ mod tests {
                 vec![Value::String("Jane Doe".into()), Value::Number(2)],
                 vec![Value::String("John Doe".into()), Value::Number(1)],
                 vec![Value::String("Some Dude".into()), Value::Number(3)],
+            ],
+        )
+    }
+
+    #[test]
+    fn build_up_index_on_create_index_statement() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));")?;
+
+        db.exec("INSERT INTO users(id,email) VALUES (100, 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, email) VALUES (200, 'jane@email.com');")?;
+        db.exec("INSERT INTO users(id, email) VALUES (300, 'some@dude.com');")?;
+
+        db.exec("CREATE UNIQUE INDEX email_uq ON users(email);")?;
+
+        assert_index_contains(
+            &mut db,
+            "email_uq",
+            Column::new("email", DataType::Varchar(255)),
+            &[
+                vec![Value::String("jane@email.com".into()), Value::Number(2)],
+                vec![Value::String("john@email.com".into()), Value::Number(1)],
+                vec![Value::String("some@dude.com".into()), Value::Number(3)],
             ],
         )
     }

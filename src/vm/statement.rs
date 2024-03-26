@@ -1,12 +1,23 @@
-//! Code that deals with simple SQL statements that don't require plans.
+//! Code that deals with simple SQL statements that don't require [`Plan`]
+//! trees.
+//!
+//! This boils down to `CREATE` statements, which don't need plans because they
+//! don't work with "tuples".
 
-use std::io::{self, Read, Seek, Write};
+use std::{
+    io::{self, Read, Seek, Write},
+    rc::Rc,
+};
 
+use super::plan::{Plan, SeqScan};
 use crate::{
-    db::{mkdb_meta_schema, Database, DatabaseContext, DbError, RowId, MKDB_META, MKDB_META_ROOT},
+    db::{
+        mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId, SqlError,
+        MKDB_META, MKDB_META_ROOT,
+    },
     paging::{io::FileOps, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
-    storage::{tuple, BTree, FixedSizeMemCmp},
+    storage::{tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
 };
 
 /// Executes a SQL statement that doesn't require a query plan.
@@ -58,9 +69,19 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
             }
         }
 
-        Statement::Create(Create::Index { name, table, .. }) => {
-            // TODO: Insert keys into index if the table is not empty.
+        Statement::Create(Create::Index {
+            name,
+            table,
+            column,
+            unique,
+        }) => {
+            if !unique {
+                return Err(DbError::Sql(SqlError::Other(
+                    "only unique indexes are supported".into(),
+                )));
+            }
 
+            // Allocate the root page and add the new entry to the meta table.
             let root = alloc_root_page(db)?;
 
             insert_into_mkdb_meta(db, vec![
@@ -71,6 +92,56 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 Value::String(sql),
             ])?;
 
+            // Now build up the index.
+            let metadata = db.table_metadata(&table)?;
+
+            let col = metadata
+                .schema
+                .index_of(&column)
+                .ok_or(SqlError::InvalidColumn(column))?;
+
+            let index = IndexMetadata {
+                column: metadata.schema.columns[col].clone(),
+                name: name.clone(),
+                root,
+            };
+
+            let mut scan = Plan::SeqScan(SeqScan {
+                cursor: Cursor::new(metadata.root, 0),
+                table: metadata.clone(),
+                pager: Rc::clone(&db.pager),
+            });
+
+            while let Some(mut tuple) = scan.try_next()? {
+                let mut pager = db.pager.borrow_mut();
+
+                // TODO: This allocates BytesCmp on every iteration. Can't put
+                // it outside of the loop because of the borrow_mut() call. The
+                // scan plan also borrows the pager with a mutable reference.
+                let mut btree = BTree::new(
+                    &mut pager,
+                    index.root,
+                    Box::<dyn BytesCmp>::from(&index.column.data_type),
+                );
+
+                let key = tuple.swap_remove(col);
+                let row_id = tuple.swap_remove(0);
+
+                let entry = tuple::serialize(&index.schema(), &[key.clone(), row_id]);
+
+                // TODO: try_insert() API.
+                if btree.get(&entry)?.is_some() {
+                    return Err(DbError::Sql(SqlError::Other(format!(
+                        "could not create unique index '{name}' because key {key} is duplicated",
+                    ))));
+                }
+
+                btree.insert(entry)?;
+            }
+
+            // Invalidate the table so that the next time it is loaded it
+            // includes the new index. Alternatively we could manually insert
+            // the index metadata we constructed previously here.
             db.context.invalidate(&table);
         }
 

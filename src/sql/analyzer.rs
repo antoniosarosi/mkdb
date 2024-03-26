@@ -9,7 +9,7 @@
 use std::fmt::Display;
 
 use crate::{
-    db::{DatabaseContext, DbError, Schema, SqlError},
+    db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata},
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
     vm::{TypeError, VmDataType},
 };
@@ -143,7 +143,7 @@ pub(crate) fn analyze(
             }
 
             for (expr, col) in values.iter().zip(columns) {
-                analyze_assignment(&metadata.schema, col, expr, false)?;
+                analyze_assignment(&metadata, col, expr, false)?;
             }
         }
 
@@ -181,7 +181,7 @@ pub(crate) fn analyze(
             let metadata = ctx.table_metadata(table)?;
 
             for col in columns {
-                analyze_assignment(&metadata.schema, &col.identifier, &col.value, true)?;
+                analyze_assignment(&metadata, &col.identifier, &col.value, true)?;
             }
 
             analyze_where(&metadata.schema, r#where)?;
@@ -213,19 +213,22 @@ fn analyze_where(schema: &Schema, r#where: &Option<Expression>) -> Result<(), Db
 
 /// Makes sure that the expression will evaluate to a data type that can be
 /// assigned to the given column.
+///
+/// Performs some additional checks such as VARCHAR(max) character limits.
 fn analyze_assignment(
-    schema: &Schema,
+    table: &TableMetadata,
     column: &str,
     value: &Expression,
     allow_identifiers: bool,
 ) -> Result<(), SqlError> {
-    let index = schema
+    let index = table
+        .schema
         .index_of(column)
         .ok_or(SqlError::InvalidColumn(column.into()))?;
 
-    let expected_data_type = VmDataType::from(schema.columns[index].data_type);
+    let expected_data_type = VmDataType::from(table.schema.columns[index].data_type);
     let pre_eval_data_type = if allow_identifiers {
-        analyze_expression(schema, value)?
+        analyze_expression(&table.schema, value)?
     } else {
         analyze_expression(&Schema::empty(), value)?
     };
@@ -237,7 +240,7 @@ fn analyze_assignment(
         }));
     }
 
-    if let DataType::Varchar(max) = schema.columns[index].data_type {
+    if let DataType::Varchar(max) = table.schema.columns[index].data_type {
         let Expression::Value(Value::String(string)) = value else {
             unreachable!();
         };
