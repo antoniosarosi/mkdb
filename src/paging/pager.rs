@@ -572,14 +572,21 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     /// will be replaced by a [`FreePage`] instance and all the data will be
     /// lost. Consider that a "use after free" bug.
     pub fn free_page(&mut self, page_number: PageNumber) -> io::Result<()> {
-        // Initialize last free page.
+        // Bring the page into memory if it's not already there. The lookup
+        // function will initialize the page as "free page" but then it will
+        // write the data from disk into its buffer so it doesn't matter. We
+        // don't know the type of the page here anyway.
         let index = self.lookup::<FreePage>(page_number)?;
 
-        // We have to push the page to the write queue before modifying it so
-        // that the journal gets its original contents.
+        // Push the page to the write queue before modifying it so that the
+        // journal gets its original contents. We don't care about the type of
+        // the page here, we only care about the binary buffer, which is what
+        // the journal will get.
         self.push_to_write_queue(page_number, index)?;
 
-        // Now reinitialize the page as a free page.
+        // Now it's safe to reinitialize the page as a free page. The page
+        // number is already stored in the write queue so at some point this
+        // will be written to disk.
         self.cache[index].reinit_as::<FreePage>();
 
         let mut header = self.read_header()?;
