@@ -243,7 +243,7 @@ pub(crate) struct Cache {
     /// Maximum number of pages that can be stored in memory.
     max_size: usize,
     /// Size of each page.
-    page_size: usize,
+    pub(super) page_size: usize,
     /// Maximum percentage of pages that can be pinned at once.
     pin_percentage_limit: f32,
     /// Number of pinned pages.

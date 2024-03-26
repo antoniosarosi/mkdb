@@ -21,15 +21,15 @@ mod vm;
 
 use std::{
     env,
-    io::{self, Read, Write},
+    io::{Read, Write},
     net::TcpListener,
 };
 
-use db::Projection;
+use db::{DbError, Projection};
 
 use crate::db::Database;
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), DbError> {
     let file = env::args().nth(1).expect("database file not provided");
 
     let listener = TcpListener::bind("127.0.0.1:8000")?;
@@ -54,7 +54,11 @@ fn main() -> io::Result<()> {
         let exit_command = "quit";
 
         while let Some(byte) = stream.bytes().next() {
-            let byte = byte.unwrap();
+            let Ok(byte) = byte else {
+                println!("Close {conn} connection");
+                break;
+            };
+
             statement.push(byte.into());
 
             if statement.len() >= exit_command.len()

@@ -837,7 +837,7 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
 
         let (key_idx, child_idx) = match leaf_key_search {
             LeafKeySearch::Min => (0, 0),
-            LeafKeySearch::Max => (node.len() - 1, node.len()),
+            LeafKeySearch::Max => (node.len().saturating_sub(1), node.len()),
         };
 
         if node.is_leaf() {
@@ -872,10 +872,6 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
 
     /// Returns the greatest entry in this tree.
     pub fn max(&mut self) -> io::Result<Option<Payload>> {
-        if self.pager.get(self.root)?.is_empty() {
-            return Ok(None);
-        }
-
         let (page, slot) = self.search_max_key(self.root, &mut Vec::new())?;
 
         if self.pager.get(page)?.is_empty() {
@@ -2470,12 +2466,7 @@ mod tests {
 
             let mut pager = Pager::<MemBuf>::builder()
                 .page_size(page_size)
-                .cache(
-                    Cache::builder()
-                        .page_size(page_size)
-                        .max_size(self.cache_size)
-                        .build(),
-                )
+                .cache(Cache::builder().max_size(self.cache_size).build())
                 .wrap(buf);
 
             pager.init()?;
@@ -4001,6 +3992,35 @@ mod tests {
                 }
             ]
         },);
+
+        Ok(())
+    }
+
+    /// Should return 15. This is important because we use max() to load ROW IDs.
+    ///
+    /// ```text
+    ///                 +--------+
+    ///                 |        | Empty Root
+    ///                 +--------+
+    ///                     |
+    ///                 +--------+
+    ///         +-------| 4,8,12 |--------+
+    ///       /         +--------+         \
+    ///     /           /        \          \
+    /// +-------+  +-------+  +---------+  +----------+
+    /// | 1,2,3 |  | 5,6,7 |  | 9,10,11 |  | 13,14,15 |
+    /// +-------+  +-------+  +---------+  +----------+
+    /// ```
+    #[test]
+    fn find_max_with_empty_root() -> io::Result<()> {
+        let mut btree = BTree::builder()
+            .root_at_zero(true)
+            .keys(1..=15)
+            .try_build()?;
+
+        let max = btree.max()?.unwrap();
+
+        assert_eq!(deserialize_key(max.as_ref()), 15);
 
         Ok(())
     }

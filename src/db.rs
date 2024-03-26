@@ -58,7 +58,7 @@ pub(crate) struct Database<F> {
 
 impl Database<File> {
     /// Initializes a [`Database`] instance from the given file.
-    pub fn init(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn init(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let file = File::options()
             .create(true)
             .truncate(false)
@@ -69,7 +69,7 @@ impl Database<File> {
         let metadata = file.metadata()?;
 
         if !metadata.is_file() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file"));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file").into());
         }
 
         let block_size = Disk::from(&path).block_size()?;
@@ -89,6 +89,9 @@ impl Database<File> {
             .wrap(file);
 
         pager.init()?;
+
+        // Initial rollback on startup if the journal file exists.
+        pager.rollback()?;
 
         Ok(Database::new(Rc::new(RefCell::new(pager)), work_dir))
     }
@@ -723,14 +726,9 @@ mod tests {
     }
 
     fn init_database_with(conf: DbConf) -> io::Result<Database<MemBuf>> {
-        let cache = Cache::builder()
-            .page_size(conf.page_size)
-            .max_size(conf.cache_size)
-            .build();
-
         let mut pager = Pager::<MemBuf>::builder()
             .page_size(conf.page_size)
-            .cache(cache)
+            .cache(Cache::with_max_size(conf.cache_size))
             .wrap(io::Cursor::new(Vec::<u8>::new()));
 
         pager.init()?;
