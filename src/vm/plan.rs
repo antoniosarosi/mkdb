@@ -247,18 +247,21 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 }
 
 /// Raw values from `INSERT INTO table (c1, c2) VALUES (v1, v2)`.
+///
+/// This supports multiple values but the parser does not currently parse
+/// `INSERT` statements with multiple values.
 pub(crate) struct Values {
-    pub values: Vec<Expression>,
+    pub values: VecDeque<Vec<Expression>>,
 }
 
 impl Values {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        if self.values.is_empty() {
+        let Some(mut values) = self.values.pop_front() else {
             return Ok(None);
-        }
+        };
 
         Ok(Some(
-            self.values
+            values
                 .drain(..)
                 .map(|expr| vm::resolve_literal_expression(&expr))
                 .collect::<Result<Vec<Value>, SqlError>>()?,
@@ -1580,3 +1583,6 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }))
     }
 }
+
+// TODO: Some tests would be nice here. We can use the [`Values`] plan as a base
+// for mocks that return any tuples we want.

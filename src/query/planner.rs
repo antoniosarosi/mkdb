@@ -4,6 +4,7 @@
 //! what exactly we're "generating here".
 
 use std::{
+    collections::VecDeque,
     io::{Read, Seek, Write},
     path::PathBuf,
     rc::Rc,
@@ -37,7 +38,9 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             columns,
             values,
         } => {
-            let source = Box::new(Plan::Values(Values { values }));
+            let source = Box::new(Plan::Values(Values {
+                values: VecDeque::from([values]),
+            }));
 
             Plan::Insert(Insert {
                 source,
