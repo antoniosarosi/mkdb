@@ -1,11 +1,55 @@
-/// A tuple is a single database row.
-///
-/// TODO: Right now we're "serializing" and "deserializing" rows which is not
-/// really needed. We already store the rows in such a format that we can
-/// interpret the bytes in them as numbers or strings without having to copy
-/// them into [`Value`] structures. Serializing and deserializing made it easy
-/// to develop in the beginning because it doesn't require any unsafe code, but
-/// it's probably the biggest performance hit not counting unoptimized IO.
+//! A tuple is a single database row or any collection of [`Value`] instances.
+//!
+//! TODO: Right now we're "serializing" and "deserializing" rows which is not
+//! really needed. We already store the rows in such a format that we can
+//! interpret the bytes in them as numbers or strings without having to copy
+//! them into [`Value`] structures. Serializing and deserializing made it easy
+//! to develop in the beginning because it doesn't require any unsafe code, but
+//! it's probably the biggest performance hit not counting unoptimized IO.
+//!
+//! # Serialization Format
+//!
+//! All numbers are serialized in big endian format because that allows the
+//! BTree to compare them using a simple memcmp(). Normally only the first
+//! column of a tuple needs to be compared as that's where we store the
+//! [`RowId`], but for simplicity we just encode every number in big endian.
+//!
+//! Strings on the other hand are UTF-8 encoded with a 4 byte little endian
+//! prefix where we store the byte length of the string (number of bytes, not
+//! number of characters). So, putting it all together, a tuple like this one:
+//!
+//! ```rust
+//! [
+//!     Value::Number(1),
+//!     Value::String("hello".into()),
+//!     Value::Number(2),
+//! ]
+//! ```
+//!
+//! with a schema like this one:
+//!
+//! ```rust
+//! [DataType::BigInt, DataType::Varchar(255), DataType::Int]
+//! ```
+//!
+//! would serialize into the following bytes (not bits, bytes):
+//!
+//! ```text
+//! +-----------------+---------+---------------------+---------+
+//! | 0 0 0 0 0 0 0 1 | 5 0 0 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
+//! +-----------------+---------+---------------------+---------+
+//!  8 byte big endian  4 byte       String bytes       4 byte
+//!       BigInt        little                        big endian
+//!                     endian                            Int
+//!                     String
+//!                     length
+//! ```
+//!
+//! The only thing we're missing here is alignment. The page module already
+//! supports 64 bit alignment, so if we align columns and write some unsafe
+//! code to obtain references to values from a binary buffer we would get rid
+//! of serialization / deserialization. It would require some changes throughout
+//! the codebase, but definitely doable.
 use std::mem;
 
 use crate::{
@@ -13,14 +57,20 @@ use crate::{
     sql::statement::{DataType, Value},
 };
 
+/// Almost all tuples (except BTree index tuples) have a [`RowId`] as the first
+/// element.
+///
+/// This function returns the [`RowId`].
 pub(crate) fn deserialize_row_id(buf: &[u8]) -> RowId {
     RowId::from_be_bytes(buf[..mem::size_of::<RowId>()].try_into().unwrap())
 }
 
+/// Serializes the `row_id` into a big endian buffer.
 pub(crate) fn serialize_row_id(row_id: RowId) -> [u8; mem::size_of::<RowId>()] {
     row_id.to_be_bytes()
 }
 
+/// Returns the byte length of the given data type. Only works with integers.
 pub(crate) fn byte_length_of_integer_type(data_type: &DataType) -> usize {
     match data_type {
         DataType::Int | DataType::UnsignedInt => 4,
@@ -29,6 +79,7 @@ pub(crate) fn byte_length_of_integer_type(data_type: &DataType) -> usize {
     }
 }
 
+/// Calculates the size that the given tuple would take on disk once serialized.
 pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
     schema
         .columns
@@ -54,6 +105,7 @@ pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
         .sum()
 }
 
+/// See the module level documentation for the serialization format.
 pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
     debug_assert_eq!(
         schema.len(),
@@ -105,6 +157,7 @@ pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
     buf
 }
 
+/// See the module level documentation for the serialization format.
 pub(crate) fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
     let mut values = Vec::new();
     let mut cursor = 0;

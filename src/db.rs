@@ -43,6 +43,10 @@ pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
 /// beginning of each tuple.
+///
+/// The big endian format allows for fast memcmp() comparisons where we don't
+/// need to parse or cast the integer to compare it to another one. This idea
+/// was of course stolen from SQLite.
 pub(crate) type RowId = u64;
 
 /// Main entry point to everything.
@@ -255,6 +259,22 @@ impl From<Vec<Column>> for Schema {
     }
 }
 
+/// This only exists because in earlier development stages the iterator model
+/// was not yet implemented.
+///
+/// Without the iterator model we coudn't process tuples one at a time, we had
+/// to collect them all at once and process them after that. So all tests in
+/// this module (quite a few at this point) were written using this struct for
+/// `assert_eq` comparisons.
+///
+/// Right now we're only using this struct to collect the results of a query
+/// in memory, which of course is not ideal because they may not fit in memory.
+/// But it's good enough for tests and for returning data in the `main.rs` file.
+///
+/// Since we have the capability of processing tuples one at a time we could
+/// probably stream them through the network one by one or in chunks, so clients
+/// could issue queries that don't fit in the server's memory and still obtain
+/// all the results. Again, that's an optimization for another day :)
 #[derive(Debug, PartialEq)]
 pub(crate) struct Projection {
     pub schema: Schema,
@@ -417,6 +437,8 @@ impl Context {
     }
 }
 
+// Mainly used for mocks in tests to avoid passing the entire database around
+// and debugging mutual recursive calls.
 #[cfg(test)]
 impl TryFrom<&[&str]> for Context {
     type Error = DbError;
