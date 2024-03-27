@@ -220,15 +220,22 @@ mod windows {
 
     impl Open for OpenOptions {
         fn open(mut self, path: impl AsRef<Path>) -> io::Result<File> {
-            if self.lock {
-                self.inner.share_mode(0);
-            }
+            let mut flags = FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0);
 
             if self.bypass_cache {
-                let flags =
-                    FileSystem::FILE_FLAG_NO_BUFFERING | FileSystem::FILE_FLAG_WRITE_THROUGH;
+                flags |= FileSystem::FILE_FLAG_NO_BUFFERING;
+            }
 
+            if self.sync_on_write {
+                flags |= FileSystem::FILE_FLAG_WRITE_THROUGH;
+            }
+
+            if flags.0 != 0 {
                 self.inner.custom_flags(flags.0);
+            }
+
+            if self.lock {
+                self.inner.share_mode(0);
             }
 
             self.inner.open(path)
