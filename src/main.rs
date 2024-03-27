@@ -36,11 +36,11 @@ use crate::{db::Database, pool::ThreadPool};
 fn main() -> Result<(), DbError> {
     let file = env::args().nth(1).expect("database file not provided");
 
-    let listener = TcpListener::bind("127.0.0.1:8000")?;
-    println!("Listening on 8000");
-
     let db = &*Box::leak(Box::new(Mutex::new(Database::init(file)?)));
     let pool = ThreadPool::new(8);
+
+    let listener = TcpListener::bind("127.0.0.1:8000")?;
+    println!("Listening on 8000");
 
     for stream in listener.incoming() {
         pool.execute(|| {
