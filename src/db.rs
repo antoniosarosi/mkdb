@@ -9,7 +9,6 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
-    os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     rc::Rc,
     usize,
@@ -81,6 +80,7 @@ impl Database<File> {
             .read(true)
             .write(true)
             .bypass_cache(true)
+            .sync_on_write(false)
             .lock(true)
             .open(&path)?;
 

@@ -25,29 +25,58 @@ pub(crate) struct Fs;
 impl Fs {
     /// See [`OpenOptions`].
     pub fn options() -> OpenOptions {
-        OpenOptions {
-            inner: File::options(),
-            bypass_cache: false,
-            lock: false,
-        }
+        OpenOptions::default()
     }
 }
 
 /// Just like [`fs::OpenOptions`] but with some additional options that are
 /// handled differently depending on the operating system.
+///
+/// See the resources below for some background.
+///
+/// Linux:
+/// - [What does O_DIRECT really mean?](https://stackoverflow.com/questions/41257656/what-does-o-direct-really-mean)
+/// - [O_SYNC VS O_DSYNC](https://www.linuxquestions.org/questions/linux-general-1/o_sync-vs-o_dsync-4175616852/)
+/// - [How are the O_SYNC and O_DIRECT flags in open(2) different/alike?](https://stackoverflow.com/questions/5055859/how-are-the-o-sync-and-o-direct-flags-in-open2-different-alike)
+/// - [open(2) man page](https://man7.org/linux/man-pages/man2/open.2.html)
+///
+/// Windows:
+/// - [CreateFileA function parameters](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea#parameters)
+/// - [CreateFile with FILE_FLAG_NO_BUFFERING but not FILE_FLAG_WRITE_THROUGH](https://stackoverflow.com/questions/51315745/createfile-with-file-flag-no-buffering-but-not-file-flag-write-through)
+/// - [On the interaction between the FILE_FLAG_NO_BUFFERING and FILE_FLAG_WRITE_THROUGH flags](https://devblogs.microsoft.com/oldnewthing/20210729-00/?p=105494)
+/// - [How Postgres uses Windows flags](https://github.com/postgres/postgres/blob/a767cdc84c9a4cba1f92854de55fb8b5f2de4598/src/port/open.c#L84-L100)
 pub(crate) struct OpenOptions {
     /// Inner [`std::fs::OpenOptions`] instance.
     inner: fs::OpenOptions,
     /// Bypasses OS cache.
     bypass_cache: bool,
+    /// When calling write() makes sure that data reaches disk before returning.
+    sync_on_write: bool,
     /// Locks the file exclusively for the calling process.
     lock: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            inner: File::options(),
+            bypass_cache: false,
+            sync_on_write: false,
+            lock: false,
+        }
+    }
 }
 
 impl OpenOptions {
     /// Disables the OS cache for reads and writes.
     pub fn bypass_cache(mut self, bypass_cache: bool) -> Self {
         self.bypass_cache = bypass_cache;
+        self
+    }
+
+    /// Every call to write() will make sure that the data reaches the disk.
+    pub fn sync_on_write(mut self, sync_on_write: bool) -> Self {
+        self.sync_on_write = sync_on_write;
         self
     }
 
@@ -89,25 +118,51 @@ mod unix {
     use std::{
         fs::File,
         io,
-        os::{fd::AsRawFd, unix::prelude::MetadataExt},
+        os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, prelude::MetadataExt},
+        },
         path::Path,
     };
 
-    use super::{Fs, Os};
+    use super::{DiskBlockSize, Fs, Open, OpenOptions};
 
     impl DiskBlockSize for Fs {
         fn disk_block_size(path: impl AsRef<Path>) -> io::Result<usize> {
             Ok(File::open(&path)?.metadata()?.blksize() as usize)
         }
+    }
 
-        fn lock(file: &File) -> io::Result<()> {
-            let lock = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    impl Open for OpenOptions {
+        fn open(mut self, path: impl AsRef<Path>) -> io::Result<File> {
+            let mut flags = 0;
 
-            if lock != 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, "could not lock file"));
+            if self.bypass_cache {
+                flags |= libc::O_DIRECT;
             }
 
-            Ok(())
+            if self.sync_on_write {
+                flags |= libc::O_DSYNC;
+            }
+
+            if flags != 0 {
+                self.inner.custom_flags(flags);
+            }
+
+            let file = self.inner.open(&path)?;
+
+            if self.lock {
+                let lock = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+
+                if lock != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("could not lock file {}", path.as_ref().display()),
+                    ));
+                }
+            }
+
+            Ok(file)
         }
     }
 }
