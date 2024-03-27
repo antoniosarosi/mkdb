@@ -58,8 +58,18 @@ pub(crate) struct Database<F> {
     /// Working directory (the directory of the file).
     pub work_dir: PathBuf,
     /// `true` if we are currently in a transaction.
-    transaction_started: bool,
+    pub transaction_started: bool,
 }
+
+/// Not really "Send" because of the [`Rc<RefCell>`], but we put the entire
+/// database behind a mutex when working with it in the "main.rs" file and we
+/// take care of not unlocking the database until `transaction_started` is
+/// false. We could probably build a specific struct that wraps the Database
+/// and does all this, but what we really should do instead is make the program
+/// actually multithreaded. We can support multiple readers while only allowing
+/// one writer. Of course, easier said than done, that's why we're using a
+/// Mutex :)
+unsafe impl Send for Database<File> {}
 
 impl Database<File> {
     /// Initializes a [`Database`] instance from the given file.

@@ -14,6 +14,7 @@
 mod db;
 mod os;
 mod paging;
+mod pool;
 mod query;
 mod sql;
 mod storage;
@@ -21,13 +22,16 @@ mod vm;
 
 use std::{
     env,
+    fs::File,
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+    thread,
 };
 
 use db::{DbError, Projection};
 
-use crate::db::Database;
+use crate::{db::Database, pool::ThreadPool};
 
 fn main() -> Result<(), DbError> {
     let file = env::args().nth(1).expect("database file not provided");
@@ -35,58 +39,105 @@ fn main() -> Result<(), DbError> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     println!("Listening on 8000");
 
-    let mut db = Database::init(file)?;
+    let db = &*Box::leak(Box::new(Mutex::new(Database::init(file)?)));
+    let pool = ThreadPool::new(8);
 
     for stream in listener.incoming() {
-        let stream = &mut stream.unwrap();
-        let conn = stream.peer_addr().unwrap().to_string();
-        println!("Connection from {}", conn);
-
-        let prompt = "mkdb> ";
-
-        stream.write_all(
-            format!("Welcome to the MKDB 'shell' (not really a shell). Type SQL statements below or 'quit' to exit the program.\n\n{prompt}")
-                .as_bytes(),
-        )?;
-
-        let mut statement = String::new();
-
-        let exit_command = "quit";
-
-        while let Some(byte) = stream.bytes().next() {
-            let Ok(byte) = byte else {
-                println!("Close {conn} connection");
-                break;
-            };
-
-            statement.push(byte.into());
-
-            if statement.len() >= exit_command.len()
-                && &statement[statement.len() - exit_command.len()..] == exit_command
-            {
-                println!("Close {conn} connection");
-                stream.write_all("Closing connection\n".as_bytes())?;
-                break;
+        pool.execute(|| {
+            if let Err(e) = handle_client(&mut stream.unwrap(), db) {
+                eprintln!(
+                    "error on thread {:?} while processing connection: {e:?}",
+                    thread::current().id()
+                )
             }
+        });
+    }
 
-            if byte == b';' {
-                let _ = match db.exec(&statement) {
-                    Ok(projection) => {
-                        if projection.schema.columns.is_empty() {
-                            let rows_affected = projection.results.len();
-                            stream
-                                .write_all(format!("OK, {rows_affected} rows affected").as_bytes())
-                        } else {
-                            stream.write_all(ascii_table(projection).as_bytes())
-                        }
-                    }
+    Ok(())
+}
 
-                    Err(e) => stream.write_all(e.to_string().as_bytes()),
-                };
-                stream.write_all(format!("\n{prompt}").as_bytes()).unwrap();
-                statement = String::new();
-            }
+fn handle_client(
+    stream: &mut TcpStream,
+    db: &'static Mutex<Database<File>>,
+) -> Result<(), DbError> {
+    let conn = stream.peer_addr().unwrap().to_string();
+    println!("Connection from {}", conn);
+
+    let prompt = "mkdb> ";
+
+    stream.write_all(
+        format!("Welcome to the MKDB 'shell' (not really a shell). Type SQL statements below or 'quit' to exit the program.\n\n{prompt}")
+            .as_bytes(),
+    )?;
+
+    let mut statement = String::new();
+
+    let exit_command = "quit";
+
+    // Db mutext guard. We'll set it to Some once we acquire it and then set it
+    // back to None when the transaction ends.
+    let mut guard = None;
+
+    while let Some(byte) = stream.bytes().next() {
+        let Ok(byte) = byte else {
+            println!("Close {conn} connection");
+            break;
+        };
+
+        statement.push(byte.into());
+
+        if statement.len() >= exit_command.len()
+            && &statement[statement.len() - exit_command.len()..] == exit_command
+        {
+            println!("Close {conn} connection");
+            stream.write_all("Closing connection\n".as_bytes())?;
+            break;
         }
+
+        // Keep reading bytes until we find the SQL statement terminator and we
+        // can actually do something.
+        if byte != b';' {
+            continue;
+        }
+
+        // We don't have a guard, try to acquire one.
+        if guard.is_none() {
+            guard = match db.try_lock() {
+                Ok(guard) => Some(guard),
+
+                Err(_) => {
+                    stream.write_all(
+                        "database is locked by another connection, blocking until we can acquire the lock...\n"
+                            .as_bytes(),
+                    )?;
+                    Some(db.lock().unwrap())
+                }
+            };
+        }
+
+        let lock = guard.as_mut().unwrap();
+
+        match lock.exec(&statement) {
+            Ok(projection) => {
+                if projection.schema.columns.is_empty() {
+                    let rows_affected = projection.results.len();
+                    stream.write_all(format!("OK, {rows_affected} rows affected").as_bytes())?;
+                } else {
+                    stream.write_all(ascii_table(projection).as_bytes())?;
+                }
+            }
+
+            Err(e) => stream.write_all(e.to_string().as_bytes())?,
+        };
+
+        // We only drop the Mutex guard when the transaction ends. Otherwise we
+        // keep the database locked so no other threads can access.
+        if !lock.transaction_started {
+            drop(guard.take());
+        }
+
+        stream.write_all(format!("\n{prompt}").as_bytes()).unwrap();
+        statement = String::new();
     }
 
     Ok(())
