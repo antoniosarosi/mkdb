@@ -3,7 +3,7 @@
 Toy database implemented for learning purposes. Almost all of the implementation
 ideas come from these resources:
 
-- [SQLite 2.X.X source code](https://github.com/antoniosarosi/sqlite2-btree-visualizer)
+- [SQLite 2.8.1 source code](https://github.com/antoniosarosi/sqlite2-btree-visualizer)
 - [CMU Intro to Database Systems 2023](https://www.youtube.com/playlist?list=PLSE8ODhjZXjbj8BMuIrRcacnQh20hmY9g)
 - [CMU Intro to Database Systems 2018](https://www.youtube.com/playlist?list=PLSE8ODhjZXja3hgmuwhf89qboV1kOxMx7)
 
@@ -24,11 +24,21 @@ Use `cargo` to compile the project:
 cargo +nightly build
 ```
 
-Alternatively, set your default toolchaing to `nightly` to avoid specifying
+Alternatively, set your default toolchain to `nightly` to avoid specifying
 `+nightly` for every `cargo` command:
 
 ```bash
 rustup default nightly
+```
+
+## Compiler Version
+
+If you see any compilation errors it's probably because of the compiler
+version. Run `rustc +nightly --version` and compare the output to the last
+version used to compile and test the project:
+
+```
+rustc 1.78.0-nightly (9c3ad802d 2024-03-07)
 ```
 
 # Tests
@@ -42,8 +52,8 @@ cargo +nightly test
 
 ## Unsafe
 
-Most of the [unsafe](https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html)
-code is located in [`./src/storage/page.rs`](./src/paging/page.rs), which is the
+All the [unsafe](https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html) code
+is located in [`./src/storage/page.rs`](./src/paging/page.rs), which is the
 module that implements slotted pages. [`Miri`](https://github.com/rust-lang/miri)
 can be used to test possible undefined behaviour bugs. Install the component
 using `rustup`:
@@ -65,8 +75,35 @@ testing them with Miri as well:
 
 ```bash
 cargo +nightly miri test paging
-cargo +nightly miri test storage::btree::tests
+cargo +nightly miri test storage::btree
 ```
 
 If all these modules work correctly without UB then the rest of the codebase
-should be fine.
+should be fine. The ultimate UB test is the [`./src/db.rs`](./src/db.rs) module
+since it's the entry point to SQL execution so it makes use of every other
+module. It can be tested with Miri as well since tests are configured to run
+completely in memory without files or system calls:
+
+```bash
+cargo +nightly miri test db::tests
+```
+
+The rest of modules don't make any use of unsafe code so it's not necessary to
+test them with Miri.
+
+# Running The Program
+
+Use `cargo +nightly run -- file.db` to start the server on port `8000` (not yet
+configurable, should be a parameter like the file). `file.db` can be any empty
+file or a file previously managed by `mkdb`. It works like SQLite in that
+regard, the difference is that in order to use `mkdb` you have to connect to
+the server with some TCP client like `netcat`:
+
+```bash
+netcat 127.0.0.1 8000
+```
+
+It doesn't have a real "shell" where you can use arrow keys to cycle through
+previous commands and fancy stuff like that, this part is a little rough around
+the edges at this point. There is no network protocol for sending data back and
+forth either, we send raw strings.

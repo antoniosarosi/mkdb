@@ -375,6 +375,14 @@ pub(crate) struct BTree<'p, F, C> {
     root: PageNumber,
 
     /// Pager instance.
+    ///
+    /// TODO: Should be some owned value instead of a mutable reference but
+    /// [`std::cell::RefCell`] is anoying to use here because of recursion and
+    /// calls to functions that need the pager from other functions that also
+    /// need the pager. We can use it by dropping manually the
+    /// [`std::cell::RefMut`] instances whenever we know the next function call
+    /// will borrow the pager but that's just suboptimal. The pager should be
+    /// fully multithreaded and we could use an Arc or something here.
     pager: &'p mut Pager<F>,
 
     /// Bytes comparator used to obtain [`Ordering`] instances from binary data.
@@ -2362,9 +2370,9 @@ mod tests {
     use super::{BTree, Cursor, FixedSizeMemCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE};
     use crate::{
         paging::{
-            cache::{Cache, DEFAULT_MAX_CACHE_SIZE, MIN_CACHE_SIZE},
+            cache::{Cache, MIN_CACHE_SIZE},
             io::MemBuf,
-            pager::{PageNumber, Pager},
+            pager::{self, PageNumber, Pager},
         },
         storage::{
             btree::Payload,
@@ -2413,45 +2421,48 @@ mod tests {
         }
     }
 
+    fn init_pager(builder: pager::Builder) -> io::Result<Pager<MemBuf>> {
+        let mut pager = builder.wrap(io::Cursor::new(Vec::new()));
+        pager.init()?;
+
+        Ok(pager)
+    }
+
+    fn pager_with_page_size(page_size: usize) -> io::Result<Pager<MemBuf>> {
+        init_pager(Pager::<MemBuf>::builder().page_size(page_size))
+    }
+
+    fn pager_for_order(order: usize) -> io::Result<Pager<MemBuf>> {
+        pager_with_page_size(optimal_page_size_for_order(order))
+    }
+
+    fn default_test_pager() -> io::Result<Pager<MemBuf>> {
+        pager_for_order(4)
+    }
+
     /// Test builder for [`BTree<'p, MemBuf, FixedSizeCmp>`].
-    struct Builder {
+    struct TestBuilder {
         keys: Vec<Key>,
-        order: usize,
-        page_size: Option<usize>,
         root_at_zero: bool,
         balance_siblings_per_side: usize,
-        cache_size: usize,
         minimum_keys: usize,
     }
 
-    impl Default for Builder {
+    impl Default for TestBuilder {
         fn default() -> Self {
-            Builder {
+            TestBuilder {
                 keys: vec![],
-                order: 4,
-                page_size: None,
                 root_at_zero: false,
                 balance_siblings_per_side: DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
-                cache_size: DEFAULT_MAX_CACHE_SIZE,
                 // We use small page sizes for tests which don't allow many keys
                 minimum_keys: 1,
             }
         }
     }
 
-    impl Builder {
+    impl TestBuilder {
         fn keys(mut self, keys: impl IntoIterator<Item = Key>) -> Self {
             self.keys = keys.into_iter().collect();
-            self
-        }
-
-        fn order(mut self, order: usize) -> Self {
-            self.order = order;
-            self
-        }
-
-        fn page_size(mut self, page_size: usize) -> Self {
-            self.page_size = Some(page_size);
             self
         }
 
@@ -2465,24 +2476,10 @@ mod tests {
             self
         }
 
-        fn cache_size(mut self, cache_size: usize) -> Self {
-            self.cache_size = cache_size;
-            self
-        }
-
-        fn try_build<'p>(self) -> io::Result<BTree<'p, MemBuf, FixedSizeMemCmp>> {
-            let page_size = self
-                .page_size
-                .unwrap_or(optimal_page_size_for_order(self.order));
-            let buf = io::Cursor::new(Vec::new());
-
-            let mut pager = Pager::<MemBuf>::builder()
-                .page_size(page_size)
-                .cache(Cache::builder().max_size(self.cache_size).build())
-                .wrap(buf);
-
-            pager.init()?;
-
+        fn on<'p>(
+            self,
+            pager: &'p mut Pager<MemBuf>,
+        ) -> io::Result<BTree<'p, MemBuf, FixedSizeMemCmp>> {
             let root = if self.root_at_zero {
                 0
             } else {
@@ -2491,7 +2488,7 @@ mod tests {
 
             // TODO: Do something about leaking, we shouldn't need that here.
             let mut btree = BTree {
-                pager: Box::leak(Box::new(pager)),
+                pager,
                 root,
                 balance_siblings_per_side: self.balance_siblings_per_side,
                 comparator: FixedSizeMemCmp::for_type::<Key>(),
@@ -2524,8 +2521,8 @@ mod tests {
             Ok(node)
         }
 
-        fn builder() -> Builder {
-            Builder::default()
+        fn test() -> TestBuilder {
+            TestBuilder::default()
         }
 
         fn insert_key(&mut self, key: Key) -> io::Result<()> {
@@ -2599,7 +2596,8 @@ mod tests {
     /// ```
     #[test]
     fn fill_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=3).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=3).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node::leaf([1, 2, 3]));
 
@@ -2630,7 +2628,8 @@ mod tests {
     /// ```
     #[test]
     fn split_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=4).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=4).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![3],
@@ -2668,7 +2667,8 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_split() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=7).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=7).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![4],
@@ -2706,7 +2706,8 @@ mod tests {
     /// ```
     #[test]
     fn split_leaf_node() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=8).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=8).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![3, 6],
@@ -2730,7 +2731,8 @@ mod tests {
     /// ```
     #[test]
     fn basic_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=15).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=15).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![4, 8, 12],
@@ -2777,7 +2779,8 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_root() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=16).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=16).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![11],
@@ -2837,7 +2840,8 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_split() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=27).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=27).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![15],
@@ -2902,7 +2906,8 @@ mod tests {
     /// ```
     #[test]
     fn propagate_split_to_internal_nodes() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=31).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=31).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![11, 23],
@@ -2955,7 +2960,8 @@ mod tests {
     /// ```
     #[test]
     fn sequential_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=46).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=46).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![15, 31],
@@ -3020,7 +3026,8 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_leaf_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=15).on(pager)?;
 
         btree.remove_key(13)?;
 
@@ -3073,7 +3080,8 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_internal_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=16).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=16).on(pager)?;
 
         btree.remove_key(8)?;
 
@@ -3133,7 +3141,8 @@ mod tests {
     /// ```
     #[test]
     fn delete_from_root() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=16).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=16).on(pager)?;
 
         btree.remove_key(11)?;
 
@@ -3195,7 +3204,8 @@ mod tests {
     /// ```
     #[test]
     fn delete_using_successor_instead_of_predecessor() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=26).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=26).on(pager)?;
 
         btree.remove_key(11)?;
 
@@ -3264,7 +3274,8 @@ mod tests {
     /// ```
     #[test]
     fn delay_leaf_node_merge() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=15).on(pager)?;
 
         btree.try_remove_all_keys((14..=15).rev())?;
 
@@ -3320,7 +3331,8 @@ mod tests {
     /// ```
     #[test]
     fn merge_leaf_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=15).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=15).on(pager)?;
 
         btree.try_remove_all_keys((12..=15).rev())?;
 
@@ -3360,7 +3372,8 @@ mod tests {
     /// ```
     #[test]
     fn merge_root() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=4).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=4).on(pager)?;
 
         btree.remove_key(4)?;
 
@@ -3400,7 +3413,8 @@ mod tests {
     /// ```
     #[test]
     fn decrease_tree_height() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=16).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=16).on(pager)?;
 
         btree.try_remove_all_keys(15..=16)?;
 
@@ -3452,7 +3466,8 @@ mod tests {
     /// ```
     #[test]
     fn delay_internal_node_merge() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=35).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=35).on(pager)?;
 
         btree.try_remove_all_keys(1..=3)?;
 
@@ -3539,7 +3554,8 @@ mod tests {
     /// ```
     #[test]
     fn merge_internal_node() -> io::Result<()> {
-        let mut btree = BTree::builder().keys(1..=35).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().keys(1..=35).on(pager)?;
 
         btree
             .try_remove_all_keys(1..=3)
@@ -3606,7 +3622,8 @@ mod tests {
     /// ```
     #[test]
     fn greater_order_insertion() -> io::Result<()> {
-        let btree = BTree::builder().order(6).keys(1..=36).try_build()?;
+        let pager = &mut pager_for_order(6)?;
+        let btree = BTree::test().keys(1..=36).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![24],
@@ -3667,7 +3684,8 @@ mod tests {
     /// ```
     #[test]
     fn greater_order_deletion() -> io::Result<()> {
-        let mut btree = BTree::builder().order(6).keys(1..=36).try_build()?;
+        let pager = &mut pager_for_order(6)?;
+        let mut btree = BTree::test().keys(1..=36).on(pager)?;
 
         btree.try_remove_all_keys(34..=36)?;
 
@@ -3715,10 +3733,12 @@ mod tests {
     /// ```
     #[test]
     fn increased_balance_siblings_per_side() -> io::Result<()> {
-        let mut btree = BTree::builder()
+        let pager = &mut default_test_pager()?;
+
+        let mut btree = BTree::test()
             .balance_siblings_per_side(2)
             .keys(1..=15)
-            .try_build()?;
+            .on(pager)?;
 
         btree.remove_key(3)?;
         btree.insert_key(16)?;
@@ -3754,7 +3774,8 @@ mod tests {
             align_upwards(space_needed as usize, MEM_ALIGNMENT)
         };
 
-        let mut btree = BTree::builder().page_size(page_size).try_build()?;
+        let pager = &mut pager_with_page_size(page_size)?;
+        let mut btree = BTree::test().on(pager)?;
 
         // This should fill the root page.
         for (i, size) in payload_sizes.iter().enumerate() {
@@ -3796,7 +3817,8 @@ mod tests {
             large_key.extend(&(0..=255).collect::<Vec<u8>>());
         }
 
-        let mut btree = BTree::builder().page_size(page_size).try_build()?;
+        let pager = &mut pager_with_page_size(page_size)?;
+        let mut btree = BTree::test().on(pager)?;
 
         btree.insert(large_key.clone())?;
 
@@ -3863,9 +3885,8 @@ mod tests {
         // header sizes don't mess up what we're trying to do here.
         let payload_size = 32;
 
-        let mut btree = BTree::builder()
-            .page_size(optimal_page_size_for_max_payload(payload_size, 5))
-            .try_build()?;
+        let pager = &mut pager_with_page_size(optimal_page_size_for_max_payload(payload_size, 5))?;
+        let mut btree = BTree::test().on(pager)?;
 
         for key in 1..=36 {
             btree.insert(serialize_key_of_size(key, payload_size))?;
@@ -3940,10 +3961,9 @@ mod tests {
     /// ```
     #[test]
     fn page_zero_root_basic_insertion() -> io::Result<()> {
-        let btree = BTree::builder()
-            .root_at_zero(true)
-            .keys(1..=15)
-            .try_build()?;
+        let pager = &mut default_test_pager()?;
+
+        let btree = BTree::test().root_at_zero(true).keys(1..=15).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![],
@@ -3982,10 +4002,9 @@ mod tests {
     /// same as [`propagate_split_to_root`].
     #[test]
     fn page_zero_insert_divider_in_empty_root() -> io::Result<()> {
-        let btree = BTree::builder()
-            .root_at_zero(true)
-            .keys(1..=16)
-            .try_build()?;
+        let pager = &mut default_test_pager()?;
+
+        let btree = BTree::test().root_at_zero(true).keys(1..=16).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![11],
@@ -4025,10 +4044,9 @@ mod tests {
     /// ```
     #[test]
     fn find_max_with_empty_root() -> io::Result<()> {
-        let mut btree = BTree::builder()
-            .root_at_zero(true)
-            .keys(1..=15)
-            .try_build()?;
+        let pager = &mut default_test_pager()?;
+
+        let mut btree = BTree::test().root_at_zero(true).keys(1..=15).on(pager)?;
 
         let max = btree.max()?.unwrap();
 
@@ -4039,10 +4057,9 @@ mod tests {
 
     #[test]
     fn page_zero_merge_all_nodes() -> io::Result<()> {
-        let mut btree = BTree::builder()
-            .root_at_zero(true)
-            .keys(1..=16)
-            .try_build()?;
+        let pager = &mut default_test_pager()?;
+
+        let mut btree = BTree::test().root_at_zero(true).keys(1..=16).on(pager)?;
 
         btree.try_remove_all_keys(2..=16)?;
 
@@ -4096,8 +4113,10 @@ mod tests {
     /// ```
     #[test]
     fn basic_cursor() -> io::Result<()> {
+        let pager = &mut pager_for_order(3)?;
+
         let keys = 1..=30;
-        let mut btree = BTree::builder().order(3).keys(keys.clone()).try_build()?;
+        let mut btree = BTree::test().keys(keys.clone()).on(pager)?;
 
         assert_cursor_traversal_matches(&mut btree, keys)
     }
@@ -4106,8 +4125,10 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn cursor_with_more_depth_and_keys() -> io::Result<()> {
+        let pager = &mut pager_for_order(6)?;
+
         let keys = 1..=400;
-        let mut btree = BTree::builder().order(6).keys(keys.clone()).try_build()?;
+        let mut btree = BTree::test().keys(keys.clone()).on(pager)?;
 
         assert_cursor_traversal_matches(&mut btree, keys)
     }
@@ -4129,19 +4150,23 @@ mod tests {
     /// ```
     #[test]
     fn cursor_on_empty_root_with_children() -> io::Result<()> {
+        let pager = &mut default_test_pager()?;
+
         let keys = 1..=15;
 
-        let mut btree = BTree::builder()
+        let mut btree = BTree::test()
             .root_at_zero(true)
             .keys(keys.clone())
-            .try_build()?;
+            .on(pager)?;
 
         assert_cursor_traversal_matches(&mut btree, keys)
     }
 
     #[test]
     fn cursor_on_empty_root_with_no_children() -> io::Result<()> {
-        let btree = BTree::builder().try_build()?;
+        let pager = &mut default_test_pager()?;
+
+        let btree = BTree::test().on(pager)?;
         let mut cursor = Cursor::new(btree.root, 0);
 
         assert!(cursor.next(btree.pager).is_none());
@@ -4153,7 +4178,11 @@ mod tests {
     /// still works in practice.
     #[test]
     fn cache_pressure() -> io::Result<()> {
-        let mut btree = BTree::builder().cache_size(MIN_CACHE_SIZE).try_build()?;
+        let pager = &mut init_pager(
+            Pager::<MemBuf>::builder().cache(Cache::with_max_size(MIN_CACHE_SIZE)),
+        )?;
+
+        let mut btree = BTree::test().on(pager)?;
 
         btree.try_insert_all_keys(1..=31)?;
         btree.try_remove_all_keys(2..=31)?;
@@ -4165,10 +4194,11 @@ mod tests {
 
     #[test]
     fn cache_pressure_with_page_zero() -> io::Result<()> {
-        let mut btree = BTree::builder()
-            .root_at_zero(true)
-            .cache_size(MIN_CACHE_SIZE)
-            .try_build()?;
+        let pager = &mut init_pager(
+            Pager::<MemBuf>::builder().cache(Cache::with_max_size(MIN_CACHE_SIZE)),
+        )?;
+
+        let mut btree = BTree::test().root_at_zero(true).on(pager)?;
 
         btree.try_insert_all_keys(1..=31)?;
         btree.try_remove_all_keys(2..=31)?;
@@ -4181,7 +4211,8 @@ mod tests {
     /// Same as [`basic_insertion`] but inserting in reverse order.
     #[test]
     fn reverse_order_basic_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys(1..=15).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys(1..=15).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![4, 8, 12],
@@ -4199,7 +4230,8 @@ mod tests {
     /// Same as [`propagate_split_to_root`] but reversing the order.
     #[test]
     fn reverse_order_insertion() -> io::Result<()> {
-        let btree = BTree::builder().keys((1..=16).rev()).try_build()?;
+        let pager = &mut default_test_pager()?;
+        let btree = BTree::test().keys((1..=16).rev()).on(pager)?;
 
         assert_eq!(Node::try_from(btree)?, Node {
             keys: vec![11],
@@ -4225,7 +4257,8 @@ mod tests {
     /// Same as [`basic_insertion`] but inserting more "randomly".
     #[test]
     fn random_order_basic_insertion() -> io::Result<()> {
-        let mut btree = BTree::builder().try_build()?;
+        let pager = &mut default_test_pager()?;
+        let mut btree = BTree::test().on(pager)?;
 
         btree.try_insert_all_keys([4, 2, 1, 3, 5])?;
         btree.try_insert_all_keys([11, 15, 13, 12, 14])?;

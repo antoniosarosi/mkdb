@@ -326,7 +326,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     pub fn rollback(&mut self) -> Result<usize, DbError> {
         // No-op if already open. Only necessary for the initial rollback on
         // startup.
-        self.journal.open()?;
+        self.journal.open_if_exists()?;
 
         let mut num_pages_rolled_back = 0;
         let mut journal_pages = self.journal.iter()?;
@@ -799,11 +799,15 @@ impl<F: FileOps> Journal<F> {
     }
 
     /// Opens the journal file if it exists and is not already open.
-    pub fn open(&mut self) -> io::Result<()> {
+    pub fn open_if_exists(&mut self) -> io::Result<()> {
         if self.file.is_some() {
             return Ok(());
         }
 
+        // Miri doesn't work with system calls. All the tests run in memory
+        // anyway and won't actually open any file. This is only needed when
+        // the program runs on top of a real file system.
+        #[cfg(not(miri))]
         if self.file_path.is_file() {
             self.file = Some(F::open(&self.file_path)?);
         }
