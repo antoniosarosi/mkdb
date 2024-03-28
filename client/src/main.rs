@@ -8,6 +8,8 @@ use mkdb::tcp::proto::Response;
 use rustyline::{error::ReadlineError, DefaultEditor};
 
 const EXIT_CMD: &str = "quit";
+const PROMPT: &str = "mkdb> ";
+const CONTINUATION_PROMPT: &str = "sql> ";
 
 fn main() -> rustyline::Result<()> {
     let port = env::args()
@@ -28,17 +30,28 @@ fn main() -> rustyline::Result<()> {
 
     let mut sql = String::new();
     let mut payload = Vec::new();
+    let mut prompt = PROMPT;
 
     loop {
-        let readline = rl.readline("mkdb> ");
+        let readline = rl.readline(prompt);
         match readline {
             Ok(line) => {
-                sql.push_str(&line.trim_end());
+                if sql.is_empty() && line.trim() == EXIT_CMD {
+                    break;
+                }
 
-                if !line.contains(";") {
+                if line.trim().is_empty() {
                     continue;
                 }
 
+                sql.push_str(&line.trim_end());
+
+                if !line.contains(";") {
+                    prompt = CONTINUATION_PROMPT;
+                    continue;
+                }
+
+                prompt = PROMPT;
                 rl.add_history_entry(&sql)?;
 
                 if !sql.ends_with(";") {
