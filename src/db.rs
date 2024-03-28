@@ -14,9 +14,8 @@ use std::{
 };
 
 use crate::{
-    os::{DiskBlockSize, Fs, Open},
+    os::{DiskBlockSize, Open},
     paging::{
-        self,
         io::FileOps,
         pager::{PageNumber, Pager},
     },
@@ -84,7 +83,7 @@ unsafe impl Send for Database<File> {}
 impl Database<File> {
     /// Initializes a [`Database`] instance from the given file.
     pub fn init(path: impl AsRef<Path>) -> Result<Self, DbError> {
-        let file = Fs::options()
+        let file = crate::os::Fs::options()
             .create(true)
             .truncate(false)
             .read(true)
@@ -100,7 +99,7 @@ impl Database<File> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file").into());
         }
 
-        let block_size = Fs::disk_block_size(&path)?;
+        let block_size = crate::os::Fs::disk_block_size(&path)?;
 
         let full_db_file_path = path.as_ref().canonicalize()?;
         let work_dir = full_db_file_path.parent().unwrap().to_path_buf();
@@ -380,6 +379,7 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
+    /// Returns the next [`RowId`] that should be used for rows in this table.
     pub fn next_row_id(&mut self) -> RowId {
         let row_id = self.row_id;
         self.row_id += 1;
@@ -797,7 +797,9 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 ///
 /// See [`vm::statement`].
 enum Exec<F> {
+    /// Statements that don't need any plans executed by [`vm::statement`].
     Statement(Statement),
+    /// Complex statements that require [`Plan`] trees executed by [`vm::plan`].
     Plan(Plan<F>),
 }
 

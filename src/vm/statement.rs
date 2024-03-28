@@ -113,17 +113,15 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 pager: Rc::clone(&db.pager),
             });
 
-            while let Some(mut tuple) = scan.try_next()? {
-                let mut pager = db.pager.borrow_mut();
+            let comparator = Box::<dyn BytesCmp>::from(&index.column.data_type);
 
-                // TODO: This allocates BytesCmp on every iteration. Can't put
-                // it outside of the loop because of the borrow_mut() call. The
-                // scan plan also borrows the pager with a mutable reference.
-                let mut btree = BTree::new(
-                    &mut pager,
-                    index.root,
-                    Box::<dyn BytesCmp>::from(&index.column.data_type),
-                );
+            while let Some(mut tuple) = scan.try_next()? {
+                // TODO: We have to borrow the pager and recreate the BTree on
+                // every iteration because the scan plan above already borrows
+                // the pager when we call .try_next(), so we can't create the
+                // BTree before starting the loop.
+                let mut pager = db.pager.borrow_mut();
+                let mut btree = BTree::new(&mut pager, index.root, &comparator);
 
                 let key = tuple.swap_remove(col);
                 let row_id = tuple.swap_remove(0);

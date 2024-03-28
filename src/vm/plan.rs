@@ -1581,5 +1581,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
     }
 }
 
-// TODO: Some tests would be nice here. We can use the [`Values`] plan as a base
-// for mocks that return any tuples we want.
+// TODO: All the code in this module is indirectly tested by
+// [`crate::db::tests`] but some specific tests would be nice here. We can use
+// the [`Values`] plan as a base for mocks that return any tuples we want and
+// build a little testing framework with that.

@@ -132,12 +132,6 @@ impl BytesCmp for StringCmp {
     }
 }
 
-impl BytesCmp for Box<dyn BytesCmp> {
-    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
-        self.as_ref().bytes_cmp(a, b)
-    }
-}
-
 impl From<&DataType> for Box<dyn BytesCmp> {
     /// Easy way to obtain a [`BytesCmp`] impl at runtime based on SQL data
     /// types.
@@ -146,6 +140,18 @@ impl From<&DataType> for Box<dyn BytesCmp> {
             DataType::Varchar(_) => Box::new(StringCmp(mem::size_of::<u32>())),
             fixed => Box::new(FixedSizeMemCmp(byte_length_of_integer_type(fixed))),
         }
+    }
+}
+
+impl BytesCmp for &Box<dyn BytesCmp> {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        self.as_ref().bytes_cmp(a, b)
+    }
+}
+
+impl BytesCmp for Box<dyn BytesCmp> {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        self.as_ref().bytes_cmp(a, b)
     }
 }
 
