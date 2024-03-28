@@ -12,7 +12,7 @@ use std::{
 
 use super::optimizer::generate_scan_plan;
 use crate::{
-    db::{Database, DatabaseContext, DbError, Schema},
+    db::{Database, DatabaseContext, DbError, Schema, SqlError},
     paging,
     sql::{
         analyzer,
@@ -66,18 +66,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 let mut sort_schema = metadata.schema.clone();
 
                 for (i, expr) in order_by.iter().enumerate() {
-                    let mut col = Column::new(&format!("sort_key_{i}"), DataType::BigInt);
-
-                    match analyzer::analyze_expression(&metadata.schema, expr)? {
-                        VmDataType::Bool => col.data_type = DataType::Bool,
-                        // TODO: What should we do with strings longer than u16::MAX?
-                        VmDataType::String => col.data_type = DataType::Varchar(65535),
-                        // TODO: Numbers are BigInt by default. We can figure out if the
-                        // expression that generated the number contains some column
-                        // identifier and use that type instead. But this does the job
-                        // for now.
-                        _ => {}
-                    }
+                    let data_type = resolve_unknown_type(&metadata.schema, expr)?;
+                    let col = Column::new(&format!("sort_key_{i}"), data_type);
                     sort_schema.push(col);
                 }
 
@@ -106,9 +96,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             }
 
             let mut output_schema = Schema::empty();
-            let mut unknown_types = Vec::new();
 
-            for (i, expr) in columns.iter().enumerate() {
+            for expr in &columns {
                 match expr {
                     Expression::Identifier(ident) => output_schema.push(
                         metadata.schema.columns[metadata.schema.index_of(ident).unwrap()].clone(),
@@ -116,30 +105,11 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
                     _ => {
                         output_schema.push(Column {
-                            name: expr.to_string(),    // TODO: AS alias
-                            data_type: DataType::Bool, // We'll set it later
+                            name: expr.to_string(), // TODO: AS alias
+                            data_type: resolve_unknown_type(&metadata.schema, expr)?,
                             constraints: vec![],
                         });
-
-                        unknown_types.push(i);
                     }
-                }
-            }
-
-            // TODO: There are no expressions that can evaluate to strings as of
-            // right now and we set the default to be bool. So if there's an
-            // expression that evaluates to a number we'll change its type. The
-            // problem is that we don't know the exact kind of number, an expression
-            // with a raw value like 4294967296 should evaluate to UnsignedBigInt
-            // but -65536 should probably evaluate to Int. Expressions that have
-            // identifiers in them should probably evaluate to the type of the
-            // identifier. Not gonna worry about this for now, this is a toy
-            // database after all :)
-            for i in unknown_types {
-                if let VmDataType::Number =
-                    analyzer::analyze_expression(&metadata.schema, &columns[i]).unwrap()
-                {
-                    output_schema.columns[i].data_type = DataType::BigInt;
                 }
             }
 
@@ -183,5 +153,36 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
         }
 
         other => todo!("unhandled statement {other}"),
+    })
+}
+
+/// Returns a concrete [`DataType`] for an expression that hasn't been executed
+/// yet.
+///
+/// TODO: There are no expressions that can evaluate to strings as of right now
+/// since we didn't implement `CONCAT()` or any other similar function, so
+/// strings can only come from identifiers. The [`analyzer`] should never return
+/// [`VmDataType::String`], so it doesn't matter what type we return in that
+/// case.
+///
+/// The real problem is when expressions evaluate to numbers becase we don't
+/// know the exact kind of number. An expression with a raw value like
+/// 4294967296 should evaluate to [`DataType::UnsignedBigInt`] but -65536 should
+/// probably evaluate to [`DataType::Int`]. Expressions that have identifiers in
+/// them should probably evaluate to the type of the identifier, but what if
+/// there are multiple identifiers of different integer types? Not gonna worry
+/// about this for now, this is a toy database after all :)
+fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, SqlError> {
+    Ok(match expr {
+        Expression::Identifier(col) => {
+            let index = schema.index_of(col).unwrap();
+            schema.columns[index].data_type
+        }
+
+        _ => match analyzer::analyze_expression(schema, expr)? {
+            VmDataType::Bool => DataType::Bool,
+            VmDataType::Number => DataType::BigInt,
+            VmDataType::String => DataType::Varchar(65535),
+        },
     })
 }
