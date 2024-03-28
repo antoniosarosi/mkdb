@@ -21,7 +21,6 @@ fn main() -> rustyline::Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     println!("Welcome to the MKDB shell. Type SQL statements below or '{EXIT_CMD}' to exit the program.\n");
 
-    // `()` can be used when no completer is required
     let mut rl = DefaultEditor::new()?;
     #[cfg(feature = "with-file-history")]
     if rl.load_history("history.txt").is_err() {
@@ -33,68 +32,76 @@ fn main() -> rustyline::Result<()> {
     let mut prompt = PROMPT;
 
     loop {
-        let readline = rl.readline(prompt);
-        match readline {
-            Ok(line) => {
-                if sql.is_empty() && line.trim() == EXIT_CMD {
-                    break;
+        let line = match rl.readline(prompt) {
+            Ok(line) => line,
+
+            Err(e) => {
+                match e {
+                    ReadlineError::Interrupted => println!("CTRL-C"),
+                    ReadlineError::Eof => println!("CTRL-D"),
+                    other => println!("Error: {other:?}"),
                 }
 
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                sql.push_str(&line.trim_end());
-
-                if !line.contains(";") {
-                    prompt = CONTINUATION_PROMPT;
-                    continue;
-                }
-
-                prompt = PROMPT;
-                rl.add_history_entry(&sql)?;
-
-                if !sql.ends_with(";") {
-                    sql.clear();
-                    println!("Only one SQL statement at a time terminated with ';' can be sent");
-                    continue;
-                }
-
-                stream.write_all(sql.as_bytes())?;
-                sql.clear();
-
-                let mut payload_len_buf = [0; 4];
-                stream.read_exact(&mut payload_len_buf)?;
-                let payload_len = u32::from_le_bytes(payload_len_buf) as usize;
-
-                payload.resize(payload_len, 0);
-                stream.read_exact(&mut payload)?;
-
-                match mkdb::tcp::proto::deserialize(&payload) {
-                    Ok(response) => match response {
-                        Response::EmptySet(affected_rows) => {
-                            println!("Query OK, {affected_rows} rows affected")
-                        }
-                        Response::Err(e) => println!("{e}"),
-                        Response::Projection(projection) => println!("{}", ascii_table(projection)),
-                    },
-
-                    Err(e) => println!("decode error: {e}"),
-                };
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
                 break;
             }
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
-                break;
-            }
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break;
-            }
+        };
+
+        // quit
+        if sql.is_empty() && line.trim() == EXIT_CMD {
+            break;
         }
+
+        // Empty line, nothing to do.
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Keep line breaks to avoid syntax errors.
+        if !sql.is_empty() {
+            sql.push('\n');
+        }
+        sql.push_str(&line);
+
+        // Statement is not complete.
+        if !line.contains(";") {
+            prompt = CONTINUATION_PROMPT;
+            continue;
+        }
+
+        // Now we have a full statement, add it to the history and reset prompt.
+        prompt = PROMPT;
+        rl.add_history_entry(&sql)?;
+
+        if !sql.ends_with(";") {
+            sql.clear();
+            println!("Only one SQL statement at a time terminated with ';' can be sent");
+            continue;
+        }
+
+        // Send the statement to the server.
+        stream.write_all(sql.as_bytes())?;
+        sql.clear();
+
+        // Read header.
+        let mut payload_len_buf = [0; 4];
+        stream.read_exact(&mut payload_len_buf)?;
+        let payload_len = u32::from_le_bytes(payload_len_buf) as usize;
+
+        // Read payload.
+        payload.resize(payload_len, 0);
+        stream.read_exact(&mut payload)?;
+
+        match mkdb::tcp::proto::deserialize(&payload) {
+            Ok(response) => match response {
+                Response::EmptySet(affected_rows) => {
+                    println!("Query OK, {affected_rows} rows affected")
+                }
+                Response::Err(e) => println!("{e}"),
+                Response::Projection(projection) => println!("{}", ascii_table(projection)),
+            },
+
+            Err(e) => println!("decode error: {e}"),
+        };
     }
 
     #[cfg(feature = "with-file-history")]
