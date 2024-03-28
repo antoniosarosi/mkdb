@@ -97,7 +97,7 @@ fn main() -> rustyline::Result<()> {
                     println!("Query OK, {affected_rows} rows affected")
                 }
                 Response::Err(e) => println!("{e}"),
-                Response::Projection(projection) => println!("{}", ascii_table(projection)),
+                Response::QuerySet(collection) => println!("{}", ascii_table(collection)),
             },
 
             Err(e) => println!("decode error: {e}"),
@@ -109,18 +109,18 @@ fn main() -> rustyline::Result<()> {
     Ok(())
 }
 
-fn ascii_table(projection: mkdb::Projection) -> String {
+fn ascii_table(query: mkdb::QuerySet) -> String {
     // Initialize width of each column to the length of the table headers.
-    let mut widths: Vec<usize> = projection
+    let mut widths: Vec<usize> = query
         .schema
         .columns
         .iter()
-        .map(|col| col.name.len())
+        .map(|col| col.name.chars().count())
         .collect();
 
     // We only need strings.
-    let rows: Vec<Vec<String>> = projection
-        .results
+    let rows: Vec<Vec<String>> = query
+        .tuples
         .iter()
         .map(|row| row.iter().map(ToString::to_string).collect())
         .collect();
@@ -168,7 +168,7 @@ fn ascii_table(projection: mkdb::Projection) -> String {
     table.push('\n');
 
     table.push_str(&make_row(
-        &projection
+        &query
             .schema
             .columns
             .iter()

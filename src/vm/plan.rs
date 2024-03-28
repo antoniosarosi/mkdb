@@ -99,8 +99,8 @@ pub(crate) enum Plan<F> {
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
 // [`enum_dispatch`](https://docs.rs/enum_dispatch/) here to automate the match
-// statement or switch to Box<dyn Iterator<Item = Result<Projection, DbError>>>
-// but that's even more verbose than this and requires F: 'static everywhere. We
+// statement or switch to Box<dyn Iterator<Item = Result<Tuple, DbError>>> but
+// that's even more verbose than this and requires F: 'static everywhere. We
 // also woudn't know the type of a plan because dyn Trait doesn't have a tag. So
 // match it for now :)
 impl<F: Seek + Read + Write + FileOps> Plan<F> {
@@ -289,7 +289,8 @@ impl<F: Seek + Read + Write + FileOps> Filter<F> {
 
 /// Applies a projection to a tuple.
 ///
-/// In simple words, it "selects" columns from a row. For example:
+/// A "projection" is a relation algebra unary operation which, in simple words,
+/// "selects" columns from a row. For example:
 ///
 /// ```sql
 /// CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);

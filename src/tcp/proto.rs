@@ -58,9 +58,9 @@
 //!   4 bytes   1 byte  2 bytes         27 bytes
 //! ```
 //!
-//! ## Projection
+//! ## Query Set
 //!
-//! [`Response::Projection`] includes the schema of the returned values and
+//! [`Response::QuerySet`] includes the schema of the returned values and
 //! the returned values themselves. The prefix for this variant is `+`.
 //! Following the prefix there's a 2 byte little endian integer that encodes
 //! the number of columns in the schema. After that, columns are serialized in
@@ -141,7 +141,7 @@
 use std::{array::TryFromSliceError, fmt, num::TryFromIntError, string::FromUtf8Error};
 
 use crate::{
-    db::{DbError, Projection},
+    db::{DbError, QuerySet},
     sql::statement::{Column, DataType},
     storage::tuple,
 };
@@ -191,17 +191,17 @@ impl fmt::Display for EncodingError {
 pub enum Response {
     EmptySet(usize),
     Err(String),
-    Projection(Projection),
+    QuerySet(QuerySet),
 }
 
-impl From<Result<Projection, DbError>> for Response {
-    fn from(result: Result<Projection, DbError>) -> Self {
+impl From<Result<QuerySet, DbError>> for Response {
+    fn from(result: Result<QuerySet, DbError>) -> Self {
         match result {
-            Ok(projection) if projection.schema.columns.is_empty() => {
-                Response::EmptySet(projection.results.len())
+            Ok(empty_set) if empty_set.schema.columns.is_empty() => {
+                Response::EmptySet(empty_set.tuples.len())
             }
 
-            Ok(projection) => Response::Projection(projection),
+            Ok(query_set) => Response::QuerySet(query_set),
 
             Err(e) => Response::Err(e.to_string()),
         }
@@ -225,10 +225,10 @@ pub fn serialize(payload: &Response) -> Result<Vec<u8>, EncodingError> {
             packet.extend_from_slice(&(u32::try_from(*affected_rows)?).to_le_bytes());
         }
 
-        Response::Projection(projection) => {
+        Response::QuerySet(query_set) => {
             packet.push(b'+');
-            packet.extend_from_slice(&(u16::try_from(projection.schema.len())?).to_le_bytes());
-            for col in &projection.schema.columns {
+            packet.extend_from_slice(&(u16::try_from(query_set.schema.len())?).to_le_bytes());
+            for col in &query_set.schema.columns {
                 packet.extend_from_slice(&(u16::try_from(col.name.len())?).to_le_bytes());
                 packet.extend_from_slice(col.name.as_bytes());
                 packet.push(match col.data_type {
@@ -240,9 +240,9 @@ pub fn serialize(payload: &Response) -> Result<Vec<u8>, EncodingError> {
                     DataType::Varchar(_) => 5,
                 });
             }
-            packet.extend_from_slice(&(u32::try_from(projection.results.len())?).to_le_bytes());
-            for tuple in &projection.results {
-                packet.extend_from_slice(&tuple::serialize(&projection.schema, tuple));
+            packet.extend_from_slice(&(u32::try_from(query_set.tuples.len())?).to_le_bytes());
+            for tuple in &query_set.tuples {
+                packet.extend_from_slice(&tuple::serialize(&query_set.schema, tuple));
             }
         }
     }
@@ -265,7 +265,7 @@ pub fn deserialize(payload: &[u8]) -> Result<Response, EncodingError> {
         }
 
         b'+' => {
-            let mut projection = Projection::empty();
+            let mut query_set = QuerySet::empty();
             let mut cursor = 1;
 
             let schema_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into()?);
@@ -289,19 +289,19 @@ pub fn deserialize(payload: &[u8]) -> Result<Response, EncodingError> {
                 };
                 cursor += 1;
 
-                projection.schema.push(Column::new(&name, data_type));
+                query_set.schema.push(Column::new(&name, data_type));
             }
 
             let num_tuples = u32::from_le_bytes(payload[cursor..cursor + 4].try_into()?);
             cursor += 4;
 
             for _ in 0..num_tuples {
-                let tuple = tuple::deserialize(&payload[cursor..], &projection.schema);
-                cursor += tuple::size_of(&tuple, &projection.schema);
-                projection.results.push(tuple);
+                let tuple = tuple::deserialize(&payload[cursor..], &query_set.schema);
+                cursor += tuple::size_of(&tuple, &query_set.schema);
+                query_set.tuples.push(tuple);
             }
 
-            Response::Projection(projection)
+            Response::QuerySet(query_set)
         }
 
         prefix => Err(EncodingError::InvalidPrefix(prefix))?,
@@ -312,7 +312,7 @@ pub fn deserialize(payload: &[u8]) -> Result<Response, EncodingError> {
 mod test {
     use super::EncodingError;
     use crate::{
-        db::{Projection, Schema},
+        db::{QuerySet, Schema},
         sql::statement::{Column, DataType, Value},
         tcp::proto::{deserialize, serialize, Response},
         DbError,
@@ -320,7 +320,7 @@ mod test {
 
     #[test]
     fn serialize_deserialize_results() -> Result<(), EncodingError> {
-        let payload = Response::Projection(Projection::new(
+        let payload = Response::QuerySet(QuerySet::new(
             Schema::new(vec![
                 Column::new("id", DataType::UnsignedBigInt),
                 Column::new("name", DataType::Varchar(65535)),
@@ -358,8 +358,8 @@ mod test {
 
     #[test]
     fn serialize_deserialize_empty_set() -> Result<(), EncodingError> {
-        let projection = Projection::new(Schema::new(vec![]), vec![vec![], vec![], vec![]]);
-        let response = Response::from(Ok(projection));
+        let empty_set = QuerySet::new(Schema::new(vec![]), vec![vec![], vec![], vec![]]);
+        let response = Response::from(Ok(empty_set));
         let packet = serialize(&response)?;
 
         assert_eq!(deserialize(&packet[4..])?, Response::EmptySet(3));

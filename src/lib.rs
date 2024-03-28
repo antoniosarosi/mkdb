@@ -24,7 +24,7 @@ mod vm;
 
 pub mod tcp;
 
-pub use db::{DbError, Projection};
+pub use db::{DbError, QuerySet};
 pub use storage::tuple::deserialize;
 
 pub type Result<T> = std::result::Result<T, DbError>;

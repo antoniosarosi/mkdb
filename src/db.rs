@@ -57,8 +57,11 @@ pub(crate) type RowId = u64;
 /// Provides the high level [`Database::exec`] API that receives SQL text and
 /// runs it.
 pub(crate) struct Database<F> {
-    /// The database owns the pager. TODO: [`Rc<Refcell>`] is a temporary
-    /// solution until we make the pager multithreaded.
+    /// The database owns the pager.
+    ///
+    /// TODO: [`Rc<Refcell>`] is a temporary solution until we make the pager
+    /// multithreaded. The pager should be able to allow multiple readers and
+    /// one writer.
     pub pager: Rc<RefCell<Pager<F>>>,
     /// Database context. See [`DatabaseContext`].
     pub context: Context,
@@ -122,14 +125,22 @@ impl Database<File> {
     }
 }
 
+/// Errors somehow related to SQL.
 #[derive(Debug, PartialEq)]
 pub(crate) enum SqlError {
+    /// Database table not found or otherwise not usable.
     InvalidTable(String),
+    /// Table column not found or not usable in the context of the error.
     InvalidColumn(String),
+    /// Duplicated UNIQUE columns, duplicated PRIMARY KEY columns, etc.
     DuplicatedKey(Value),
+    /// Errors caught by the [`sql::analyzer`].
     AnalyzerError(AnalyzerError),
+    /// Data type errors. Trying to add numbers to strings, etc.
     TypeError(TypeError),
+    /// Errors thrown by the [`vm`] when executing expressions.
     VmError(VmError),
+    /// Uncategorized error with custom message.
     Other(String),
 }
 
@@ -165,12 +176,18 @@ impl Display for SqlError {
     }
 }
 
+/// Generic top level error.
 #[derive(Debug)]
 pub enum DbError {
+    /// Files, sockets, etc.
     Io(io::Error),
+    /// [`sql::parser`] error.
     Parser(ParserError),
+    /// Other SQL error not related to syntax.
     Sql(SqlError),
+    /// Something in the database file or journal file is corrupted/unexpected.
     Corrupted(String),
+    /// Uncategorized custom error.
     Other(String),
 }
 
@@ -204,7 +221,7 @@ impl From<ParserError> for DbError {
     }
 }
 
-/// Table schema.
+/// In-memory representation of a table schema.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Schema {
     /// Column definitions.
@@ -267,43 +284,44 @@ impl From<Vec<Column>> for Schema {
 /// This only exists because in earlier development stages the iterator model
 /// was not yet implemented.
 ///
-/// Without the iterator model we coudn't process tuples one at a time, we had
+/// Without the iterator model we couldn't process tuples one at a time, we had
 /// to collect them all at once and process them after that. So all tests in
 /// this module (quite a few at this point) were written using this struct for
 /// `assert_eq` comparisons.
 ///
 /// Right now we're only using this struct to collect the results of a query
-/// in memory, which of course is not ideal because they may not fit in memory.
-/// But it's good enough for tests and for returning data in the `main.rs` file.
-///
-/// Since we have the capability of processing tuples one at a time we could
-/// probably stream them through the network one by one or in chunks, so clients
-/// could issue queries that don't fit in the server's memory and still obtain
-/// all the results. Again, that's an optimization for another day :)
+/// in memory, which we mostly need for tests and also the client package
+/// collects all the results to print an ASCII table like the MySQL client.
 #[derive(Debug, PartialEq)]
-pub struct Projection {
+pub struct QuerySet {
+    /// Schema of the results.
     pub schema: Schema,
-    pub results: Vec<Vec<Value>>,
+    /// Rows.
+    pub tuples: Vec<Vec<Value>>,
 }
 
-impl Projection {
-    pub fn new(schema: Schema, results: Vec<Vec<Value>>) -> Self {
-        Self { schema, results }
+impl QuerySet {
+    /// Creates a new [`QuerySet`].
+    pub fn new(schema: Schema, tuples: Vec<Vec<Value>>) -> Self {
+        Self { schema, tuples }
     }
 
+    /// Creates a set with no schema and no results.
     pub fn empty() -> Self {
         Self {
             schema: Schema::empty(),
-            results: Vec::new(),
+            tuples: Vec::new(),
         }
     }
 
+    /// Returns a concrete value given its column name and row number.
     pub fn get(&self, row: usize, column: &str) -> Option<&Value> {
-        self.results.get(row)?.get(self.schema.index_of(column)?)
+        self.tuples.get(row)?.get(self.schema.index_of(column)?)
     }
 
+    /// `true` if there are no results.
     pub fn is_empty(&self) -> bool {
-        self.results.is_empty()
+        self.tuples.is_empty()
     }
 }
 
@@ -394,11 +412,16 @@ const DEFAULT_RELATION_CACHE_SIZE: usize = 512;
 /// so it would call the [`crate::sql`] module again, and we don't want so much
 /// mutual recursion because it makes test debugging hard.
 pub(crate) struct Context {
+    /// Maps the table name to its metadata.
     tables: HashMap<String, TableMetadata>,
+    /// Maximum size of the cache.
     max_size: Option<usize>,
 }
 
 impl Context {
+    /// New default [`Context`].
+    ///
+    /// [`Context::max_size`] is unlimited.
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
@@ -406,6 +429,7 @@ impl Context {
         }
     }
 
+    /// New [`Context`] with fixed max size.
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
             tables: HashMap::with_capacity(max_size),
@@ -413,19 +437,22 @@ impl Context {
         }
     }
 
+    /// `true` if `table` exists in memory.
     pub fn contains(&self, table: &str) -> bool {
         self.tables.contains_key(table)
     }
 
-    pub fn insert(&mut self, table: String, metadata: TableMetadata) {
+    /// Adds the given table and metadata to this context.
+    pub fn insert(&mut self, metadata: TableMetadata) {
         if self.max_size.is_some_and(|size| self.tables.len() >= size) {
             let evict = self.tables.keys().next().unwrap().clone();
             self.tables.remove(&evict);
         }
 
-        self.tables.insert(table, metadata);
+        self.tables.insert(metadata.name.clone(), metadata);
     }
 
+    /// Removes the `table` from cache. Next it will be loaded from disk.
     pub fn invalidate(&mut self, table: &str) {
         self.tables.remove(table);
     }
@@ -481,7 +508,7 @@ impl TryFrom<&[&str]> for Context {
                         }
                     }
 
-                    context.insert(name.clone(), metadata);
+                    context.insert(metadata);
                 }
 
                 Statement::Create(Create::Index {
@@ -521,6 +548,7 @@ impl DatabaseContext for Context {
 }
 
 impl<F> Database<F> {
+    /// Creates a new database.
     pub fn new(pager: Rc<RefCell<Pager<F>>>, work_dir: PathBuf) -> Self {
         Self {
             pager,
@@ -530,27 +558,33 @@ impl<F> Database<F> {
         }
     }
 
+    /// Returns `true` if there's a transaction in progress at the moment.
     pub fn transaction_in_progress(&self) -> bool {
         self.transaction_in_progress
     }
 
+    /// Starts a new transaction.
+    ///
+    /// Transactions can only be terminated by calling [`Database::rollback`]
+    /// or [`Database::commit`]. Otherwise the equivalent SQL statements can
+    /// be used to terminate transactions.
     pub fn start_transaction(&mut self) {
         self.transaction_in_progress = true;
     }
 }
 
-impl<F: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<F> {
+impl<F: Seek + Read + Write + FileOps> DatabaseContext for Database<F> {
     fn table_metadata(&mut self, table: &str) -> Result<&mut TableMetadata, DbError> {
         if !self.context.contains(table) {
             let metadata = self.load_table_metadata(table)?;
-            self.context.insert(table.into(), metadata);
+            self.context.insert(metadata);
         }
 
         self.context.table_metadata(table)
     }
 }
 
-impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
+impl<F: Seek + Read + Write + FileOps> Database<F> {
     /// Loads the next row ID that should be used for the table rooted at
     /// `root`.
     ///
@@ -690,19 +724,33 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
 
     /// Highest level API in the entire system.
     ///
-    /// Receives a SQL string and executes it.
-    pub fn exec(&mut self, input: &str) -> Result<Projection, DbError> {
+    /// Receives a SQL string and executes it, collecting the results in memory.
+    /// Of course this is not ideal for real work because the results might not
+    /// fit in memory, but it's nice for tests or queries that we know for sure
+    /// will return only a few rows.
+    ///
+    /// Otherwise [`Database::prepare`] must be used instead to obtain an
+    /// iterator over the rows produced by the query. That will limit the memory
+    /// usage to the size of internal buffers used the [`Plan`] execution engine
+    /// at [`vm::plan`].
+    pub fn exec(&mut self, input: &str) -> Result<QuerySet, DbError> {
         let (schema, mut preapred_staement) = self.prepare(input)?;
 
-        let mut projection = Projection::new(schema, vec![]);
+        let mut query_set = QuerySet::new(schema, vec![]);
 
         while let Some(tuple) = preapred_staement.try_next()? {
-            projection.results.push(tuple);
+            query_set.tuples.push(tuple);
         }
 
-        Ok(projection)
+        Ok(query_set)
     }
 
+    /// Parses the given `sql` and generates an execution plan for it.
+    ///
+    /// The execution plan is returned and can be iterated tuple by tuple
+    /// with fixed memory usage (except for the size of the tuple itself). This
+    /// is the API the should be used to process queries as it will not make use
+    /// of all the system's RAM.
     pub fn prepare(&mut self, sql: &str) -> Result<(Schema, PreparedStatement<'_, F>), DbError> {
         let statement = sql::pipeline(sql, self)?;
 
@@ -732,17 +780,22 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
         Ok((schema, prepared_statement))
     }
 
+    /// Manually rolls back the database and stops the current transaction.
     pub fn rollback(&mut self) -> Result<usize, DbError> {
         self.transaction_in_progress = false;
         self.pager.borrow_mut().rollback()
     }
 
+    /// Manually commits the changes and stops the current transaction.
     pub fn commit(&mut self) -> io::Result<()> {
         self.transaction_in_progress = false;
         self.pager.borrow_mut().commit()
     }
 }
 
+/// Not all statements need [`Plan`] trees for execution.
+///
+/// See [`vm::statement`].
 enum Exec<F> {
     Statement(Statement),
     Plan(Plan<F>),
@@ -753,8 +806,8 @@ enum Exec<F> {
 ///
 /// The prepared statement contains the plan that the virtual machine will run
 /// and can be queried like an iterator through the [`Self::try_next`] method.
-/// Everything is lazily evaluated, the statement will do absolutely nothing
-/// unless consumed.
+/// Everything is lazily evaluated, the prepared statement will do absolutely
+/// nothing unless consumed.
 ///
 /// It's important to take into account that after the first call to
 /// [`Self::try_next`] the database will start a transaction if there isn't one
@@ -768,12 +821,21 @@ enum Exec<F> {
 /// `ROLLBACK` or there is an error. Whenever there's an error the database
 /// always rolls back.
 pub(crate) struct PreparedStatement<'d, F> {
+    /// Reference to the main databases object.
     db: &'d mut Database<F>,
+    /// Execution plan.
+    ///
+    /// Once this is set to [`None`] the iterator is considered fully consumed
+    /// and will no longer produce results.
     exec: Option<Exec<F>>,
+    /// `true` if the client did not start a transaction.
     auto_commit: bool,
 }
 
 impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
+    /// Returns the next tuple that the query produces.
+    ///
+    /// See the documentation of [`PreparedStatement`] for more details.
     pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(exec) = self.exec.as_mut() else {
             return Ok(None);
@@ -858,7 +920,7 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, Projection, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, QuerySet, Schema, SqlError, TypeError},
         paging::{
             self,
             cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
@@ -919,7 +981,7 @@ mod tests {
 
         assert_eq!(
             query,
-            Projection::new(mkdb_meta_schema(), vec![
+            QuerySet::new(mkdb_meta_schema(), vec![
                 vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
@@ -954,12 +1016,12 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![Value::Number(1), Value::String("John Doe".into())],
                 vec![Value::Number(2), Value::String("Jane Doe".into())],
             ]
@@ -978,13 +1040,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1011,13 +1073,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM products;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("price", DataType::Int),
                 Column::new("discount", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![Value::Number(1), Value::Number(110), Value::Number(4),],
                 vec![Value::Number(2), Value::Number(40), Value::Number(20),],
             ]
@@ -1037,13 +1099,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE age > 18;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(2),
                     Value::String("Jane Doe".into()),
@@ -1071,13 +1133,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users ORDER BY name, age;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1123,9 +1185,9 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users ORDER BY name;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![Column::new("name", DataType::Varchar(255)),]),
-            results: expected,
+            tuples: expected,
         });
 
         Ok(())
@@ -1143,14 +1205,14 @@ mod tests {
 
         let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::new("age", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::primary_key("id", DataType::Int),
                 Column::new("is_admin", DataType::Bool),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(18),
                     Value::String("John Doe".into()),
@@ -1179,13 +1241,13 @@ mod tests {
 
         let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("price / 10", DataType::BigInt),
                 Column::new("discount * 100", DataType::BigInt),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![Value::Number(1), Value::Number(10), Value::Number(500),],
                 vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
             ]
@@ -1213,9 +1275,9 @@ mod tests {
 
         let query = db.exec("SELECT * FROM mkdb_meta;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: mkdb_meta_schema(),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
@@ -1318,7 +1380,7 @@ mod tests {
                 panic!("root {root} used for both {root_used_by} and {name}");
             }
 
-            assert_eq!(query.results[i], tuple);
+            assert_eq!(query.tuples[i], tuple);
         }
 
         Ok(())
@@ -1337,7 +1399,7 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert!(query.results.is_empty());
+        assert!(query.tuples.is_empty());
 
         assert_index_contains(
             &mut db,
@@ -1360,13 +1422,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::unique("email", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![vec![
+            tuples: vec![vec![
                 Value::Number(1),
                 Value::String("john@email.com".into()),
                 Value::Number(18)
@@ -1404,13 +1466,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1445,13 +1507,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1711,13 +1773,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users ORDER BY id;")?;
 
-        assert_eq!(&query, &Projection {
+        assert_eq!(&query, &QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::unique("email", DataType::Varchar(255)),
             ]),
-            results: expected_table_entries.clone()
+            tuples: expected_table_entries.clone()
         });
 
         assert_index_contains(
@@ -1843,13 +1905,13 @@ mod tests {
             Err(DbError::Sql(SqlError::DuplicatedKey(Value::Number(2))))
         );
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1888,9 +1950,9 @@ mod tests {
             ))))
         );
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: mkdb_meta_schema(),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::String("table".into()),
                     Value::String("users".into()),
@@ -1922,13 +1984,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE id = 2;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![vec![
+            tuples: vec![vec![
                 Value::Number(2),
                 Value::String("Jane Doe".into()),
                 Value::Number(22)
@@ -1950,13 +2012,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE id < 3;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -1985,13 +2047,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE id > 2;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(3),
                     Value::String("Some Dude".into()),
@@ -2020,13 +2082,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE id <= 3;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(1),
                     Value::String("John Doe".into()),
@@ -2060,13 +2122,13 @@ mod tests {
 
         let query = db.exec("SELECT * FROM users WHERE id >= 3;")?;
 
-        assert_eq!(query, Projection {
+        assert_eq!(query, QuerySet {
             schema: Schema::from(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
             ]),
-            results: vec![
+            tuples: vec![
                 vec![
                     Value::Number(3),
                     Value::String("Some Dude".into()),
