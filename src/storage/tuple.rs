@@ -18,7 +18,7 @@
 //! prefix where we store the byte length of the string (number of bytes, not
 //! number of characters). So, putting it all together, a tuple like this one:
 //!
-//! ```rust
+//! ```ignore
 //! [
 //!     Value::Number(1),
 //!     Value::String("hello".into()),
@@ -28,7 +28,7 @@
 //!
 //! with a schema like this one:
 //!
-//! ```rust
+//! ```ignore
 //! [DataType::BigInt, DataType::Varchar(255), DataType::Int]
 //! ```
 //!
@@ -158,7 +158,7 @@ pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
 }
 
 /// See the module level documentation for the serialization format.
-pub(crate) fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
+pub fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
     let mut values = Vec::new();
     let mut cursor = 0;
 

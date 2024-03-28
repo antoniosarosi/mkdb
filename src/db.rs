@@ -11,7 +11,6 @@ use std::{
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     rc::Rc,
-    usize,
 };
 
 use crate::{
@@ -62,11 +61,11 @@ pub(crate) struct Database<F> {
     /// Working directory (the directory of the file).
     pub work_dir: PathBuf,
     /// `true` if we are currently in a transaction.
-    pub transaction_started: bool,
+    pub transaction_in_progress: bool,
 }
 
 /// Not really "Send" because of the [`Rc<RefCell>`], but we put the entire
-/// database behind a mutex when working with it in the "main.rs" file and we
+/// database behind a mutex when working with it in the "server.rs" file and we
 /// take care of not unlocking the database until `transaction_started` is
 /// false. We could probably build a specific struct that wraps the Database
 /// and does all this, but what we really should do instead is make the program
@@ -163,11 +162,12 @@ impl Display for SqlError {
 }
 
 #[derive(Debug)]
-pub(crate) enum DbError {
+pub enum DbError {
     Io(io::Error),
     Parser(ParserError),
     Sql(SqlError),
     Corrupted(String),
+    Other(String),
 }
 
 impl Display for DbError {
@@ -177,6 +177,7 @@ impl Display for DbError {
             Self::Parser(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
             Self::Corrupted(message) => f.write_str(message),
+            Self::Other(message) => f.write_str(message),
         }
     }
 }
@@ -201,7 +202,7 @@ impl From<ParserError> for DbError {
 
 /// Table schema.
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct Schema {
+pub struct Schema {
     /// Column definitions.
     pub columns: Vec<Column>,
     /// Quick index to find column defs based on their name.
@@ -276,7 +277,7 @@ impl From<Vec<Column>> for Schema {
 /// could issue queries that don't fit in the server's memory and still obtain
 /// all the results. Again, that's an optimization for another day :)
 #[derive(Debug, PartialEq)]
-pub(crate) struct Projection {
+pub struct Projection {
     pub schema: Schema,
     pub results: Vec<Vec<Value>>,
 }
@@ -532,8 +533,12 @@ impl<F> Database<F> {
             pager,
             work_dir,
             context: Context::with_max_size(DEFAULT_RELATION_CACHE_SIZE),
-            transaction_started: false,
+            transaction_in_progress: false,
         }
+    }
+
+    pub fn transaction_in_progress(&self) -> bool {
+        self.transaction_in_progress
     }
 }
 
@@ -685,19 +690,19 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
     pub fn exec(&mut self, input: &str) -> Result<Projection, DbError> {
         let statement = sql::pipeline(input, self)?;
 
-        if statement == Statement::StartTransaction && self.transaction_started {
+        if statement == Statement::StartTransaction && self.transaction_in_progress {
             return Err(DbError::Sql(SqlError::Other(String::from(
                 "There is already a transaction in progress",
             ))));
         }
 
         let commit = statement == Statement::Commit
-            || statement != Statement::StartTransaction && !self.transaction_started;
+            || statement != Statement::StartTransaction && !self.transaction_in_progress;
 
         let rollback = statement == Statement::Rollback;
 
-        if !self.transaction_started {
-            self.transaction_started = true;
+        if !self.transaction_in_progress {
+            self.transaction_in_progress = true;
         }
 
         let projection = match &statement {
@@ -715,21 +720,20 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
         let mut pager = self.pager.borrow_mut();
 
         if rollback || projection.is_err() {
-            self.transaction_started = false;
-
-            if let Err(rollback_err) = pager.rollback() {
-                if let Err(query_err) = projection {
-                    panic!("database bruh moment: found error {query_err:?} while processing query so we had to rollback, but then there was an error while rolling back: {rollback_err:?}");
-                } else {
-                    return Err(rollback_err);
-                }
-            }
+            self.transaction_in_progress = false;
+            pager.rollback()?;
         } else if commit {
-            self.transaction_started = false;
+            self.transaction_in_progress = false;
             pager.commit()?;
         }
 
         projection
+    }
+
+    /// Used by the server to manually rollback if the connection is closed.
+    pub fn rollback(&mut self) -> Result<usize, DbError> {
+        self.transaction_in_progress = false;
+        self.pager.borrow_mut().rollback()
     }
 }
 

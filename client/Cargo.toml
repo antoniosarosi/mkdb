@@ -1,0 +1,8 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mkdb = { path = ".." }
+rustyline = "14.0.0"

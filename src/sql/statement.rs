@@ -110,7 +110,7 @@ pub(crate) enum DataType {
 
 /// Resolved values from expressions.
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) enum Value {
+pub enum Value {
     /// UTF-8 string.
     String(String),
 
@@ -143,7 +143,7 @@ pub(crate) struct Assignment {
 
 /// Column definitions from `INSERT` statements.
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct Column {
+pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<Constraint>,

@@ -161,7 +161,7 @@ fn alloc_root_page<F: Seek + Read + Write + FileOps>(
 ///
 /// This is the same as running:
 ///
-/// ```no_run
+/// ```ignore
 /// #[rustfmt::skip]
 /// db.exec(r#"
 ///     INSERT INTO mkdb_meta (type, name, root, table_name, sql)

@@ -27,7 +27,7 @@ use crate::{
 /// binary slices as parameters. For example, suppose we need to compare the
 /// following two slices:
 ///
-/// ```no_run
+/// ```ignore
 /// let A = [1, 0, 0, 0];
 /// let B = [2, 0, 0, 0, 0, 0, 0, 0];
 /// ```
@@ -59,11 +59,11 @@ pub(crate) struct FixedSizeMemCmp(pub usize);
 impl FixedSizeMemCmp {
     /// Creates a comparator for a certain type.
     ///
-    /// ```no_run
+    /// ```ignore
     /// let comparator = FixedSizeMemCmp::for_type::<u32>();
     ///
-    /// let a = [1, 0, 0, 0, 0, 0, 0]
-    /// let b = [2, 0, 0, 0]
+    /// let a = [1, 0, 0, 0, 0, 0, 0];
+    /// let b = [2, 0, 0, 0];
     ///
     /// assert_eq!(comparator.bytes_cmp(a, b), std::cmp::Ordering::Less);
     /// ```

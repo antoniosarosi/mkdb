@@ -3,8 +3,15 @@ name = "mkdb"
 version = "0.1.0"
 edition = "2021"
 
+# The main MKDB project doesn't use any dependencies except system libraries.
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.153"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.54.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"]}
+
+# The client project uses RustyLine for the shell, but can be compiled separately.
+
+[workspace]
+members = ["client"]
