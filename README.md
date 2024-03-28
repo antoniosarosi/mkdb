@@ -93,17 +93,24 @@ test them with Miri.
 
 # Running The Program
 
-Use `cargo +nightly run -- file.db` to start the server on port `8000` (not yet
-configurable, should be a parameter like the file). `file.db` can be any empty
-file or a file previously managed by `mkdb`. It works like SQLite in that
-regard, the difference is that in order to use `mkdb` you have to connect to
-the server with some TCP client like `netcat`:
+Use this command to start the TCP server on port `8000` (the default if not
+specified):
 
 ```bash
-netcat 127.0.0.1 8000
+cargo +nightly run -- file.db 8000
 ```
 
-It doesn't have a real "shell" where you can use arrow keys to cycle through
-previous commands and fancy stuff like that, this part is a little rough around
-the edges at this point. There is no network protocol for sending data back and
-forth either, we send raw strings.
+`file.db` can be any empty file or a file previously
+managed by `mkdb`. It works like SQLite in that regard, the difference is that
+in order to use `mkdb` you have to connect to the server with some TCP client
+that implements the network protocol described at
+[`./src/tcp/proto.rs`](./src/tcp/proto.rs). The [`./client`](`./client`) package
+is a console client similar to that of MySQL or any other database and can be
+used like this:
+
+```bash
+cargo +nightly run --package client -- 8000
+```
+
+This will connect to the `mkdb` server running on port `8000` and provide you with
+a shell where you can type SQL and see the results of the queries.
