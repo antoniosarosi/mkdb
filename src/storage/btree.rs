@@ -53,7 +53,7 @@ pub(crate) trait BytesCmp {
 /// Compares the first `self.0` number of bytes using the good old `memcmp`.
 /// This is more useful than it seems at first glance because if we store
 /// integer keys at the beginning of the binary buffer in big endian format,
-/// then this is all we need to successfuly determine the [`Ordering`].
+/// then this is all we need to successfully determine the [`Ordering`].
 pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {

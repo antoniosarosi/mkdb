@@ -28,7 +28,11 @@ use crate::{
         statement::{Column, Create, DataType, Statement, Value},
     },
     storage::{tuple, BTree, FixedSizeMemCmp},
-    vm::{self, plan::Plan, TypeError, VmError},
+    vm::{
+        self,
+        plan::{Plan, Tuple},
+        TypeError, VmError,
+    },
 };
 
 /// Database file default page size.
@@ -303,17 +307,6 @@ impl Projection {
     }
 }
 
-impl<F: Seek + Read + Write + FileOps> TryFrom<Plan<F>> for Projection {
-    type Error = DbError;
-
-    fn try_from(plan: Plan<F>) -> Result<Self, Self::Error> {
-        let schema = plan.schema().unwrap_or(Schema::empty());
-        let results = plan.collect::<Result<Vec<_>, DbError>>()?;
-
-        Ok(Self { schema, results })
-    }
-}
-
 /// Schema of the table used to keep track of the database information.
 pub(crate) fn mkdb_meta_schema() -> Schema {
     Schema::from(vec![
@@ -540,6 +533,10 @@ impl<F> Database<F> {
     pub fn transaction_in_progress(&self) -> bool {
         self.transaction_in_progress
     }
+
+    pub fn start_transaction(&mut self) {
+        self.transaction_in_progress = true;
+    }
 }
 
 impl<F: Seek + Read + Write + paging::io::FileOps> DatabaseContext for Database<F> {
@@ -592,14 +589,6 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
             });
         }
 
-        let query = self.exec(&format!(
-            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
-        ))?;
-
-        if query.is_empty() {
-            return Err(DbError::Sql(SqlError::InvalidTable(table.into())));
-        }
-
         let mut metadata = TableMetadata {
             root: 1,
             name: String::from(table),
@@ -610,24 +599,32 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
 
         let mut found_table_definition = false;
 
-        for i in 0..query.results.len() {
-            let root = match query.get(i, "root") {
-                Some(Value::Number(root)) => *root as PageNumber,
-                _ => unreachable!(),
+        let (schema, mut results) = self.prepare(&format!(
+            "SELECT root, sql FROM {MKDB_META} where table_name = '{table}';"
+        ))?;
+
+        let corrupted_error = || {
+            DbError::Corrupted(format!(
+                "{MKDB_META} table is corrupted or contains wrong/unexpected data"
+            ))
+        };
+
+        while let Some(tuple) = results.try_next()? {
+            let Value::Number(root) = &tuple[schema.index_of("root").ok_or(corrupted_error())?]
+            else {
+                return Err(corrupted_error());
             };
 
-            match query.get(i, "sql") {
-                Some(Value::String(sql)) => match Parser::new(sql).parse_statement()? {
+            match &tuple[schema.index_of("sql").ok_or(corrupted_error())?] {
+                Value::String(sql) => match Parser::new(&sql).parse_statement()? {
                     Statement::Create(Create::Table { columns, .. }) => {
                         assert!(
                             !found_table_definition,
                             "multiple definitions of table '{table}'"
                         );
 
-                        metadata.root = root;
+                        metadata.root = *root as PageNumber;
                         metadata.schema = Schema::from(columns);
-                        metadata.row_id = self.load_next_row_id(root)?;
-
                         metadata.schema.prepend_row_id();
 
                         found_table_definition = true;
@@ -652,16 +649,23 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
                         metadata.indexes.push(IndexMetadata {
                             column: metadata.schema.columns[col_idx].clone(),
                             name,
-                            root,
+                            root: *root as PageNumber,
                             unique,
                         });
                     }
 
-                    _ => unreachable!(),
+                    _ => return Err(corrupted_error()),
                 },
-                _ => unreachable!(),
+
+                _ => return Err(corrupted_error()),
             };
         }
+
+        if !found_table_definition {
+            return Err(DbError::Sql(SqlError::InvalidTable(table.into())));
+        }
+
+        metadata.row_id = self.load_next_row_id(metadata.root)?;
 
         Ok(metadata)
     }
@@ -688,52 +692,157 @@ impl<F: Seek + Read + Write + paging::io::FileOps> Database<F> {
     ///
     /// Receives a SQL string and executes it.
     pub fn exec(&mut self, input: &str) -> Result<Projection, DbError> {
-        let statement = sql::pipeline(input, self)?;
+        let (schema, mut preapred_staement) = self.prepare(input)?;
 
-        if statement == Statement::StartTransaction && self.transaction_in_progress {
-            return Err(DbError::Sql(SqlError::Other(String::from(
-                "There is already a transaction in progress",
-            ))));
+        let mut projection = Projection::new(schema, vec![]);
+
+        while let Some(tuple) = preapred_staement.try_next()? {
+            projection.results.push(tuple);
         }
 
-        let commit = statement == Statement::Commit
-            || statement != Statement::StartTransaction && !self.transaction_in_progress;
-
-        let rollback = statement == Statement::Rollback;
-
-        if !self.transaction_in_progress {
-            self.transaction_in_progress = true;
-        }
-
-        let projection = match &statement {
-            Statement::Create(_) => {
-                vm::statement::exec(statement, self).map(|_| Projection::empty())
-            }
-
-            Statement::StartTransaction | Statement::Commit | Statement::Rollback => {
-                Ok(Projection::empty())
-            }
-
-            _ => query::planner::generate_plan(statement, self).and_then(vm::plan::exec),
-        };
-
-        let mut pager = self.pager.borrow_mut();
-
-        if rollback || projection.is_err() {
-            self.transaction_in_progress = false;
-            pager.rollback()?;
-        } else if commit {
-            self.transaction_in_progress = false;
-            pager.commit()?;
-        }
-
-        projection
+        Ok(projection)
     }
 
-    /// Used by the server to manually rollback if the connection is closed.
+    pub fn prepare(&mut self, sql: &str) -> Result<(Schema, PreparedStatement<'_, F>), DbError> {
+        let statement = sql::pipeline(sql, self)?;
+
+        let mut schema = Schema::empty();
+
+        let exec = match &statement {
+            Statement::Create(_)
+            | Statement::StartTransaction
+            | Statement::Commit
+            | Statement::Rollback => Exec::Statement(statement),
+
+            _ => {
+                let plan = query::planner::generate_plan(statement, self)?;
+                if let Some(plan_schema) = plan.schema() {
+                    schema = plan_schema;
+                }
+                Exec::Plan(plan)
+            }
+        };
+
+        let prepared_statement = PreparedStatement {
+            db: self,
+            auto_commit: false,
+            exec: Some(exec),
+        };
+
+        Ok((schema, prepared_statement))
+    }
+
     pub fn rollback(&mut self) -> Result<usize, DbError> {
         self.transaction_in_progress = false;
         self.pager.borrow_mut().rollback()
+    }
+
+    pub fn commit(&mut self) -> io::Result<()> {
+        self.transaction_in_progress = false;
+        self.pager.borrow_mut().commit()
+    }
+}
+
+enum Exec<F> {
+    Statement(Statement),
+    Plan(Plan<F>),
+}
+
+/// A prepared statement is a statement that has been successfully parsed and
+/// is ready to execute.
+///
+/// The prepared statement contains the plan that the virtual machine will run
+/// and can be queried like an iterator through the [`Self::try_next`] method.
+/// Everything is lazily evaluated, the statement will do absolutely nothing
+/// unless consumed.
+///
+/// It's important to take into account that after the first call to
+/// [`Self::try_next`] the database will start a transaction if there isn't one
+/// in progress and that transaction *will not end* until either the statement
+/// iterator is fully consumed or the transaction is stopped manually with
+/// [`Database::rollback`] or [`Database::commit`].
+///
+/// If the iterator fails or consumes all the tuples then the transaction is
+/// automatically closed. Transactions manually started by the client through
+/// `START TRANSACTION` are only closed when the client sends `COMMIT` or
+/// `ROLLBACK` or there is an error. Whenever there's an error the database
+/// always rolls back.
+pub(crate) struct PreparedStatement<'d, F> {
+    db: &'d mut Database<F>,
+    exec: Option<Exec<F>>,
+    auto_commit: bool,
+}
+
+impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
+    pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(exec) = self.exec.as_mut() else {
+            return Ok(None);
+        };
+
+        if let Exec::Statement(Statement::StartTransaction) = exec {
+            if self.db.transaction_in_progress() {
+                return Err(DbError::Other(String::from(
+                    "There is already a transaction in progress",
+                )));
+            }
+
+            self.db.start_transaction();
+            return Ok(None);
+        }
+
+        if !self.db.transaction_in_progress() {
+            self.db.start_transaction();
+            self.auto_commit = true;
+        }
+
+        let tuple = match exec {
+            Exec::Statement(_) => {
+                // Statements only run once, the iterator ends right here.
+                let Some(Exec::Statement(statement)) = self.exec.take() else {
+                    unreachable!();
+                };
+
+                match statement {
+                    Statement::Commit => {
+                        self.db.commit()?;
+                    }
+                    Statement::Rollback => {
+                        self.db.rollback()?;
+                    }
+                    Statement::Create(_) => {
+                        if let Err(e) = vm::statement::exec(statement, self.db) {
+                            self.db.rollback()?;
+                            return Err(e);
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+
+                None
+            }
+
+            Exec::Plan(plan) => match plan.try_next() {
+                Ok(tuple) => tuple,
+
+                Err(e) => {
+                    // The iterator ends here, rollback and return the error.
+                    self.exec.take();
+                    self.db.rollback()?;
+                    return Err(e);
+                }
+            },
+        };
+
+        // If this block runs then everything executed successfully. End the
+        // iterator and auto commit if necessary.
+        if tuple.is_none() {
+            self.exec.take();
+            if self.auto_commit {
+                self.db.commit()?;
+            }
+        }
+
+        Ok(tuple)
     }
 }
 

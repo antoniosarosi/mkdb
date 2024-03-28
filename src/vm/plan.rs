@@ -55,16 +55,12 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Projection, RowId, Schema, SqlError, TableMetadata},
+    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata},
     paging::{io::FileOps, pager::Pager},
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
 };
-
-pub(crate) fn exec<F: Seek + Read + Write + FileOps>(plan: Plan<F>) -> Result<Projection, DbError> {
-    Projection::try_from(plan)
-}
 
 pub(crate) type Tuple = Vec<Value>;
 

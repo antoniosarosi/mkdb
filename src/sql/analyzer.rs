@@ -1,7 +1,7 @@
 //! This module performs semantic or context dependant analysys on parsed SQL
 //! statements.
 //!
-//! After a statement has been successfuly analyzed by [`analyze`], it should
+//! After a statement has been successfully analyzed by [`analyze`], it should
 //! execute with almost no runtime errors, except for stuff like integer
 //! overflow above [`i128::MAX`] (see [`Value`] for details), division by zero
 //! or similar edge cases.
