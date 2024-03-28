@@ -55,16 +55,6 @@ fn handle_client(
 
     while let Some(result) = stream.bytes().next() {
         let Ok(byte) = result else {
-            println!("Close {conn} connection");
-
-            // If the connection is closed while a transaction is still in
-            // progress we must rollback because the client didn't commit.
-            if let Some(mut db) = guard {
-                if db.transaction_in_progress() {
-                    db.rollback()?;
-                }
-            }
-
             break;
         };
 
@@ -114,6 +104,16 @@ fn handle_client(
         }
 
         statement = String::new();
+    }
+
+    println!("Close {conn} connection");
+
+    // If the connection is closed while a transaction is still in
+    // progress we must rollback because the client didn't commit.
+    if let Some(mut db) = guard {
+        if db.transaction_in_progress() {
+            db.rollback()?;
+        }
     }
 
     Ok(())

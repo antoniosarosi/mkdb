@@ -10,12 +10,11 @@ use rustyline::{error::ReadlineError, DefaultEditor};
 const EXIT_CMD: &str = "quit";
 
 fn main() -> rustyline::Result<()> {
-    // let port = env::args()
-    //     .nth(1)
-    //     .expect("port not provided")
-    //     .parse::<u16>()
-    //     .expect("port parse error");
-    let port = 8000;
+    let port = env::args()
+        .nth(1)
+        .expect("port not provided")
+        .parse::<u16>()
+        .expect("port parse error");
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     println!("Welcome to the MKDB shell. Type SQL statements below or '{EXIT_CMD}' to exit the program.\n");
