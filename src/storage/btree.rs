@@ -54,6 +54,7 @@ pub(crate) trait BytesCmp {
 /// This is more useful than it seems at first glance because if we store
 /// integer keys at the beginning of the binary buffer in big endian format,
 /// then this is all we need to successfully determine the [`Ordering`].
+#[derive(Debug)]
 pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {
@@ -100,6 +101,7 @@ impl BytesCmp for FixedSizeMemCmp {
 /// Then computes the total length of the string in bytes by reading the first
 /// `self.0` bytes as a little endian integer and once the total length is known
 /// [`str`] instances can be created.
+#[derive(Debug)]
 pub(crate) struct StringCmp(pub usize);
 
 impl BytesCmp for StringCmp {
@@ -1044,7 +1046,7 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    /// 
+    ///
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+

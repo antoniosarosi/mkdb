@@ -50,6 +50,7 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 /// file. Otherwise, if the user wants to "rollback" the changes, we copy the
 /// original pages back to the database file, leaving it in the same state as
 /// it was prior to modification. See [`Journal`] for more details.
+#[derive(Debug)]
 pub(crate) struct Pager<F> {
     /// Wrapped IO/file handle/descriptor.
     file: BlockIo<F>,
@@ -733,6 +734,7 @@ const JOURNAL_HEADER_SIZE: usize = JOURNAL_MAGIC_SIZE + JOURNAL_PAGE_NUM_SIZE;
 /// a syscall every single time we want to write a page to the journal file,
 /// which should make this more efficient. But without any benchmarks to prove
 /// it you can call it yet another useless micro-optimization :)
+#[derive(Debug)]
 struct Journal<F> {
     /// In-memory page buffer.
     buffer: Vec<u8>,

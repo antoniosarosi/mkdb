@@ -47,6 +47,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::{HashMap, VecDeque},
+    fmt::Debug,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
     ops::Index,
@@ -56,7 +57,10 @@ use std::{
 
 use crate::{
     db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata, ROW_ID_COL},
-    paging::{io::FileOps, pager::Pager},
+    paging::{
+        io::FileOps,
+        pager::{PageNumber, Pager},
+    },
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
@@ -74,6 +78,7 @@ pub(crate) type Tuple = Vec<Value>;
 /// Technically we could make this work with traits and [`Box<dyn Trait>`] but
 /// no clear benefit was found on previous attempts. See the comment below on
 /// the [`Self::try_next`] impl block.
+#[derive(Debug)]
 pub(crate) enum Plan<F> {
     /// Runs a sequential scan on a table and returns the rows one by one.
     SeqScan(SeqScan<F>),
@@ -91,10 +96,14 @@ pub(crate) enum Plan<F> {
     Update(Update<F>),
     /// Deletes data from tables.
     Delete(Delete<F>),
-    /// Executes `ORDER BY` clauses.
+    /// Executes `ORDER BY` clauses or any other internal sorting.
     Sort(Sort<F>),
     /// Helper for the main [`Plan::Sort`] plan.
     SortKeysGen(SortKeysGen<F>),
+    /// Helper for the main [`Plan::IndexScan`] plan.
+    IndexCursor(IndexCursor<F>),
+    /// Helper for various plans.
+    BufferedIter(BufferedIter<F>),
 }
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
@@ -116,6 +125,8 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
             Self::Delete(delete) => delete.try_next(),
             Self::Sort(sort) => sort.try_next(),
             Self::SortKeysGen(sort_keys_gen) => sort_keys_gen.try_next(),
+            Self::IndexCursor(index_cursor) => index_cursor.try_next(),
+            Self::BufferedIter(buffered_iter) => buffered_iter.try_next(),
         }
     }
 }
@@ -146,6 +157,7 @@ impl<F> Plan<F> {
 /// BTree.
 ///
 /// See [`Cursor::try_next`] for details.
+#[derive(Debug)]
 pub(crate) struct SeqScan<F> {
     pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
@@ -174,29 +186,49 @@ pub(crate) enum InitialPosition {
     AfterKey,
 }
 
-/// Index scan uses an indexed column to retrieve data from a table.
-///
-/// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
-/// all the row IDs we need without scanning sequentially.
-pub(crate) struct IndexScan<F> {
-    pub index: IndexMetadata,
-    pub table: TableMetadata,
-    pub key: Vec<u8>,
-    pub initial_position: InitialPosition,
-    pub comparator: Box<dyn BytesCmp>,
-    pub stop_on_match: Option<BinaryOperator>,
-    pub done: bool,
-    pub init: bool,
-    pub pager: Rc<RefCell<Pager<F>>>,
-    pub cursor: Cursor,
+#[derive(Debug, PartialEq)]
+pub(crate) enum StopCondition {
+    OnMatch(BinaryOperator),
+    Once,
+    None,
 }
 
-// TODO: Sort index entries by row_id to improve sequential IO.
-impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
+/// Helper plan for the main [`IndexScan`] plan.
+///
+/// This is a special cursor over a range of keys in an index BTree. See
+/// [`crate::query::optimizer::generate_index_scan_plan`] for details.
+pub(crate) struct IndexCursor<F> {
+    pub index: IndexMetadata,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub initial_position: InitialPosition,
+    pub key: Vec<u8>,
+    pub stop_condition: StopCondition,
+    pub comparator: Box<dyn BytesCmp>,
+    pub cursor: Cursor,
+    pub init: bool,
+    pub done: bool,
+}
+
+impl<F: Debug> Debug for IndexCursor<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexCursor")
+            .field("index", &self.index)
+            .field("pager", &self.pager)
+            .field("initial_positioin", &self.initial_position)
+            .field("key", &self.key)
+            .field("stop_condition", &self.stop_condition)
+            .field("cursor", &self.cursor)
+            .field("init", &self.init)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         if self.done {
             return Ok(None);
-        };
+        }
 
         let mut pager = self.pager.borrow_mut();
 
@@ -224,10 +256,10 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             return Ok(None);
         };
 
-        if let Some(operator) = &self.stop_on_match {
-            let entry = &pager.get(page)?.cell(slot).content;
+        if let StopCondition::OnMatch(operator) = &self.stop_condition {
+            let entry = reassemble_payload(&mut pager, page, slot)?;
 
-            let ordering = self.comparator.bytes_cmp(entry, &self.key);
+            let ordering = self.comparator.bytes_cmp(entry.as_ref(), &self.key);
 
             let stop = match operator {
                 BinaryOperator::Gt => ordering == Ordering::Greater,
@@ -243,8 +275,102 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             }
         }
 
-        let index_entry =
-            tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index.schema());
+        if let StopCondition::Once = &self.stop_condition {
+            self.done = true;
+        }
+
+        Ok(Some(tuple::deserialize(
+            reassemble_payload(&mut pager, page, slot)?.as_ref(),
+            &self.index.schema(),
+        )))
+    }
+}
+
+/// Index scan uses an indexed column to retrieve data from a table.
+///
+/// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
+/// all the row IDs we need without scanning sequentially.
+///
+/// # Index Scan Algorithm
+///
+/// The index BTree maps keys to Row IDs like this:
+///
+/// ```text
+///                        +--------------+
+///                        | "Carla" -> 4 |
+///                        +--------------+
+///                          /           \
+/// +-------------+------------+      +--------------+------------+
+/// | "Alex" -> 5 | "Bob" -> 3 |      | "David" -> 2 | "Fia" -> 1 |
+/// +-------------+------------+      +--------------+------------+
+/// ```
+///
+/// Then the table BTree stores rows sorted by their Row ID:
+///
+/// ```text
+///                           +------------+
+///                           | 3 -> "Bob" |
+///                           +------------+
+///                            /          \
+/// +------------+--------------+      +--------------+-------------+
+/// | 1 -> "Fia" | 2 -> "David" |      | 4 -> "Carla" | 5 -> "Alex" |
+/// +------------+--------------+      +--------------+-------------+
+/// ```
+///
+/// The first step in the algorithm is sorting all the BTree entries that
+/// we need by Row ID. Imagine the user sent a query like this one:
+///
+/// ```sql
+/// SELECT * FROM users WHERE name < "Carla";
+/// ```
+///
+/// The [`IndexCursor`] helper will return these tuples:
+///
+/// ```text
+/// +--------------+
+/// | "Alex" -> 5  |
+/// +--------------+
+/// | "Bob" -> 3   |
+/// +--------------+
+/// | "Carla" -> 4 |
+/// +--------------+
+/// ```
+///
+/// These tuples will be buffered by [`BufferedIter`] and stored in a file if
+/// necessary. Remember that we can never assume that something fits in memory
+/// when writing a database.
+///
+/// After we have all the tuples the [`Sort`] plan takes care of sorting them by
+/// Row ID and will start returning the following results:
+///
+/// ```text
+/// +--------------+
+/// | "Bob" -> 3   |
+/// +--------------+
+/// | "Carla" -> 4 |
+/// +--------------+
+/// | "Alex" -> 5  |
+/// +--------------+
+/// ```
+///
+/// Now that we have to Row IDs we can position the BTree cursor to the first
+/// one and return tuples from that subtree until we're done with it. After that
+/// search the next subtree and repeat the algorithm.
+#[derive(Debug)]
+pub(crate) struct IndexScan<F> {
+    pub index: IndexMetadata,
+    pub table: TableMetadata,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub source: Box<Plan<F>>,
+}
+
+impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(index_entry) = self.source.try_next()? else {
+            return Ok(None);
+        };
+
+        let mut pager = self.pager.borrow_mut();
 
         let Value::Number(row_id) = index_entry[1] else {
             return Err(DbError::Corrupted(format!(
@@ -284,6 +410,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 ///
 /// This supports multiple values but the parser does not currently parse
 /// `INSERT` statements with multiple values.
+#[derive(Debug)]
 pub(crate) struct Values {
     pub values: VecDeque<Vec<Expression>>,
 }
@@ -307,6 +434,7 @@ impl Values {
 /// evaluate to `true`.
 ///
 /// Used for `WHERE` clauses in `SELECT`, `DELETE` and `UPDATE` statements.
+#[derive(Debug)]
 pub(crate) struct Filter<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
@@ -338,6 +466,7 @@ impl<F: Seek + Read + Write + FileOps> Filter<F> {
 ///
 /// The projection in this case would be the "id" and "age columns". The name
 /// is discarded.
+#[derive(Debug)]
 pub(crate) struct Project<F> {
     pub source: Box<Plan<F>>,
     pub input_schema: Schema,
@@ -361,6 +490,7 @@ impl<F: Seek + Read + Write + FileOps> Project<F> {
 }
 
 /// Inserts data into a table and upates indexes.
+#[derive(Debug)]
 pub(crate) struct Insert<F> {
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
@@ -408,11 +538,12 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 }
 
 /// Assigns values to columns.
+#[derive(Debug)]
 pub(crate) struct Update<F> {
     pub table: TableMetadata,
     pub assignments: Vec<Assignment>,
     pub pager: Rc<RefCell<Pager<F>>>,
-    pub source: BufferedIter<F>,
+    pub source: Box<Plan<F>>,
 }
 
 impl<F: Seek + Read + Write + FileOps> Update<F> {
@@ -469,10 +600,11 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
 }
 
 /// Removes values from a table BTree and from all the necessary index BTrees.
+#[derive(Debug)]
 pub(crate) struct Delete<F> {
     pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
-    pub source: BufferedIter<F>,
+    pub source: Box<Plan<F>>,
 }
 
 impl<F: Seek + Read + Write + FileOps> Delete<F> {
@@ -776,6 +908,7 @@ impl TupleBuffer {
 /// [`BufferedIter`] acts like a normal iterator that returns tuples one at a
 /// time. If the collected tuples fit in memory there is no IO, so that's the
 /// best case scenario.
+#[derive(Debug)]
 pub(crate) struct BufferedIter<F> {
     /// Tuple source. This is where we collect from.
     pub source: Box<Plan<F>>,
@@ -811,16 +944,30 @@ impl<F: FileOps> BufferedIter<F> {
 //     }
 // }
 
-impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
-    // TODO: Create a builder or something.
-    pub fn new(source: Box<Plan<F>>, work_dir: PathBuf, schema: Schema, page_size: usize) -> Self {
+/// Used to build [`BufferedIter`] objects.
+pub(crate) struct BufferedIterConfig<F> {
+    pub source: Box<Plan<F>>,
+    pub schema: Schema,
+    pub work_dir: PathBuf,
+    pub mem_buf_size: usize,
+}
+
+impl<F> From<BufferedIterConfig<F>> for BufferedIter<F> {
+    fn from(
+        BufferedIterConfig {
+            source,
+            schema,
+            work_dir,
+            mem_buf_size,
+        }: BufferedIterConfig<F>,
+    ) -> Self {
         // TODO: Use uuid or tempfile or something. This is poor man's random
         // file name.
         let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
 
         Self {
             source,
-            mem_buf: TupleBuffer::new(page_size, schema.clone(), true),
+            mem_buf: TupleBuffer::new(mem_buf_size, schema.clone(), true),
             schema,
             collected: false,
             file_path,
@@ -828,7 +975,9 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
             reader: None,
         }
     }
+}
 
+impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
     /// Collects all the tuples from [`Self::source`].
     fn collect(&mut self) -> Result<(), DbError> {
         // Buffer tuples in-memory until we have no space left. At that point
@@ -892,6 +1041,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
 /// `ORDER BY` expressions and appends the results to each tuple.
 ///
 /// See the documentation of [`Sort`] for more details.
+#[derive(Debug)]
 pub(crate) struct SortKeysGen<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
@@ -915,6 +1065,17 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 
         Ok(Some(tuple))
     }
+}
+
+/// Used to build [`Sort`] objects.
+///
+/// Building objects ain't easy these days...
+pub(crate) struct SortConfig<F> {
+    pub page_size: usize,
+    pub work_dir: PathBuf,
+    pub source: BufferedIter<F>,
+    pub comparator: TuplesComparator,
+    pub input_buffers: usize,
 }
 
 /// External K-way merge sort implementation.
@@ -1327,6 +1488,7 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 /// beginning for the IO complexity analysis and formulas, but basically the
 /// more buffers we have the less IO we have to do. The number of input buffers
 /// is configured through [`Self::input_buffers`].
+#[derive(Debug)]
 pub(crate) struct Sort<F> {
     /// Tuple input.
     pub source: BufferedIter<F>,
@@ -1352,9 +1514,36 @@ pub(crate) struct Sort<F> {
     pub output_file_path: PathBuf,
 }
 
+impl<F> From<SortConfig<F>> for Sort<F> {
+    fn from(
+        SortConfig {
+            page_size,
+            work_dir,
+            source,
+            comparator,
+            input_buffers,
+        }: SortConfig<F>,
+    ) -> Self {
+        Self {
+            page_size,
+            work_dir,
+            source,
+            comparator,
+            input_buffers,
+            sorted: false,
+            input_file: None,
+            output_file: None,
+            output_buffer: TupleBuffer::empty(),
+            input_file_path: PathBuf::new(),
+            output_file_path: PathBuf::new(),
+        }
+    }
+}
+
 /// Compares two tuples using their "sort keys" and returns an [`Ordering`].
 ///
 /// See the documentation of [`Sort`] for more details.
+#[derive(Debug)]
 pub(crate) struct TuplesComparator {
     /// Original schema of the tuples.
     pub schema: Schema,

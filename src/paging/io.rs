@@ -132,6 +132,7 @@ impl FileOps for MemBuf {
 /// reads and writes it returns full pages abstracting the blocks.
 ///
 /// See [`BlockIo::read`] for more details on how it works.
+#[derive(Debug)]
 pub(super) struct BlockIo<I> {
     /// Underlying IO resource handle.
     io: I,
@@ -161,8 +162,13 @@ impl<I> BlockIo<I> {
         );
 
         // Used for development/debugging in case we mess up. Don't wanna create
-        // giant Gigabyte sized files all of a sudden.
-        debug_assert!(page_number < 1000, "page number {page_number} too high");
+        // giant Gigabyte sized files all of a sudden. The maximum limit is
+        // 100 MiB.
+        debug_assert!(
+            self.page_size * (page_number as usize) < (100 << 20),
+            "page number {page_number} too high for page_size {}: limit is 100 MiB",
+            self.page_size,
+        );
     }
 }
 

@@ -1583,6 +1583,110 @@ mod tests {
         )
     }
 
+    // If buffering doesn't work correctly the delete should destroy the cursor
+    // of the scan plan.
+    #[test]
+    fn delete_where_indexed_exact() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
+
+        db.exec("DELETE FROM users WHERE id = 2;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("john@email.com".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("some_dude@email.com".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Column::primary_key("id", DataType::Int),
+            &[vec![Value::Number(1), Value::Number(1)], vec![
+                Value::Number(3),
+                Value::Number(3),
+            ]],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Column::unique("email", DataType::Varchar(255)),
+            &[
+                vec![Value::String("john@email.com".into()), Value::Number(1)],
+                vec![
+                    Value::String("some_dude@email.com".into()),
+                    Value::Number(3),
+                ],
+            ],
+        )
+    }
+
+    // Again, if buffering doesn't work this will fail.
+    #[test]
+    fn delete_where_indexed_ranged() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
+
+        db.exec("DELETE FROM users WHERE id >= 2;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![vec![
+                Value::Number(1),
+                Value::String("john@email.com".into()),
+                Value::Number(18)
+            ],]
+        });
+
+        assert_index_contains(
+            &mut db,
+            "users_pk_index",
+            Column::primary_key("id", DataType::Int),
+            &[vec![Value::Number(1), Value::Number(1)]],
+        )?;
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            Column::unique("email", DataType::Varchar(255)),
+            &[vec![
+                Value::String("john@email.com".into()),
+                Value::Number(1),
+            ]],
+        )
+    }
+
     #[test]
     fn update() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -2270,6 +2374,45 @@ mod tests {
                     Value::Number(30)
                 ],
             ]
+        });
+
+        Ok(())
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn large_index_scan() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        let mut users = Vec::new();
+
+        for i in 1..=400 {
+            let name = format!("User{i:03}");
+            users.push(vec![Value::Number(i), Value::String(name)]);
+        }
+
+        for user in &users {
+            db.exec(&format!(
+                "INSERT INTO users(id, name) VALUES ({}, {});",
+                user[0], user[1]
+            ))?;
+        }
+
+        users.drain(..users.len() / 2);
+
+        let query = db.exec(&format!("SELECT * FROM users WHERE id > {};", users.len()))?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::from(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+            ]),
+            tuples: users,
         });
 
         Ok(())

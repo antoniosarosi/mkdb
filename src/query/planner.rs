@@ -6,7 +6,6 @@
 use std::{
     collections::VecDeque,
     io::{Read, Seek, Write},
-    path::PathBuf,
     rc::Rc,
 };
 
@@ -20,8 +19,8 @@ use crate::{
     },
     vm::{
         plan::{
-            BufferedIter, Delete, Insert, Plan, Project, Sort, SortKeysGen, TupleBuffer,
-            TuplesComparator, Update, Values,
+            BufferedIter, BufferedIterConfig, Delete, Insert, Plan, Project, Sort, SortConfig,
+            SortKeysGen, TuplesComparator, Update, Values,
         },
         VmDataType,
     },
@@ -89,39 +88,33 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 // sorting then just skip the sort key generation completely,
                 // we already have all the sort keys we need.
                 let buffered_iter_source = if sort_schema.len() > table.schema.len() {
-                    Box::new(Plan::SortKeysGen(SortKeysGen {
-                        source,
+                    Plan::SortKeysGen(SortKeysGen {
+                        source: Box::new(source),
                         schema: table.schema.clone(),
                         gen_exprs: order_by
                             .into_iter()
                             .filter(|expr| !matches!(expr, Expression::Identifier(_)))
                             .collect(),
-                    }))
+                    })
                 } else {
                     source
                 };
 
-                source = Box::new(Plan::Sort(Sort {
+                source = Plan::Sort(Sort::from(SortConfig {
                     page_size,
                     work_dir: work_dir.clone(),
-                    source: BufferedIter::new(
-                        buffered_iter_source,
+                    source: BufferedIter::from(BufferedIterConfig {
+                        source: Box::new(buffered_iter_source),
                         work_dir,
-                        sort_schema.clone(),
-                        page_size,
-                    ),
+                        schema: sort_schema.clone(),
+                        mem_buf_size: page_size,
+                    }),
                     comparator: TuplesComparator {
                         schema: table.schema.clone(),
                         sort_schema,
                         sort_keys_indexes,
                     },
-                    sorted: false,
-                    input_file: None,
-                    output_file: None,
                     input_buffers: 4,
-                    output_buffer: TupleBuffer::empty(),
-                    input_file_path: PathBuf::new(),
-                    output_file_path: PathBuf::new(),
                 }));
             }
 
@@ -146,7 +139,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 input_schema: table.schema.clone(),
                 output_schema,
                 projection: columns,
-                source,
+                source: Box::new(source),
             })
         }
 
@@ -155,39 +148,55 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             columns,
             r#where,
         } => {
-            let source = optimizer::generate_scan_plan(&table, r#where, db)?;
+            let mut source = optimizer::generate_scan_plan(&table, r#where, db)?;
             let work_dir = db.work_dir.clone();
-
+            let page_size = db.pager.borrow().page_size;
             let metadata = db.table_metadata(&table)?;
+
+            // Index scans have their own internal buffering for sorting.
+            // Sequential scans plans don't, which is useful for SELECT
+            // statements that don't need any buffering. Updates and deletes do
+            // need buffering because BTree operations can destroy the scan
+            // cursor. Maybe we can keep track of every cursor when updating the
+            // BTree but as of right now it seems pretty complicated because the
+            // BTree is not a self contained unit that can be passed around like
+            // the pager.
+            if !is_scan_plan_buffered(&source) {
+                source = Plan::BufferedIter(BufferedIter::from(BufferedIterConfig {
+                    source: Box::new(source),
+                    work_dir,
+                    schema: metadata.schema.clone(),
+                    mem_buf_size: page_size,
+                }));
+            }
 
             Plan::Update(Update {
                 table: metadata.clone(),
                 assignments: columns,
-                source: BufferedIter::new(
-                    source,
-                    work_dir,
-                    metadata.schema.clone(),
-                    db.pager.borrow().page_size,
-                ),
                 pager: Rc::clone(&db.pager),
+                source: Box::new(source),
             })
         }
 
         Statement::Delete { from, r#where } => {
-            let source = optimizer::generate_scan_plan(&from, r#where, db)?;
+            let mut source = optimizer::generate_scan_plan(&from, r#where, db)?;
             let work_dir = db.work_dir.clone();
-
+            let page_size = db.pager.borrow().page_size;
             let metadata = db.table_metadata(&from)?;
+
+            if !is_scan_plan_buffered(&source) {
+                source = Plan::BufferedIter(BufferedIter::from(BufferedIterConfig {
+                    source: Box::new(source),
+                    work_dir,
+                    mem_buf_size: page_size,
+                    schema: metadata.schema.clone(),
+                }));
+            }
 
             Plan::Delete(Delete {
                 table: metadata.clone(),
-                source: BufferedIter::new(
-                    source,
-                    work_dir,
-                    metadata.schema.clone(),
-                    db.pager.borrow().page_size,
-                ),
                 pager: Rc::clone(&db.pager),
+                source: Box::new(source),
             })
         }
 
@@ -224,4 +233,15 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
             VmDataType::String => DataType::Varchar(65535),
         },
     })
+}
+
+/// Returns `true` if the given scan buffers the tuples before returning
+/// them.
+fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
+    match plan {
+        Plan::Filter(filter) => matches!(&*filter.source, Plan::IndexScan(_)),
+        Plan::IndexScan(_) => true,
+        Plan::SeqScan(_) => false,
+        _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
+    }
 }
