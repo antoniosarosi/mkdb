@@ -1196,6 +1196,68 @@ mod tests {
         Ok(())
     }
 
+    // The default page size won't be enough to store this tuples.
+    #[test]
+    fn select_order_by_large_tuples() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (id BIGINT, name VARCHAR(255), email VARCHAR(255), age INT);")?;
+
+        let mut expected = Vec::new();
+
+        for i in 1..=10 {
+            let name = format!("Very Long User{i} Name").repeat(10);
+            let mut email = format!("very_long_user_email{i}").repeat(10);
+            email.push_str("@email.com");
+            expected.push(vec![
+                Value::Number(i),
+                Value::String(name),
+                Value::String(email),
+                Value::Number(i + 20),
+            ]);
+        }
+
+        for user in expected.iter().rev() {
+            db.exec(&format!(
+                "INSERT INTO users(id, name, email, age) VALUES ({});",
+                user.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
+        }
+
+        expected.sort_by(|user1, user2| {
+            user1[1]
+                .partial_cmp(&user2[1])
+                .or(user1[2].partial_cmp(&user2[2]).or_else(|| {
+                    let (Value::Number(age1), Value::Number(age2)) = (&user1[3], &user2[3]) else {
+                        unreachable!();
+                    };
+
+                    (age1 + 10).partial_cmp(&(age2 + 10))
+                }))
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let query = db.exec("SELECT * FROM users ORDER BY name, email, age + 10;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::from(vec![
+                Column::new("id", DataType::BigInt),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ],),
+            tuples: expected,
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn select_order_by_expressions() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {
