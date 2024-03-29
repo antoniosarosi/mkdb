@@ -28,7 +28,7 @@
 //! multiple sources then instead of a simple pipeline we'd have a tree. A
 //! basic example is the `JOIN` statement which is not yet implemented.
 //!
-//! Another important details which makes the code here more complicated is that
+//! Another important detail which makes the code here more complicated is that
 //! some plans cannot work with a single tuple, they need all the tuples in
 //! order to execute their code. One example is the [`Sort`] plan which needs
 //! all the tuples before it can sort them. Other examples are the [`Update`] or
@@ -57,10 +57,7 @@ use std::{
 
 use crate::{
     db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata, ROW_ID_COL},
-    paging::{
-        io::FileOps,
-        pager::{PageNumber, Pager},
-    },
+    paging::{io::FileOps, pager::Pager},
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
     vm,
@@ -179,17 +176,26 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
+/// Describes the initial cursor position of [`IndexCursor`].
 #[derive(Debug, PartialEq)]
 pub(crate) enum InitialPosition {
+    /// Beginning of the BTree. First page first cell.
     Start,
+    /// Exactly at the key we're searching by.
     AtKey,
+    /// Right after the key we're searching by.
     AfterKey,
 }
 
+/// Stops the [`IndexCursor`] once the condition here resolves to `true`.
 #[derive(Debug, PartialEq)]
 pub(crate) enum StopCondition {
+    /// Stops the cursor once the binary operator applied to the key we're
+    /// poining at and the key we're searching by returns `true`.
     OnMatch(BinaryOperator),
+    /// Forces the cursor to return only one result.
     Once,
+    /// No condition, the cursor will stop when it reaches the end of the BTree.
     None,
 }
 
@@ -297,11 +303,11 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 ///
 /// ```text
 ///                        +--------------+
-///                        | "Carla" -> 4 |
+///                        | "Carla" -> 5 |
 ///                        +--------------+
 ///                          /           \
 /// +-------------+------------+      +--------------+------------+
-/// | "Alex" -> 5 | "Bob" -> 3 |      | "David" -> 2 | "Fia" -> 1 |
+/// | "Alex" -> 3 | "Bob" -> 1 |      | "David" -> 4 | "Fia" -> 2 |
 /// +-------------+------------+      +--------------+------------+
 /// ```
 ///
@@ -321,18 +327,18 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 /// we need by Row ID. Imagine the user sent a query like this one:
 ///
 /// ```sql
-/// SELECT * FROM users WHERE name < "Carla";
+/// SELECT * FROM users WHERE name <= "Carla";
 /// ```
 ///
 /// The [`IndexCursor`] helper will return these tuples:
 ///
 /// ```text
 /// +--------------+
-/// | "Alex" -> 5  |
+/// | "Alex" -> 3  |
 /// +--------------+
-/// | "Bob" -> 3   |
+/// | "Bob" -> 1   |
 /// +--------------+
-/// | "Carla" -> 4 |
+/// | "Carla" -> 5 |
 /// +--------------+
 /// ```
 ///
@@ -345,17 +351,16 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 ///
 /// ```text
 /// +--------------+
-/// | "Bob" -> 3   |
+/// | "Bob" -> 1   |
 /// +--------------+
-/// | "Carla" -> 4 |
+/// | "Alex" -> 3  |
 /// +--------------+
-/// | "Alex" -> 5  |
+/// | "Carla" -> 5 |
 /// +--------------+
 /// ```
 ///
-/// Now that we have to Row IDs we can position the BTree cursor to the first
-/// one and return tuples from that subtree until we're done with it. After that
-/// search the next subtree and repeat the algorithm.
+/// Sorting the tuples by [`RowId`] saves us from doing completely random IO,
+/// so scanning the table BTree will be a little bit more predictable.
 #[derive(Debug)]
 pub(crate) struct IndexScan<F> {
     pub index: IndexMetadata,
