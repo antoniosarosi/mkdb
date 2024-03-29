@@ -914,6 +914,7 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
 mod tests {
     use std::{
         cell::RefCell,
+        cmp::Ordering,
         collections::HashMap,
         io::{self, Read, Seek, Write},
         path::PathBuf,
@@ -1190,6 +1191,68 @@ mod tests {
         assert_eq!(query, QuerySet {
             schema: Schema::from(vec![Column::new("name", DataType::Varchar(255)),]),
             tuples: expected,
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_order_by_expressions() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE products (id INT, name VARCHAR(255), price INT, discount INT);")?;
+
+        let mut products = vec![
+            (1, "mouse", 20, 10),
+            (2, "mouse", 20, 20),
+            (3, "keyboard", 40, 25),
+            (4, "keyboard", 20, 50),
+            (5, "speakers", 40, 10),
+        ];
+
+        for (id, name, price, discount) in &products {
+            db.exec(&format!("INSERT INTO products(id, name, price, discount) VALUES ({id}, '{name}', {price}, {discount});"))?;
+        }
+
+        products.sort_by(
+            |(_, name1, price1, discount1), (_, name2, price2, discount2)| {
+                let mut ordering = name1.cmp(name2);
+
+                if ordering == Ordering::Equal {
+                    ordering = (price1 - price1 * discount1 / 100)
+                        .cmp(&(price2 - price2 * discount2 / 100));
+                }
+
+                if ordering == Ordering::Equal {
+                    ordering = price1.cmp(price2);
+                }
+
+                ordering
+            },
+        );
+
+        let query = db
+            .exec("SELECT * FROM products ORDER BY name, price - price * discount / 100, price;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::from(vec![
+                Column::new("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("price", DataType::Int),
+                Column::new("discount", DataType::Int),
+            ]),
+            tuples: products
+                .into_iter()
+                .map(|(id, name, price, discount)| vec![
+                    Value::Number(id),
+                    Value::String(name.into()),
+                    Value::Number(price),
+                    Value::Number(discount)
+                ])
+                .collect(),
         });
 
         Ok(())

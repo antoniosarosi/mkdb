@@ -857,7 +857,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
 pub(crate) struct SortKeysGen<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
-    pub order_by: Vec<Expression>,
+    pub gen_exprs: Vec<Expression>,
 }
 
 impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
@@ -866,7 +866,12 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
             return Ok(None);
         };
 
-        for expr in &self.order_by {
+        for expr in &self.gen_exprs {
+            debug_assert!(
+                !matches!(expr, Expression::Identifier(_)),
+                "identifiers are not allowed here"
+            );
+
             tuple.push(vm::resolve_expression(&tuple, &self.schema, expr)?);
         }
 
@@ -886,7 +891,10 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 /// the lecture suggests but the core concepts are the same. The first thing we
 /// do is we generate the "sort keys" for all the tuples and collect them into
 /// a file or in-memory buffer if we're lucky enough and they fit. Sort keys are
-/// basically the results of the `ORDER BY` expressions. For example:
+/// basically the resolved values of `ORDER BY` expressions. In the case of
+/// simple columns we already have the value in the database. However, in the
+/// case of more complicated expressions *that are NOT simple columns* we have
+/// to compute the value. For example:
 ///
 /// ```sql
 /// CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), price INT, discount INT);
@@ -894,20 +902,24 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 /// SELECT * FROM products ORDER BY price * discount, price;
 /// ```
 ///
-/// The "sort keys" for each tuple in the query above would be the values
-/// generated for the expressions `price * discount` and `price`. These sort
-/// keys are computed by [`SortKeysGen`] before the [`BufferedIter`] writes the
-/// tuple to a file or an in-memory buffer and they are appended to the end of
-/// the tuple after all its other columns.
+/// In the example above the first sort key is `price * discount`, which is an
+/// expression that needs to be evaluated. The second sort key corresponds to
+/// the expression `price`, which is a simple column that we already have value
+/// for, we don't need to generate it. The sort keys that need to be generated
+/// are computed by [`SortKeysGen`] before the [`BufferedIter`] writes the tuple
+/// to a file or an in-memory buffer and they are appended to the end of the
+/// tuple after all its other columns. That format is then used by
+/// [`TuplesComparator`] to determine the final [`Ordering`].
 ///
 /// The reason we need to generate the sort keys so early is because they change
 /// the length in bytes of the tuple and we need to know the length of the
 /// largest tuple that we are going to work with in order to compute the exact
 /// page size that we need for the K-way external merge sort.
 ///
-/// Note that there is no overflow at this level, tuples that are distributed
+/// Note that there is no "overflow" at this level, tuples that are distributed
 /// across overflow pages are already merged together back into one contiguous
-/// buffer by the scan plan. So we only work with complete data here.
+/// buffer by the scan plan. So we only work with complete data here, there are
+/// no partial rows.
 ///
 /// Once the [`BufferedIter`] has successfully collected all the tuples modified
 /// by [`SortKeysGen`] we can finally start sorting.
@@ -1280,10 +1292,8 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 pub(crate) struct Sort<F> {
     /// Tuple input.
     pub source: BufferedIter<F>,
-    /// Original schema of the tuples.
-    pub schema: Schema,
-    /// Schema that includes the sort keys.
-    pub sort_schema: Schema,
+    /// Tuples comparator used to obtain [`Ordering`] instances.
+    pub comparator: TuplesComparator,
     /// `true` if we already sorted the tuples.
     pub sorted: bool,
     /// Page size used by the [`Pager`].
@@ -1304,33 +1314,57 @@ pub(crate) struct Sort<F> {
     pub output_file_path: PathBuf,
 }
 
-/// Compares two tuples and returns the [`Ordering`].
-fn cmp_tuples(t1: &[Value], t2: &[Value]) -> Ordering {
-    for (a, b) in t1.iter().zip(t2) {
-        match a.partial_cmp(b) {
-            Some(ordering) => {
-                if ordering != Ordering::Equal {
-                    return ordering;
+/// Compares two tuples using their "sort keys" and returns an [`Ordering`].
+///
+/// See the documentation of [`Sort`] for more details.
+pub(crate) struct TuplesComparator {
+    /// Original schema of the tuples.
+    pub schema: Schema,
+    /// Schema that includes generated sort keys (expressions like `age + 10`).
+    pub sort_schema: Schema,
+    /// Index of each sort key in [`Self::sort_schema`].
+    pub sort_keys_indexes: Vec<usize>,
+}
+
+impl TuplesComparator {
+    pub fn cmp(&self, t1: &[Value], t2: &[Value]) -> Ordering {
+        debug_assert!(t1.len() == t2.len(), "tuple length mismatch");
+
+        debug_assert!(
+            t1.len() == self.sort_schema.len(),
+            "tuple length doesn't match sort schema length"
+        );
+
+        for index in self.sort_keys_indexes.iter().copied() {
+            match t1[index].partial_cmp(&t2[index]) {
+                Some(ordering) => {
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
                 }
-            }
-            None => {
-                if mem::discriminant(a) != mem::discriminant(b) {
-                    unreachable!("it should be impossible to run into type errors at this point: cmp() {a} against {b}");
+                None => {
+                    if mem::discriminant(&t1[index]) != mem::discriminant(&t2[index]) {
+                        unreachable!(
+                            "it should be impossible to run into type errors at this point: cmp() {} against {}",
+                            t1[index],
+                            t2[index]
+                        );
+                    }
                 }
             }
         }
-    }
 
-    Ordering::Equal
+        Ordering::Equal
+    }
 }
 
 impl<F> Sort<F> {
-    /// Sorts the tuples in [`Self::output_page`].
+    /// Sorts the tuples in [`Self::output_buffer`].
     fn sort_output_buffer(&mut self) {
         self.output_buffer
             .tuples
             .make_contiguous()
-            .sort_by(|t1, t2| cmp_tuples(&t1[self.schema.len()..], &t2[self.schema.len()..]));
+            .sort_by(|t1, t2| self.comparator.cmp(&t1, &t2));
     }
 }
 
@@ -1372,6 +1406,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }
 
         // We need files to sort.
+        // TODO: Again, this project has no dependencies but we could use tempfile.
         let input_file_name = format!("{}.mkdb.sort", &self.source as *const _ as usize);
         self.input_file_path = self.work_dir.join(input_file_name);
         self.input_file = Some(F::create(&self.input_file_path)?);
@@ -1396,7 +1431,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         // below into its own function considering that the first pass we would
         // do here doesn't need to fill the input buffers from a file but
         // rather from the buffered iterator source.
-        self.output_buffer = TupleBuffer::new(self.page_size, self.sort_schema.clone(), false);
+        self.output_buffer =
+            TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
 
         let mut input_pages = 0;
         while let Some(tuple) = self.source.try_next()? {
@@ -1427,7 +1463,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         let mut input_buffers = Vec::from_iter(
             std::iter::repeat_with(|| {
-                TupleBuffer::new(self.page_size, self.sort_schema.clone(), false)
+                TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false)
             })
             .take(self.input_buffers),
         );
@@ -1479,10 +1515,9 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                             continue;
                         }
 
-                        let cmp = cmp_tuples(
-                            &input_buffers[i][0][self.schema.len()..],
-                            &input_buffers[min][0][self.schema.len()..],
-                        );
+                        let cmp = self
+                            .comparator
+                            .cmp(&input_buffers[i][0], &input_buffers[min][0]);
 
                         if cmp == Ordering::Less {
                             min = i;
@@ -1575,7 +1610,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // Remove sort keys when returning to the next plan node.
         Ok(self.output_buffer.pop_front().map(|mut tuple| {
-            tuple.drain(self.schema.len()..);
+            tuple.drain(self.comparator.schema.len()..);
             tuple
         }))
     }

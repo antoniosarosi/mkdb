@@ -1,7 +1,7 @@
 //! Generates [`Plan`] trees.
 //!
 //! See the module level documentation of [`crate::vm::plan`] to understand
-//! what exactly we're "generating here".
+//! what exactly we're "generating" here.
 
 use std::{
     collections::VecDeque,
@@ -10,7 +10,7 @@ use std::{
     rc::Rc,
 };
 
-use super::optimizer::generate_scan_plan;
+use super::optimizer;
 use crate::{
     db::{Database, DatabaseContext, DbError, Schema, SqlError},
     paging,
@@ -20,8 +20,8 @@ use crate::{
     },
     vm::{
         plan::{
-            BufferedIter, Delete, Insert, Plan, Project, Sort, SortKeysGen, TupleBuffer, Update,
-            Values,
+            BufferedIter, Delete, Insert, Plan, Project, Sort, SortKeysGen, TupleBuffer,
+            TuplesComparator, Update, Values,
         },
         VmDataType,
     },
@@ -55,36 +55,61 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             r#where,
             order_by,
         } => {
-            let mut source = generate_scan_plan(&from, r#where, db)?;
+            let mut source = optimizer::generate_scan_plan(&from, r#where, db)?;
 
             let page_size = db.pager.borrow().page_size;
 
             let work_dir = db.work_dir.clone();
-            let metadata = db.table_metadata(&from)?;
+            let table = db.table_metadata(&from)?;
 
             if !order_by.is_empty() {
-                let mut sort_schema = metadata.schema.clone();
+                let mut sort_schema = table.schema.clone();
+                let mut sort_keys_indexes = Vec::with_capacity(order_by.len());
 
+                // Precompute all the sort keys indexes so that the sorter
+                // doesn't waste time figuring out where the columns are.
                 for (i, expr) in order_by.iter().enumerate() {
-                    let data_type = resolve_unknown_type(&metadata.schema, expr)?;
-                    let col = Column::new(&format!("sort_key_{i}"), data_type);
-                    sort_schema.push(col);
+                    let index = match expr {
+                        Expression::Identifier(col) => table.schema.index_of(&col).unwrap(),
+
+                        _ => {
+                            let index = sort_schema.len();
+                            let data_type = resolve_unknown_type(&table.schema, expr)?;
+                            let col = Column::new(&format!("sort_key_{i}"), data_type);
+                            sort_schema.push(col);
+
+                            index
+                        }
+                    };
+
+                    sort_keys_indexes.push(index);
                 }
+
+                // If there are no expressions that need to be evaluated for
+                // sorting then just skip the sort key generation completely,
+                // we already have all the sort keys we need.
+                let buffered_iter_source = if sort_schema.len() > table.schema.len() {
+                    Box::new(Plan::SortKeysGen(SortKeysGen {
+                        source,
+                        schema: table.schema.clone(),
+                        gen_exprs: order_by
+                            .into_iter()
+                            .filter(|expr| !matches!(expr, Expression::Identifier(_)))
+                            .collect(),
+                    }))
+                } else {
+                    source
+                };
 
                 source = Box::new(Plan::Sort(Sort {
                     page_size,
                     work_dir: work_dir.clone(),
-                    schema: metadata.schema.clone(),
-                    source: BufferedIter::new(
-                        Box::new(Plan::SortKeysGen(SortKeysGen {
-                            source,
-                            order_by,
-                            schema: metadata.schema.clone(),
-                        })),
-                        work_dir,
-                        sort_schema.clone(),
-                    ),
-                    sort_schema,
+                    source: BufferedIter::new(buffered_iter_source, work_dir, sort_schema.clone()),
+                    comparator: TuplesComparator {
+                        schema: table.schema.clone(),
+                        sort_schema,
+                        sort_keys_indexes,
+                    },
                     sorted: false,
                     input_file: None,
                     output_file: None,
@@ -99,14 +124,13 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
             for expr in &columns {
                 match expr {
-                    Expression::Identifier(ident) => output_schema.push(
-                        metadata.schema.columns[metadata.schema.index_of(ident).unwrap()].clone(),
-                    ),
+                    Expression::Identifier(ident) => output_schema
+                        .push(table.schema.columns[table.schema.index_of(ident).unwrap()].clone()),
 
                     _ => {
                         output_schema.push(Column {
                             name: expr.to_string(), // TODO: AS alias
-                            data_type: resolve_unknown_type(&metadata.schema, expr)?,
+                            data_type: resolve_unknown_type(&table.schema, expr)?,
                             constraints: vec![],
                         });
                     }
@@ -114,7 +138,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             }
 
             Plan::Project(Project {
-                input_schema: metadata.schema.clone(),
+                input_schema: table.schema.clone(),
                 output_schema,
                 projection: columns,
                 source,
@@ -126,7 +150,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             columns,
             r#where,
         } => {
-            let source = generate_scan_plan(&table, r#where, db)?;
+            let source = optimizer::generate_scan_plan(&table, r#where, db)?;
             let work_dir = db.work_dir.clone();
 
             let metadata = db.table_metadata(&table)?;
@@ -140,7 +164,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
         }
 
         Statement::Delete { from, r#where } => {
-            let source = generate_scan_plan(&from, r#where, db)?;
+            let source = optimizer::generate_scan_plan(&from, r#where, db)?;
             let work_dir = db.work_dir.clone();
 
             let metadata = db.table_metadata(&from)?;
