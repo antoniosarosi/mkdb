@@ -106,17 +106,20 @@ pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
 }
 
 /// See the module level documentation for the serialization format.
-pub(crate) fn serialize(schema: &Schema, values: &[Value]) -> Vec<u8> {
-    debug_assert_eq!(
-        schema.len(),
-        values.len(),
-        "length of schema and values must be the same"
-    );
-
+pub(crate) fn serialize<'v>(
+    schema: &Schema,
+    values: (impl IntoIterator<Item = &'v Value> + Copy),
+) -> Vec<u8> {
     let mut buf = Vec::new();
 
+    debug_assert_eq!(
+        schema.len(),
+        values.clone().into_iter().count(),
+        "length of schema and values must the same",
+    );
+
     // TODO: Alignment.
-    for (col, val) in schema.columns.iter().zip(values) {
+    for (col, val) in schema.columns.iter().zip(values.into_iter()) {
         match (&col.data_type, val) {
             (DataType::Varchar(_), Value::String(string)) => {
                 if string.as_bytes().len() > u32::MAX as usize {

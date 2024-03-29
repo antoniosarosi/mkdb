@@ -277,9 +277,9 @@ impl Schema {
     }
 }
 
-impl From<Vec<Column>> for Schema {
-    fn from(columns: Vec<Column>) -> Self {
-        Self::new(columns)
+impl<'c, C: IntoIterator<Item = &'c Column>> From<C> for Schema {
+    fn from(columns: C) -> Self {
+        Self::new(Vec::from_iter(columns.into_iter().cloned()))
     }
 }
 
@@ -329,7 +329,7 @@ impl QuerySet {
 
 /// Schema of the table used to keep track of the database information.
 pub(crate) fn mkdb_meta_schema() -> Schema {
-    Schema::from(vec![
+    Schema::from(&[
         // Either "index" or "table"
         Column::new("type", DataType::Varchar(255)),
         // Index or table name
@@ -472,7 +472,7 @@ impl TryFrom<&[&str]> for Context {
 
             match statement {
                 Statement::Create(Create::Table { name, columns }) => {
-                    let mut schema = Schema::from(columns.clone());
+                    let mut schema = Schema::from(&columns);
                     schema.prepend_row_id();
 
                     let mut metadata = TableMetadata {
@@ -654,7 +654,7 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
                         );
 
                         metadata.root = *root as PageNumber;
-                        metadata.schema = Schema::from(columns);
+                        metadata.schema = Schema::new(columns);
 
                         // Figure out if this table needs a row_id column.
                         if !metadata.schema.columns[0]
@@ -1043,7 +1043,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
             ]),
@@ -1067,7 +1067,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1100,7 +1100,7 @@ mod tests {
         let query = db.exec("SELECT * FROM products;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("price", DataType::Int),
                 Column::new("discount", DataType::Int),
@@ -1126,7 +1126,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE age > 18;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1160,7 +1160,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users ORDER BY name, age;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1212,7 +1212,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users ORDER BY name;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![Column::new("name", DataType::Varchar(255)),]),
+            schema: Schema::new(vec![Column::new("name", DataType::Varchar(255)),]),
             tuples: expected,
         });
 
@@ -1269,7 +1269,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users ORDER BY name, email, age + 10;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::new("id", DataType::BigInt),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("email", DataType::Varchar(255)),
@@ -1323,7 +1323,7 @@ mod tests {
             .exec("SELECT * FROM products ORDER BY name, price - price * discount / 100, price;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::new("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("price", DataType::Int),
@@ -1356,7 +1356,7 @@ mod tests {
         let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::new("age", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::primary_key("id", DataType::Int),
@@ -1392,7 +1392,7 @@ mod tests {
         let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("price / 10", DataType::BigInt),
                 Column::new("discount * 100", DataType::BigInt),
@@ -1568,7 +1568,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::unique("email", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1607,7 +1607,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::unique("email", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1655,7 +1655,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::unique("email", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1692,7 +1692,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1733,7 +1733,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -1955,7 +1955,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users ORDER BY id;")?;
 
         assert_eq!(&query, &QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::unique("email", DataType::Varchar(255)),
@@ -2081,7 +2081,7 @@ mod tests {
         );
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2160,7 +2160,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE id = 2;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2188,7 +2188,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE id < 3;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2223,7 +2223,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE id > 2;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2258,7 +2258,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE id <= 3;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2298,7 +2298,7 @@ mod tests {
         let query = db.exec("SELECT * FROM users WHERE id >= 3;")?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
                 Column::new("age", DataType::Int),
@@ -2349,7 +2349,7 @@ mod tests {
         let query = db.exec(&format!("SELECT * FROM users WHERE id > {};", users.len()))?;
 
         assert_eq!(query, QuerySet {
-            schema: Schema::from(vec![
+            schema: Schema::new(vec![
                 Column::primary_key("id", DataType::Int),
                 Column::new("name", DataType::Varchar(255)),
             ]),

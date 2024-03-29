@@ -100,7 +100,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         (Expression::Identifier(col), Expression::Value(value))
         | (Expression::Value(value), Expression::Identifier(col)) => {
             let index = indexes[col].clone();
-            let key = tuple::serialize(&Schema::from(vec![index.column.clone()]), &[value.clone()]);
+            let key = tuple::serialize(&Schema::from([&index.column]), [value]);
 
             (key, index)
         }

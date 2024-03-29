@@ -130,8 +130,7 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 let index_key = tuple.swap_remove(col);
                 let primary_key = tuple.swap_remove(0);
 
-                let entry =
-                    tuple::serialize(&index.schema.clone(), &[index_key.clone(), primary_key]);
+                let entry = tuple::serialize(&index.schema.clone(), [&index_key, &primary_key]);
 
                 btree
                     .try_insert(entry)?

@@ -657,25 +657,6 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
         Ok(Ok(()))
     }
 
-    /// Replaces `old` with `new`.
-    ///
-    /// If the keys of `old` and `new` are equal then this is a normal update.
-    /// Otherwise `old` must be removed and `new` must be inserted. If `new`
-    /// already exists an error is returned with the location of the key.
-    pub fn try_replace(&mut self, old: &[u8], new: Vec<u8>) -> io::Result<Result<(), Search>> {
-        if self.comparator.bytes_cmp(&old, &new) == Ordering::Equal {
-            return self.insert(new).map(|_| Ok(()));
-        }
-
-        let result = self.try_insert(new);
-
-        if result.is_ok() {
-            self.remove(old)?;
-        }
-
-        result
-    }
-
     /// Removes the entry corresponding to the given key if it exists.
     ///
     /// # Deletion algorithm

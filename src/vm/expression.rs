@@ -299,7 +299,7 @@ mod tests {
         assert_resolve(Resolve {
             expression: "x / y + 10 * z - 5",
             vm_context: VmCtx {
-                schema: Schema::from(vec![
+                schema: Schema::new(vec![
                     Column::new("x", DataType::Int),
                     Column::new("y", DataType::Int),
                     Column::new("z", DataType::Int),
@@ -315,7 +315,7 @@ mod tests {
         assert_resolve(Resolve {
             expression: "x + y != 10",
             vm_context: VmCtx {
-                schema: Schema::from(vec![
+                schema: Schema::new(vec![
                     Column::new("x", DataType::Int),
                     Column::new("y", DataType::Int),
                 ]),
@@ -330,7 +330,7 @@ mod tests {
         assert_resolve(Resolve {
             expression: "x + 10 < 20 AND y + 1 = 10 OR z != 0",
             vm_context: VmCtx {
-                schema: Schema::from(vec![
+                schema: Schema::new(vec![
                     Column::new("x", DataType::Int),
                     Column::new("y", DataType::Int),
                     Column::new("z", DataType::Int),
@@ -346,7 +346,7 @@ mod tests {
         assert_resolve(Resolve {
             expression: "x + 10 / (y - 5)",
             vm_context: VmCtx {
-                schema: Schema::from(vec![
+                schema: Schema::new(vec![
                     Column::new("x", DataType::Int),
                     Column::new("y", DataType::Int),
                 ]),
@@ -361,7 +361,7 @@ mod tests {
         assert_resolve(Resolve {
             expression: "x + 10 / (y - 5)",
             vm_context: VmCtx {
-                schema: Schema::from(vec![Column::new("x", DataType::Int)]),
+                schema: Schema::new(vec![Column::new("x", DataType::Int)]),
                 tuple: vec![Value::Number(15)],
             },
             expected: Err(SqlError::InvalidColumn("y".into())),

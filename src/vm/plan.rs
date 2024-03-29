@@ -50,7 +50,7 @@ use std::{
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
-    ops::Index,
+    ops::{Deref, Index},
     path::PathBuf,
     rc::Rc,
 };
@@ -399,7 +399,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         let table_entry = btree
             .get(&tuple::serialize(
-                &Schema::new(vec![self.index.schema.columns[1].clone()]),
+                &Schema::from([&self.index.schema.columns[1]]),
                 &[Value::Number(primary_key)],
             ))?
             .ok_or_else(|| {
@@ -539,10 +539,10 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
                     index.column.name, self.table.name
                 )))?;
 
-            let index_key = tuple[col].clone();
-            let primary_key = tuple[0].clone();
+            let index_key = &tuple[col];
+            let primary_key = &tuple[0];
 
-            let entry = tuple::serialize(&index.schema, &[index_key, primary_key]);
+            let entry = tuple::serialize(&index.schema, [index_key, primary_key]);
 
             let mut btree = BTree::new(
                 &mut pager,
@@ -559,7 +559,7 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
     }
 }
 
-/// Assigns values to columns.
+/// Assigns values to columns and updates indexes in the process.
 #[derive(Debug)]
 pub(crate) struct Update<F> {
     pub table: TableMetadata,
@@ -574,16 +574,22 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             return Ok(None);
         };
 
-        // Col Name -> (old value, new value)
+        // Col Name -> (old value, new value index)
         let mut updated_cols = HashMap::new();
 
         for assignment in &self.assignments {
-            let col = self.table.schema.index_of(&assignment.identifier).unwrap();
-            let new_value = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
-            let old_value = tuple[col].clone();
-            tuple[col] = new_value.clone();
+            let col =
+                self.table
+                    .schema
+                    .index_of(&assignment.identifier)
+                    .ok_or(DbError::Corrupted(format!(
+                        "column {} not found in table schema {:?}",
+                        assignment.identifier, self.table
+                    )))?;
 
-            updated_cols.insert(assignment.identifier.clone(), (old_value, new_value));
+            let new_value = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
+            let old_value = mem::replace(&mut tuple[col], new_value);
+            updated_cols.insert(assignment.identifier.clone(), (old_value, col));
         }
 
         let mut pager = self.pager.borrow_mut();
@@ -596,20 +602,19 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             )),
         );
 
-        // Complete upated tuple.
+        // Updated tuple.
         let updated_entry = tuple::serialize(&self.table.schema, &tuple);
 
         // If the primary key changes we have to remove the old entry from the
         // BTree. Otherwise we do a normal update.
         if let Some((old_pk, new_pk)) = updated_cols.get(&self.table.schema.columns[0].name) {
-            if old_pk != new_pk {
+            if old_pk != &tuple[*new_pk] {
                 btree
                     .try_insert(updated_entry)?
                     .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
-
                 btree.remove(&tuple::serialize(
-                    &Schema::from(vec![self.table.schema.columns[0].clone()]),
-                    &[old_pk.clone()],
+                    &Schema::from([&self.table.schema.columns[0]]),
+                    [old_pk],
                 ))?;
             }
         } else {
@@ -628,29 +633,21 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             // normal update.
             if let Some((old_key, new_key)) = updated_cols.get(&index.column.name) {
                 let updated_index_entry =
-                    tuple::serialize(&index.schema, &[new_key.clone(), tuple[0].clone()]);
+                    tuple::serialize(&index.schema, [&tuple[*new_key], &tuple[0]]);
 
-                if old_key != new_key {
-                    btree.remove(&tuple::serialize(
-                        &Schema::from(vec![index.column.clone()]),
-                        &[old_key.clone()],
-                    ))?;
-
+                if old_key != &tuple[*new_key] {
                     btree
                         .try_insert(updated_index_entry)?
-                        .map_err(|_| SqlError::DuplicatedKey(new_key.clone()))?;
+                        .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(*new_key)))?;
+                    btree.remove(&tuple::serialize(&Schema::from([&index.column]), [old_key]))?;
                 } else {
                     btree.insert(updated_index_entry)?;
                 }
-            } else if let Some((old_pk, new_pk)) =
-                updated_cols.get(&self.table.schema.columns[0].name)
-            {
-                let index_key =
-                    tuple[self.table.schema.index_of(&index.column.name).unwrap()].clone();
-
-                btree.insert(tuple::serialize(&index.schema, &[
-                    index_key,
-                    new_pk.clone(),
+            } else if updated_cols.contains_key(&self.table.schema.columns[0].name) {
+                let index_col = self.table.schema.index_of(&index.column.name).unwrap();
+                btree.insert(tuple::serialize(&index.schema, [
+                    &tuple[index_col],
+                    &tuple[0],
                 ]))?;
             }
         }
@@ -685,10 +682,8 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         btree.remove(&tuple::serialize(&self.table.schema, &tuple))?;
 
         for index in &self.table.indexes {
-            let col_idx = self.table.schema.index_of(&index.column.name).unwrap();
-            let key = tuple[col_idx].clone();
-
-            let entry = tuple::serialize(&Schema::from(vec![index.column.clone()]), &[key]);
+            let col = self.table.schema.index_of(&index.column.name).unwrap();
+            let entry = tuple::serialize(&Schema::from([&index.column]), [&tuple[col]]);
 
             let mut btree = BTree::new(
                 &mut pager,
