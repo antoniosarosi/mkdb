@@ -55,7 +55,7 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata},
+    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata, ROW_ID_COL},
     paging::{io::FileOps, pager::Pager},
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
@@ -217,7 +217,11 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             tuple::deserialize(&pager.get(page)?.cell(slot).content, &self.index.schema());
 
         let Value::Number(row_id) = index_entry[1] else {
-            panic!("indexes should always map to row IDs but this one doesn't: {index_entry:?}");
+            return Err(DbError::Corrupted(format!(
+                "indexes should always map to row IDs but index {} at root {} doesn't: {index_entry:?}",
+                self.index.name,
+                self.index.root,
+            )));
         };
 
         let mut btree = BTree::new(
@@ -228,12 +232,16 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         let table_entry = btree
             .get(&tuple::serialize_row_id(row_id as RowId))?
-            .unwrap_or_else(|| {
-                panic!(
-                    "index at root {} maps to row ID {} that doesn't exist in table at root {}",
-                    self.index.root, row_id, self.table.root
-                )
-            });
+            .ok_or_else(|| {
+                DbError::Corrupted(format!(
+                    "index {} at root {} maps to row ID {} that doesn't exist in table {} at root {}",
+                    self.index.name,
+                    self.index.root,
+                    row_id,
+                    self.table.name,
+                    self.table.root,
+                ))
+            })?;
 
         Ok(Some(tuple::deserialize(
             table_entry.as_ref(),
@@ -347,7 +355,7 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 
         for index in &self.table.indexes {
             let col = self.table.schema.index_of(&index.column.name).unwrap();
-            assert_eq!(self.table.schema.columns[0].name, "row_id");
+            assert_eq!(self.table.schema.columns[0].name, ROW_ID_COL);
 
             let key = tuple[col].clone();
             let row_id = tuple[0].clone();

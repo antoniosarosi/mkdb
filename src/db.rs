@@ -40,6 +40,9 @@ pub(crate) const DEFAULT_PAGE_SIZE: usize = 4096;
 /// Name of the meta-table used to keep track of other tables.
 pub(crate) const MKDB_META: &str = "mkdb_meta";
 
+/// Name of the column used to store [`RowId`] values.
+pub(crate) const ROW_ID_COL: &str = "row_id";
+
 /// Root page of the meta-table.
 pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
@@ -264,13 +267,13 @@ impl Schema {
 
     /// Prepends the special "row_id" column at the beginning of the schema.
     pub fn prepend_row_id(&mut self) {
-        debug_assert!(self.columns[0].name != "row_id");
+        debug_assert!(self.columns[0].name != ROW_ID_COL);
 
-        let col = Column::new("row_id", DataType::UnsignedBigInt);
+        let col = Column::new(ROW_ID_COL, DataType::UnsignedBigInt);
 
         self.columns.insert(0, col);
         self.index.values_mut().for_each(|idx| *idx += 1);
-        self.index.insert(String::from("row_id"), 0);
+        self.index.insert(String::from(ROW_ID_COL), 0);
     }
 }
 
@@ -358,7 +361,7 @@ impl IndexMetadata {
     pub fn schema(&self) -> Schema {
         Schema::new(vec![
             self.column.clone(),
-            Column::new("row_id", DataType::UnsignedBigInt),
+            Column::new(ROW_ID_COL, DataType::UnsignedBigInt),
         ])
     }
 }
@@ -923,7 +926,7 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, QuerySet, Schema, SqlError, TypeError},
+        db::{mkdb_meta_schema, QuerySet, Schema, SqlError, TypeError, ROW_ID_COL},
         paging::{
             self,
             cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
@@ -1681,7 +1684,7 @@ mod tests {
                 entry.as_ref(),
                 &Schema::from(vec![
                     key.clone(),
-                    Column::new("row_id", DataType::UnsignedBigInt),
+                    Column::new(ROW_ID_COL, DataType::UnsignedBigInt),
                 ]),
             ));
         }

@@ -9,7 +9,7 @@
 use std::fmt::Display;
 
 use crate::{
-    db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata},
+    db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, ROW_ID_COL},
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
     vm::{TypeError, VmDataType},
 };
@@ -28,6 +28,8 @@ pub(crate) enum AnalyzerError {
     AlreadyExists(AlreadyExists),
     /// Number of characters exceeds `VARCHAR(max)`.
     ValueTooLong(String, usize),
+    /// Attempt to change the special Row ID column manually.
+    RowIdAssignment,
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,6 +59,10 @@ impl Display for AnalyzerError {
             Self::ValueTooLong(string, max) => {
                 write!(f, "string '{string}' too long for type VARCHAR({max})")
             }
+            Self::RowIdAssignment => write!(
+                f,
+                "'{ROW_ID_COL}' is reserved for internal use, it cannot be manually changed or created"
+            ),
         }
     }
 }
@@ -87,6 +93,10 @@ pub(crate) fn analyze(
             let mut found_primary_key = false;
 
             for col in columns {
+                if col.name == ROW_ID_COL {
+                    return Err(AnalyzerError::RowIdAssignment.into());
+                }
+
                 if col.constraints.contains(&Constraint::PrimaryKey) {
                     if found_primary_key {
                         return Err(AnalyzerError::MultiplePrimaryKeys.into());
@@ -221,6 +231,10 @@ fn analyze_assignment(
     value: &Expression,
     allow_identifiers: bool,
 ) -> Result<(), SqlError> {
+    if column == ROW_ID_COL {
+        return Err(AnalyzerError::RowIdAssignment.into());
+    }
+
     let index = table
         .schema
         .index_of(column)

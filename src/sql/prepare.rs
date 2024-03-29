@@ -1,7 +1,7 @@
 // Final step in the SQL pipeline before plan generation.
 
 use super::statement::{Expression, Statement, Value};
-use crate::db::{DatabaseContext, DbError};
+use crate::db::{DatabaseContext, DbError, ROW_ID_COL};
 
 /// Takes a statement and prepares it for plan generation.
 ///
@@ -55,7 +55,7 @@ pub(crate) fn prepare(
                 .schema
                 .columns
                 .iter()
-                .filter(|&col| col.name != "row_id")
+                .filter(|&col| col.name != ROW_ID_COL)
                 .cloned()
                 .map(|col| Expression::Identifier(col.name))
                 .collect::<Vec<Expression>>();
@@ -80,9 +80,9 @@ pub(crate) fn prepare(
         } => {
             let metadata = ctx.table_metadata(into)?;
 
-            if metadata.schema.columns[0].name == "row_id" {
+            if metadata.schema.columns[0].name == ROW_ID_COL {
                 let row_id = metadata.next_row_id();
-                columns.insert(0, "row_id".into());
+                columns.insert(0, ROW_ID_COL.into());
                 values.insert(0, Expression::Value(Value::Number(row_id.into())));
             }
 
