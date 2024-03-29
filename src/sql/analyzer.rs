@@ -147,8 +147,14 @@ pub(crate) fn analyze(
                 }
             }
 
-            // -1 because row_id
-            if metadata.schema.len() - 1 != columns.len() {
+            // The user can't manually set the special "row_id" the column.
+            let schema_len = if metadata.schema.columns[0].name == ROW_ID_COL {
+                metadata.schema.len() - 1
+            } else {
+                metadata.schema.len()
+            };
+
+            if schema_len != columns.len() {
                 return Err(AnalyzerError::MissingColumns.into());
             }
 

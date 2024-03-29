@@ -191,12 +191,12 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
             source: BufferedIter::from(BufferedIterConfig {
                 source: Box::new(source),
                 work_dir: work_dir.clone(),
-                schema: index.schema(),
+                schema: index.schema.clone(),
                 mem_buf_size: page_size,
             }),
             comparator: TuplesComparator {
-                schema: index.schema(),
-                sort_schema: index.schema(),
+                schema: index.schema.clone(),
+                sort_schema: index.schema.clone(),
                 sort_keys_indexes: vec![1],
             },
             input_buffers: 4,

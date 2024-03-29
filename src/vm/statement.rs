@@ -12,8 +12,8 @@ use std::{
 use super::plan::{Plan, SeqScan};
 use crate::{
     db::{
-        mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId, SqlError,
-        MKDB_META, MKDB_META_ROOT,
+        mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId, Schema,
+        SqlError, MKDB_META, MKDB_META_ROOT,
     },
     paging::{io::FileOps, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
@@ -102,6 +102,10 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
 
             let index = IndexMetadata {
                 column: metadata.schema.columns[col].clone(),
+                schema: Schema::new(vec![
+                    metadata.schema.columns[col].clone(),
+                    metadata.schema.columns[0].clone(),
+                ]),
                 name: name.clone(),
                 root,
                 unique,
@@ -123,14 +127,15 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 let mut pager = db.pager.borrow_mut();
                 let mut btree = BTree::new(&mut pager, index.root, &comparator);
 
-                let key = tuple.swap_remove(col);
-                let row_id = tuple.swap_remove(0);
+                let index_key = tuple.swap_remove(col);
+                let primary_key = tuple.swap_remove(0);
 
-                let entry = tuple::serialize(&index.schema(), &[key.clone(), row_id]);
+                let entry =
+                    tuple::serialize(&index.schema.clone(), &[index_key.clone(), primary_key]);
 
                 btree
                     .try_insert(entry)?
-                    .map_err(|_| SqlError::DuplicatedKey(key))?;
+                    .map_err(|_| SqlError::DuplicatedKey(index_key))?;
             }
 
             // Invalidate the table so that the next time it is loaded it

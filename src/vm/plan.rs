@@ -56,10 +56,14 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata, ROW_ID_COL},
+    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata},
     paging::{io::FileOps, pager::Pager},
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
-    storage::{reassemble_payload, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
+    storage::{
+        reassemble_payload,
+        tuple::{self, byte_length_of_integer_type},
+        BTree, BytesCmp, Cursor, FixedSizeMemCmp,
+    },
     vm,
 };
 
@@ -287,7 +291,7 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 
         Ok(Some(tuple::deserialize(
             reassemble_payload(&mut pager, page, slot)?.as_ref(),
-            &self.index.schema(),
+            &self.index.schema,
         )))
     }
 }
@@ -377,7 +381,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         let mut pager = self.pager.borrow_mut();
 
-        let Value::Number(row_id) = index_entry[1] else {
+        let Value::Number(primary_key) = index_entry[1] else {
             return Err(DbError::Corrupted(format!(
                 "indexes should always map to row IDs but index {} at root {} doesn't: {index_entry:?}",
                 self.index.name,
@@ -388,17 +392,22 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
         let mut btree = BTree::new(
             &mut pager,
             self.table.root,
-            FixedSizeMemCmp::for_type::<RowId>(),
+            FixedSizeMemCmp(byte_length_of_integer_type(
+                &self.index.schema.columns[1].data_type,
+            )),
         );
 
         let table_entry = btree
-            .get(&tuple::serialize_row_id(row_id as RowId))?
+            .get(&tuple::serialize(
+                &Schema::new(vec![self.index.schema.columns[1].clone()]),
+                &[Value::Number(primary_key)],
+            ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
                     "index {} at root {} maps to row ID {} that doesn't exist in table {} at root {}",
                     self.index.name,
                     self.index.root,
-                    row_id,
+                    primary_key,
                     self.table.name,
                     self.table.root,
                 ))
@@ -516,16 +525,24 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
             FixedSizeMemCmp::for_type::<RowId>(),
         );
 
-        btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
+        btree
+            .try_insert(tuple::serialize(&self.table.schema, &tuple))?
+            .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
 
         for index in &self.table.indexes {
-            let col = self.table.schema.index_of(&index.column.name).unwrap();
-            assert_eq!(self.table.schema.columns[0].name, ROW_ID_COL);
+            let col = self
+                .table
+                .schema
+                .index_of(&index.column.name)
+                .ok_or(DbError::Corrupted(format!(
+                    "index column '{}' not found on table {} schema",
+                    index.column.name, self.table.name
+                )))?;
 
-            let key = tuple[col].clone();
-            let row_id = tuple[0].clone();
+            let index_key = tuple[col].clone();
+            let primary_key = tuple[0].clone();
 
-            let entry = tuple::serialize(&index.schema(), &[key, row_id]);
+            let entry = tuple::serialize(&index.schema, &[index_key, primary_key]);
 
             let mut btree = BTree::new(
                 &mut pager,
@@ -557,7 +574,8 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             return Ok(None);
         };
 
-        let mut updated_index_cols = HashMap::new();
+        // Col Name -> (old value, new value)
+        let mut updated_cols = HashMap::new();
 
         for assignment in &self.assignments {
             let col = self.table.schema.index_of(&assignment.identifier).unwrap();
@@ -565,7 +583,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             let old_value = tuple[col].clone();
             tuple[col] = new_value.clone();
 
-            updated_index_cols.insert(assignment.identifier.clone(), (old_value, new_value));
+            updated_cols.insert(assignment.identifier.clone(), (old_value, new_value));
         }
 
         let mut pager = self.pager.borrow_mut();
@@ -573,30 +591,67 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
         let mut btree = BTree::new(
             &mut pager,
             self.table.root,
-            FixedSizeMemCmp::for_type::<RowId>(),
+            FixedSizeMemCmp(byte_length_of_integer_type(
+                &self.table.schema.columns[0].data_type,
+            )),
         );
 
-        btree.insert(tuple::serialize(&self.table.schema, &tuple))?;
+        // Complete upated tuple.
+        let updated_entry = tuple::serialize(&self.table.schema, &tuple);
 
-        for index in &self.table.indexes {
-            if let Some((old_key, new_key)) = updated_index_cols.remove(&index.column.name) {
-                let mut btree = BTree::new(
-                    &mut pager,
-                    index.root,
-                    Box::<dyn BytesCmp>::from(&index.column.data_type),
-                );
+        // If the primary key changes we have to remove the old entry from the
+        // BTree. Otherwise we do a normal update.
+        if let Some((old_pk, new_pk)) = updated_cols.get(&self.table.schema.columns[0].name) {
+            if old_pk != new_pk {
+                btree
+                    .try_insert(updated_entry)?
+                    .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
 
                 btree.remove(&tuple::serialize(
-                    &Schema::from(vec![index.column.clone()]),
-                    &[old_key],
+                    &Schema::from(vec![self.table.schema.columns[0].clone()]),
+                    &[old_pk.clone()],
                 ))?;
+            }
+        } else {
+            btree.insert(updated_entry)?;
+        }
 
-                btree
-                    .try_insert(tuple::serialize(&index.schema(), &[
-                        new_key.clone(),
-                        tuple[0].clone(),
-                    ]))?
-                    .map_err(|_| SqlError::DuplicatedKey(new_key))?;
+        for index in &self.table.indexes {
+            let mut btree = BTree::new(
+                &mut pager,
+                index.root,
+                Box::<dyn BytesCmp>::from(&index.column.data_type),
+            );
+
+            // Indexed column was updated. If the key changed we need to remove
+            // the old one from the index and insert the new one. Otherwise
+            // normal update.
+            if let Some((old_key, new_key)) = updated_cols.get(&index.column.name) {
+                let updated_index_entry =
+                    tuple::serialize(&index.schema, &[new_key.clone(), tuple[0].clone()]);
+
+                if old_key != new_key {
+                    btree.remove(&tuple::serialize(
+                        &Schema::from(vec![index.column.clone()]),
+                        &[old_key.clone()],
+                    ))?;
+
+                    btree
+                        .try_insert(updated_index_entry)?
+                        .map_err(|_| SqlError::DuplicatedKey(new_key.clone()))?;
+                } else {
+                    btree.insert(updated_index_entry)?;
+                }
+            } else if let Some((old_pk, new_pk)) =
+                updated_cols.get(&self.table.schema.columns[0].name)
+            {
+                let index_key =
+                    tuple[self.table.schema.index_of(&index.column.name).unwrap()].clone();
+
+                btree.insert(tuple::serialize(&index.schema, &[
+                    index_key,
+                    new_pk.clone(),
+                ]))?;
             }
         }
 
@@ -622,7 +677,9 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         let mut btree = BTree::new(
             &mut pager,
             self.table.root,
-            FixedSizeMemCmp::for_type::<RowId>(),
+            FixedSizeMemCmp(byte_length_of_integer_type(
+                &self.table.schema.columns[0].data_type,
+            )),
         );
 
         btree.remove(&tuple::serialize(&self.table.schema, &tuple))?;

@@ -24,7 +24,7 @@ use crate::{
         self,
         analyzer::AnalyzerError,
         parser::{Parser, ParserError},
-        statement::{Column, Create, DataType, Statement, Value},
+        statement::{Column, Constraint, Create, DataType, Statement, Value},
     },
     storage::{tuple, BTree, FixedSizeMemCmp},
     vm::{
@@ -353,17 +353,10 @@ pub(crate) struct IndexMetadata {
     pub name: String,
     /// Column on which the index was created.
     pub column: Column,
+    /// Schema of the index. Always key -> primary key.
+    pub schema: Schema,
     /// Always `true` because non-unique indexes are not implemented.
     pub unique: bool,
-}
-
-impl IndexMetadata {
-    pub fn schema(&self) -> Schema {
-        Schema::new(vec![
-            self.column.clone(),
-            Column::new(ROW_ID_COL, DataType::UnsignedBigInt),
-        ])
-    }
 }
 
 /// Data that we need to know about tables at runtime.
@@ -491,9 +484,7 @@ impl TryFrom<&[&str]> for Context {
                     };
                     root += 1;
 
-                    use crate::sql::statement::Constraint;
-
-                    for column in columns {
+                    for column in &columns {
                         for constraint in &column.constraints {
                             let index_name = match constraint {
                                 Constraint::PrimaryKey => format!("{name}_pk_index"),
@@ -502,6 +493,7 @@ impl TryFrom<&[&str]> for Context {
 
                             metadata.indexes.push(IndexMetadata {
                                 column: column.clone(),
+                                schema: Schema::new(vec![column.clone(), columns[0].clone()]),
                                 name: index_name,
                                 root,
                                 unique: true,
@@ -521,10 +513,11 @@ impl TryFrom<&[&str]> for Context {
                     ..
                 }) if unique => {
                     let table = context.table_metadata(&name)?;
-                    let col_idx = table.schema.index_of(&column).unwrap();
+                    let index_col = table.schema.columns[table.schema.index_of(&column).unwrap()].clone();
 
                     table.indexes.push(IndexMetadata {
-                        column: table.schema.columns[col_idx].clone(),
+                        column: index_col.clone(),
+                        schema: Schema::new(vec![index_col, table.schema.columns[0].clone()]),
                         name,
                         root,
                         unique,
@@ -662,7 +655,18 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 
                         metadata.root = *root as PageNumber;
                         metadata.schema = Schema::from(columns);
-                        metadata.schema.prepend_row_id();
+
+                        // Figure out if this table needs a row_id column.
+                        if !metadata.schema.columns[0]
+                            .constraints
+                            .contains(&Constraint::PrimaryKey)
+                            || matches!(
+                                metadata.schema.columns[0].data_type,
+                                DataType::Varchar(_) | DataType::Bool
+                            )
+                        {
+                            metadata.schema.prepend_row_id();
+                        }
 
                         found_table_definition = true;
                     }
@@ -683,8 +687,14 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
                             )),
                         )?;
 
+                        let index_col = metadata.schema.columns[col_idx].clone();
+
                         metadata.indexes.push(IndexMetadata {
-                            column: metadata.schema.columns[col_idx].clone(),
+                            column: index_col.clone(),
+                            schema: Schema::new(vec![
+                                index_col,
+                                metadata.schema.columns[0].clone(),
+                            ]),
                             name,
                             root: *root as PageNumber,
                             unique,
@@ -708,21 +718,31 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
     }
 
     /// Returns the root page of `index` if it exists.
-    fn root_of_index(&mut self, index: &str) -> Result<PageNumber, DbError> {
+    fn index_metadata(&mut self, index_name: &str) -> Result<IndexMetadata, DbError> {
         let query = self.exec(&format!(
-            "SELECT root FROM {MKDB_META} where name = '{index}' AND type = 'index';"
+            "SELECT table_name FROM {MKDB_META} where name = '{index_name}' AND type = 'index';"
         ))?;
 
         if query.is_empty() {
             return Err(DbError::Sql(SqlError::Other(format!(
-                "index {index} does not exist"
+                "index {index_name} does not exist"
             ))));
         }
 
-        match query.get(0, "root") {
-            Some(Value::Number(root)) => Ok(*root as PageNumber),
+        let table_name = match query.get(0, "table_name") {
+            Some(Value::String(name)) => name,
             _ => unreachable!(),
-        }
+        };
+
+        let table_metadata = self.table_metadata(&table_name)?;
+
+        // TODO: Innefficient.
+        Ok(table_metadata
+            .indexes
+            .iter()
+            .find(|index| index.name == index_name)
+            .unwrap()
+            .clone())
     }
 
     /// Highest level API in the entire system.
@@ -930,7 +950,7 @@ mod tests {
         paging::{
             self,
             cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
-            io::MemBuf,
+            io::{FileOps, MemBuf},
             pager::Pager,
         },
         sql::{
@@ -1531,12 +1551,7 @@ mod tests {
 
         assert!(query.tuples.is_empty());
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::primary_key("id", DataType::Int),
-            &[],
-        )
+        assert_index_contains(&mut db, "users_pk_index", &[])
     }
 
     #[test]
@@ -1565,22 +1580,15 @@ mod tests {
             ]]
         });
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::primary_key("id", DataType::Int),
-            &[vec![Value::Number(1), Value::Number(1)]],
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &[vec![
+            Value::Number(1),
+            Value::Number(1),
+        ]])?;
 
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            Column::unique("email", DataType::Varchar(255)),
-            &[vec![
-                Value::String("john@email.com".into()),
-                Value::Number(1),
-            ]],
-        )
+        assert_index_contains(&mut db, "users_email_uq_index", &[vec![
+            Value::String("john@email.com".into()),
+            Value::Number(1),
+        ]])
     }
 
     // If buffering doesn't work correctly the delete should destroy the cursor
@@ -1618,28 +1626,18 @@ mod tests {
             ]
         });
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::primary_key("id", DataType::Int),
-            &[vec![Value::Number(1), Value::Number(1)], vec![
-                Value::Number(3),
-                Value::Number(3),
-            ]],
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &[
+            vec![Value::Number(1), Value::Number(1)],
+            vec![Value::Number(3), Value::Number(3)],
+        ])?;
 
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            Column::unique("email", DataType::Varchar(255)),
-            &[
-                vec![Value::String("john@email.com".into()), Value::Number(1)],
-                vec![
-                    Value::String("some_dude@email.com".into()),
-                    Value::Number(3),
-                ],
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![Value::String("john@email.com".into()), Value::Number(1)],
+            vec![
+                Value::String("some_dude@email.com".into()),
+                Value::Number(3),
             ],
-        )
+        ])
     }
 
     // Again, if buffering doesn't work this will fail.
@@ -1669,22 +1667,15 @@ mod tests {
             ],]
         });
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::primary_key("id", DataType::Int),
-            &[vec![Value::Number(1), Value::Number(1)]],
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &[vec![
+            Value::Number(1),
+            Value::Number(1),
+        ]])?;
 
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            Column::unique("email", DataType::Varchar(255)),
-            &[vec![
-                Value::String("john@email.com".into()),
-                Value::Number(1),
-            ]],
-        )
+        assert_index_contains(&mut db, "users_email_uq_index", &[vec![
+            Value::String("john@email.com".into()),
+            Value::Number(1),
+        ]])
     }
 
     #[test]
@@ -1769,28 +1760,21 @@ mod tests {
         Ok(())
     }
 
-    fn assert_index_contains<F: Seek + Read + Write + paging::io::FileOps>(
+    fn assert_index_contains<F: Seek + Read + Write + FileOps>(
         db: &mut Database<F>,
         name: &str,
-        key: Column,
         expected_entries: &[Vec<Value>],
     ) -> Result<(), DbError> {
-        let root = db.root_of_index(name)?;
+        let index = db.index_metadata(name)?;
 
         let mut pager = db.pager.borrow_mut();
-        let mut cursor = Cursor::new(root, 0);
+        let mut cursor = Cursor::new(index.root, 0);
 
         let mut entries = Vec::new();
 
         while let Some((page, slot)) = cursor.try_next(&mut pager)? {
             let entry = reassemble_payload(&mut pager, page, slot)?;
-            entries.push(tuple::deserialize(
-                entry.as_ref(),
-                &Schema::from(vec![
-                    key.clone(),
-                    Column::new(ROW_ID_COL, DataType::UnsignedBigInt),
-                ]),
-            ));
+            entries.push(tuple::deserialize(entry.as_ref(), &index.schema));
         }
 
         assert_eq!(entries, expected_entries);
@@ -1807,16 +1791,11 @@ mod tests {
         db.exec("INSERT INTO users(id, name, age) VALUES (200, 'Jane Doe', 22);")?;
         db.exec("INSERT INTO users(id, name, age) VALUES (300, 'Some Dude', 24);")?;
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::new("id", DataType::Int),
-            &[
-                vec![Value::Number(100), Value::Number(1)],
-                vec![Value::Number(200), Value::Number(2)],
-                vec![Value::Number(300), Value::Number(3)],
-            ],
-        )
+        assert_index_contains(&mut db, "users_pk_index", &[
+            vec![Value::Number(100), Value::Number(100)],
+            vec![Value::Number(200), Value::Number(200)],
+            vec![Value::Number(300), Value::Number(300)],
+        ])
     }
 
     #[test]
@@ -1834,41 +1813,26 @@ mod tests {
             "INSERT INTO users(id, name, email) VALUES (300, 'Some Dude', 'some_dude@email.com');",
         )?;
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::new("id", DataType::Int),
-            &[
-                vec![Value::Number(100), Value::Number(1)],
-                vec![Value::Number(200), Value::Number(2)],
-                vec![Value::Number(300), Value::Number(3)],
-            ],
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &[
+            vec![Value::Number(100), Value::Number(100)],
+            vec![Value::Number(200), Value::Number(200)],
+            vec![Value::Number(300), Value::Number(300)],
+        ])?;
 
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            Column::new("email", DataType::Varchar(255)),
-            &[
-                vec![Value::String("jane@email.com".into()), Value::Number(2)],
-                vec![Value::String("john@email.com".into()), Value::Number(1)],
-                vec![
-                    Value::String("some_dude@email.com".into()),
-                    Value::Number(3),
-                ],
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![Value::String("jane@email.com".into()), Value::Number(200)],
+            vec![Value::String("john@email.com".into()), Value::Number(100)],
+            vec![
+                Value::String("some_dude@email.com".into()),
+                Value::Number(300),
             ],
-        )?;
+        ])?;
 
-        assert_index_contains(
-            &mut db,
-            "name_idx",
-            Column::new("name", DataType::Varchar(255)),
-            &[
-                vec![Value::String("Jane Doe".into()), Value::Number(2)],
-                vec![Value::String("John Doe".into()), Value::Number(1)],
-                vec![Value::String("Some Dude".into()), Value::Number(3)],
-            ],
-        )
+        assert_index_contains(&mut db, "name_idx", &[
+            vec![Value::String("Jane Doe".into()), Value::Number(200)],
+            vec![Value::String("John Doe".into()), Value::Number(100)],
+            vec![Value::String("Some Dude".into()), Value::Number(300)],
+        ])
     }
 
     #[test]
@@ -1889,38 +1853,26 @@ mod tests {
         db.exec("UPDATE users SET id = 3, email = 'some@dude.com' WHERE id = 300;")?;
         db.exec("UPDATE users SET email = 'updated@email.com' WHERE id = 200;")?;
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::new("id", DataType::Int),
-            &[
-                vec![Value::Number(3), Value::Number(3)],
-                vec![Value::Number(100), Value::Number(1)],
-                vec![Value::Number(200), Value::Number(2)],
-            ],
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &[
+            vec![Value::Number(3), Value::Number(3)],
+            vec![Value::Number(100), Value::Number(100)],
+            vec![Value::Number(200), Value::Number(200)],
+        ])?;
 
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            Column::new("email", DataType::Varchar(255)),
-            &[
-                vec![Value::String("john@email.com".into()), Value::Number(1)],
-                vec![Value::String("some@dude.com".into()), Value::Number(3)],
-                vec![Value::String("updated@email.com".into()), Value::Number(2)],
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![Value::String("john@email.com".into()), Value::Number(100)],
+            vec![Value::String("some@dude.com".into()), Value::Number(3)],
+            vec![
+                Value::String("updated@email.com".into()),
+                Value::Number(200),
             ],
-        )?;
+        ])?;
 
-        assert_index_contains(
-            &mut db,
-            "name_idx",
-            Column::new("name", DataType::Varchar(255)),
-            &[
-                vec![Value::String("Jane Doe".into()), Value::Number(2)],
-                vec![Value::String("John Doe".into()), Value::Number(1)],
-                vec![Value::String("Some Dude".into()), Value::Number(3)],
-            ],
-        )
+        assert_index_contains(&mut db, "name_idx", &[
+            vec![Value::String("Jane Doe".into()), Value::Number(200)],
+            vec![Value::String("John Doe".into()), Value::Number(100)],
+            vec![Value::String("Some Dude".into()), Value::Number(3)],
+        ])
     }
 
     #[test]
@@ -1929,22 +1881,17 @@ mod tests {
 
         db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));")?;
 
-        db.exec("INSERT INTO users(id,email) VALUES (100, 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, email) VALUES (100, 'john@email.com');")?;
         db.exec("INSERT INTO users(id, email) VALUES (200, 'jane@email.com');")?;
         db.exec("INSERT INTO users(id, email) VALUES (300, 'some@dude.com');")?;
 
         db.exec("CREATE UNIQUE INDEX email_uq ON users(email);")?;
 
-        assert_index_contains(
-            &mut db,
-            "email_uq",
-            Column::new("email", DataType::Varchar(255)),
-            &[
-                vec![Value::String("jane@email.com".into()), Value::Number(2)],
-                vec![Value::String("john@email.com".into()), Value::Number(1)],
-                vec![Value::String("some@dude.com".into()), Value::Number(3)],
-            ],
-        )
+        assert_index_contains(&mut db, "email_uq", &[
+            vec![Value::String("jane@email.com".into()), Value::Number(200)],
+            vec![Value::String("john@email.com".into()), Value::Number(100)],
+            vec![Value::String("some@dude.com".into()), Value::Number(300)],
+        ])
     }
 
     /// This test really "tests" the limits of the underlying BTrees by using a
@@ -2016,12 +1963,7 @@ mod tests {
             tuples: expected_table_entries.clone()
         });
 
-        assert_index_contains(
-            &mut db,
-            "users_pk_index",
-            Column::new("id", DataType::Int),
-            &expected_pk_index_entries,
-        )?;
+        assert_index_contains(&mut db, "users_pk_index", &expected_pk_index_entries)?;
 
         expected_table_entries.sort_by(|a, b| {
             let (Value::String(email_a), Value::String(email_b)) = (&a[2], &b[2]) else {
@@ -2034,7 +1976,6 @@ mod tests {
         assert_index_contains(
             &mut db,
             "users_email_uq_index",
-            Column::new("email", DataType::Varchar(255)),
             &expected_email_uq_index_entries,
         )?;
 
