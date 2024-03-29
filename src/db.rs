@@ -653,7 +653,7 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
             };
 
             match &tuple[schema.index_of("sql").ok_or(corrupted_error())?] {
-                Value::String(sql) => match Parser::new(&sql).parse_statement()? {
+                Value::String(sql) => match Parser::new(sql).parse_statement()? {
                     Statement::Create(Create::Table { columns, .. }) => {
                         assert!(
                             !found_table_definition,

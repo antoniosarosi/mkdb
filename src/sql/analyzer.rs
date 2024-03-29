@@ -153,7 +153,7 @@ pub(crate) fn analyze(
             }
 
             for (expr, col) in values.iter().zip(columns) {
-                analyze_assignment(&metadata, col, expr, false)?;
+                analyze_assignment(metadata, col, expr, false)?;
             }
         }
 
@@ -191,7 +191,7 @@ pub(crate) fn analyze(
             let metadata = ctx.table_metadata(table)?;
 
             for col in columns {
-                analyze_assignment(&metadata, &col.identifier, &col.value, true)?;
+                analyze_assignment(metadata, &col.identifier, &col.value, true)?;
             }
 
             analyze_where(&metadata.schema, r#where)?;

@@ -70,7 +70,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 // doesn't waste time figuring out where the columns are.
                 for (i, expr) in order_by.iter().enumerate() {
                     let index = match expr {
-                        Expression::Identifier(col) => table.schema.index_of(&col).unwrap(),
+                        Expression::Identifier(col) => table.schema.index_of(col).unwrap(),
 
                         _ => {
                             let index = sort_schema.len();

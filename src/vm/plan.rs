@@ -167,6 +167,13 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum InitialPosition {
+    Start,
+    AtKey,
+    AfterKey,
+}
+
 /// Index scan uses an indexed column to retrieve data from a table.
 ///
 /// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
@@ -174,8 +181,12 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
 pub(crate) struct IndexScan<F> {
     pub index: IndexMetadata,
     pub table: TableMetadata,
-    pub stop_when: Option<(Vec<u8>, BinaryOperator, Box<dyn BytesCmp>)>,
+    pub key: Vec<u8>,
+    pub initial_position: InitialPosition,
+    pub comparator: Box<dyn BytesCmp>,
+    pub stop_on_match: Option<BinaryOperator>,
     pub done: bool,
+    pub init: bool,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub cursor: Cursor,
 }
@@ -189,15 +200,34 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         let mut pager = self.pager.borrow_mut();
 
+        if !self.init {
+            if let InitialPosition::AtKey | InitialPosition::AfterKey = self.initial_position {
+                let mut descent = Vec::new();
+                let mut btree = BTree::new(&mut pager, self.index.root, &self.comparator);
+                let search = btree.search(self.index.root, &self.key, &mut descent)?;
+
+                self.cursor = match search.index {
+                    Ok(slot) => Cursor::initialized(search.page, slot, descent),
+                    Err(_) => Cursor::done(),
+                };
+
+                if self.initial_position == InitialPosition::AfterKey {
+                    self.cursor.try_next(&mut pager)?;
+                }
+            }
+
+            self.init = true;
+        }
+
         let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
             self.done = true;
             return Ok(None);
         };
 
-        if let Some((key, operator, cmp)) = &self.stop_when {
+        if let Some(operator) = &self.stop_on_match {
             let entry = &pager.get(page)?.cell(slot).content;
 
-            let ordering = cmp.bytes_cmp(entry, key);
+            let ordering = self.comparator.bytes_cmp(entry, &self.key);
 
             let stop = match operator {
                 BinaryOperator::Gt => ordering == Ordering::Greater,
@@ -1372,7 +1402,7 @@ impl<F> Sort<F> {
         self.output_buffer
             .tuples
             .make_contiguous()
-            .sort_by(|t1, t2| self.comparator.cmp(&t1, &t2));
+            .sort_by(|t1, t2| self.comparator.cmp(t1, t2));
     }
 }
 

@@ -2482,10 +2482,7 @@ mod tests {
             self
         }
 
-        fn on<'p>(
-            self,
-            pager: &'p mut Pager<MemBuf>,
-        ) -> io::Result<BTree<'p, MemBuf, FixedSizeMemCmp>> {
+        fn on(self, pager: &mut Pager<MemBuf>) -> io::Result<BTree<'_, MemBuf, FixedSizeMemCmp>> {
             let root = if self.root_at_zero {
                 0
             } else {

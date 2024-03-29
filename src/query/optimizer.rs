@@ -2,19 +2,16 @@
 
 use std::{
     collections::HashMap,
-    io::{self, Read, Seek, Write},
+    io::{Read, Seek, Write},
     rc::Rc,
 };
 
 use crate::{
     db::{Database, DatabaseContext, DbError, IndexMetadata, Schema},
-    paging::{
-        io::FileOps,
-        pager::{PageNumber, Pager},
-    },
-    sql::statement::{BinaryOperator, DataType, Expression},
-    storage::{tuple, BTree, BytesCmp, Cursor},
-    vm::plan::{Filter, IndexScan, Plan, SeqScan},
+    paging::io::FileOps,
+    sql::statement::{BinaryOperator, Expression},
+    storage::{tuple, BytesCmp, Cursor},
+    vm::plan::{Filter, IndexScan, InitialPosition, Plan, SeqScan},
 };
 
 /// Generates an optimized scan plan.
@@ -36,31 +33,15 @@ pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
         generate_sequential_scan_plan(table, db)?
     };
 
+    if !needs_filter(&source, &expr) {
+        return Ok(source);
+    }
+
     Ok(Box::new(Plan::Filter(Filter {
         source,
         schema: db.table_metadata(table)?.schema.clone(),
         filter: expr,
     })))
-}
-
-/// Creates a new cursor and positions it at the given key.
-///
-/// The cursor will return the given key when calling [`Cursor::try_next`].
-fn position_cursor_at_key<F: Seek + Read + Write + FileOps>(
-    key: &[u8],
-    data_type: &DataType,
-    root: PageNumber,
-    pager: &mut Pager<F>,
-) -> io::Result<Cursor> {
-    let mut descent = Vec::new();
-
-    let mut btree = BTree::new(pager, root, Box::<dyn BytesCmp>::from(data_type));
-    let search = btree.search(root, key, &mut descent)?;
-
-    match search.index {
-        Ok(slot) => Ok(Cursor::initialized(search.page, slot, descent)),
-        Err(_) => Ok(Cursor::done()),
-    }
 }
 
 /// Basically a constructor. We'll use this until we figure out exactly how to
@@ -112,9 +93,6 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         return Ok(None);
     };
 
-    // Grab some metadata
-    let table = metadata.clone();
-
     let (key, index) = match (left.as_ref(), right.as_ref()) {
         (Expression::Identifier(col), Expression::Value(value))
         | (Expression::Value(value), Expression::Identifier(col)) => {
@@ -127,10 +105,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         _ => unreachable!(),
     };
 
-    // Now do the magic.
-    let pager = &mut db.pager.borrow_mut();
-
-    let (cursor, stop_when) = match (left.as_ref(), operator, right.as_ref()) {
+    let (initial_position, stop_on_match) = match (left.as_ref(), operator, right.as_ref()) {
         // Case 1:
         // SELECT * FROM t WHERE x = 5;
         // SELECT * FROM t WHERE 5 = x;
@@ -138,8 +113,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // Position the cursor at key 5 and stop at the next key.
         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            let cursor = position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
-            (cursor, Some(BinaryOperator::Gt))
+            (InitialPosition::AtKey, Some(BinaryOperator::Gt))
         }
 
         // Case 2:
@@ -150,10 +124,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // 5 which will cause the cursor to move to the successor.
         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-            let mut cursor =
-                position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
-            cursor.try_next(pager)?;
-            (cursor, None)
+            (InitialPosition::AfterKey, None)
         }
 
         // Case 3:
@@ -164,8 +135,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // tell it to stop once it finds a key >= 5.
         (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
-            let cursor = Cursor::new(index.root, 0);
-            (cursor, Some(BinaryOperator::GtEq))
+            (InitialPosition::Start, Some(BinaryOperator::GtEq))
         }
 
         // Case 4:
@@ -176,8 +146,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // cursor will then return key 5 and everything after.
         (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-            let cursor = position_cursor_at_key(&key, &index.column.data_type, index.root, pager)?;
-            (cursor, None)
+            (InitialPosition::AtKey, None)
         }
 
         // Case 5:
@@ -188,24 +157,21 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // tell it to stop once it finds a key > 5
         (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
-            let cursor = Cursor::new(index.root, 0);
-            (cursor, Some(BinaryOperator::Gt))
+            (InitialPosition::Start, Some(BinaryOperator::Gt))
         }
 
         _ => unreachable!(),
     };
 
     Ok(Some(Box::new(Plan::IndexScan(IndexScan {
-        cursor,
-        stop_when: stop_when.map(|operator| {
-            (
-                key,
-                operator,
-                Box::<dyn BytesCmp>::from(&index.column.data_type),
-            )
-        }),
-        table,
+        initial_position,
+        key,
+        stop_on_match,
+        table: metadata.clone(),
+        comparator: Box::<dyn BytesCmp>::from(&index.column.data_type),
+        cursor: Cursor::new(index.root, 0),
         index,
+        init: false,
         done: false,
         pager: Rc::clone(&db.pager),
     }))))
@@ -283,4 +249,38 @@ fn find_indexed_expr<'e>(
 
         _ => None,
     }
+}
+
+/// Returns `true` if the `plan` needs the `expr` filter applied.
+///
+/// Simple expressions with indexed columns like the following one don't need
+/// filters because the [`IndexScan`] already filters the output:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 5;
+/// ```
+///
+/// There are more cases where the filter wouldn't be needed but this is good
+/// enough for now.
+fn needs_filter<F>(plan: &Plan<F>, expr: &Expression) -> bool {
+    let Plan::IndexScan(_) = plan else {
+        return true;
+    };
+
+    if let Expression::BinaryOperation {
+        left,
+        operator,
+        right,
+    } = expr
+    {
+        if matches!(
+            (left.as_ref(), operator, right.as_ref()),
+            (Expression::Identifier(_col), _, Expression::Value(_value))
+                | (Expression::Value(_value), _, Expression::Identifier(_col))
+        ) {
+            return false;
+        }
+    }
+
+    true
 }
