@@ -775,14 +775,14 @@ impl<F: FileOps> BufferedIter<F> {
 
 impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
     // TODO: Create a builder or something.
-    pub fn new(source: Box<Plan<F>>, work_dir: PathBuf, schema: Schema) -> Self {
+    pub fn new(source: Box<Plan<F>>, work_dir: PathBuf, schema: Schema, page_size: usize) -> Self {
         // TODO: Use uuid or tempfile or something. This is poor man's random
         // file name.
         let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
 
         Self {
             source,
-            mem_buf: TupleBuffer::new(256, schema.clone(), true),
+            mem_buf: TupleBuffer::new(page_size, schema.clone(), true),
             schema,
             collected: false,
             file_path,

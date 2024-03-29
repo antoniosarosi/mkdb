@@ -104,7 +104,12 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 source = Box::new(Plan::Sort(Sort {
                     page_size,
                     work_dir: work_dir.clone(),
-                    source: BufferedIter::new(buffered_iter_source, work_dir, sort_schema.clone()),
+                    source: BufferedIter::new(
+                        buffered_iter_source,
+                        work_dir,
+                        sort_schema.clone(),
+                        page_size,
+                    ),
                     comparator: TuplesComparator {
                         schema: table.schema.clone(),
                         sort_schema,
@@ -158,7 +163,12 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             Plan::Update(Update {
                 table: metadata.clone(),
                 assignments: columns,
-                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
+                source: BufferedIter::new(
+                    source,
+                    work_dir,
+                    metadata.schema.clone(),
+                    db.pager.borrow().page_size,
+                ),
                 pager: Rc::clone(&db.pager),
             })
         }
@@ -171,7 +181,12 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
             Plan::Delete(Delete {
                 table: metadata.clone(),
-                source: BufferedIter::new(source, work_dir, metadata.schema.clone()),
+                source: BufferedIter::new(
+                    source,
+                    work_dir,
+                    metadata.schema.clone(),
+                    db.pager.borrow().page_size,
+                ),
                 pager: Rc::clone(&db.pager),
             })
         }
