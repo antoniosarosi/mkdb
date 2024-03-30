@@ -2620,6 +2620,135 @@ mod tests {
     }
 
     #[test]
+    fn delete_where_indexed_column_ranged() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
+
+        db.exec("DELETE FROM users WHERE email >= 'john@email.com';")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![vec![
+                Value::Number(2),
+                Value::String("jane@email.com".into()),
+                Value::Number(22)
+            ]]
+        });
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[vec![
+            Value::String("jane@email.com".into()),
+            Value::Number(2),
+        ]])
+    }
+
+    #[test]
+    fn delete_where_auto_index_key_no_match() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
+
+        db.exec("DELETE FROM users WHERE id >= 4;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("john@email.com".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("jane@email.com".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("some_dude@email.com".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![Value::String("jane@email.com".into()), Value::Number(2)],
+            vec![Value::String("john@email.com".into()), Value::Number(1)],
+            vec![
+                Value::String("some_dude@email.com".into()),
+                Value::Number(3),
+            ],
+        ])
+    }
+
+    #[test]
+    fn delete_from_multiple_indexes() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (email VARCHAR(255) UNIQUE, name VARCHAR(64) UNIQUE, id INT PRIMARY KEY);",
+        )?;
+
+        db.exec("INSERT INTO users(id, name, email) VALUES (100, 'John Doe', 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (200, 'Jane Doe', 'jane@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (300, 'Some Dude', 'some@dude.com');")?;
+
+        db.exec("DELETE FROM users WHERE name >= 'John Doe';")?;
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[vec![
+            Value::String("jane@email.com".into()),
+            Value::Number(2),
+        ]])?;
+
+        assert_index_contains(&mut db, "users_pk_index", &[vec![
+            Value::Number(200),
+            Value::Number(2),
+        ]])?;
+
+        assert_index_contains(&mut db, "users_name_uq_index", &[vec![
+            Value::String("Jane Doe".into()),
+            Value::Number(2),
+        ]])
+    }
+
+    #[test]
+    fn delete_from_empty_table() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, name VARCHAR(64));",
+        )?;
+        db.exec("CREATE UNIQUE INDEX name_idx ON users(name);")?;
+
+        db.exec("DELETE FROM users WHERE id >= 500;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert!(query.is_empty());
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[])?;
+        assert_index_contains(&mut db, "name_idx", &[])
+    }
+
+    #[test]
     fn update() -> Result<(), DbError> {
         let mut db = init_database()?;
 
@@ -2699,6 +2828,108 @@ mod tests {
         });
 
         Ok(())
+    }
+
+    #[test]
+    fn update_no_match() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+
+        db.exec("UPDATE users SET age = 20, name = 'Updated Name' WHERE age > 50;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_primary_key() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (name VARCHAR(255), age INT, id INT PRIMARY KEY, email VARCHAR(255) UNIQUE);")?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (1, 'John Doe', 'john@doe.com', 18);",
+        )?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (2, 'Jane Doe', 'jane@doe.com', 22);",
+        )?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (3, 'Some Dude', 'some@dude.com', 24);",
+        )?;
+
+        db.exec("UPDATE users SET id = 10 where id = 1;")?;
+
+        let query = db.exec("SELECT id, name, email, age FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(10),
+                    Value::String("John Doe".into()),
+                    Value::String("john@doe.com".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::String("jane@doe.com".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::String("some@dude.com".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        assert_index_contains(&mut db, "users_pk_index", &[
+            vec![Value::Number(2), Value::Number(2)],
+            vec![Value::Number(3), Value::Number(3)],
+            vec![Value::Number(10), Value::Number(1)],
+        ])?;
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![Value::String("jane@doe.com".into()), Value::Number(2)],
+            vec![Value::String("john@doe.com".into()), Value::Number(1)],
+            vec![Value::String("some@dude.com".into()), Value::Number(3)],
+        ])
     }
 
     #[test]

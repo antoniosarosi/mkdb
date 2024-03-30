@@ -477,7 +477,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 
         debug_assert!(
             index_entry.len() == 2,
-            "index entries must always have two values: index key -> primary key"
+            "index entries must always have two values: index key -> primary key but found {index_entry:?}"
         );
 
         let mut pager = self.pager.borrow_mut();
