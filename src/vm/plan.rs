@@ -315,14 +315,17 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 
         let mut found_key = false;
 
-        // Best case is when we find the key. If we don't find the key we
-        // position the cursor to the previous one and consume that key.
         let slot = match search.index {
             Ok(slot) => {
                 found_key = true;
                 slot
             }
 
+            // We didn't find the exact key we were looking for. This index is
+            // the index where the key "should" be located, so we'll position
+            // the cursor right before this index and consume the previous key,
+            // allowing the cursor to compute where the next one is (which is
+            // not easy, see the cursor code).
             Err(slot) => slot.saturating_sub(1),
         };
 
@@ -333,6 +336,9 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 
         self.cursor = Cursor::initialized(search.page, slot, descent);
 
+        // If we didn't find the key we're pointing to an entry that's located
+        // "before" the key, by consuming that entry we know that anything that
+        // comes after is >= than the key.
         if self.initial_position == InitialPosition::AfterKey || !found_key {
             self.cursor.try_next(&mut pager)?;
         }

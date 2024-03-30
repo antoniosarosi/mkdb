@@ -1025,6 +1025,28 @@ mod tests {
         })
     }
 
+    fn assert_index_contains<F: Seek + Read + Write + FileOps>(
+        db: &mut Database<F>,
+        name: &str,
+        expected_entries: &[Vec<Value>],
+    ) -> Result<(), DbError> {
+        let index = db.index_metadata(name)?;
+
+        let mut pager = db.pager.borrow_mut();
+        let mut cursor = Cursor::new(index.root, 0);
+
+        let mut entries = Vec::new();
+
+        while let Some((page, slot)) = cursor.try_next(&mut pager)? {
+            let entry = reassemble_payload(&mut pager, page, slot)?;
+            entries.push(tuple::deserialize(entry.as_ref(), &index.schema));
+        }
+
+        assert_eq!(entries, expected_entries);
+
+        Ok(())
+    }
+
     #[test]
     fn create_table_auto_index() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -1399,7 +1421,7 @@ mod tests {
             email_a.cmp(email_b)
         });
 
-        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
+        let query = db.exec("SELECT * FROM users;")?;
 
         assert_eq!(&query, &QuerySet {
             schema: Schema::new(vec![
@@ -1455,6 +1477,69 @@ mod tests {
                     Value::String("Some Dude".into()),
                     Value::Number(24)
                 ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_disordered_columns() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT, is_admin BOOL);",
+        )?;
+        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (1, 'John Doe', 18, TRUE);")?;
+        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (2, 'Jane Doe', 22, FALSE);")?;
+
+        let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::new("age", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::primary_key("id", DataType::Int),
+                Column::new("is_admin", DataType::Bool),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(18),
+                    Value::String("John Doe".into()),
+                    Value::Number(1),
+                    Value::Bool(true),
+                ],
+                vec![
+                    Value::Number(22),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(2),
+                    Value::Bool(false),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_expressions() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE products (id INT PRIMARY KEY, price INT, discount INT);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (1, 100, 5);")?;
+        db.exec("INSERT INTO products(id, price, discount) VALUES (2, 250, 10);")?;
+
+        let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("price / 10", DataType::BigInt),
+                Column::new("discount * 100", DataType::BigInt),
+            ]),
+            tuples: vec![
+                vec![Value::Number(1), Value::Number(10), Value::Number(500),],
+                vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
             ]
         });
 
@@ -1532,7 +1617,7 @@ mod tests {
         Ok(())
     }
 
-    // The default page size won't be enough to store this tuples.
+    // The default page size won't be enough to store these tuples.
     #[test]
     fn select_order_by_large_tuples() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {
@@ -1657,69 +1742,6 @@ mod tests {
     }
 
     #[test]
-    fn select_disordered_columns() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec(
-            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT, is_admin BOOL);",
-        )?;
-        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (1, 'John Doe', 18, TRUE);")?;
-        db.exec("INSERT INTO users(id, name, age, is_admin) VALUES (2, 'Jane Doe', 22, FALSE);")?;
-
-        let query = db.exec("SELECT age, name, id, is_admin FROM users;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::new("age", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::primary_key("id", DataType::Int),
-                Column::new("is_admin", DataType::Bool),
-            ]),
-            tuples: vec![
-                vec![
-                    Value::Number(18),
-                    Value::String("John Doe".into()),
-                    Value::Number(1),
-                    Value::Bool(true),
-                ],
-                vec![
-                    Value::Number(22),
-                    Value::String("Jane Doe".into()),
-                    Value::Number(2),
-                    Value::Bool(false),
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_expressions() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE products (id INT PRIMARY KEY, price INT, discount INT);")?;
-        db.exec("INSERT INTO products(id, price, discount) VALUES (1, 100, 5);")?;
-        db.exec("INSERT INTO products(id, price, discount) VALUES (2, 250, 10);")?;
-
-        let query = db.exec("SELECT id, price / 10, discount * 100 FROM products;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("price / 10", DataType::BigInt),
-                Column::new("discount * 100", DataType::BigInt),
-            ]),
-            tuples: vec![
-                vec![Value::Number(1), Value::Number(10), Value::Number(500),],
-                vec![Value::Number(2), Value::Number(25), Value::Number(1000),],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
     fn select_where_auto_index_exact() -> Result<(), DbError> {
         let mut db = init_database()?;
 
@@ -1742,6 +1764,69 @@ mod tests {
                 Value::Number(22)
             ],]
         });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_exact() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email = 'bob@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![vec![
+                Value::Number(2),
+                Value::String("Bob".into()),
+                Value::String("bob@email.com".into()),
+            ],]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_exact_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (10, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (20, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (30, 'Some Dude', 24);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id = 15;")?;
+
+        assert!(query.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_exact_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email = 'carla@email.com';")?;
+
+        assert!(query.is_empty());
 
         Ok(())
     }
@@ -1782,6 +1867,118 @@ mod tests {
     }
 
     #[test]
+    fn select_where_indexed_column_less_than() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email < 'david@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_less_than_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (10, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (20, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (30, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (40, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id < 35;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(10),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(20),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(30),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_less_than_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email < 'carla@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
     fn select_where_auto_index_greather_than() -> Result<(), DbError> {
         let mut db = init_database()?;
 
@@ -1811,6 +2008,99 @@ mod tests {
                     Value::Number(30)
                 ],
             ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_greater_than_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (10, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (20, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (30, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (40, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id > 25;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(30),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(40),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_greater_than() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email > 'bob@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![vec![
+                Value::Number(3),
+                Value::String("David".into()),
+                Value::String("david@email.com".into()),
+            ],]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_greater_than_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email > 'carla@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![vec![
+                Value::Number(3),
+                Value::String("David".into()),
+                Value::String("david@email.com".into()),
+            ]]
         });
 
         Ok(())
@@ -1857,6 +2147,113 @@ mod tests {
     }
 
     #[test]
+    fn select_where_auto_index_less_than_or_equal_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (10, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (20, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (30, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (40, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id <= 25;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(10),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(20),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_less_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email <= 'bob@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ]
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_less_than_or_equal_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email <= 'carla@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ]
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
     fn select_where_auto_index_greather_than_or_equal() -> Result<(), DbError> {
         let mut db = init_database()?;
 
@@ -1884,6 +2281,119 @@ mod tests {
                     Value::Number(4),
                     Value::String("Another Dude".into()),
                     Value::Number(30)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_greather_than_or_equal_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (10, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (20, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (30, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (40, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id >= 15;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(20),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(30),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(40),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_greater_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email >= 'bob@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("David".into()),
+                    Value::String("david@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_indexed_column_greater_than_or_equal_not_found() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'John', 'john@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE email >= 'carla@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(3),
+                    Value::String("David".into()),
+                    Value::String("david@email.com".into()),
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("John".into()),
+                    Value::String("john@email.com".into()),
                 ],
             ]
         });
@@ -1921,6 +2431,48 @@ mod tests {
         let query = db.exec(&format!(
             "SELECT * FROM users WHERE id > {};",
             total_users / 2
+        ))?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+            ]),
+            tuples: users,
+        });
+
+        Ok(())
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn large_auto_index_scan_key_not_found() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        let mut users = Vec::new();
+
+        let dont_insert_key = 200;
+
+        for i in 1..=400 {
+            if i != dont_insert_key {
+                let name = format!("User{i:03}");
+                db.exec(&format!(
+                    "INSERT INTO users(id, name) VALUES ({i}, '{name}');"
+                ))?;
+
+                if i > dont_insert_key {
+                    users.push(vec![Value::Number(i), Value::String(name)]);
+                }
+            }
+        }
+
+        let query = db.exec(&format!(
+            "SELECT * FROM users WHERE id > {dont_insert_key};"
         ))?;
 
         assert_eq!(query, QuerySet {
@@ -2145,28 +2697,6 @@ mod tests {
                 ]
             ]
         });
-
-        Ok(())
-    }
-
-    fn assert_index_contains<F: Seek + Read + Write + FileOps>(
-        db: &mut Database<F>,
-        name: &str,
-        expected_entries: &[Vec<Value>],
-    ) -> Result<(), DbError> {
-        let index = db.index_metadata(name)?;
-
-        let mut pager = db.pager.borrow_mut();
-        let mut cursor = Cursor::new(index.root, 0);
-
-        let mut entries = Vec::new();
-
-        while let Some((page, slot)) = cursor.try_next(&mut pager)? {
-            let entry = reassemble_payload(&mut pager, page, slot)?;
-            entries.push(tuple::deserialize(entry.as_ref(), &index.schema));
-        }
-
-        assert_eq!(entries, expected_entries);
 
         Ok(())
     }
