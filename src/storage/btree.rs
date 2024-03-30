@@ -54,7 +54,7 @@ pub(crate) trait BytesCmp {
 /// This is more useful than it seems at first glance because if we store
 /// integer keys at the beginning of the binary buffer in big endian format,
 /// then this is all we need to successfully determine the [`Ordering`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {
@@ -82,6 +82,17 @@ impl BytesCmp for FixedSizeMemCmp {
     }
 }
 
+impl TryFrom<&DataType> for FixedSizeMemCmp {
+    type Error = ();
+
+    fn try_from(data_type: &DataType) -> Result<Self, Self::Error> {
+        match data_type {
+            DataType::Varchar(_) | DataType::Bool => Err(()),
+            fixed => Ok(Self(byte_length_of_integer_type(fixed))),
+        }
+    }
+}
+
 /// Compares UTF-8 strings.
 ///
 /// Assumes that the buffers have this format:
@@ -101,7 +112,7 @@ impl BytesCmp for FixedSizeMemCmp {
 /// Then computes the total length of the string in bytes by reading the first
 /// `self.0` bytes as a little endian integer and once the total length is known
 /// [`str`] instances can be created.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct StringCmp(pub usize);
 
 impl BytesCmp for StringCmp {
@@ -154,6 +165,34 @@ impl BytesCmp for &Box<dyn BytesCmp> {
 impl BytesCmp for Box<dyn BytesCmp> {
     fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
         self.as_ref().bytes_cmp(a, b)
+    }
+}
+
+/// [`Box<dyn BytesCmp>`] kinda sucks.
+///
+/// Jump table based dynamic dispatch for the win. No allocations, easy
+/// [`Debug`] impl, [`Copy`], etc.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BTreeKeyComparator {
+    MemCmp(FixedSizeMemCmp),
+    StrCmp(StringCmp),
+}
+
+impl From<&DataType> for BTreeKeyComparator {
+    fn from(data_type: &DataType) -> Self {
+        match data_type {
+            DataType::Varchar(_) => Self::StrCmp(StringCmp(mem::size_of::<u32>())),
+            fixed => Self::MemCmp(FixedSizeMemCmp(byte_length_of_integer_type(fixed))),
+        }
+    }
+}
+
+impl BytesCmp for BTreeKeyComparator {
+    fn bytes_cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        match self {
+            Self::MemCmp(mem_cmp) => mem_cmp.bytes_cmp(a, b),
+            Self::StrCmp(str_cmp) => str_cmp.bytes_cmp(a, b),
+        }
     }
 }
 

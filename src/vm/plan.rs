@@ -50,19 +50,20 @@ use std::{
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
-    ops::{Deref, Index},
+    ops::Index,
     path::PathBuf,
     rc::Rc,
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, RowId, Schema, SqlError, TableMetadata},
-    paging::{io::FileOps, pager::Pager},
+    db::{DbError, IndexMetadata, Schema, SqlError, TableMetadata},
+    paging::{
+        io::FileOps,
+        pager::{PageNumber, Pager},
+    },
     sql::statement::{Assignment, BinaryOperator, Expression, Value},
     storage::{
-        reassemble_payload,
-        tuple::{self, byte_length_of_integer_type},
-        BTree, BytesCmp, Cursor, FixedSizeMemCmp,
+        reassemble_payload, tuple, BTree, BTreeKeyComparator, BytesCmp, Cursor, FixedSizeMemCmp,
     },
     vm,
 };
@@ -81,9 +82,11 @@ pub(crate) type Tuple = Vec<Value>;
 /// the [`Self::try_next`] impl block.
 #[derive(Debug)]
 pub(crate) enum Plan<F> {
-    /// Runs a sequential scan on a table and returns the rows one by one.
+    /// Runs a sequential scan on a table BTree and returns the rows one by one.
     SeqScan(SeqScan<F>),
-    /// Uses an index to scan the table instead of doing it sequentially.
+    /// Range scan for table BTrees or index BTrees.
+    RangeScan(RangeScan<F>),
+    /// Uses an external index BTree to scan a table.
     IndexScan(IndexScan<F>),
     /// Returns raw values from `INSERT INTO` statements.
     Values(Values),
@@ -101,8 +104,6 @@ pub(crate) enum Plan<F> {
     Sort(Sort<F>),
     /// Helper for the main [`Plan::Sort`] plan.
     SortKeysGen(SortKeysGen<F>),
-    /// Helper for the main [`Plan::IndexScan`] plan.
-    IndexCursor(IndexCursor<F>),
     /// Helper for various plans.
     BufferedIter(BufferedIter<F>),
 }
@@ -117,6 +118,7 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
     pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         match self {
             Self::SeqScan(seq_scan) => seq_scan.try_next(),
+            Self::RangeScan(range_scan) => range_scan.try_next(),
             Self::IndexScan(index_scan) => index_scan.try_next(),
             Self::Values(values) => values.try_next(),
             Self::Filter(filter) => filter.try_next(),
@@ -126,7 +128,6 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
             Self::Delete(delete) => delete.try_next(),
             Self::Sort(sort) => sort.try_next(),
             Self::SortKeysGen(sort_keys_gen) => sort_keys_gen.try_next(),
-            Self::IndexCursor(index_cursor) => index_cursor.try_next(),
             Self::BufferedIter(buffered_iter) => buffered_iter.try_next(),
         }
     }
@@ -180,18 +181,20 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
-/// Describes the initial cursor position of [`IndexCursor`].
+/// Describes the initial cursor position of [`RangeScan`].
 #[derive(Debug, PartialEq)]
 pub(crate) enum InitialPosition {
     /// Beginning of the BTree. First page first cell.
     Start,
-    /// Exactly at the key we're searching by.
+    /// Near the key we're searching by. The key may not exist.
     AtKey,
     /// Right after the key we're searching by.
     AfterKey,
+    /// Exact match. If we don't find the key the iterator is considered done.
+    Exact,
 }
 
-/// Stops the [`IndexCursor`] once the condition here resolves to `true`.
+/// Stops the [`RangeScan`] once the condition here resolves to `true`.
 #[derive(Debug, PartialEq)]
 pub(crate) enum StopCondition {
     /// Stops the cursor once the binary operator applied to the key we're
@@ -203,73 +206,161 @@ pub(crate) enum StopCondition {
     None,
 }
 
-/// Helper plan for the main [`IndexScan`] plan.
-///
-/// This is a special cursor over a range of keys in an index BTree. See
-/// [`crate::query::optimizer::generate_index_scan_plan`] for details.
-pub(crate) struct IndexCursor<F> {
-    pub index: IndexMetadata,
+/// The [`RangeScan`] works for both table BTrees and index BTrees.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RangeScanKind {
+    Index(IndexMetadata),
+    Table(TableMetadata),
+}
+
+/// Parameters for constructing [`RangeScan`] objects.
+pub(crate) struct RangeScanConfig<F> {
+    pub kind: RangeScanKind,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub initial_position: InitialPosition,
     pub key: Vec<u8>,
     pub stop_condition: StopCondition,
-    pub comparator: Box<dyn BytesCmp>,
-    pub cursor: Cursor,
-    pub init: bool,
-    pub done: bool,
 }
 
-impl<F: Debug> Debug for IndexCursor<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IndexCursor")
-            .field("index", &self.index)
-            .field("pager", &self.pager)
-            .field("initial_positioin", &self.initial_position)
-            .field("key", &self.key)
-            .field("stop_condition", &self.stop_condition)
-            .field("cursor", &self.cursor)
-            .field("init", &self.init)
-            .field("done", &self.done)
-            .finish()
+/// BTree range scan.
+///
+/// This struct serves 2 purposes:
+///
+/// 1. Scan auto-indexed BTree tables.
+/// 2. Scan external index BTrees.
+///
+/// It's called a "range" scan because it's used to partially scan BTrees.
+/// Queries like the following:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id > 500;
+/// ```
+///
+/// only need to scan half of the BTree and we know the starting position
+/// beforehand. The [`RangeScan`] positions its cursor at the first key that is
+/// greater than 500 and starts returning tuples from there.
+///
+/// # Range Scan Algorithm
+///
+/// Each [`RangeScan`] object will receive an [`InitialPosition`] and a
+/// [`StopCondition`] as parameters. The initial position informs us about where
+/// the cursor should be initialized. For the query above, the query planner
+/// will tell us to to position the cursor "after" key 500.
+#[derive(Debug)]
+pub(crate) struct RangeScan<F> {
+    kind: RangeScanKind,
+    root: PageNumber,
+    schema: Schema,
+    pager: Rc<RefCell<Pager<F>>>,
+    initial_position: InitialPosition,
+    key: Vec<u8>,
+    stop_condition: StopCondition,
+    comparator: BTreeKeyComparator,
+    cursor: Cursor,
+    init: bool,
+    done: bool,
+}
+
+impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
+    fn from(
+        RangeScanConfig {
+            kind,
+            pager,
+            initial_position,
+            key,
+            stop_condition,
+        }: RangeScanConfig<F>,
+    ) -> Self {
+        let (root, schema, comparator) = match &kind {
+            RangeScanKind::Index(index) => (
+                index.root,
+                index.schema.clone(),
+                BTreeKeyComparator::from(&index.column.data_type),
+            ),
+            RangeScanKind::Table(table) => (
+                table.root,
+                table.schema.clone(),
+                BTreeKeyComparator::from(&table.schema.columns[0].data_type),
+            ),
+        };
+
+        Self {
+            kind,
+            schema,
+            comparator,
+            pager,
+            initial_position,
+            key,
+            stop_condition,
+            root,
+            cursor: Cursor::new(root, 0),
+            done: false,
+            init: false,
+        }
     }
 }
 
-impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
+impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
+    /// Positions the cursor.
+    fn init(&mut self) -> io::Result<()> {
+        let mut pager = self.pager.borrow_mut();
+
+        if self.initial_position == InitialPosition::Start {
+            return Ok(());
+        };
+
+        let mut descent = Vec::new();
+        let mut btree = BTree::new(&mut pager, self.root, self.comparator);
+        let search = btree.search(self.root, &self.key, &mut descent)?;
+
+        let mut found_key = false;
+
+        // Best case is when we find the key. If we don't find the key we
+        // position the cursor to the previous one and consume that key.
+        let slot = match search.index {
+            Ok(slot) => {
+                found_key = true;
+                slot
+            }
+
+            Err(slot) => slot.saturating_sub(1),
+        };
+
+        if self.initial_position == InitialPosition::Exact && !found_key {
+            self.cursor = Cursor::done();
+            return Ok(());
+        }
+
+        self.cursor = Cursor::initialized(search.page, slot, descent);
+
+        if self.initial_position == InitialPosition::AfterKey || !found_key {
+            self.cursor.try_next(&mut pager)?;
+        }
+
+        Ok(())
+    }
+
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         if self.done {
             return Ok(None);
         }
 
-        let mut pager = self.pager.borrow_mut();
-
         if !self.init {
-            if let InitialPosition::AtKey | InitialPosition::AfterKey = self.initial_position {
-                let mut descent = Vec::new();
-                let mut btree = BTree::new(&mut pager, self.index.root, &self.comparator);
-                let search = btree.search(self.index.root, &self.key, &mut descent)?;
-
-                self.cursor = match search.index {
-                    Ok(slot) => Cursor::initialized(search.page, slot, descent),
-                    Err(_) => Cursor::done(),
-                };
-
-                if self.initial_position == InitialPosition::AfterKey {
-                    self.cursor.try_next(&mut pager)?;
-                }
-            }
-
+            self.init()?;
             self.init = true;
         }
+
+        let mut pager = self.pager.borrow_mut();
 
         let Some((page, slot)) = self.cursor.try_next(&mut pager)? else {
             self.done = true;
             return Ok(None);
         };
 
-        if let StopCondition::OnMatch(operator) = &self.stop_condition {
-            let entry = reassemble_payload(&mut pager, page, slot)?;
+        let tuple = reassemble_payload(&mut pager, page, slot)?;
 
-            let ordering = self.comparator.bytes_cmp(entry.as_ref(), &self.key);
+        if let StopCondition::OnMatch(operator) = &self.stop_condition {
+            let ordering = self.comparator.bytes_cmp(tuple.as_ref(), &self.key);
 
             let stop = match operator {
                 BinaryOperator::Gt => ordering == Ordering::Greater,
@@ -289,21 +380,19 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
             self.done = true;
         }
 
-        Ok(Some(tuple::deserialize(
-            reassemble_payload(&mut pager, page, slot)?.as_ref(),
-            &self.index.schema,
-        )))
+        Ok(Some(tuple::deserialize(tuple.as_ref(), &self.schema)))
     }
 }
 
 /// Index scan uses an indexed column to retrieve data from a table.
 ///
-/// An index is a BTree that maps a key to a [`RowId`], so it's easy to find
-/// all the row IDs we need without scanning sequentially.
+/// An index is a BTree that maps a column value to the primary key or row ID of
+/// the table. It makes it easy to find all the primary keys we need without
+/// scanning sequentially.
 ///
 /// # Index Scan Algorithm
 ///
-/// The index BTree maps keys to Row IDs like this:
+/// The index BTree maps keys to primary keys / row IDs like this:
 ///
 /// ```text
 ///                        +--------------+
@@ -315,7 +404,7 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 /// +-------------+------------+      +--------------+------------+
 /// ```
 ///
-/// Then the table BTree stores rows sorted by their Row ID:
+/// Then the table BTree stores rows sorted by their primary key / Row ID:
 ///
 /// ```text
 ///                           +------------+
@@ -334,7 +423,7 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 /// SELECT * FROM users WHERE name <= "Carla";
 /// ```
 ///
-/// The [`IndexCursor`] helper will return these tuples:
+/// The [`RangeScan`] helper will return these tuples:
 ///
 /// ```text
 /// +--------------+
@@ -363,11 +452,12 @@ impl<F: Seek + Read + Write + FileOps> IndexCursor<F> {
 /// +--------------+
 /// ```
 ///
-/// Sorting the tuples by [`RowId`] saves us from doing completely random IO,
+/// Sorting the tuples by primary key saves us from doing completely random IO,
 /// so scanning the table BTree will be a little bit more predictable.
 #[derive(Debug)]
 pub(crate) struct IndexScan<F> {
     pub index: IndexMetadata,
+    pub comparator: FixedSizeMemCmp,
     pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
@@ -379,23 +469,22 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             return Ok(None);
         };
 
+        debug_assert!(
+            index_entry.len() == 2,
+            "index entries must always have two values: index key -> primary key"
+        );
+
         let mut pager = self.pager.borrow_mut();
 
         let Value::Number(primary_key) = index_entry[1] else {
             return Err(DbError::Corrupted(format!(
-                "indexes should always map to row IDs but index {} at root {} doesn't: {index_entry:?}",
+                "indexes should always map to primary keys or row IDs but index {} at root {} doesn't: {index_entry:?}",
                 self.index.name,
                 self.index.root,
             )));
         };
 
-        let mut btree = BTree::new(
-            &mut pager,
-            self.table.root,
-            FixedSizeMemCmp(byte_length_of_integer_type(
-                &self.index.schema.columns[1].data_type,
-            )),
-        );
+        let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
         let table_entry = btree
             .get(&tuple::serialize(
@@ -404,7 +493,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
             ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
-                    "index {} at root {} maps to row ID {} that doesn't exist in table {} at root {}",
+                    "index {} at root {} maps to primary key or row ID {} that doesn't exist in table {} at root {}",
                     self.index.name,
                     self.index.root,
                     primary_key,
@@ -509,6 +598,7 @@ pub(crate) struct Insert<F> {
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
     pub table: TableMetadata,
+    pub comparator: FixedSizeMemCmp,
 }
 
 impl<F: Seek + Read + Write + FileOps> Insert<F> {
@@ -519,13 +609,11 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 
         let mut pager = self.pager.borrow_mut();
 
-        let mut btree = BTree::new(
-            &mut pager,
-            self.table.root,
-            FixedSizeMemCmp::for_type::<RowId>(),
-        );
-
-        btree
+        // TODO: We know that all tables use integers as BTree keys whereas
+        // indexes can use either strings or integers. Having two types of
+        // BTrees introduces code bloat but at the same time using dynamic
+        // dispatch for a type that we alrady know doesn't make sense.
+        BTree::new(&mut pager, self.table.root, self.comparator)
             .try_insert(tuple::serialize(&self.table.schema, &tuple))?
             .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
 
@@ -535,23 +623,18 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
                 .schema
                 .index_of(&index.column.name)
                 .ok_or(DbError::Corrupted(format!(
-                    "index column '{}' not found on table {} schema",
-                    index.column.name, self.table.name
+                    "index column '{}' not found on table {} schema: {:?}",
+                    index.column.name, self.table.name, self.table.schema,
                 )))?;
 
-            let index_key = &tuple[col];
-            let primary_key = &tuple[0];
+            // This one's dynamic, we can either use Box<dyn BytesCmp> or the
+            // BTreeKeyComparator enum which dispatches using jump tables
+            // instead of VTables. The enum also doesn't need an additional Box
+            // allocation.
+            let comparator = BTreeKeyComparator::from(&index.column.data_type);
 
-            let entry = tuple::serialize(&index.schema, [index_key, primary_key]);
-
-            let mut btree = BTree::new(
-                &mut pager,
-                index.root,
-                Box::<dyn BytesCmp>::from(&index.column.data_type),
-            );
-
-            btree
-                .try_insert(entry)?
+            BTree::new(&mut pager, index.root, comparator)
+                .try_insert(tuple::serialize(&index.schema, [&tuple[col], &tuple[0]]))?
                 .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(col)))?;
         }
 
@@ -566,6 +649,7 @@ pub(crate) struct Update<F> {
     pub assignments: Vec<Assignment>,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
+    pub comparator: FixedSizeMemCmp,
 }
 
 impl<F: Seek + Read + Write + FileOps> Update<F> {
@@ -587,36 +671,33 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
                         assignment.identifier, self.table
                     )))?;
 
+            // Compute updated column value.
             let new_value = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
-            let old_value = mem::replace(&mut tuple[col], new_value);
-            updated_cols.insert(assignment.identifier.clone(), (old_value, col));
+
+            // If the value did not change we'll skip this column.
+            if &new_value != &tuple[col] {
+                let old_value = mem::replace(&mut tuple[col], new_value);
+                updated_cols.insert(assignment.identifier.clone(), (old_value, col));
+            }
         }
 
         let mut pager = self.pager.borrow_mut();
-
-        let mut btree = BTree::new(
-            &mut pager,
-            self.table.root,
-            FixedSizeMemCmp(byte_length_of_integer_type(
-                &self.table.schema.columns[0].data_type,
-            )),
-        );
+        let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
         // Updated tuple.
         let updated_entry = tuple::serialize(&self.table.schema, &tuple);
 
         // If the primary key changes we have to remove the old entry from the
-        // BTree. Otherwise we do a normal update.
+        // BTree. Otherwise we do a normal update where we override the existing
+        // entry.
         if let Some((old_pk, new_pk)) = updated_cols.get(&self.table.schema.columns[0].name) {
-            if old_pk != &tuple[*new_pk] {
-                btree
-                    .try_insert(updated_entry)?
-                    .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
-                btree.remove(&tuple::serialize(
-                    &Schema::from([&self.table.schema.columns[0]]),
-                    [old_pk],
-                ))?;
-            }
+            btree
+                .try_insert(updated_entry)?
+                .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
+            btree.remove(&tuple::serialize(
+                &Schema::from([&self.table.schema.columns[0]]),
+                [old_pk],
+            ))?;
         } else {
             btree.insert(updated_entry)?;
         }
@@ -625,24 +706,29 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             let mut btree = BTree::new(
                 &mut pager,
                 index.root,
-                Box::<dyn BytesCmp>::from(&index.column.data_type),
+                BTreeKeyComparator::from(&index.column.data_type),
             );
 
-            // Indexed column was updated. If the key changed we need to remove
-            // the old one from the index and insert the new one. Otherwise
-            // normal update.
+            // Three cases to consider:
+            //
+            // 1. The value of the indexed column has changed. Remove the
+            // previous one and insert the new one. If the primary key we're
+            // pointing to has changed then this case covers that as well.
+            //
+            // 2. Only the primary key has changed while the indexed column
+            // value remains the same. In that case do a normal update
+            // overriding the previous index entry.
+            //
+            // 3. Nothing has change, move to the next iteration.
             if let Some((old_key, new_key)) = updated_cols.get(&index.column.name) {
-                let updated_index_entry =
-                    tuple::serialize(&index.schema, [&tuple[*new_key], &tuple[0]]);
+                btree
+                    .try_insert(tuple::serialize(&index.schema, [
+                        &tuple[*new_key],
+                        &tuple[0],
+                    ]))?
+                    .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(*new_key)))?;
 
-                if old_key != &tuple[*new_key] {
-                    btree
-                        .try_insert(updated_index_entry)?
-                        .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(*new_key)))?;
-                    btree.remove(&tuple::serialize(&Schema::from([&index.column]), [old_key]))?;
-                } else {
-                    btree.insert(updated_index_entry)?;
-                }
+                btree.remove(&tuple::serialize(&Schema::from([&index.column]), [old_key]))?;
             } else if updated_cols.contains_key(&self.table.schema.columns[0].name) {
                 let index_col = self.table.schema.index_of(&index.column.name).unwrap();
                 btree.insert(tuple::serialize(&index.schema, [
@@ -660,6 +746,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
 #[derive(Debug)]
 pub(crate) struct Delete<F> {
     pub table: TableMetadata,
+    pub comparator: FixedSizeMemCmp,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
 }
@@ -671,13 +758,7 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         };
 
         let mut pager = self.pager.borrow_mut();
-        let mut btree = BTree::new(
-            &mut pager,
-            self.table.root,
-            FixedSizeMemCmp(byte_length_of_integer_type(
-                &self.table.schema.columns[0].data_type,
-            )),
-        );
+        let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
         btree.remove(&tuple::serialize(&self.table.schema, &tuple))?;
 
@@ -688,7 +769,7 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
             let mut btree = BTree::new(
                 &mut pager,
                 index.root,
-                Box::<dyn BytesCmp>::from(&index.column.data_type),
+                BTreeKeyComparator::from(&index.column.data_type),
             );
 
             btree.remove(&entry)?;
@@ -968,19 +1049,19 @@ impl TupleBuffer {
 #[derive(Debug)]
 pub(crate) struct BufferedIter<F> {
     /// Tuple source. This is where we collect from.
-    pub source: Box<Plan<F>>,
+    source: Box<Plan<F>>,
     /// Tuple schema.
-    pub schema: Schema,
+    schema: Schema,
     /// `true` if [`Self::collect`] completed successfully.
-    pub collected: bool,
+    collected: bool,
     /// In-memory buffer that stores tuples from the source.
-    pub mem_buf: TupleBuffer,
+    mem_buf: TupleBuffer,
     /// File handle/descriptor in case we had to create the collection file.
-    pub file: Option<F>,
+    file: Option<F>,
     /// Buffered reader in case we created the file and have to read from it.
-    pub reader: Option<BufReader<F>>,
+    reader: Option<BufReader<F>>,
     /// Path of the collection file.
-    pub file_path: PathBuf,
+    file_path: PathBuf,
 }
 
 impl<F: FileOps> BufferedIter<F> {
@@ -1548,27 +1629,27 @@ pub(crate) struct SortConfig<F> {
 #[derive(Debug)]
 pub(crate) struct Sort<F> {
     /// Tuple input.
-    pub source: BufferedIter<F>,
+    source: BufferedIter<F>,
     /// Tuples comparator used to obtain [`Ordering`] instances.
-    pub comparator: TuplesComparator,
+    comparator: TuplesComparator,
     /// `true` if we already sorted the tuples.
-    pub sorted: bool,
+    sorted: bool,
     /// Page size used by the [`Pager`].
-    pub page_size: usize,
+    page_size: usize,
     /// How many input buffers to use for the K-way algorithm. This is "K".
-    pub input_buffers: usize,
+    input_buffers: usize,
     /// K-way output buffer. Used also for sorting in memory and returning tuples.
-    pub output_buffer: TupleBuffer,
+    output_buffer: TupleBuffer,
     /// Working directory to create temporary files.
-    pub work_dir: PathBuf,
+    work_dir: PathBuf,
     /// File used to read tuples.
-    pub input_file: Option<F>,
+    input_file: Option<F>,
     /// File used to write tuples to.
-    pub output_file: Option<F>,
+    output_file: Option<F>,
     /// Path of [`Self::input_file`].
-    pub input_file_path: PathBuf,
+    input_file_path: PathBuf,
     /// Path of [`Self::output_file`].
-    pub output_file_path: PathBuf,
+    output_file_path: PathBuf,
 }
 
 impl<F> From<SortConfig<F>> for Sort<F> {

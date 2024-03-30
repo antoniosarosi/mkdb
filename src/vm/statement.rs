@@ -12,8 +12,8 @@ use std::{
 use super::plan::{Plan, SeqScan};
 use crate::{
     db::{
-        mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId, Schema,
-        SqlError, MKDB_META, MKDB_META_ROOT,
+        has_btree_key, mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId,
+        Schema, SqlError, MKDB_META, MKDB_META_ROOT,
     },
     paging::{io::FileOps, pager::PageNumber},
     sql::statement::{Constraint, Create, Statement, Value},
@@ -44,8 +44,11 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                 Value::String(sql),
             ])?;
 
+            let skip_primary_key_index = if has_btree_key(&columns) { 1 } else { 0 };
+
             let indexes = columns
                 .into_iter()
+                .skip(skip_primary_key_index)
                 .filter(|col| !col.constraints.is_empty())
                 .flat_map(|col| {
                     let table_name = name.clone();

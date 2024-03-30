@@ -267,7 +267,10 @@ impl Schema {
 
     /// Prepends the special "row_id" column at the beginning of the schema.
     pub fn prepend_row_id(&mut self) {
-        debug_assert!(self.columns[0].name != ROW_ID_COL);
+        debug_assert!(
+            self.columns[0].name != ROW_ID_COL,
+            "schema already has {ROW_ID_COL}: {self:?}"
+        );
 
         let col = Column::new(ROW_ID_COL, DataType::UnsignedBigInt);
 
@@ -275,12 +278,31 @@ impl Schema {
         self.index.values_mut().for_each(|idx| *idx += 1);
         self.index.insert(String::from(ROW_ID_COL), 0);
     }
+
+    /// See [`has_btree_key`].
+    pub fn has_btree_key(&self) -> bool {
+        return has_btree_key(&self.columns);
+    }
 }
 
 impl<'c, C: IntoIterator<Item = &'c Column>> From<C> for Schema {
     fn from(columns: C) -> Self {
         Self::new(Vec::from_iter(columns.into_iter().cloned()))
     }
+}
+
+/// Returns `true` if the primary key of the table can also be used as the BTree
+/// key.
+///
+/// If the table doesn't need a Row ID we won't create an index for the primary
+/// key because the table BTree itself will already be an index for the primary
+/// key since we're using index organized storage.
+///
+/// On the other hand if we need a Row ID then the primary key is not usable as
+/// a direct table index, so we'll create a separate BTree index instead.
+pub fn has_btree_key(columns: &[Column]) -> bool {
+    columns[0].constraints.contains(&Constraint::PrimaryKey)
+        && !matches!(columns[0].data_type, DataType::Varchar(_) | DataType::Bool)
 }
 
 /// This only exists because in earlier development stages the iterator model
@@ -345,7 +367,7 @@ pub(crate) fn mkdb_meta_schema() -> Schema {
 }
 
 /// Data that we need to know about an index at runtime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexMetadata {
     /// Root page of the index-
     pub root: PageNumber,
@@ -360,7 +382,7 @@ pub(crate) struct IndexMetadata {
 }
 
 /// Data that we need to know about tables at runtime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TableMetadata {
     /// Root page of the table.
     pub root: PageNumber,
@@ -381,6 +403,19 @@ impl TableMetadata {
         self.row_id += 1;
 
         row_id
+    }
+
+    /// As of right now all tables use integers as real primary keys.
+    ///
+    /// Varchar primary keys are not used, we use the special "row_id" column
+    /// in that case.
+    pub(crate) fn comparator(&self) -> Result<FixedSizeMemCmp, DbError> {
+        FixedSizeMemCmp::try_from(&self.schema.columns[0].data_type).map_err(|_| {
+            DbError::Corrupted(format!(
+                "table {} is using a non-integer BTree key of type {}",
+                self.name, self.schema.columns[0].data_type
+            ))
+        })
     }
 }
 
@@ -656,15 +691,10 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
                         metadata.root = *root as PageNumber;
                         metadata.schema = Schema::new(columns);
 
-                        // Figure out if this table needs a row_id column.
-                        if !metadata.schema.columns[0]
-                            .constraints
-                            .contains(&Constraint::PrimaryKey)
-                            || matches!(
-                                metadata.schema.columns[0].data_type,
-                                DataType::Varchar(_) | DataType::Bool
-                            )
-                        {
+                        // Tables tha don't have an integer primary key as the
+                        // first field will use a hidden primary key that we
+                        // generate ourselves.
+                        if !metadata.schema.has_btree_key() {
                             metadata.schema.prepend_row_id();
                         }
 
@@ -946,9 +976,8 @@ mod tests {
 
     use super::{Database, DbError, DEFAULT_PAGE_SIZE};
     use crate::{
-        db::{mkdb_meta_schema, QuerySet, Schema, SqlError, TypeError, ROW_ID_COL},
+        db::{mkdb_meta_schema, QuerySet, Schema, SqlError, TypeError},
         paging::{
-            self,
             cache::{Cache, DEFAULT_MAX_CACHE_SIZE},
             io::{FileOps, MemBuf},
             pager::Pager,
@@ -997,10 +1026,33 @@ mod tests {
     }
 
     #[test]
-    fn create_table() -> Result<(), DbError> {
+    fn create_table_auto_index() -> Result<(), DbError> {
         let mut db = init_database()?;
 
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
+        db.exec(sql)?;
+
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
+
+        assert_eq!(
+            query,
+            QuerySet::new(mkdb_meta_schema(), vec![vec![
+                Value::String("table".into()),
+                Value::String("users".into()),
+                Value::Number(1),
+                Value::String("users".into()),
+                Value::String(Parser::new(sql).parse_statement()?.to_string())
+            ]])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_table_with_forced_pk_index() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let sql = "CREATE TABLE users (name VARCHAR(255), id INT PRIMARY KEY);";
         db.exec(sql)?;
 
         let query = db.exec("SELECT * FROM mkdb_meta;")?;
@@ -1028,6 +1080,184 @@ mod tests {
                 ]
             ])
         );
+
+        Ok(())
+    }
+
+    // If the first column can be used as a primary key then there will be no
+    // separate index BTree for it.
+    #[test]
+    fn create_multiple_tables_with_auto_index() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let t1 = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
+        let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
+        let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
+
+        db.exec(t1)?;
+        db.exec(t2)?;
+        db.exec(t3)?;
+
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: mkdb_meta_schema(),
+            tuples: vec![
+                vec![
+                    Value::String("table".into()),
+                    Value::String("users".into()),
+                    Value::Number(1),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(t1).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("tasks".into()),
+                    Value::Number(2),
+                    Value::String("tasks".into()),
+                    Value::String(Parser::new(t2).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("products".into()),
+                    Value::Number(3),
+                    Value::String("products".into()),
+                    Value::String(Parser::new(t3).parse_statement()?.to_string())
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    // If the first column can't be used as a primary key then the database
+    // always creates a unique index for the PK.
+    #[test]
+    fn create_multiple_tables_with_forced_pk_index() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let t1 = "CREATE TABLE users (name VARCHAR(255), id INT PRIMARY KEY);";
+        let i1 = "CREATE UNIQUE INDEX users_pk_index ON users(id);";
+
+        let t2 = "CREATE TABLE tasks (title VARCHAR(255), description VARCHAR(255), id INT PRIMARY KEY);";
+        let i2 = "CREATE UNIQUE INDEX tasks_pk_index ON tasks(id);";
+
+        let t3 = "CREATE TABLE products (price INT, id INT PRIMARY KEY);";
+        let i3 = "CREATE UNIQUE INDEX products_pk_index ON products(id);";
+
+        db.exec(t1)?;
+        db.exec(t2)?;
+        db.exec(t3)?;
+
+        let query = db.exec("SELECT * FROM mkdb_meta;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: mkdb_meta_schema(),
+            tuples: vec![
+                vec![
+                    Value::String("table".into()),
+                    Value::String("users".into()),
+                    Value::Number(1),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(t1).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("users_pk_index".into()),
+                    Value::Number(2),
+                    Value::String("users".into()),
+                    Value::String(Parser::new(i1).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("tasks".into()),
+                    Value::Number(3),
+                    Value::String("tasks".into()),
+                    Value::String(Parser::new(t2).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("tasks_pk_index".into()),
+                    Value::Number(4),
+                    Value::String("tasks".into()),
+                    Value::String(Parser::new(i2).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("table".into()),
+                    Value::String("products".into()),
+                    Value::Number(5),
+                    Value::String("products".into()),
+                    Value::String(Parser::new(t3).parse_statement()?.to_string())
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("products_pk_index".into()),
+                    Value::Number(6),
+                    Value::String("products".into()),
+                    Value::String(Parser::new(i3).parse_statement()?.to_string())
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    /// Used mostly to test the possibilities of a BTree rooted at page zero,
+    /// since that's a special case.
+    #[cfg(not(miri))]
+    #[test]
+    fn create_many_tables_with_forced_pk_index() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let mut expected = Vec::new();
+
+        let schema = "(title VARCHAR(255), description VARCHAR(255), id INT PRIMARY KEY)";
+
+        for i in 1..=100 {
+            let table_name = format!("table_{i:03}");
+            let index_name = format!("{table_name}_pk_index");
+
+            let table_sql = format!("CREATE TABLE {table_name} {schema};");
+            let index_sql = format!("CREATE UNIQUE INDEX {index_name} ON {table_name}(id);");
+
+            db.exec(&table_sql)?;
+
+            expected.push(vec![
+                Value::String("table".into()),
+                Value::String(table_name.clone()),
+                Value::Number(0),
+                Value::String(table_name.clone()),
+                Value::String(Parser::new(&table_sql).parse_statement()?.to_string()),
+            ]);
+
+            expected.push(vec![
+                Value::String("index".into()),
+                Value::String(index_name),
+                Value::Number(0),
+                Value::String(table_name),
+                Value::String(Parser::new(&index_sql).parse_statement()?.to_string()),
+            ]);
+        }
+
+        let query = db.exec("SELECT * FROM mkdb_meta ORDER BY table_name, name;")?;
+
+        let mut roots = HashMap::new();
+
+        for (i, mut tuple) in expected.into_iter().enumerate() {
+            let root = match query.get(i, "root").unwrap() {
+                Value::Number(root) => *root,
+                other => panic!("root is not a page number: {other:?}"),
+            };
+
+            let name = tuple[1].clone();
+            tuple[2] = Value::Number(root);
+
+            if let Err(root_used_by) = roots.try_insert(root, name.clone()) {
+                panic!("root {root} used for both {root_used_by} and {name}");
+            }
+
+            assert_eq!(query.tuples[i], tuple);
+        }
 
         Ok(())
     }
@@ -1110,6 +1340,89 @@ mod tests {
                 vec![Value::Number(2), Value::Number(40), Value::Number(20),],
             ]
         });
+
+        Ok(())
+    }
+
+    /// This test really "tests" the limits of the underlying BTrees by using a
+    /// really small page size and variable length data that's going to force
+    /// the BTrees to allocate a bunch of overflow pages and rebalance many
+    /// times. The pager will allocate hundreds of both overflow and slotted
+    /// pages. On top of that, we set the cache size to a really small number
+    /// to force as many evictions as possible.
+    ///
+    /// If this one works then I guess we can go home...
+    #[cfg(not(miri))]
+    #[test]
+    fn insert_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 8,
+        })?;
+
+        let create_table = r#"
+            CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name VARCHAR(255),
+                email VARCHAR(255) UNIQUE
+            );
+        "#;
+
+        db.exec(create_table)?;
+
+        let mut expected_table_entries = Vec::new();
+        let mut expected_email_uq_index_entries = Vec::new();
+
+        for i in 1..200 {
+            let name = format!("User {i}");
+            let email = format!("user{i}@test.com");
+
+            expected_table_entries.push(vec![
+                Value::Number(i),
+                Value::String(name.clone()),
+                Value::String(email.clone()),
+            ]);
+
+            expected_email_uq_index_entries
+                .push(vec![Value::String(email.clone()), Value::Number(i)]);
+
+            db.exec(&format!(
+                "INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');"
+            ))?;
+        }
+
+        expected_email_uq_index_entries.sort_by(|a, b| {
+            let (Value::String(email_a), Value::String(email_b)) = (&a[0], &b[0]) else {
+                unreachable!();
+            };
+
+            email_a.cmp(email_b)
+        });
+
+        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
+
+        assert_eq!(&query, &QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: expected_table_entries.clone()
+        });
+
+        expected_table_entries.sort_by(|a, b| {
+            let (Value::String(email_a), Value::String(email_b)) = (&a[2], &b[2]) else {
+                unreachable!()
+            };
+
+            email_a.cmp(email_b)
+        });
+
+        assert_index_contains(
+            &mut db,
+            "users_email_uq_index",
+            &expected_email_uq_index_entries,
+        )?;
 
         Ok(())
     }
@@ -1407,68 +1720,60 @@ mod tests {
     }
 
     #[test]
-    fn create_multiple_tables() -> Result<(), DbError> {
+    fn select_where_auto_index_exact() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        let t1 = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));";
-        let i1 = "CREATE UNIQUE INDEX users_pk_index ON users(id);";
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
 
-        let t2 = "CREATE TABLE tasks (id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255));";
-        let i2 = "CREATE UNIQUE INDEX tasks_pk_index ON tasks(id);";
-
-        let t3 = "CREATE TABLE products (id INT PRIMARY KEY, price INT);";
-        let i3 = "CREATE UNIQUE INDEX products_pk_index ON products(id);";
-
-        db.exec(t1)?;
-        db.exec(t2)?;
-        db.exec(t3)?;
-
-        let query = db.exec("SELECT * FROM mkdb_meta;")?;
+        let query = db.exec("SELECT * FROM users WHERE id = 2;")?;
 
         assert_eq!(query, QuerySet {
-            schema: mkdb_meta_schema(),
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![vec![
+                Value::Number(2),
+                Value::String("Jane Doe".into()),
+                Value::Number(22)
+            ],]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_less_than() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id < 3;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
             tuples: vec![
                 vec![
-                    Value::String("table".into()),
-                    Value::String("users".into()),
                     Value::Number(1),
-                    Value::String("users".into()),
-                    Value::String(Parser::new(t1).parse_statement()?.to_string())
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
                 ],
                 vec![
-                    Value::String("index".into()),
-                    Value::String("users_pk_index".into()),
                     Value::Number(2),
-                    Value::String("users".into()),
-                    Value::String(Parser::new(i1).parse_statement()?.to_string())
-                ],
-                vec![
-                    Value::String("table".into()),
-                    Value::String("tasks".into()),
-                    Value::Number(3),
-                    Value::String("tasks".into()),
-                    Value::String(Parser::new(t2).parse_statement()?.to_string())
-                ],
-                vec![
-                    Value::String("index".into()),
-                    Value::String("tasks_pk_index".into()),
-                    Value::Number(4),
-                    Value::String("tasks".into()),
-                    Value::String(Parser::new(i2).parse_statement()?.to_string())
-                ],
-                vec![
-                    Value::String("table".into()),
-                    Value::String("products".into()),
-                    Value::Number(5),
-                    Value::String("products".into()),
-                    Value::String(Parser::new(t3).parse_statement()?.to_string())
-                ],
-                vec![
-                    Value::String("index".into()),
-                    Value::String("products_pk_index".into()),
-                    Value::Number(6),
-                    Value::String("products".into()),
-                    Value::String(Parser::new(i3).parse_statement()?.to_string())
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
                 ],
             ]
         });
@@ -1476,62 +1781,155 @@ mod tests {
         Ok(())
     }
 
-    /// Used mostly to test the possibilities of a BTree rooted at page zero,
-    /// since that's a special case.
-    #[cfg(not(miri))]
     #[test]
-    fn create_many_tables() -> Result<(), DbError> {
+    fn select_where_auto_index_greather_than() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        let mut expected = Vec::new();
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
 
-        let schema = "(id INT PRIMARY KEY, title VARCHAR(255), description VARCHAR(255))";
+        let query = db.exec("SELECT * FROM users WHERE id > 2;")?;
 
-        for i in 1..=100 {
-            let table_name = format!("table_{i:03}");
-            let index_name = format!("{table_name}_pk_index");
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
 
-            let table_sql = format!("CREATE TABLE {table_name} {schema};");
-            let index_sql = format!("CREATE UNIQUE INDEX {index_name} ON {table_name}(id);");
+        Ok(())
+    }
 
-            db.exec(&table_sql)?;
+    #[test]
+    fn select_where_auto_index_less_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
 
-            expected.push(vec![
-                Value::String("table".into()),
-                Value::String(table_name.clone()),
-                Value::Number(0),
-                Value::String(table_name.clone()),
-                Value::String(Parser::new(&table_sql).parse_statement()?.to_string()),
-            ]);
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
 
-            expected.push(vec![
-                Value::String("index".into()),
-                Value::String(index_name),
-                Value::Number(0),
-                Value::String(table_name),
-                Value::String(Parser::new(&index_sql).parse_statement()?.to_string()),
-            ]);
+        let query = db.exec("SELECT * FROM users WHERE id <= 3;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Jane Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_auto_index_greather_than_or_equal() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id >= 3;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("Another Dude".into()),
+                    Value::Number(30)
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn large_auto_index_scan() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        let mut users = Vec::new();
+
+        for i in 1..=400 {
+            let name = format!("User{i:03}");
+            users.push(vec![Value::Number(i), Value::String(name)]);
         }
 
-        let query = db.exec("SELECT * FROM mkdb_meta ORDER BY table_name, name;")?;
-
-        let mut roots = HashMap::new();
-
-        for (i, mut tuple) in expected.into_iter().enumerate() {
-            let root = match query.get(i, "root").unwrap() {
-                Value::Number(root) => *root,
-                other => panic!("root is not a page number: {other:?}"),
-            };
-
-            let name = tuple[1].clone();
-            tuple[2] = Value::Number(root);
-
-            if let Err(root_used_by) = roots.try_insert(root, name.clone()) {
-                panic!("root {root} used for both {root_used_by} and {name}");
-            }
-
-            assert_eq!(query.tuples[i], tuple);
+        for user in &users {
+            db.exec(&format!(
+                "INSERT INTO users(id, name) VALUES ({}, {});",
+                user[0], user[1]
+            ))?;
         }
+
+        let total_users = users.len();
+        users.drain(..users.len() / 2);
+
+        let query = db.exec(&format!(
+            "SELECT * FROM users WHERE id > {};",
+            total_users / 2
+        ))?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+            ]),
+            tuples: users,
+        });
 
         Ok(())
     }
@@ -1540,10 +1938,16 @@ mod tests {
     fn delete_all() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (1, 'John Doe', 'john@doe.com', 18);",
+        )?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (2, 'Jane Doe', 'jane@doe.com', 22);",
+        )?;
+        db.exec(
+            "INSERT INTO users(id, name, email, age) VALUES (3, 'Some Dude', 'some@dude.com', 24);",
+        )?;
 
         db.exec("DELETE FROM users;")?;
 
@@ -1551,7 +1955,7 @@ mod tests {
 
         assert!(query.tuples.is_empty());
 
-        assert_index_contains(&mut db, "users_pk_index", &[])
+        assert_index_contains(&mut db, "users_email_uq_index", &[])
     }
 
     #[test]
@@ -1580,11 +1984,6 @@ mod tests {
             ]]
         });
 
-        assert_index_contains(&mut db, "users_pk_index", &[vec![
-            Value::Number(1),
-            Value::Number(1),
-        ]])?;
-
         assert_index_contains(&mut db, "users_email_uq_index", &[vec![
             Value::String("john@email.com".into()),
             Value::Number(1),
@@ -1594,7 +1993,7 @@ mod tests {
     // If buffering doesn't work correctly the delete should destroy the cursor
     // of the scan plan.
     #[test]
-    fn delete_where_indexed_exact() -> Result<(), DbError> {
+    fn delete_where_auto_index_exact() -> Result<(), DbError> {
         let mut db = init_database()?;
 
         db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
@@ -1626,11 +2025,6 @@ mod tests {
             ]
         });
 
-        assert_index_contains(&mut db, "users_pk_index", &[
-            vec![Value::Number(1), Value::Number(1)],
-            vec![Value::Number(3), Value::Number(3)],
-        ])?;
-
         assert_index_contains(&mut db, "users_email_uq_index", &[
             vec![Value::String("john@email.com".into()), Value::Number(1)],
             vec![
@@ -1642,7 +2036,7 @@ mod tests {
 
     // Again, if buffering doesn't work this will fail.
     #[test]
-    fn delete_where_indexed_ranged() -> Result<(), DbError> {
+    fn delete_where_auto_index_ranged() -> Result<(), DbError> {
         let mut db = init_database()?;
 
         db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
@@ -1666,11 +2060,6 @@ mod tests {
                 Value::Number(18)
             ],]
         });
-
-        assert_index_contains(&mut db, "users_pk_index", &[vec![
-            Value::Number(1),
-            Value::Number(1),
-        ]])?;
 
         assert_index_contains(&mut db, "users_email_uq_index", &[vec![
             Value::String("john@email.com".into()),
@@ -1786,15 +2175,15 @@ mod tests {
     fn update_pk_index_on_insert() -> Result<(), DbError> {
         let mut db = init_database()?;
 
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (100, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (200, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (300, 'Some Dude', 24);")?;
+        db.exec("CREATE TABLE users (id VARCHAR(3) PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES ('abc', 'John Doe', 18);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES ('def', 'Jane Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES ('ghi', 'Some Dude', 24);")?;
 
         assert_index_contains(&mut db, "users_pk_index", &[
-            vec![Value::Number(100), Value::Number(100)],
-            vec![Value::Number(200), Value::Number(200)],
-            vec![Value::Number(300), Value::Number(300)],
+            vec![Value::String("abc".into()), Value::Number(1)],
+            vec![Value::String("def".into()), Value::Number(2)],
+            vec![Value::String("ghi".into()), Value::Number(3)],
         ])
     }
 
@@ -1803,35 +2192,30 @@ mod tests {
         let mut db = init_database()?;
 
         db.exec(
-            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, name VARCHAR(64));",
+            "CREATE TABLE users (id VARCHAR(3) PRIMARY KEY, email VARCHAR(255) UNIQUE, name VARCHAR(64));",
         )?;
         db.exec("CREATE UNIQUE INDEX name_idx ON users(name);")?;
 
-        db.exec("INSERT INTO users(id, name, email) VALUES (100, 'John Doe', 'john@email.com');")?;
-        db.exec("INSERT INTO users(id, name, email) VALUES (200, 'Jane Doe', 'jane@email.com');")?;
-        db.exec(
-            "INSERT INTO users(id, name, email) VALUES (300, 'Some Dude', 'some_dude@email.com');",
-        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES ('ab', 'John Doe', 'john@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES ('cd', 'Jane Doe', 'jane@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES ('ef', 'Some Dude', 'some@dude.com');")?;
 
         assert_index_contains(&mut db, "users_pk_index", &[
-            vec![Value::Number(100), Value::Number(100)],
-            vec![Value::Number(200), Value::Number(200)],
-            vec![Value::Number(300), Value::Number(300)],
+            vec![Value::String("ab".into()), Value::Number(1)],
+            vec![Value::String("cd".into()), Value::Number(2)],
+            vec![Value::String("ef".into()), Value::Number(3)],
         ])?;
 
         assert_index_contains(&mut db, "users_email_uq_index", &[
-            vec![Value::String("jane@email.com".into()), Value::Number(200)],
-            vec![Value::String("john@email.com".into()), Value::Number(100)],
-            vec![
-                Value::String("some_dude@email.com".into()),
-                Value::Number(300),
-            ],
+            vec![Value::String("jane@email.com".into()), Value::Number(2)],
+            vec![Value::String("john@email.com".into()), Value::Number(1)],
+            vec![Value::String("some@dude.com".into()), Value::Number(3)],
         ])?;
 
         assert_index_contains(&mut db, "name_idx", &[
-            vec![Value::String("Jane Doe".into()), Value::Number(200)],
-            vec![Value::String("John Doe".into()), Value::Number(100)],
-            vec![Value::String("Some Dude".into()), Value::Number(300)],
+            vec![Value::String("Jane Doe".into()), Value::Number(2)],
+            vec![Value::String("John Doe".into()), Value::Number(1)],
+            vec![Value::String("Some Dude".into()), Value::Number(3)],
         ])
     }
 
@@ -1852,12 +2236,6 @@ mod tests {
 
         db.exec("UPDATE users SET id = 3, email = 'some@dude.com' WHERE id = 300;")?;
         db.exec("UPDATE users SET email = 'updated@email.com' WHERE id = 200;")?;
-
-        assert_index_contains(&mut db, "users_pk_index", &[
-            vec![Value::Number(3), Value::Number(3)],
-            vec![Value::Number(100), Value::Number(100)],
-            vec![Value::Number(200), Value::Number(200)],
-        ])?;
 
         assert_index_contains(&mut db, "users_email_uq_index", &[
             vec![Value::String("john@email.com".into()), Value::Number(100)],
@@ -1892,94 +2270,6 @@ mod tests {
             vec![Value::String("john@email.com".into()), Value::Number(100)],
             vec![Value::String("some@dude.com".into()), Value::Number(300)],
         ])
-    }
-
-    /// This test really "tests" the limits of the underlying BTrees by using a
-    /// really small page size and variable length data that's going to force
-    /// the BTrees to allocate a bunch of overflow pages and rebalance many
-    /// times. The pager will allocate hundreds of both overflow and slotted
-    /// pages. On top of that, we set the cache size to a really small number
-    /// to force as many evictions as possible.
-    ///
-    /// If this one works then I guess we can go home...
-    #[cfg(not(miri))]
-    #[test]
-    fn insert_many() -> Result<(), DbError> {
-        let mut db = init_database_with(DbConf {
-            page_size: 96,
-            cache_size: 8,
-        })?;
-
-        let create_table = r#"
-            CREATE TABLE users (
-                id INT PRIMARY KEY,
-                name VARCHAR(255),
-                email VARCHAR(255) UNIQUE
-            );
-        "#;
-
-        db.exec(create_table)?;
-
-        let mut expected_table_entries = Vec::new();
-        let mut expected_pk_index_entries = Vec::new();
-        let mut expected_email_uq_index_entries = Vec::new();
-
-        for i in 1..200 {
-            let name = format!("User {i}");
-            let email = format!("user{i}@test.com");
-
-            expected_table_entries.push(vec![
-                Value::Number(i),
-                Value::String(name.clone()),
-                Value::String(email.clone()),
-            ]);
-
-            expected_pk_index_entries.push(vec![Value::Number(i), Value::Number(i)]);
-
-            expected_email_uq_index_entries
-                .push(vec![Value::String(email.clone()), Value::Number(i)]);
-
-            db.exec(&format!(
-                "INSERT INTO users(id, name, email) VALUES ({i}, '{name}', '{email}');"
-            ))?;
-        }
-
-        expected_email_uq_index_entries.sort_by(|a, b| {
-            let (Value::String(email_a), Value::String(email_b)) = (&a[0], &b[0]) else {
-                unreachable!();
-            };
-
-            email_a.cmp(email_b)
-        });
-
-        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
-
-        assert_eq!(&query, &QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::unique("email", DataType::Varchar(255)),
-            ]),
-            tuples: expected_table_entries.clone()
-        });
-
-        assert_index_contains(&mut db, "users_pk_index", &expected_pk_index_entries)?;
-
-        expected_table_entries.sort_by(|a, b| {
-            let (Value::String(email_a), Value::String(email_b)) = (&a[2], &b[2]) else {
-                unreachable!()
-            };
-
-            email_a.cmp(email_b)
-        });
-
-        assert_index_contains(
-            &mut db,
-            "users_email_uq_index",
-            &expected_email_uq_index_entries,
-        )?;
-
-        Ok(())
     }
 
     #[test]
@@ -2065,7 +2355,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_duplicated_keys() -> Result<(), DbError> {
+    fn insert_duplicated_keys_auto_index() -> Result<(), DbError> {
         let mut db = init_database()?;
 
         db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
@@ -2108,7 +2398,6 @@ mod tests {
         let mut db = init_database()?;
 
         let create_table = "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));";
-        let create_pk_idx = "CREATE UNIQUE INDEX users_pk_index ON users(id);";
 
         db.exec(create_table)?;
         db.exec("INSERT INTO users(id, email) VALUES (1, 'john@doe.com');")?;
@@ -2127,233 +2416,13 @@ mod tests {
 
         assert_eq!(query, QuerySet {
             schema: mkdb_meta_schema(),
-            tuples: vec![
-                vec![
-                    Value::String("table".into()),
-                    Value::String("users".into()),
-                    Value::Number(1),
-                    Value::String("users".into()),
-                    Value::String(Parser::new(create_table).parse_statement()?.to_string())
-                ],
-                vec![
-                    Value::String("index".into()),
-                    Value::String("users_pk_index".into()),
-                    Value::Number(2),
-                    Value::String("users".into()),
-                    Value::String(Parser::new(create_pk_idx).parse_statement()?.to_string())
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_where_indexed_exact() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
-
-        let query = db.exec("SELECT * FROM users WHERE id = 2;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("age", DataType::Int),
-            ]),
             tuples: vec![vec![
-                Value::Number(2),
-                Value::String("Jane Doe".into()),
-                Value::Number(22)
-            ],]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_where_indexed_less_than() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
-
-        let query = db.exec("SELECT * FROM users WHERE id < 3;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("age", DataType::Int),
-            ]),
-            tuples: vec![
-                vec![
-                    Value::Number(1),
-                    Value::String("John Doe".into()),
-                    Value::Number(18)
-                ],
-                vec![
-                    Value::Number(2),
-                    Value::String("Jane Doe".into()),
-                    Value::Number(22)
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_where_indexed_greather_than() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
-
-        let query = db.exec("SELECT * FROM users WHERE id > 2;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("age", DataType::Int),
-            ]),
-            tuples: vec![
-                vec![
-                    Value::Number(3),
-                    Value::String("Some Dude".into()),
-                    Value::Number(24)
-                ],
-                vec![
-                    Value::Number(4),
-                    Value::String("Another Dude".into()),
-                    Value::Number(30)
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_where_indexed_less_than_or_equal() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
-
-        let query = db.exec("SELECT * FROM users WHERE id <= 3;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("age", DataType::Int),
-            ]),
-            tuples: vec![
-                vec![
-                    Value::Number(1),
-                    Value::String("John Doe".into()),
-                    Value::Number(18)
-                ],
-                vec![
-                    Value::Number(2),
-                    Value::String("Jane Doe".into()),
-                    Value::Number(22)
-                ],
-                vec![
-                    Value::Number(3),
-                    Value::String("Some Dude".into()),
-                    Value::Number(24)
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn select_where_indexed_greather_than_or_equal() -> Result<(), DbError> {
-        let mut db = init_database()?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'Jane Doe', 22);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
-        db.exec("INSERT INTO users(id, name, age) VALUES (4, 'Another Dude', 30);")?;
-
-        let query = db.exec("SELECT * FROM users WHERE id >= 3;")?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-                Column::new("age", DataType::Int),
-            ]),
-            tuples: vec![
-                vec![
-                    Value::Number(3),
-                    Value::String("Some Dude".into()),
-                    Value::Number(24)
-                ],
-                vec![
-                    Value::Number(4),
-                    Value::String("Another Dude".into()),
-                    Value::Number(30)
-                ],
-            ]
-        });
-
-        Ok(())
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn large_index_scan() -> Result<(), DbError> {
-        let mut db = init_database_with(DbConf {
-            page_size: 96,
-            cache_size: 1024,
-        })?;
-
-        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
-
-        let mut users = Vec::new();
-
-        for i in 1..=400 {
-            let name = format!("User{i:03}");
-            users.push(vec![Value::Number(i), Value::String(name)]);
-        }
-
-        for user in &users {
-            db.exec(&format!(
-                "INSERT INTO users(id, name) VALUES ({}, {});",
-                user[0], user[1]
-            ))?;
-        }
-
-        users.drain(..users.len() / 2);
-
-        let query = db.exec(&format!("SELECT * FROM users WHERE id > {};", users.len()))?;
-
-        assert_eq!(query, QuerySet {
-            schema: Schema::new(vec![
-                Column::primary_key("id", DataType::Int),
-                Column::new("name", DataType::Varchar(255)),
-            ]),
-            tuples: users,
+                Value::String("table".into()),
+                Value::String("users".into()),
+                Value::Number(1),
+                Value::String("users".into()),
+                Value::String(Parser::new(create_table).parse_statement()?.to_string())
+            ]]
         });
 
         Ok(())

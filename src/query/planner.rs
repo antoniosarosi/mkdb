@@ -41,8 +41,11 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 values: VecDeque::from([values]),
             }));
 
+            let table = db.table_metadata(&into)?.clone();
+
             Plan::Insert(Insert {
                 source,
+                comparator: table.comparator()?,
                 table: db.table_metadata(&into)?.clone(),
                 pager: Rc::clone(&db.pager),
             })
@@ -171,6 +174,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             }
 
             Plan::Update(Update {
+                comparator: metadata.comparator()?,
                 table: metadata.clone(),
                 assignments: columns,
                 pager: Rc::clone(&db.pager),
@@ -194,6 +198,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             }
 
             Plan::Delete(Delete {
+                comparator: metadata.comparator()?,
                 table: metadata.clone(),
                 pager: Rc::clone(&db.pager),
                 source: Box::new(source),
@@ -240,8 +245,8 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
 fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
     match plan {
         Plan::Filter(filter) => matches!(&*filter.source, Plan::IndexScan(_)),
+        Plan::SeqScan(_) | Plan::RangeScan(_) => false,
         Plan::IndexScan(_) => true,
-        Plan::SeqScan(_) => false,
         _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
     }
 }

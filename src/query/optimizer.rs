@@ -1,4 +1,6 @@
-// Generates optimized plans.
+//! Generates optimized plans.
+//!
+//! See the module level documentation of [`crate::vm::plan`].
 
 use std::{
     collections::HashMap,
@@ -7,20 +9,21 @@ use std::{
 };
 
 use crate::{
-    db::{Database, DatabaseContext, DbError, IndexMetadata, Schema},
+    db::{Database, DatabaseContext, DbError, IndexMetadata, Schema, SqlError, TableMetadata},
     paging::io::FileOps,
     sql::statement::{BinaryOperator, Expression},
-    storage::{tuple, BytesCmp, Cursor},
+    storage::{tuple, Cursor},
     vm::plan::{
-        BufferedIter, BufferedIterConfig, Filter, IndexCursor, IndexScan, InitialPosition, Plan,
-        SeqScan, Sort, SortConfig, StopCondition, TuplesComparator,
+        BufferedIter, BufferedIterConfig, Filter, IndexScan, InitialPosition, Plan, RangeScan,
+        RangeScanConfig, RangeScanKind, SeqScan, Sort, SortConfig, StopCondition, TuplesComparator,
     },
 };
 
 /// Generates an optimized scan plan.
 ///
-/// The generated plan will be either [`SeqScan`] or [`IndexScan`] with an
-/// optional [`Filter`] on top of it, depending on how the query looks like.
+/// The generated plan will be either [`SeqScan`], [`RangeScan`] or
+/// [`IndexScan`] with an optional [`Filter`] on top of it, depending on how the
+/// query looks like.
 pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     filter: Option<Expression>,
@@ -30,8 +33,8 @@ pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
         return generate_sequential_scan_plan(table, db);
     };
 
-    let source = if let Some(index_scan) = generate_index_scan_plan(table, db, &expr)? {
-        index_scan
+    let source = if let Some(optimized_scan) = generate_optimized_scan_plan(table, db, &expr)? {
+        optimized_scan
     } else {
         generate_sequential_scan_plan(table, db)?
     };
@@ -47,8 +50,7 @@ pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     }))
 }
 
-/// Basically a constructor. We'll use this until we figure out exactly how to
-/// build stuff here.
+/// Constructs a [`Plan::SeqScan`] instance.
 fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     db: &mut Database<F>,
@@ -62,47 +64,53 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
     }))
 }
 
-/// Attempts to generate an [`IndexScan`] plan.
+/// Attempts to generate a [`RangeScan`] or an [`IndexScan`] plan.
 ///
 /// It's only possible to do so if we find an expression that contains an
-/// indexed column and must always be executed. Otherwise we'll fallback to
-/// sequential scans.
-fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
-    table: &str,
+/// indexed column or the table primary key column and must always be executed.
+/// Otherwise we'll fallback to sequential scans.
+fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
+    table_name: &str,
     db: &mut Database<F>,
     filter: &Expression,
 ) -> Result<Option<Plan<F>>, DbError> {
-    let metadata = db.table_metadata(table)?.clone();
-
-    if metadata.indexes.is_empty() {
-        return Ok(None);
-    }
+    let table = db.table_metadata(table_name)?.clone();
 
     // Build index map (column name -> index metadata)
-    let indexes = HashMap::from_iter(
-        metadata
+    let mut indexes = HashMap::from_iter(
+        table
             .indexes
             .iter()
             .map(|index| (index.column.name.clone(), index.clone())),
     );
 
-    // Find expression that's using an indexed column.
+    // Find expression that's using an indexed column or the primary key.
     let Some(Expression::BinaryOperation {
         left,
         operator,
         right,
-    }) = find_indexed_expr(&indexes, filter)
+    }) = find_indexed_expr(&table, &indexes, filter)
     else {
         return Ok(None);
     };
 
-    let (key, index) = match (left.as_ref(), right.as_ref()) {
+    let (key, col, kind) = match (left.as_ref(), right.as_ref()) {
         (Expression::Identifier(col), Expression::Value(value))
         | (Expression::Value(value), Expression::Identifier(col)) => {
-            let index = indexes[col].clone();
-            let key = tuple::serialize(&Schema::from([&index.column]), [value]);
+            let index_col = table
+                .schema
+                .index_of(col)
+                .ok_or(SqlError::InvalidColumn(col.into()))?;
 
-            (key, index)
+            let key = tuple::serialize(&Schema::from([&table.schema.columns[index_col]]), [value]);
+
+            let kind = if let Some(index) = indexes.get(col) {
+                RangeScanKind::Index(index.clone())
+            } else {
+                RangeScanKind::Table(table.clone())
+            };
+
+            (key, index_col, kind)
         }
 
         _ => unreachable!(),
@@ -113,18 +121,18 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
         // SELECT * FROM t WHERE x = 5;
         // SELECT * FROM t WHERE 5 = x;
         //
-        // Position the cursor at key 5 and stop at the next key.
+        // Position the cursor at key 5 and stop after returning that key.
         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            (InitialPosition::AtKey, StopCondition::Once)
+            (InitialPosition::Exact, StopCondition::Once)
         }
 
         // Case 2:
         // SELECT * FROM t WHERE x > 5;
         // SELECT * FROM t WHERE 5 < x;
         //
-        // Position the cursor at key 5, assume it's initialized and consume key
-        // 5 which will cause the cursor to move to the successor.
+        // Position the cursor at key 5, consume key 5 which will cause the
+        // cursor to move to the successor and return keys until finished.
         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
             (InitialPosition::AfterKey, StopCondition::None)
@@ -171,19 +179,23 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
     let work_dir = db.work_dir.clone();
     let page_size = db.pager.borrow().page_size;
 
-    let mut source = Plan::IndexCursor(IndexCursor {
-        pager: Rc::clone(&db.pager),
-        cursor: Cursor::new(index.root, 0),
-        comparator: Box::<dyn BytesCmp>::from(&index.column.data_type),
-        index: index.clone(),
+    let maybe_index = indexes.remove(&table.schema.columns[col].name);
+
+    let mut source = Plan::RangeScan(RangeScan::from(RangeScanConfig {
+        kind,
         initial_position,
         key,
         stop_condition,
-        init: false,
-        done: false,
-    });
+        pager: Rc::clone(&db.pager),
+    }));
 
-    // We'll skip the sorter if only one tuple will be returned.
+    // Table BTree range scan, no additional index needed.
+    let Some(index) = maybe_index else {
+        return Ok(Some(source));
+    };
+
+    // We'll skip the sorter if only one tuple will be returned since it
+    // requires a bunch of extra steps in the pipeline.
     if *operator != BinaryOperator::Eq {
         source = Plan::Sort(Sort::from(SortConfig {
             page_size,
@@ -204,8 +216,9 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
     }
 
     Ok(Some(Plan::IndexScan(IndexScan {
-        table: metadata,
-        index: index,
+        comparator: table.comparator()?,
+        table,
+        index,
         pager: Rc::clone(&db.pager),
         source: Box::new(source),
     })))
@@ -248,6 +261,7 @@ fn generate_index_scan_plan<F: Seek + Read + Write + FileOps>(
 /// be better than others for a certain query. This is a toy database so ain't
 /// nobody gonna worry about that :)
 fn find_indexed_expr<'e>(
+    table: &TableMetadata,
     indexes: &HashMap<String, IndexMetadata>,
     expr: &'e Expression,
 ) -> Option<&'e Expression> {
@@ -259,7 +273,7 @@ fn find_indexed_expr<'e>(
         } => match (left.as_ref(), right.as_ref()) {
             (Expression::Identifier(col), Expression::Value(_))
             | (Expression::Value(_), Expression::Identifier(col))
-                if indexes.contains_key(col)
+                if (indexes.contains_key(col) || &table.schema.columns[0].name == col)
                     && matches!(
                         operator,
                         BinaryOperator::Eq
@@ -272,14 +286,13 @@ fn find_indexed_expr<'e>(
                 Some(expr)
             }
 
-            _ if *operator == BinaryOperator::And => {
-                find_indexed_expr(indexes, left).or_else(|| find_indexed_expr(indexes, right))
-            }
+            _ if *operator == BinaryOperator::And => find_indexed_expr(table, indexes, left)
+                .or_else(|| find_indexed_expr(table, indexes, right)),
 
             _ => None,
         },
 
-        Expression::Nested(expr) => find_indexed_expr(indexes, expr),
+        Expression::Nested(expr) => find_indexed_expr(table, indexes, expr),
 
         _ => None,
     }
@@ -297,7 +310,7 @@ fn find_indexed_expr<'e>(
 /// There are more cases where the filter wouldn't be needed but this is good
 /// enough for now.
 fn needs_filter<F>(plan: &Plan<F>, expr: &Expression) -> bool {
-    let Plan::IndexScan(_) = plan else {
+    let (Plan::IndexScan(_) | Plan::RangeScan(_)) = plan else {
         return true;
     };
 
