@@ -138,6 +138,12 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 }
             }
 
+            // No need to project if the output schema is the exact same as the
+            // table schema.
+            if table.schema == output_schema {
+                return Ok(source);
+            }
+
             Plan::Project(Project {
                 input_schema: table.schema.clone(),
                 output_schema,
@@ -248,5 +254,311 @@ fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
         Plan::SeqScan(_) | Plan::RangeScan(_) => false,
         Plan::IndexScan(_) => true,
         _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::HashMap, io, path::PathBuf, rc::Rc};
+
+    use crate::{
+        db::{Database, DatabaseContext, IndexMetadata, Schema, TableMetadata},
+        paging::{io::MemBuf, pager::Pager},
+        sql::{
+            self,
+            parser::Parser,
+            statement::{BinaryOperator, Column, Create, DataType, Expression, Statement, Value},
+        },
+        storage::{
+            tuple::{self, byte_length_of_integer_type},
+            BTreeKeyComparator, Cursor, FixedSizeMemCmp,
+        },
+        vm::plan::{
+            Filter, IndexScan, InitialPosition, Plan, Project, RangeScan, RangeScanConfig,
+            RangeScanKind, SeqScan, StopCondition,
+        },
+        DbError,
+    };
+
+    /// Test database context.
+    struct DbCtx {
+        inner: Database<MemBuf>,
+        tables: HashMap<String, TableMetadata>,
+        indexes: HashMap<String, IndexMetadata>,
+    }
+
+    impl DbCtx {
+        fn pager(&self) -> Rc<RefCell<Pager<MemBuf>>> {
+            Rc::clone(&self.inner.pager)
+        }
+    }
+
+    impl AsMut<Database<MemBuf>> for DbCtx {
+        fn as_mut(&mut self) -> &mut Database<MemBuf> {
+            &mut self.inner
+        }
+    }
+
+    fn init_db(ctx: &[&str]) -> Result<DbCtx, DbError> {
+        let mut pager = Pager::<MemBuf>::builder().wrap(io::Cursor::new(Vec::<u8>::new()));
+        pager.init()?;
+
+        let mut db = Database::new(Rc::new(RefCell::new(pager)), PathBuf::new());
+
+        let mut tables = HashMap::new();
+        let mut indexes = HashMap::new();
+
+        let mut fetch_tables = Vec::new();
+
+        for sql in ctx {
+            if let Statement::Create(Create::Table { name, .. }) =
+                Parser::new(sql).parse_statement()?
+            {
+                fetch_tables.push(name);
+            }
+
+            db.exec(sql)?;
+        }
+
+        for table_name in fetch_tables {
+            let table = db.table_metadata(&table_name)?;
+
+            for index in &table.indexes {
+                indexes.insert(index.name.to_owned(), index.to_owned());
+            }
+
+            tables.insert(table_name, table.to_owned());
+        }
+
+        Ok(DbCtx {
+            inner: db,
+            tables,
+            indexes,
+        })
+    }
+
+    fn gen_plan(
+        db: &mut impl AsMut<Database<MemBuf>>,
+        query: &str,
+    ) -> Result<Plan<MemBuf>, DbError> {
+        let statement = sql::pipeline(query, db.as_mut())?;
+        super::generate_plan(statement, db.as_mut())
+    }
+
+    fn parse_expr(expr: &str) -> Expression {
+        Parser::new(expr).parse_expression().unwrap()
+    }
+
+    #[test]
+    fn generate_basic_sequential_scan() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users;")?,
+            Plan::SeqScan(SeqScan {
+                pager: db.pager(),
+                cursor: Cursor::new(db.tables["users"].root, 0),
+                table: db.tables["users"].to_owned(),
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_sequential_scan_with_filter() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE age >= 20;")?,
+            Plan::Filter(Filter {
+                filter: parse_expr("age >= 20"),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::SeqScan(SeqScan {
+                    pager: db.pager(),
+                    cursor: Cursor::new(db.tables["users"].root, 0),
+                    table: db.tables["users"].to_owned(),
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    // Tables with no primary key have a special "row_id" column.
+    #[test]
+    fn generate_sequential_scan_with_projection_when_using_row_id() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users;")?,
+            Plan::Project(Project {
+                input_schema: db.tables["users"].schema.to_owned(),
+                output_schema: Schema::new(vec![
+                    Column::new("id", DataType::Int),
+                    Column::new("name", DataType::Varchar(255))
+                ]),
+                projection: vec![
+                    Expression::Identifier("id".into()),
+                    Expression::Identifier("name".into())
+                ],
+                source: Box::new(Plan::SeqScan(SeqScan {
+                    pager: db.pager(),
+                    cursor: Cursor::new(db.tables["users"].root, 0),
+                    table: db.tables["users"].to_owned(),
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    // Tables with no primary key have a special "row_id" column.
+    #[test]
+    fn generate_sequential_scan_with_projection_when_selecting_columns() -> Result<(), DbError> {
+        let mut db = init_db(&[
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255));",
+        ])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT email, id FROM users;")?,
+            Plan::Project(Project {
+                input_schema: db.tables["users"].schema.to_owned(),
+                output_schema: Schema::new(vec![
+                    Column::new("email", DataType::Varchar(255)),
+                    Column::primary_key("id", DataType::Int),
+                ]),
+                projection: vec![
+                    Expression::Identifier("email".into()),
+                    Expression::Identifier("id".into()),
+                ],
+                source: Box::new(Plan::SeqScan(SeqScan {
+                    cursor: Cursor::new(db.tables["users"].root, 0),
+                    table: db.tables["users"].to_owned(),
+                    pager: db.pager()
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_basic_sequential_scan_with_filter_and_projection() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT name FROM users WHERE age >= 20;")?,
+            Plan::Project(Project {
+                input_schema: db.tables["users"].schema.to_owned(),
+                output_schema: Schema::new(vec![Column::new("name", DataType::Varchar(255))]),
+                projection: vec![Expression::Identifier("name".into())],
+                source: Box::new(Plan::Filter(Filter {
+                    filter: parse_expr("age >= 20"),
+                    schema: db.tables["users"].schema.to_owned(),
+                    source: Box::new(Plan::SeqScan(SeqScan {
+                        cursor: Cursor::new(db.tables["users"].root, 0),
+                        table: db.tables["users"].to_owned(),
+                        pager: db.pager()
+                    }))
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_range_scan_exact_on_auto_index() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                pager: db.pager(),
+                initial_position: InitialPosition::Exact,
+                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
+                stop_condition: StopCondition::Once,
+                kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_index_scan_exact() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE);"])?;
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE email = 'bob@email.com';"
+            )?,
+            Plan::IndexScan(IndexScan {
+                pager: db.pager(),
+                comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
+                index: db.indexes["users_email_uq_index"].to_owned(),
+                table: db.tables["users"].to_owned(),
+                source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                    initial_position: InitialPosition::Exact,
+                    key: tuple::serialize_key(
+                        &DataType::Varchar(255),
+                        &Value::String("bob@email.com".into())
+                    ),
+                    stop_condition: StopCondition::Once,
+                    pager: db.pager(),
+                    kind: RangeScanKind::Index(db.indexes["users_email_uq_index"].to_owned()),
+                })))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn skip_filter_on_simple_range_scan() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE id < 5;")?,
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                pager: db.pager(),
+                initial_position: InitialPosition::Start,
+                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
+                stop_condition: StopCondition::OnMatch(BinaryOperator::GtEq),
+                kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_filter_if_cant_be_skipped() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE id < 5 AND name = 'Bob';"
+            )?,
+            Plan::Filter(Filter {
+                filter: parse_expr("id < 5 AND name = 'Bob'"),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                    pager: db.pager(),
+                    initial_position: InitialPosition::Start,
+                    key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
+                    stop_condition: StopCondition::OnMatch(BinaryOperator::GtEq),
+                    kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+                })))
+            })
+        );
+
+        Ok(())
     }
 }

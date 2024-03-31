@@ -54,7 +54,7 @@ pub(crate) trait BytesCmp {
 /// This is more useful than it seems at first glance because if we store
 /// integer keys at the beginning of the binary buffer in big endian format,
 /// then this is all we need to successfully determine the [`Ordering`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FixedSizeMemCmp(pub usize);
 
 impl FixedSizeMemCmp {
@@ -112,7 +112,7 @@ impl TryFrom<&DataType> for FixedSizeMemCmp {
 /// Then computes the total length of the string in bytes by reading the first
 /// `self.0` bytes as a little endian integer and once the total length is known
 /// [`str`] instances can be created.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StringCmp(pub usize);
 
 impl BytesCmp for StringCmp {
@@ -172,7 +172,7 @@ impl BytesCmp for Box<dyn BytesCmp> {
 ///
 /// Jump table based dynamic dispatch for the win. No allocations, easy
 /// [`Debug`] impl, [`Copy`], etc.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BTreeKeyComparator {
     MemCmp(FixedSizeMemCmp),
     StrCmp(StringCmp),
@@ -2042,7 +2042,10 @@ pub(crate) fn reassemble_payload<F: Seek + Read + Write + FileOps>(
 }
 
 /// BTree cursor.
-#[derive(Debug)]
+///
+/// TODO: Allow the cursor to own a reference to the pager like other structs
+/// do.
+#[derive(Debug, PartialEq)]
 pub(crate) struct Cursor {
     /// The page that the cursor points at currently.
     page: PageNumber,

@@ -80,7 +80,7 @@ pub(crate) type Tuple = Vec<Value>;
 /// Technically we could make this work with traits and [`Box<dyn Trait>`] but
 /// no clear benefit was found on previous attempts. See the comment below on
 /// the [`Self::try_next`] impl block.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Plan<F> {
     /// Runs a sequential scan on a table BTree and returns the rows one by one.
     SeqScan(SeqScan<F>),
@@ -144,12 +144,19 @@ impl<F: Seek + Read + Write + FileOps> Iterator for Plan<F> {
 impl<F> Plan<F> {
     /// Returns the final schema of this plan.
     ///
-    /// For now this is always going to be the columns of `SELECT` statements.
+    /// This is the schema of the top level plan.
     pub fn schema(&self) -> Option<Schema> {
-        match self {
-            Self::Project(project) => Some(project.output_schema.clone()),
-            _ => None,
-        }
+        let schema = match self {
+            Self::Project(project) => &project.output_schema,
+            Self::IndexScan(index_scan) => &index_scan.table.schema,
+            Self::SeqScan(seq_scan) => &seq_scan.table.schema,
+            Self::RangeScan(range_scan) => &range_scan.schema,
+            Self::Sort(sort) => &sort.source.schema,
+            Self::Filter(filter) => return filter.source.schema(),
+            _ => return None,
+        };
+
+        Some(schema.to_owned())
     }
 }
 
@@ -159,7 +166,7 @@ impl<F> Plan<F> {
 /// BTree.
 ///
 /// See [`Cursor::try_next`] for details.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct SeqScan<F> {
     pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
@@ -246,7 +253,7 @@ pub(crate) struct RangeScanConfig<F> {
 /// [`StopCondition`] as parameters. The initial position informs us about where
 /// the cursor should be initialized. For the query above, the query planner
 /// will tell us to to position the cursor "after" key 500.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct RangeScan<F> {
     kind: RangeScanKind,
     root: PageNumber,
@@ -460,7 +467,7 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 ///
 /// Sorting the tuples by primary key saves us from doing completely random IO,
 /// so scanning the table BTree will be a little bit more predictable.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct IndexScan<F> {
     pub index: IndexMetadata,
     pub comparator: FixedSizeMemCmp,
@@ -493,9 +500,9 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
         let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
         let table_entry = btree
-            .get(&tuple::serialize(
-                &Schema::from([&self.index.schema.columns[1]]),
-                &[Value::Number(primary_key)],
+            .get(&tuple::serialize_key(
+                &self.index.schema.columns[1].data_type,
+                &Value::Number(primary_key),
             ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
@@ -519,7 +526,7 @@ impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
 ///
 /// This supports multiple values but the parser does not currently parse
 /// `INSERT` statements with multiple values.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Values {
     pub values: VecDeque<Vec<Expression>>,
 }
@@ -543,7 +550,7 @@ impl Values {
 /// evaluate to `true`.
 ///
 /// Used for `WHERE` clauses in `SELECT`, `DELETE` and `UPDATE` statements.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Filter<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
@@ -575,7 +582,7 @@ impl<F: Seek + Read + Write + FileOps> Filter<F> {
 ///
 /// The projection in this case would be the "id" and "age columns". The name
 /// is discarded.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Project<F> {
     pub source: Box<Plan<F>>,
     pub input_schema: Schema,
@@ -599,7 +606,7 @@ impl<F: Seek + Read + Write + FileOps> Project<F> {
 }
 
 /// Inserts data into a table and upates indexes.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Insert<F> {
     pub pager: Rc<RefCell<Pager<F>>>,
     pub source: Box<Plan<F>>,
@@ -649,7 +656,7 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 }
 
 /// Assigns values to columns and updates indexes in the process.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Update<F> {
     pub table: TableMetadata,
     pub assignments: Vec<Assignment>,
@@ -700,9 +707,9 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             btree
                 .try_insert(updated_entry)?
                 .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(0)))?;
-            btree.remove(&tuple::serialize(
-                &Schema::from([&self.table.schema.columns[0]]),
-                [old_pk],
+            btree.remove(&tuple::serialize_key(
+                &self.table.schema.columns[0].data_type,
+                old_pk,
             ))?;
         } else {
             btree.insert(updated_entry)?;
@@ -734,7 +741,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
                     ]))?
                     .map_err(|_| SqlError::DuplicatedKey(tuple.swap_remove(*new_key)))?;
 
-                btree.remove(&tuple::serialize(&Schema::from([&index.column]), [old_key]))?;
+                btree.remove(&tuple::serialize_key(&index.column.data_type, old_key))?;
             } else if updated_cols.contains_key(&self.table.schema.columns[0].name) {
                 let index_col = self.table.schema.index_of(&index.column.name).unwrap();
                 btree.insert(tuple::serialize(&index.schema, [
@@ -749,7 +756,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
 }
 
 /// Removes values from a table BTree and from all the necessary index BTrees.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Delete<F> {
     pub table: TableMetadata,
     pub comparator: FixedSizeMemCmp,
@@ -766,11 +773,14 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
         let mut pager = self.pager.borrow_mut();
         let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
-        btree.remove(&tuple::serialize(&self.table.schema, &tuple))?;
+        btree.remove(&tuple::serialize_key(
+            &self.table.schema.columns[0].data_type,
+            &tuple[0],
+        ))?;
 
         for index in &self.table.indexes {
             let col = self.table.schema.index_of(&index.column.name).unwrap();
-            let entry = tuple::serialize(&Schema::from([&index.column]), [&tuple[col]]);
+            let key = tuple::serialize_key(&index.column.data_type, &tuple[col]);
 
             let mut btree = BTree::new(
                 &mut pager,
@@ -778,7 +788,7 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
                 BTreeKeyComparator::from(&index.column.data_type),
             );
 
-            btree.remove(&entry)?;
+            btree.remove(&key)?;
         }
 
         Ok(Some(vec![]))
@@ -873,7 +883,7 @@ const TUPLE_PAGE_HEADER_SIZE: usize = mem::size_of::<u32>();
 /// automatically fails and will be rolled back by the journal system when we
 /// reboot. At that point the file no longer serves any purpose, it's not used
 /// for recovery.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct TupleBuffer {
     /// Maximum size of this buffer in bytes.
     page_size: usize,
@@ -1133,6 +1143,13 @@ pub(crate) struct BufferedIter<F> {
     file_path: PathBuf,
 }
 
+// Can't derive because of the BufReader<F>.
+impl<F: PartialEq> PartialEq for BufferedIter<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.schema == other.schema
+    }
+}
+
 impl<F: FileOps> BufferedIter<F> {
     /// Drops the IO resource and deletes it from the file system.
     fn drop_file(&mut self) -> io::Result<()> {
@@ -1242,7 +1259,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
 /// `ORDER BY` expressions and appends the results to each tuple.
 ///
 /// See the documentation of [`Sort`] for more details.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct SortKeysGen<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
@@ -1689,7 +1706,7 @@ pub(crate) struct SortConfig<F> {
 /// beginning for the IO complexity analysis and formulas, but basically the
 /// more buffers we have the less IO we have to do. The number of input buffers
 /// is configured through [`Self::input_buffers`].
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Sort<F> {
     /// Tuple input.
     source: BufferedIter<F>,
@@ -1744,7 +1761,7 @@ impl<F> From<SortConfig<F>> for Sort<F> {
 /// Compares two tuples using their "sort keys" and returns an [`Ordering`].
 ///
 /// See the documentation of [`Sort`] for more details.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct TuplesComparator {
     /// Original schema of the tuples.
     pub schema: Schema,

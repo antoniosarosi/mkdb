@@ -17,7 +17,7 @@ use std::{
 
 use super::{
     cache::{Cache, FrameId},
-    io::{BlockIo, FileOps},
+    io::{BlockIo, FileOps, MemBuf},
 };
 use crate::{
     db::{DbError, DEFAULT_PAGE_SIZE},
@@ -50,7 +50,7 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 /// file. Otherwise, if the user wants to "rollback" the changes, we copy the
 /// original pages back to the database file, leaving it in the same state as
 /// it was prior to modification. See [`Journal`] for more details.
-#[derive(Debug)]
+#[derive(PartialEq)]
 pub(crate) struct Pager<F> {
     /// Wrapped IO/file handle/descriptor.
     file: BlockIo<F>,
@@ -66,6 +66,19 @@ pub(crate) struct Pager<F> {
     journal: Journal<F>,
     /// Keeps track of pages written to the journal file.
     journal_pages: HashSet<PageNumber>,
+}
+
+// The derive Debug impl for the Pager prints too much stuff (the internal
+// io Cursor buffer, every cache allocated page, etc). We'll just print some
+// basic configs, this is only needed for tests.
+impl<F> Debug for Pager<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pager")
+            .field("page_size", &self.page_size)
+            .field("cache_size", &self.cache.max_size())
+            .field("journal_max_buf_pages", &self.journal.max_pages)
+            .finish()
+    }
 }
 
 /// Builder for [`Pager`].
@@ -734,7 +747,7 @@ const JOURNAL_HEADER_SIZE: usize = JOURNAL_MAGIC_SIZE + JOURNAL_PAGE_NUM_SIZE;
 /// a syscall every single time we want to write a page to the journal file,
 /// which should make this more efficient. But without any benchmarks to prove
 /// it you can call it yet another useless micro-optimization :)
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Journal<F> {
     /// In-memory page buffer.
     buffer: Vec<u8>,
@@ -985,6 +998,8 @@ impl<'j, F: Read> JournalPagesIter<'j, F> {
                 return Ok(None);
             };
 
+            // TODO: We can optimize this read operation by prefetching the
+            // next header when reading the chunk.
             let mut header_buf = [0; JOURNAL_HEADER_SIZE];
             let bytes = file.read(&mut header_buf)?;
 

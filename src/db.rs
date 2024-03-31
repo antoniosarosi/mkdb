@@ -742,7 +742,9 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
             return Err(DbError::Sql(SqlError::InvalidTable(table.into())));
         }
 
-        metadata.row_id = self.load_next_row_id(metadata.root)?;
+        if metadata.schema.columns[0].name == ROW_ID_COL {
+            metadata.row_id = self.load_next_row_id(metadata.root)?;
+        }
 
         Ok(metadata)
     }

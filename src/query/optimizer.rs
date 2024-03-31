@@ -102,7 +102,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
                 .index_of(col)
                 .ok_or(SqlError::InvalidColumn(col.into()))?;
 
-            let key = tuple::serialize(&Schema::from([&table.schema.columns[index_col]]), [value]);
+            let key = tuple::serialize_key(&table.schema.columns[index_col].data_type, value);
 
             let kind = if let Some(index) = indexes.get(col) {
                 RangeScanKind::Index(index.clone())

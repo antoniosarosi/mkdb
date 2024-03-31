@@ -132,7 +132,7 @@ impl FileOps for MemBuf {
 /// reads and writes it returns full pages abstracting the blocks.
 ///
 /// See [`BlockIo::read`] for more details on how it works.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct BlockIo<I> {
     /// Underlying IO resource handle.
     io: I,

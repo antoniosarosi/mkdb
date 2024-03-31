@@ -108,6 +108,19 @@ pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
         .sum()
 }
 
+/// Serialize a single value.
+///
+/// It's called serialize key because otherwise we just use [`serialize`].
+/// This is only used to serialize the first part of a tuple in order to search
+/// BTrees.
+pub(crate) fn serialize_key(data_type: &DataType, value: &Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    serialize_value_into(&mut buf, data_type, value);
+    buf
+}
+
+/// Serialize a complete tuple.
+///
 /// See the module level documentation for the serialization format.
 pub(crate) fn serialize<'v>(
     schema: &Schema,
@@ -123,44 +136,53 @@ pub(crate) fn serialize<'v>(
 
     // TODO: Alignment.
     for (col, val) in schema.columns.iter().zip(values.into_iter()) {
-        match (&col.data_type, val) {
-            (DataType::Varchar(_), Value::String(string)) => {
-                if string.as_bytes().len() > u32::MAX as usize {
-                    todo!("strings longer than {} bytes are not handled", u32::MAX);
-                }
-
-                let byte_length = string.as_bytes().len() as u32;
-
-                buf.extend_from_slice(&byte_length.to_le_bytes());
-                buf.extend_from_slice(string.as_bytes());
-            }
-
-            (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
-
-            (integer_type, Value::Number(num)) => {
-                let bounds = match integer_type {
-                    DataType::Int => i32::MIN as i128..=i32::MAX as i128,
-                    DataType::UnsignedInt => 0..=u32::MAX as i128,
-                    DataType::BigInt => i64::MIN as i128..=i64::MAX as i128,
-                    DataType::UnsignedBigInt => 0..=u64::MAX as i128,
-                    _ => unreachable!(),
-                };
-
-                assert!(
-                    bounds.contains(num),
-                    "integer overflow while serializing number {num} into data type {integer_type:?}"
-                );
-
-                let byte_length = byte_length_of_integer_type(integer_type);
-                let big_endian_bytes = num.to_be_bytes();
-                buf.extend_from_slice(&big_endian_bytes[big_endian_bytes.len() - byte_length..]);
-            }
-
-            _ => unreachable!("attempt to serialize {val} into {}", col.data_type),
-        }
+        serialize_value_into(&mut buf, &col.data_type, val);
     }
 
     buf
+}
+
+/// Low level serialization.
+///
+/// This one takes a reference instead of producing a new [`Vec<u8>`] because
+/// that would be expensive for serializing complete tuples as we'd have to
+/// allocate multiple vectors and join them together.
+fn serialize_value_into(buf: &mut Vec<u8>, data_type: &DataType, value: &Value) {
+    match (data_type, value) {
+        (DataType::Varchar(_), Value::String(string)) => {
+            if string.as_bytes().len() > u32::MAX as usize {
+                todo!("strings longer than {} bytes are not handled", u32::MAX);
+            }
+
+            let byte_length = string.as_bytes().len() as u32;
+
+            buf.extend_from_slice(&byte_length.to_le_bytes());
+            buf.extend_from_slice(string.as_bytes());
+        }
+
+        (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
+
+        (integer_type, Value::Number(num)) => {
+            let bounds = match integer_type {
+                DataType::Int => i32::MIN as i128..=i32::MAX as i128,
+                DataType::UnsignedInt => 0..=u32::MAX as i128,
+                DataType::BigInt => i64::MIN as i128..=i64::MAX as i128,
+                DataType::UnsignedBigInt => 0..=u64::MAX as i128,
+                _ => unreachable!(),
+            };
+
+            assert!(
+                bounds.contains(num),
+                "integer overflow while serializing number {num} into data type {integer_type:?}"
+            );
+
+            let byte_length = byte_length_of_integer_type(integer_type);
+            let big_endian_bytes = num.to_be_bytes();
+            buf.extend_from_slice(&big_endian_bytes[big_endian_bytes.len() - byte_length..]);
+        }
+
+        _ => unreachable!("attempt to serialize {value} into {data_type}"),
+    }
 }
 
 /// See the module level documentation for the serialization format.
