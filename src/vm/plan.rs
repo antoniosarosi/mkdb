@@ -56,7 +56,7 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Schema, SqlError, TableMetadata},
+    db::{DbError, IndexMetadata, Relation, Schema, SqlError, TableMetadata},
     paging::{
         io::FileOps,
         pager::{PageNumber, Pager},
@@ -84,10 +84,12 @@ pub(crate) type Tuple = Vec<Value>;
 pub(crate) enum Plan<F> {
     /// Runs a sequential scan on a table BTree and returns the rows one by one.
     SeqScan(SeqScan<F>),
+    /// Exact match for expressions like `SELECT * FROM table WHERE id = 5`.
+    ExactMatch(ExactMatch<F>),
     /// Range scan for table BTrees or index BTrees.
     RangeScan(RangeScan<F>),
-    /// Uses an external index BTree to scan a table.
-    IndexScan(IndexScan<F>),
+    /// Uses primary keys or row IDs to scan a table BTree.
+    KeyScan(KeyScan<F>),
     /// Returns raw values from `INSERT INTO` statements.
     Values(Values),
     /// Executes `WHERE` clauses and filters rows.
@@ -118,8 +120,9 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
     pub fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         match self {
             Self::SeqScan(seq_scan) => seq_scan.try_next(),
+            Self::ExactMatch(exact_match) => exact_match.try_next(),
             Self::RangeScan(range_scan) => range_scan.try_next(),
-            Self::IndexScan(index_scan) => index_scan.try_next(),
+            Self::KeyScan(index_scan) => index_scan.try_next(),
             Self::Values(values) => values.try_next(),
             Self::Filter(filter) => filter.try_next(),
             Self::Project(project) => project.try_next(),
@@ -148,9 +151,10 @@ impl<F> Plan<F> {
     pub fn schema(&self) -> Option<Schema> {
         let schema = match self {
             Self::Project(project) => &project.output_schema,
-            Self::IndexScan(index_scan) => &index_scan.table.schema,
+            Self::KeyScan(index_scan) => &index_scan.table.schema,
             Self::SeqScan(seq_scan) => &seq_scan.table.schema,
             Self::RangeScan(range_scan) => &range_scan.schema,
+            Self::ExactMatch(exact_match) => &exact_match.relation.schema(),
             Self::Sort(sort) => &sort.source.schema,
             Self::Filter(filter) => return filter.source.schema(),
             _ => return None,
@@ -188,16 +192,49 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
-/// The [`RangeScan`] works for both table BTrees and index BTrees.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BTreeKind {
-    Index(IndexMetadata),
-    Table(TableMetadata),
+/// Scans that are not "sequential" fall into two categories:
+/// 1. Exact key match.
+/// 2. Range scan.
+pub(crate) enum Scan {
+    Match(Vec<u8>),
+    Range((Bound<Vec<u8>>, Bound<Vec<u8>>)),
+}
+
+/// Exact key match for expressions like `SELECT * FROM table WHERE id = 5;`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ExactMatch<F> {
+    pub relation: Relation,
+    pub key: Vec<u8>,
+    pub pager: Rc<RefCell<Pager<F>>>,
+    pub done: bool,
+}
+
+impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Only runs once.
+        self.done = true;
+
+        let mut pager = self.pager.borrow_mut();
+        let mut btree = BTree::new(&mut pager, self.relation.root(), self.relation.comparator());
+
+        let Some(entry) = btree.get(&self.key)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(tuple::deserialize(
+            entry.as_ref(),
+            self.relation.schema(),
+        )))
+    }
 }
 
 /// Parameters for constructing [`RangeScan`] objects.
 pub(crate) struct RangeScanConfig<F> {
-    pub kind: BTreeKind,
+    pub relation: Relation,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
 }
@@ -216,19 +253,18 @@ pub(crate) struct RangeScanConfig<F> {
 /// SELECT * FROM users WHERE id > 500;
 /// ```
 ///
-/// only need to scan half of the BTree and we know the starting position
-/// beforehand. The [`RangeScan`] positions its cursor at the first key that is
-/// greater than 500 and starts returning tuples from there.
+/// only need to scan the BTree starting from a key >= 500. The [`RangeScan`]
+/// positions its cursor at the first key that is greater than 500 and starts
+/// returning tuples from there.
 ///
 /// # Range Scan Algorithm
 ///
-/// Each [`RangeScan`] object will receive an [`InitialPosition`] and a
-/// [`StopCondition`] as parameters. The initial position informs us about where
-/// the cursor should be initialized. For the query above, the query planner
-/// will tell us to to position the cursor "after" key 500.
+/// Each [`RangeScan`] object will receive an implementation of [`RangeBounds`]
+/// and will use [`RangeBounds::start_bound`] to position the cursor initially
+/// then it will use [`RangeBounds::end_bound`] to know when to stop.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RangeScan<F> {
-    kind: BTreeKind,
+    relation: Relation,
     root: PageNumber,
     schema: Schema,
     pager: Rc<RefCell<Pager<F>>>,
@@ -240,28 +276,21 @@ pub(crate) struct RangeScan<F> {
 }
 
 impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
-    fn from(RangeScanConfig { kind, pager, range }: RangeScanConfig<F>) -> Self {
-        let (root, schema, comparator) = match &kind {
-            BTreeKind::Index(index) => (
-                index.root,
-                index.schema.clone(),
-                BTreeKeyComparator::from(&index.column.data_type),
-            ),
-            BTreeKind::Table(table) => (
-                table.root,
-                table.schema.clone(),
-                BTreeKeyComparator::from(&table.schema.columns[0].data_type),
-            ),
-        };
-
-        Self {
-            kind,
-            schema,
-            comparator,
+    fn from(
+        RangeScanConfig {
+            relation,
             pager,
             range,
-            root,
-            cursor: Cursor::new(root, 0),
+        }: RangeScanConfig<F>,
+    ) -> Self {
+        Self {
+            schema: relation.schema().clone(),
+            comparator: relation.comparator(),
+            root: relation.root(),
+            cursor: Cursor::new(relation.root(), 0),
+            pager,
+            range,
+            relation,
             done: false,
             init: false,
         }
@@ -431,7 +460,7 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 /// Sorting the tuples by primary key saves us from doing completely random IO,
 /// so scanning the table BTree will be a little bit more predictable.
 #[derive(Debug, PartialEq)]
-pub(crate) struct IndexScan<F> {
+pub(crate) struct KeyScan<F> {
     pub index: IndexMetadata,
     pub comparator: FixedSizeMemCmp,
     pub table: TableMetadata,
@@ -439,7 +468,7 @@ pub(crate) struct IndexScan<F> {
     pub source: Box<Plan<F>>,
 }
 
-impl<F: Seek + Read + Write + FileOps> IndexScan<F> {
+impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         let Some(index_entry) = self.source.try_next()? else {
             return Ok(None);

@@ -250,9 +250,9 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
 /// them.
 fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
     match plan {
-        Plan::Filter(filter) => matches!(&*filter.source, Plan::IndexScan(_)),
+        Plan::Filter(filter) => is_scan_plan_buffered(&filter.source),
+        Plan::KeyScan(_) | Plan::ExactMatch(_) => true,
         Plan::SeqScan(_) | Plan::RangeScan(_) => false,
-        Plan::IndexScan(_) => true,
         _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
     }
 }
@@ -262,7 +262,7 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, io, ops::Bound, path::PathBuf, rc::Rc};
 
     use crate::{
-        db::{Database, DatabaseContext, IndexMetadata, Schema, TableMetadata},
+        db::{Database, DatabaseContext, IndexMetadata, Relation, Schema, TableMetadata},
         paging::{io::MemBuf, pager::Pager},
         sql::{
             self,
@@ -274,7 +274,7 @@ mod tests {
             Cursor, FixedSizeMemCmp,
         },
         vm::plan::{
-            BTreeKind, Filter, IndexScan, Plan, Project, RangeScan, RangeScanConfig, SeqScan,
+            ExactMatch, Filter, KeyScan, Plan, Project, RangeScan, RangeScanConfig, SeqScan,
         },
         DbError,
     };
@@ -470,26 +470,24 @@ mod tests {
     }
 
     #[test]
-    fn generate_range_scan_exact_on_auto_index() -> Result<(), DbError> {
+    fn generate_exact_match_on_auto_index() -> Result<(), DbError> {
         let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
 
         assert_eq!(
             gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
-            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+            Plan::ExactMatch(ExactMatch {
+                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
                 pager: db.pager(),
-                kind: BTreeKind::Table(db.tables["users"].to_owned()),
-                range: (
-                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(5))),
-                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
-                )
-            }))
+                relation: Relation::Table(db.tables["users"].to_owned()),
+                done: false,
+            })
         );
 
         Ok(())
     }
 
     #[test]
-    fn generate_index_scan_exact() -> Result<(), DbError> {
+    fn generate_exact_match_on_external_index() -> Result<(), DbError> {
         let mut db =
             init_db(&["CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE);"])?;
 
@@ -498,25 +496,20 @@ mod tests {
                 &mut db,
                 "SELECT * FROM users WHERE email = 'bob@email.com';"
             )?,
-            Plan::IndexScan(IndexScan {
+            Plan::KeyScan(KeyScan {
                 pager: db.pager(),
                 comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
                 index: db.indexes["users_email_uq_index"].to_owned(),
                 table: db.tables["users"].to_owned(),
-                source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                source: Box::new(Plan::ExactMatch(ExactMatch {
                     pager: db.pager(),
-                    kind: BTreeKind::Index(db.indexes["users_email_uq_index"].to_owned()),
-                    range: (
-                        Bound::Included(tuple::serialize_key(
-                            &DataType::Varchar(255),
-                            &Value::String("bob@email.com".into())
-                        )),
-                        Bound::Included(tuple::serialize_key(
-                            &DataType::Varchar(255),
-                            &Value::String("bob@email.com".into())
-                        ))
-                    )
-                })))
+                    relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+                    key: tuple::serialize_key(
+                        &DataType::Varchar(255),
+                        &Value::String("bob@email.com".into())
+                    ),
+                    done: false,
+                }))
             })
         );
 
@@ -531,7 +524,7 @@ mod tests {
             gen_plan(&mut db, "SELECT * FROM users WHERE id < 5;")?,
             Plan::RangeScan(RangeScan::from(RangeScanConfig {
                 pager: db.pager(),
-                kind: BTreeKind::Table(db.tables["users"].to_owned()),
+                relation: Relation::Table(db.tables["users"].to_owned()),
                 range: (
                     Bound::Unbounded,
                     Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
@@ -556,7 +549,7 @@ mod tests {
                 schema: db.tables["users"].schema.to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
                     pager: db.pager(),
-                    kind: BTreeKind::Table(db.tables["users"].to_owned()),
+                    relation: Relation::Table(db.tables["users"].to_owned()),
                     range: (
                         Bound::Unbounded,
                         Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))

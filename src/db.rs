@@ -26,7 +26,7 @@ use crate::{
         parser::{Parser, ParserError},
         statement::{Column, Constraint, Create, DataType, Statement, Value},
     },
-    storage::{tuple, BTree, FixedSizeMemCmp},
+    storage::{tuple, BTree, BTreeKeyComparator, FixedSizeMemCmp},
     vm::{
         self,
         plan::{Plan, Tuple},
@@ -394,6 +394,41 @@ pub(crate) struct TableMetadata {
     pub indexes: Vec<IndexMetadata>,
     /// Next [`RowId`] for this table.
     row_id: RowId,
+}
+
+/// Dynamic dispatch for relation types.
+///
+/// Some [`Plan`] types need to work with both table BTrees and Index BTrees but
+/// we will only know exactly wich at runtime. The relations share some
+/// properties like the root page but differ in others, for example tables have
+/// indexes associated to them but indexes don't.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Relation {
+    Index(IndexMetadata),
+    Table(TableMetadata),
+}
+
+impl Relation {
+    pub fn root(&self) -> PageNumber {
+        match self {
+            Self::Index(index) => index.root,
+            Self::Table(table) => table.root,
+        }
+    }
+
+    pub fn comparator(&self) -> BTreeKeyComparator {
+        match self {
+            Self::Index(index) => BTreeKeyComparator::from(&index.column.data_type),
+            Self::Table(table) => BTreeKeyComparator::from(&table.schema.columns[0].data_type),
+        }
+    }
+
+    pub fn schema(&self) -> &Schema {
+        match self {
+            Self::Index(index) => &index.schema,
+            Self::Table(table) => &table.schema,
+        }
+    }
 }
 
 impl TableMetadata {

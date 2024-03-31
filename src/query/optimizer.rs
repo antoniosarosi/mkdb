@@ -10,13 +10,13 @@ use std::{
 };
 
 use crate::{
-    db::{Database, DatabaseContext, DbError, IndexMetadata, SqlError, TableMetadata},
+    db::{Database, DatabaseContext, DbError, IndexMetadata, Relation, SqlError, TableMetadata},
     paging::io::FileOps,
     sql::statement::{BinaryOperator, Expression},
     storage::{tuple, Cursor},
     vm::plan::{
-        BTreeKind, BufferedIter, BufferedIterConfig, Filter, IndexScan, Plan, RangeScan,
-        RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
+        BufferedIter, BufferedIterConfig, ExactMatch, Filter, KeyScan, Plan, RangeScan,
+        RangeScanConfig, Scan, SeqScan, Sort, SortConfig, TuplesComparator,
     },
 };
 
@@ -95,7 +95,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         return Ok(None);
     };
 
-    let (key, col, kind) = match (left.as_ref(), right.as_ref()) {
+    let (key, col, relation) = match (left.as_ref(), right.as_ref()) {
         (Expression::Identifier(col), Expression::Value(value))
         | (Expression::Value(value), Expression::Identifier(col)) => {
             let index_col = table
@@ -105,19 +105,19 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
             let key = tuple::serialize_key(&table.schema.columns[index_col].data_type, value);
 
-            let kind = if let Some(index) = indexes.get(col) {
-                BTreeKind::Index(index.clone())
+            let relation = if let Some(index) = indexes.get(col) {
+                Relation::Index(index.clone())
             } else {
-                BTreeKind::Table(table.clone())
+                Relation::Table(table.clone())
             };
 
-            (key, index_col, kind)
+            (key, index_col, relation)
         }
 
         _ => unreachable!(),
     };
 
-    let range = match (left.as_ref(), operator, right.as_ref()) {
+    let scan = match (left.as_ref(), operator, right.as_ref()) {
         // Case 1:
         // SELECT * FROM t WHERE x = 5;
         // SELECT * FROM t WHERE 5 = x;
@@ -125,7 +125,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // Position the cursor at key 5 and stop after returning that key.
         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            (Bound::Included(key.clone()), Bound::Included(key.clone()))
+            Scan::Match(key)
         }
 
         // Case 2:
@@ -136,7 +136,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // cursor to move to the successor and return keys until finished.
         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-            (Bound::Excluded(key), Bound::Unbounded)
+            Scan::Range((Bound::Excluded(key), Bound::Unbounded))
         }
 
         // Case 3:
@@ -147,7 +147,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // tell it to stop once it finds a key >= 5.
         (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
-            (Bound::Unbounded, Bound::Excluded(key))
+            Scan::Range((Bound::Unbounded, Bound::Excluded(key)))
         }
 
         // Case 4:
@@ -158,7 +158,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // cursor will then return key 5 and everything after.
         (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-            (Bound::Included(key), Bound::Unbounded)
+            Scan::Range((Bound::Included(key), Bound::Unbounded))
         }
 
         // Case 5:
@@ -169,7 +169,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // tell it to stop once it finds a key > 5
         (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
-            (Bound::Unbounded, Bound::Included(key))
+            Scan::Range((Bound::Unbounded, Bound::Included(key)))
         }
 
         _ => unreachable!(),
@@ -180,20 +180,28 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
     let maybe_index = indexes.remove(&table.schema.columns[col].name);
 
-    let mut source = Plan::RangeScan(RangeScan::from(RangeScanConfig {
-        kind,
-        range,
-        pager: Rc::clone(&db.pager),
-    }));
+    let mut source = match scan {
+        Scan::Match(key) => Plan::ExactMatch(ExactMatch {
+            key,
+            relation,
+            done: false,
+            pager: Rc::clone(&db.pager),
+        }),
 
-    // Table BTree range scan, no additional index needed.
+        Scan::Range(range) => Plan::RangeScan(RangeScan::from(RangeScanConfig {
+            relation,
+            range,
+            pager: Rc::clone(&db.pager),
+        })),
+    };
+
+    // Table BTree scan, no additional index needed.
     let Some(index) = maybe_index else {
         return Ok(Some(source));
     };
 
-    // We'll skip the sorter if only one tuple will be returned since it
-    // requires a bunch of extra steps in the pipeline.
-    if *operator != BinaryOperator::Eq {
+    // Sort the keys in ascending order to favor sequential IO.
+    if let Plan::RangeScan(_) = source {
         source = Plan::Sort(Sort::from(SortConfig {
             page_size,
             work_dir: work_dir.clone(),
@@ -212,7 +220,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         }));
     }
 
-    Ok(Some(Plan::IndexScan(IndexScan {
+    Ok(Some(Plan::KeyScan(KeyScan {
         comparator: table.comparator()?,
         table,
         index,
@@ -307,10 +315,6 @@ fn find_indexed_expr<'e>(
 /// There are more cases where the filter wouldn't be needed but this is good
 /// enough for now.
 fn needs_filter<F>(plan: &Plan<F>, expr: &Expression) -> bool {
-    let (Plan::IndexScan(_) | Plan::RangeScan(_)) = plan else {
-        return true;
-    };
-
     if let Expression::BinaryOperation {
         left,
         operator,
@@ -322,7 +326,10 @@ fn needs_filter<F>(plan: &Plan<F>, expr: &Expression) -> bool {
             (Expression::Identifier(_col), _, Expression::Value(_value))
                 | (Expression::Value(_value), _, Expression::Identifier(_col))
         ) {
-            return false;
+            return !matches!(
+                plan,
+                Plan::KeyScan(_) | Plan::ExactMatch(_) | Plan::RangeScan(_)
+            );
         }
     }
 
