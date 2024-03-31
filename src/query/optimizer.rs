@@ -5,17 +5,18 @@
 use std::{
     collections::HashMap,
     io::{Read, Seek, Write},
+    ops::Bound,
     rc::Rc,
 };
 
 use crate::{
-    db::{Database, DatabaseContext, DbError, IndexMetadata, Schema, SqlError, TableMetadata},
+    db::{Database, DatabaseContext, DbError, IndexMetadata, SqlError, TableMetadata},
     paging::io::FileOps,
     sql::statement::{BinaryOperator, Expression},
     storage::{tuple, Cursor},
     vm::plan::{
-        BufferedIter, BufferedIterConfig, Filter, IndexScan, InitialPosition, Plan, RangeScan,
-        RangeScanConfig, RangeScanKind, SeqScan, Sort, SortConfig, StopCondition, TuplesComparator,
+        BTreeKind, BufferedIter, BufferedIterConfig, Filter, IndexScan, Plan, RangeScan,
+        RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
     },
 };
 
@@ -105,9 +106,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
             let key = tuple::serialize_key(&table.schema.columns[index_col].data_type, value);
 
             let kind = if let Some(index) = indexes.get(col) {
-                RangeScanKind::Index(index.clone())
+                BTreeKind::Index(index.clone())
             } else {
-                RangeScanKind::Table(table.clone())
+                BTreeKind::Table(table.clone())
             };
 
             (key, index_col, kind)
@@ -116,7 +117,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         _ => unreachable!(),
     };
 
-    let (initial_position, stop_condition) = match (left.as_ref(), operator, right.as_ref()) {
+    let range = match (left.as_ref(), operator, right.as_ref()) {
         // Case 1:
         // SELECT * FROM t WHERE x = 5;
         // SELECT * FROM t WHERE 5 = x;
@@ -124,7 +125,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // Position the cursor at key 5 and stop after returning that key.
         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            (InitialPosition::Exact, StopCondition::Once)
+            (Bound::Included(key.clone()), Bound::Included(key.clone()))
         }
 
         // Case 2:
@@ -135,7 +136,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // cursor to move to the successor and return keys until finished.
         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-            (InitialPosition::AfterKey, StopCondition::None)
+            (Bound::Excluded(key), Bound::Unbounded)
         }
 
         // Case 3:
@@ -145,10 +146,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // Allow the cursor to initialize normally (at the smallest key) and
         // tell it to stop once it finds a key >= 5.
         (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
-        | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => (
-            InitialPosition::Start,
-            StopCondition::OnMatch(BinaryOperator::GtEq),
-        ),
+        | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Excluded(key))
+        }
 
         // Case 4:
         // SELECT * FROM t WHERE x >= 5;
@@ -158,7 +158,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // cursor will then return key 5 and everything after.
         (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
         | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-            (InitialPosition::AtKey, StopCondition::None)
+            (Bound::Included(key), Bound::Unbounded)
         }
 
         // Case 5:
@@ -168,10 +168,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         // Allow the cursor to initialize normally (at the smallest key) and
         // tell it to stop once it finds a key > 5
         (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
-        | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => (
-            InitialPosition::Start,
-            StopCondition::OnMatch(BinaryOperator::Gt),
-        ),
+        | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Included(key))
+        }
 
         _ => unreachable!(),
     };
@@ -183,9 +182,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
     let mut source = Plan::RangeScan(RangeScan::from(RangeScanConfig {
         kind,
-        initial_position,
-        key,
-        stop_condition,
+        range,
         pager: Rc::clone(&db.pager),
     }));
 

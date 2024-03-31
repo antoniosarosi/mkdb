@@ -130,7 +130,7 @@ pub(crate) fn serialize<'v>(
 
     debug_assert_eq!(
         schema.len(),
-        values.clone().into_iter().count(),
+        values.into_iter().count(),
         "length of schema and values must the same",
     );
 

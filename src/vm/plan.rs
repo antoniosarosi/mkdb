@@ -50,7 +50,7 @@ use std::{
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
-    ops::Index,
+    ops::{Bound, Index, RangeBounds},
     path::PathBuf,
     rc::Rc,
 };
@@ -61,7 +61,7 @@ use crate::{
         io::FileOps,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{Assignment, BinaryOperator, Expression, Value},
+    sql::statement::{Assignment, Expression, Value},
     storage::{
         reassemble_payload, tuple, BTree, BTreeKeyComparator, BytesCmp, Cursor, FixedSizeMemCmp,
     },
@@ -188,45 +188,18 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
-/// Describes the initial cursor position of [`RangeScan`].
-#[derive(Debug, PartialEq)]
-pub(crate) enum InitialPosition {
-    /// Beginning of the BTree. First page first cell.
-    Start,
-    /// Near the key we're searching by. The key may not exist.
-    AtKey,
-    /// Right after the key we're searching by.
-    AfterKey,
-    /// Exact match. If we don't find the key the iterator is considered done.
-    Exact,
-}
-
-/// Stops the [`RangeScan`] once the condition here resolves to `true`.
-#[derive(Debug, PartialEq)]
-pub(crate) enum StopCondition {
-    /// Stops the cursor once the binary operator applied to the key we're
-    /// poining at and the key we're searching by returns `true`.
-    OnMatch(BinaryOperator),
-    /// Forces the cursor to return only one result.
-    Once,
-    /// No condition, the cursor will stop when it reaches the end of the BTree.
-    None,
-}
-
 /// The [`RangeScan`] works for both table BTrees and index BTrees.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RangeScanKind {
+pub(crate) enum BTreeKind {
     Index(IndexMetadata),
     Table(TableMetadata),
 }
 
 /// Parameters for constructing [`RangeScan`] objects.
 pub(crate) struct RangeScanConfig<F> {
-    pub kind: RangeScanKind,
+    pub kind: BTreeKind,
     pub pager: Rc<RefCell<Pager<F>>>,
-    pub initial_position: InitialPosition,
-    pub key: Vec<u8>,
-    pub stop_condition: StopCondition,
+    pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
 }
 
 /// BTree range scan.
@@ -255,13 +228,11 @@ pub(crate) struct RangeScanConfig<F> {
 /// will tell us to to position the cursor "after" key 500.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RangeScan<F> {
-    kind: RangeScanKind,
+    kind: BTreeKind,
     root: PageNumber,
     schema: Schema,
     pager: Rc<RefCell<Pager<F>>>,
-    initial_position: InitialPosition,
-    key: Vec<u8>,
-    stop_condition: StopCondition,
+    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     comparator: BTreeKeyComparator,
     cursor: Cursor,
     init: bool,
@@ -269,22 +240,14 @@ pub(crate) struct RangeScan<F> {
 }
 
 impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
-    fn from(
-        RangeScanConfig {
-            kind,
-            pager,
-            initial_position,
-            key,
-            stop_condition,
-        }: RangeScanConfig<F>,
-    ) -> Self {
+    fn from(RangeScanConfig { kind, pager, range }: RangeScanConfig<F>) -> Self {
         let (root, schema, comparator) = match &kind {
-            RangeScanKind::Index(index) => (
+            BTreeKind::Index(index) => (
                 index.root,
                 index.schema.clone(),
                 BTreeKeyComparator::from(&index.column.data_type),
             ),
-            RangeScanKind::Table(table) => (
+            BTreeKind::Table(table) => (
                 table.root,
                 table.schema.clone(),
                 BTreeKeyComparator::from(&table.schema.columns[0].data_type),
@@ -296,9 +259,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
             schema,
             comparator,
             pager,
-            initial_position,
-            key,
-            stop_condition,
+            range,
             root,
             cursor: Cursor::new(root, 0),
             done: false,
@@ -312,20 +273,23 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
     fn init(&mut self) -> io::Result<()> {
         let mut pager = self.pager.borrow_mut();
 
-        if self.initial_position == InitialPosition::Start {
-            return Ok(());
+        let key = match self.range.start_bound() {
+            Bound::Unbounded => return Ok(()),
+            Bound::Excluded(key) => key,
+            Bound::Included(key) => key,
         };
 
         let mut descent = Vec::new();
         let mut btree = BTree::new(&mut pager, self.root, self.comparator);
-        let search = btree.search(self.root, &self.key, &mut descent)?;
+        let search = btree.search(self.root, key, &mut descent)?;
 
         match search.index {
             // Found exact match. Easy case.
             Ok(slot) => {
                 self.cursor = Cursor::initialized(search.page, slot, descent);
 
-                if self.initial_position == InitialPosition::AfterKey {
+                // Skip it.
+                if let Bound::Excluded(_) = self.range.start_bound() {
                     self.cursor.try_next(&mut pager)?;
                 }
             }
@@ -337,9 +301,7 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
             // [1, 3, 5, 7]
             //
             // "slot" would be 1. Index 1 points to 3 in the array, which means
-            // we are already located at a key that is >= 1. At that point it
-            // doesn't matter if we had to be located "AtKey" or "AfterKey", we
-            // are already positioned to anything that comes after the key.
+            // we are already located at a key that is >= 1.
             //
             // On the other hand, if we were looking for key 8, "slot" would be
             // 4 which is out of bounds. That means we have to move to the next
@@ -348,11 +310,6 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
             // consume that key, allowing the cursor to compute where the next
             // one is.
             Err(slot) => {
-                if self.initial_position == InitialPosition::Exact {
-                    self.cursor = Cursor::done();
-                    return Ok(());
-                }
-
                 if slot >= pager.get(search.page)?.len() {
                     self.cursor = Cursor::initialized(search.page, slot.saturating_sub(1), descent);
                     self.cursor.try_next(&mut pager)?;
@@ -384,25 +341,19 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 
         let tuple = reassemble_payload(&mut pager, page, slot)?;
 
-        if let StopCondition::OnMatch(operator) = &self.stop_condition {
-            let ordering = self.comparator.bytes_cmp(tuple.as_ref(), &self.key);
+        let bound = self.range.end_bound();
+        if let Bound::Excluded(key) | Bound::Included(key) = bound {
+            let ordering = self.comparator.bytes_cmp(tuple.as_ref(), key);
 
-            let stop = match operator {
-                BinaryOperator::Gt => ordering == Ordering::Greater,
-                BinaryOperator::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
-                BinaryOperator::Lt => ordering == Ordering::Less,
-                BinaryOperator::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
-                _ => unreachable!(),
-            };
-
-            if stop {
+            if let Ordering::Equal | Ordering::Greater = ordering {
                 self.done = true;
-                return Ok(None);
-            }
-        }
 
-        if let StopCondition::Once = &self.stop_condition {
-            self.done = true;
+                if matches!(bound, Bound::Excluded(_))
+                    || matches!(bound, Bound::Included(_)) && ordering == Ordering::Greater
+                {
+                    return Ok(None);
+                }
+            }
         }
 
         Ok(Some(tuple::deserialize(tuple.as_ref(), &self.schema)))
@@ -700,7 +651,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
             let new_value = vm::resolve_expression(&tuple, &self.table.schema, &assignment.value)?;
 
             // If the value did not change we'll skip this column.
-            if &new_value != &tuple[col] {
+            if new_value != tuple[col] {
                 let old_value = mem::replace(&mut tuple[col], new_value);
                 updated_cols.insert(assignment.identifier.clone(), (old_value, col));
             }

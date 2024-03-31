@@ -281,7 +281,7 @@ impl Schema {
 
     /// See [`has_btree_key`].
     pub fn has_btree_key(&self) -> bool {
-        return has_btree_key(&self.columns);
+        has_btree_key(&self.columns)
     }
 }
 
@@ -766,7 +766,7 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
             _ => unreachable!(),
         };
 
-        let table_metadata = self.table_metadata(&table_name)?;
+        let table_metadata = self.table_metadata(table_name)?;
 
         // TODO: Innefficient.
         Ok(table_metadata

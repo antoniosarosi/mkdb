@@ -259,7 +259,7 @@ fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, io, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, collections::HashMap, io, ops::Bound, path::PathBuf, rc::Rc};
 
     use crate::{
         db::{Database, DatabaseContext, IndexMetadata, Schema, TableMetadata},
@@ -267,15 +267,14 @@ mod tests {
         sql::{
             self,
             parser::Parser,
-            statement::{BinaryOperator, Column, Create, DataType, Expression, Statement, Value},
+            statement::{Column, Create, DataType, Expression, Statement, Value},
         },
         storage::{
             tuple::{self, byte_length_of_integer_type},
-            BTreeKeyComparator, Cursor, FixedSizeMemCmp,
+            Cursor, FixedSizeMemCmp,
         },
         vm::plan::{
-            Filter, IndexScan, InitialPosition, Plan, Project, RangeScan, RangeScanConfig,
-            RangeScanKind, SeqScan, StopCondition,
+            BTreeKind, Filter, IndexScan, Plan, Project, RangeScan, RangeScanConfig, SeqScan,
         },
         DbError,
     };
@@ -478,10 +477,11 @@ mod tests {
             gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
             Plan::RangeScan(RangeScan::from(RangeScanConfig {
                 pager: db.pager(),
-                initial_position: InitialPosition::Exact,
-                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
-                stop_condition: StopCondition::Once,
-                kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+                kind: BTreeKind::Table(db.tables["users"].to_owned()),
+                range: (
+                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(5))),
+                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
+                )
             }))
         );
 
@@ -504,14 +504,18 @@ mod tests {
                 index: db.indexes["users_email_uq_index"].to_owned(),
                 table: db.tables["users"].to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
-                    initial_position: InitialPosition::Exact,
-                    key: tuple::serialize_key(
-                        &DataType::Varchar(255),
-                        &Value::String("bob@email.com".into())
-                    ),
-                    stop_condition: StopCondition::Once,
                     pager: db.pager(),
-                    kind: RangeScanKind::Index(db.indexes["users_email_uq_index"].to_owned()),
+                    kind: BTreeKind::Index(db.indexes["users_email_uq_index"].to_owned()),
+                    range: (
+                        Bound::Included(tuple::serialize_key(
+                            &DataType::Varchar(255),
+                            &Value::String("bob@email.com".into())
+                        )),
+                        Bound::Included(tuple::serialize_key(
+                            &DataType::Varchar(255),
+                            &Value::String("bob@email.com".into())
+                        ))
+                    )
                 })))
             })
         );
@@ -527,10 +531,11 @@ mod tests {
             gen_plan(&mut db, "SELECT * FROM users WHERE id < 5;")?,
             Plan::RangeScan(RangeScan::from(RangeScanConfig {
                 pager: db.pager(),
-                initial_position: InitialPosition::Start,
-                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
-                stop_condition: StopCondition::OnMatch(BinaryOperator::GtEq),
-                kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+                kind: BTreeKind::Table(db.tables["users"].to_owned()),
+                range: (
+                    Bound::Unbounded,
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
+                ),
             }))
         );
 
@@ -551,10 +556,11 @@ mod tests {
                 schema: db.tables["users"].schema.to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
                     pager: db.pager(),
-                    initial_position: InitialPosition::Start,
-                    key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
-                    stop_condition: StopCondition::OnMatch(BinaryOperator::GtEq),
-                    kind: RangeScanKind::Table(db.tables["users"].to_owned()),
+                    kind: BTreeKind::Table(db.tables["users"].to_owned()),
+                    range: (
+                        Bound::Unbounded,
+                        Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
+                    )
                 })))
             })
         );
