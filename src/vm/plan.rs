@@ -320,35 +320,47 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
         let mut btree = BTree::new(&mut pager, self.root, self.comparator);
         let search = btree.search(self.root, &self.key, &mut descent)?;
 
-        let mut found_key = false;
-
-        let slot = match search.index {
+        match search.index {
+            // Found exact match. Easy case.
             Ok(slot) => {
-                found_key = true;
-                slot
+                self.cursor = Cursor::initialized(search.page, slot, descent);
+
+                if self.initial_position == InitialPosition::AfterKey {
+                    self.cursor.try_next(&mut pager)?;
+                }
             }
 
             // We didn't find the exact key we were looking for. This index is
-            // the index where the key "should" be located, so we'll position
-            // the cursor right before this index and consume the previous key,
-            // allowing the cursor to compute where the next one is (which is
-            // not easy, see the cursor code).
-            Err(slot) => slot.saturating_sub(1),
+            // the index where the key "should" be located. If we were looking
+            // for key 2 in this array:
+            //
+            // [1, 3, 5, 7]
+            //
+            // "slot" would be 1. Index 1 points to 3 in the array, which means
+            // we are already located at a key that is >= 1. At that point it
+            // doesn't matter if we had to be located "AtKey" or "AfterKey", we
+            // are already positioned to anything that comes after the key.
+            //
+            // On the other hand, if we were looking for key 8, "slot" would be
+            // 4 which is out of bounds. That means we have to move to the next
+            // page in order to find the first key >= 8. Since that's not easy
+            // at all we'll position the cursor at the last key in the page and
+            // consume that key, allowing the cursor to compute where the next
+            // one is.
+            Err(slot) => {
+                if self.initial_position == InitialPosition::Exact {
+                    self.cursor = Cursor::done();
+                    return Ok(());
+                }
+
+                if slot >= pager.get(search.page)?.len() {
+                    self.cursor = Cursor::initialized(search.page, slot.saturating_sub(1), descent);
+                    self.cursor.try_next(&mut pager)?;
+                } else {
+                    self.cursor = Cursor::initialized(search.page, slot, descent);
+                }
+            }
         };
-
-        if self.initial_position == InitialPosition::Exact && !found_key {
-            self.cursor = Cursor::done();
-            return Ok(());
-        }
-
-        self.cursor = Cursor::initialized(search.page, slot, descent);
-
-        // If we didn't find the key we're pointing to an entry that's located
-        // "before" the key, by consuming that entry we know that anything that
-        // comes after is >= than the key.
-        if self.initial_position == InitialPosition::AfterKey || !found_key {
-            self.cursor.try_next(&mut pager)?;
-        }
 
         Ok(())
     }

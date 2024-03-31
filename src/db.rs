@@ -2524,6 +2524,103 @@ mod tests {
         Ok(())
     }
 
+    // Binary search will yield "should be at index 0".
+    #[test]
+    fn select_where_index_key_should_be_first_on_page() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'David', 'david@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id > 1;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(2),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("David".into()),
+                    Value::String("david@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    // BTree is configured to store at least 4 keys in each page by default. If
+    // we store large rows in a small page we'll be guaranteed to only have 4
+    // keys in that page because we can't fit anymore. We'll use that to test
+    // the edge case where a binary search results in out of bounds index.
+    #[test]
+    fn select_where_index_key_should_be_last_on_page() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 256,
+        })?;
+
+        let num_pages = 3;
+        let mut users = Vec::new();
+
+        let mut id = 1;
+
+        for _ in 0..num_pages {
+            for _ in 0..4 {
+                users.push(vec![
+                    Value::Number(id),
+                    Value::String(format!("User{id}").repeat(20)),
+                    Value::String(format!("user{id}.com")),
+                ]);
+                id += 1;
+            }
+            // Skip IDs to query one that doesn't exist later.
+            id += 1;
+        }
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+
+        for user in &users {
+            db.exec(&format!(
+                "INSERT INTO users (id, name, email) VALUES ({}, {}, {});",
+                user[0], user[1], user[2]
+            ))?;
+        }
+
+        users.drain(..4);
+        let query = db.exec("SELECT * FROM users WHERE id > 5;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: users
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn delete_all() -> Result<(), DbError> {
         let mut db = init_database()?;
