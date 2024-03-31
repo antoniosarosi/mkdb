@@ -50,7 +50,10 @@
 //! code to obtain references to values from a binary buffer we would get rid
 //! of serialization / deserialization. It would require some changes throughout
 //! the codebase, but definitely doable.
-use std::mem;
+use std::{
+    io::{self, Read},
+    mem,
+};
 
 use crate::{
     db::{RowId, Schema},
@@ -162,48 +165,43 @@ pub(crate) fn serialize<'v>(
 
 /// See the module level documentation for the serialization format.
 pub fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
-    let mut values = Vec::new();
-    let mut cursor = 0;
+    read_from(&mut io::Cursor::new(buf), schema).unwrap()
+}
 
-    // TODO: Alignment.
-    for column in &schema.columns {
-        match column.data_type {
+/// Reads one single tuple from the given reader.
+///
+/// This will call [`Read::read_exact`] many times so make sure the reader is
+/// buffered or is an in-memory array such as [`io::Cursor<Vec<u8>>`].
+pub fn read_from(reader: &mut impl Read, schema: &Schema) -> io::Result<Vec<Value>> {
+    let values = schema.columns.iter().map(|column| {
+        Ok(match column.data_type {
             DataType::Varchar(_) => {
-                let length = u32::from_le_bytes(
-                    buf[cursor..cursor + mem::size_of::<u32>()]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
+                let mut length_buffer = [0; mem::size_of::<u32>()];
+                reader.read_exact(&mut length_buffer)?;
+                let length = u32::from_le_bytes(length_buffer) as usize;
 
-                cursor += mem::size_of::<u32>();
+                let mut string = vec![0; length];
+                reader.read_exact(&mut string)?;
 
-                // TODO: We need to validate somewhere that this is actually
-                // valid UTF-8 (not here with unwrap(), before inserting into the DB).
-                values.push(Value::String(
-                    std::str::from_utf8(&buf[cursor..cursor + length])
-                        .unwrap()
-                        .into(),
-                ));
-                cursor += length;
+                // TODO: We can probably call from_utf8_unchecked() here.
+                Value::String(String::from_utf8(string).unwrap())
             }
 
             DataType::Bool => {
-                values.push(Value::Bool(buf[cursor] != 0));
-                cursor += 1;
+                let mut byte = [0];
+                reader.read_exact(&mut byte)?;
+                Value::Bool(byte[0] != 0)
             }
 
             integer_type => {
                 let byte_length = byte_length_of_integer_type(&integer_type);
                 let mut big_endian_buf = [0; mem::size_of::<i128>()];
+                reader.read_exact(&mut big_endian_buf[mem::size_of::<i128>() - byte_length..])?;
 
-                big_endian_buf[mem::size_of::<i128>() - byte_length..]
-                    .copy_from_slice(&buf[cursor..cursor + byte_length]);
-
-                values.push(Value::Number(i128::from_be_bytes(big_endian_buf)));
-                cursor += byte_length;
+                Value::Number(i128::from_be_bytes(big_endian_buf))
             }
-        }
-    }
+        })
+    });
 
-    values
+    values.collect()
 }

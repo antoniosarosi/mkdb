@@ -1546,6 +1546,42 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn select_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));")?;
+
+        let mut expected = Vec::new();
+
+        for i in 1..=500 {
+            expected.push(vec![Value::Number(i), Value::String(format!("User{i}"))]);
+        }
+
+        for user in expected.iter().rev() {
+            db.exec(&format!(
+                "INSERT INTO users(id, name) VALUES ({}, {});",
+                user[0], user[1]
+            ))?;
+        }
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+            ]),
+            tuples: expected,
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn select_order_by() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -2748,6 +2784,44 @@ mod tests {
         assert_index_contains(&mut db, "name_idx", &[])
     }
 
+    // Test the buffered iter.
+    #[cfg(not(miri))]
+    #[test]
+    fn delete_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 512,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+
+        for i in 1..=500 {
+            let name = format!("User{i}");
+            db.exec(&format!(
+                "INSERT INTO users(id, name, age) VALUES ({i}, '{name}', 18);"
+            ))?;
+        }
+
+        db.exec("DELETE FROM users WHERE id != 355;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![vec![
+                Value::Number(355),
+                Value::String("User355".into()),
+                Value::Number(18)
+            ]]
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn update() -> Result<(), DbError> {
         let mut db = init_database()?;
@@ -2866,6 +2940,48 @@ mod tests {
                     Value::Number(24)
                 ]
             ]
+        });
+
+        Ok(())
+    }
+
+    // Test the buffered iter.
+    #[cfg(not(miri))]
+    #[test]
+    fn update_many() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 512,
+        })?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+
+        let pk_range = 1..=500;
+
+        for i in pk_range.clone() {
+            let name = format!("User{i}");
+            db.exec(&format!(
+                "INSERT INTO users(id, name, age) VALUES ({i}, '{name}', 18);"
+            ))?;
+        }
+
+        db.exec("UPDATE users SET name = 'Updated Name', age = 20;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: pk_range
+                .map(|pk| vec![
+                    Value::Number(pk),
+                    Value::String("Updated Name".into()),
+                    Value::Number(20)
+                ])
+                .collect()
         });
 
         Ok(())

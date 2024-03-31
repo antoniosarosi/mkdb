@@ -785,62 +785,94 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
     }
 }
 
+/// See [`TupleBuffer`].
+const TUPLE_PAGE_HEADER_SIZE: usize = mem::size_of::<u32>();
+
 /// In-memory tuple buffer.
 ///
 /// This structure stores [`Tuple`] instances (AKA rows) and can be written to
 /// a file once it reaches a certain preconfigured threshold. The
-/// [`TupleBuffer`] can be used in two different modes: packed and not packed.
+/// [`TupleBuffer`] is used by the [`BufferedIter`] and [`Sort`] plans to store
+/// large query sets in the file system for queries like `SELECT * FROM table`
+/// which might not fit in RAM. Depending on the use case the tuple buffer can
+/// be configured with two different modes: fixed size and packed.
 ///
-/// Packing affects how the buffer is written to files. If packed, then
-/// in-memory tuples will be written to the file in one single continuous
-/// sequence of bytes that follows this format:
+/// # Fixed Size Format
 ///
-/// ```text
-/// +-----------------+ <---+
-/// |   Tuple 0 Size  |     |
-/// +-----------------+     |
-/// |       ...       |     |
-/// | Tuple 0 Content |     |
-/// |       ...       |     |
-/// +-----------------+     | VARIABLE SIZE
-/// |   Tuple 1 Size  |     |
-/// +-----------------+     |
-/// |       ...       |     |
-/// | Tuple 1 Content |     |
-/// |       ...       |     |
-/// +-----------------+ <---+
-/// ```
-///
-/// This is useful for simply collecting a huge amount of tuples and then
-/// returning them back, which is what the [`BufferedIter`] does. However, the
-/// [`Sort`] plan needs to work with fixed size pages, so it will use the
-/// [`TupleBuffer`] without packing. In that case, only one page at a time is
-/// written using this format:
+/// Setting [`TupleBuffer::packed`] to false will cause the buffer to use a
+/// "fixed size" page format when writing its contents to a file. This will
+/// produce a file with multiple pages described by the following structure:
 ///
 /// ```text
-/// +-----------------+ <---+
-/// |    Num Tuples   |     |
-/// +-----------------+     |
-/// |   Tuple 0 Size  |     |
-/// +-----------------+     |
-/// |       ...       |     |
-/// | Tuple 0 Content |     |
-/// |       ...       |     |
-/// +-----------------+     |
-/// |   Tuple 1 Size  |     | PAGE SIZE
-/// +-----------------+     |
-/// |       ...       |     |
-/// | Tuple 1 Content |     |
-/// |       ...       |     |
-/// +-----------------+     |
-/// |       ...       |     |
-/// |     Padding     |     |
-/// |       ...       |     |
-/// +-----------------+ <---+
+/// +-----------------+          <---+
+/// |   Num Tuples    | 4 bytes      |
+/// +-----------------+              |
+/// |       ...       |              |
+/// | Tuple 0 Content | Var Size     |
+/// |       ...       |              |
+/// +-----------------+              |
+/// |       ...       |              |
+/// | Tuple 1 Content | Var Size     |
+/// |       ...       |              | PAGE SIZE
+/// +-----------------+              |
+/// |       ...       |              |
+/// | Tuple 2 Content | Var Size     |
+/// |       ...       |              |
+/// +-----------------+              |
+/// |       ...       |              |
+/// |     PADDING     | Var Size     |
+/// |       ...       |              |
+/// +-----------------+          <---+
 /// ```
 ///
-/// Both the number of tuples and the tuple sizes are stored using 4 byte little
-/// endian integers.
+/// Each page contains a header that encodes the number of tuples in the page
+/// using a 32 bit little endian integer. The header is followed by N tuples
+/// stored in the same format that the database uses, see [`tuple`] for details.
+/// Storing the size of each individual tuple is not necessary because we
+/// already have the schema of the table in memory which can be used to parse
+/// variable size tuples. Finally, the page contains padding if necessary to
+/// make it fixed size.
+///
+/// Fixed size pages are necessary for sorting large amounts of data. The page
+/// size is dependant on the size of reassembled tuples that are not scattered
+/// across overflow pages (see [`reassemble_payload`]), so the page size of the
+/// sort file may not be the same as the page size used by the database. See the
+/// documentation of [`Sort`] for more details on sorting.
+///
+/// # Packed Format
+///
+/// When [`TupleBuffer::packed`] is set to true in-memory tuples will be written
+/// to the file in one single continuous sequence of bytes without any headers
+/// or padding:
+///
+/// ```text
+/// +-----------------+          <---+
+/// |       ...       |              |
+/// | Tuple 0 Content | Var Size     |
+/// |       ...       |              |
+/// +-----------------+              |
+/// |       ...       |              |
+/// | Tuple 1 Content | Var Size     | VARIABLE SIZE
+/// |       ...       |              |
+/// +-----------------+              |
+/// |       ...       |              |
+/// | Tuple 2 Content | Var Size     |
+/// |       ...       |              |
+/// +-----------------+          <---+
+/// ```
+///
+/// This format is used by the [`BufferedIter`] plan to simply store the
+/// results of a large query like `SELECT * FROM table` in a file and then
+/// "stream" the rows one by one. Again, we don't need any information about the
+/// size of anything because the table [`Schema`] already tells us exactly how
+/// to parse tuples back into [`Tuple`] structures.
+///
+/// The format of this file doesn't need to be complicated because it's just
+/// used to temporarily store rows returned by a query while the program is
+/// alive, if the program crashes the transaction that opened the query file
+/// automatically fails and will be rolled back by the journal system when we
+/// reboot. At that point the file no longer serves any purpose, it's not used
+/// for recovery.
 #[derive(Debug)]
 pub(crate) struct TupleBuffer {
     /// Maximum size of this buffer in bytes.
@@ -856,7 +888,7 @@ pub(crate) struct TupleBuffer {
     /// simply stores the maximum size that has been recorded.
     largest_tuple_size: usize,
 
-    /// See the [`TupleBuffer`] documentation.
+    /// Packed or fixed size mode.
     packed: bool,
 
     /// Schema of the tuples in this buffer.
@@ -896,7 +928,7 @@ impl TupleBuffer {
             page_size,
             schema,
             packed,
-            current_size: if packed { 0 } else { mem::size_of::<u32>() },
+            current_size: if packed { 0 } else { TUPLE_PAGE_HEADER_SIZE },
             largest_tuple_size: 0,
             tuples: VecDeque::new(),
         }
@@ -905,10 +937,7 @@ impl TupleBuffer {
     /// Returns `true` if the given `tuple` can be appended to this buffer
     /// without incrementing its size past [`Self::page_size`].
     pub fn can_fit(&self, tuple: &Tuple) -> bool {
-        let tuple_size = tuple::size_of(tuple, &self.schema);
-        let total_tuple_size = mem::size_of::<u32>() + tuple_size;
-
-        self.current_size + total_tuple_size <= self.page_size
+        self.current_size + tuple::size_of(tuple, &self.schema) <= self.page_size
     }
 
     /// Appends the given `tuple` to the buffer.
@@ -921,20 +950,19 @@ impl TupleBuffer {
     /// buffer.
     pub fn push(&mut self, tuple: Tuple) {
         let tuple_size = tuple::size_of(&tuple, &self.schema);
-        let total_tuple_size = mem::size_of::<u32>() + tuple_size;
 
         if tuple_size > self.largest_tuple_size {
             self.largest_tuple_size = tuple_size;
         }
 
-        self.current_size += total_tuple_size;
+        self.current_size += tuple_size;
         self.tuples.push_back(tuple);
     }
 
     /// Removes the first tuple in this buffer and returns it.
     pub fn pop_front(&mut self) -> Option<Tuple> {
         self.tuples.pop_front().inspect(|tuple| {
-            self.current_size -= mem::size_of::<u32>() + tuple::size_of(tuple, &self.schema);
+            self.current_size -= tuple::size_of(tuple, &self.schema);
         })
     }
 
@@ -949,7 +977,7 @@ impl TupleBuffer {
         self.current_size = if self.packed {
             0
         } else {
-            mem::size_of::<u32>()
+            TUPLE_PAGE_HEADER_SIZE
         };
     }
 
@@ -957,16 +985,17 @@ impl TupleBuffer {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.page_size);
 
+        // Page header.
         if !self.packed {
             buf.extend_from_slice(&(self.tuples.len() as u32).to_le_bytes());
         }
 
+        // Tuples.
         for tuple in &self.tuples {
-            let serialized = tuple::serialize(&self.schema, tuple);
-            buf.extend_from_slice(&(serialized.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&serialized);
+            buf.extend_from_slice(&tuple::serialize(&self.schema, tuple));
         }
 
+        // Padding.
         if !self.packed {
             buf.resize(self.page_size, 0);
         }
@@ -987,8 +1016,8 @@ impl TupleBuffer {
     /// Only works with fixed size buffers (not packed) that are already empty
     /// and the underlying file cursor **must already be positioned** at the
     /// beginning of a page.
-    pub fn read_from(&mut self, file: &mut impl Read) -> io::Result<()> {
-        assert!(
+    pub fn read_from(&mut self, file: &mut impl Read) -> Result<(), DbError> {
+        debug_assert!(
             self.is_empty() && !self.packed,
             "read_from() only works with fixed size empty buffers"
         );
@@ -996,20 +1025,20 @@ impl TupleBuffer {
         let mut buf = vec![0; self.page_size];
         file.read_exact(&mut buf)?;
 
-        let number_of_tuples = u32::from_le_bytes(buf[..mem::size_of::<u32>()].try_into().unwrap());
-        let mut index = mem::size_of::<u32>();
+        // This should only fail due to human introduced errors (wrong
+        // paremeter, incorrect seek() calls to the file, etc). We just don't
+        // want to panic here and crash the database.
+        let number_of_tuples =
+            u32::from_le_bytes(buf[..TUPLE_PAGE_HEADER_SIZE].try_into().map_err(|e| {
+                DbError::Other(format!("error while reading query file header: {e}"))
+            })?);
+
+        let mut cursor = TUPLE_PAGE_HEADER_SIZE;
 
         for _ in 0..number_of_tuples {
-            let size = u32::from_le_bytes(
-                buf[index..index + mem::size_of::<u32>()]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-
-            index += mem::size_of::<u32>();
-
-            self.push(tuple::deserialize(&buf[index..index + size], &self.schema));
-            index += size;
+            let tuple = tuple::deserialize(&buf[cursor..], &self.schema);
+            cursor += tuple::size_of(&tuple, &self.schema);
+            self.push(tuple);
         }
 
         Ok(())
@@ -1017,7 +1046,7 @@ impl TupleBuffer {
 
     /// Same as [`Self::read_from`] but positions the file cursor at the
     /// beginning of the given page number.
-    pub fn read_page(&mut self, file: &mut (impl Seek + Read), page: usize) -> io::Result<()> {
+    pub fn read_page(&mut self, file: &mut (impl Seek + Read), page: usize) -> Result<(), DbError> {
         file.seek(io::SeekFrom::Start((self.page_size * page) as u64))?;
         self.read_from(file)
     }
@@ -1052,6 +1081,40 @@ impl TupleBuffer {
 /// [`BufferedIter`] acts like a normal iterator that returns tuples one at a
 /// time. If the collected tuples fit in memory there is no IO, so that's the
 /// best case scenario.
+///
+/// # Collection Algorithm
+///
+/// We use [`TupleBuffer`] to store tuples in memory for as long as we can. Once
+/// the [`TupleBuffer`] cannot fit more tuples we write its contents to a file
+/// and repeat until the source returns no more tuples. By the end of the
+/// operation we might have something like this:
+///
+/// ```text
+///            Memory Buffer        File
+///           +----+----+----+     +----+
+/// Source -> | T8 | T7 | T6 | ->  | T1 |
+///           +----+----+----+     +----+
+///                                | T2 |
+///                                +----+
+///                                | T3 |
+///                                +----+
+///                                | T4 |
+///                                +----+
+///                                | T5 |
+///                                +----+
+/// ```
+///
+/// Now that we've collected everything we switch our behaviour from a buffered
+/// writer to a buffered reader. To ensure that tuples are returned in the same
+/// order they come from the source we have to read from the file first and
+/// finally return whatever we got left in memory.
+///
+/// The collection file format is described in the documentation of
+/// [`TupleBuffer`], but basically it only contains the tuples just like they
+/// are stored in the database without any additional information such as their
+/// size. We use [`Schema`] to parse tuples so we don't need to know their size,
+/// we can just read sequentially from the file indefinitely until there are no
+/// more bytes.
 #[derive(Debug)]
 pub(crate) struct BufferedIter<F> {
     /// Tuple source. This is where we collect from.
@@ -1144,7 +1207,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         // later.
         if let Some(mut file) = self.file.take() {
             file.rewind()?;
-            self.reader = Some(BufReader::new(file));
+            self.reader = Some(BufReader::with_capacity(self.mem_buf.page_size, file));
         }
 
         Ok(())
@@ -1159,13 +1222,7 @@ impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
         // While there's stuff written to the file return from there.
         if let Some(reader) = self.reader.as_mut() {
             if reader.has_data_left()? {
-                let mut size = [0; mem::size_of::<u32>()];
-                reader.read_exact(&mut size)?;
-
-                let mut serialized = vec![0; u32::from_le_bytes(size) as usize];
-                reader.read_exact(&mut serialized)?;
-
-                return Ok(Some(tuple::deserialize(&serialized, &self.schema)));
+                return Ok(Some(tuple::read_from(reader, &self.schema)?));
             }
 
             // Reader is done, drop the file.
@@ -1969,7 +2026,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         if self.output_buffer.is_empty() {
             if let Some(input_file) = self.input_file.as_mut() {
-                if let Err(e) = self.output_buffer.read_from(input_file) {
+                if let Err(DbError::Io(e)) = self.output_buffer.read_from(input_file) {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
                         self.drop_files()?;
                     } else {
