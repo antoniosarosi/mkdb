@@ -390,6 +390,7 @@ impl<'i> Tokenizer<'i> {
             "TRANSACTION" => Keyword::Transaction,
             "ROLLBACK" => Keyword::Rollback,
             "COMMIT" => Keyword::Commit,
+            "EXPLAIN" => Keyword::Explain,
             _ => Keyword::None,
         };
 

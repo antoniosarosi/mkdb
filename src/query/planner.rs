@@ -19,8 +19,8 @@ use crate::{
     },
     vm::{
         plan::{
-            BufferedIter, BufferedIterConfig, Delete, Insert, Plan, Project, Sort, SortConfig,
-            SortKeysGen, TuplesComparator, Update, Values,
+            Collect, CollectConfig, Delete, Insert, Plan, Project, Sort, SortConfig, SortKeysGen,
+            TuplesComparator, Update, Values,
         },
         VmDataType,
     },
@@ -90,7 +90,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 // If there are no expressions that need to be evaluated for
                 // sorting then just skip the sort key generation completely,
                 // we already have all the sort keys we need.
-                let buffered_iter_source = if sort_schema.len() > table.schema.len() {
+                let collect_source = if sort_schema.len() > table.schema.len() {
                     Plan::SortKeysGen(SortKeysGen {
                         source: Box::new(source),
                         schema: table.schema.clone(),
@@ -106,8 +106,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                 source = Plan::Sort(Sort::from(SortConfig {
                     page_size,
                     work_dir: work_dir.clone(),
-                    source: BufferedIter::from(BufferedIterConfig {
-                        source: Box::new(buffered_iter_source),
+                    collection: Collect::from(CollectConfig {
+                        source: Box::new(collect_source),
                         work_dir,
                         schema: sort_schema.clone(),
                         mem_buf_size: page_size,
@@ -170,8 +170,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             // BTree but as of right now it seems pretty complicated because the
             // BTree is not a self contained unit that can be passed around like
             // the pager.
-            if !is_scan_plan_buffered(&source) {
-                source = Plan::BufferedIter(BufferedIter::from(BufferedIterConfig {
+            if !is_scan_plan_collected(&source) {
+                source = Plan::Collect(Collect::from(CollectConfig {
                     source: Box::new(source),
                     work_dir,
                     schema: metadata.schema.clone(),
@@ -194,8 +194,8 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             let page_size = db.pager.borrow().page_size;
             let metadata = db.table_metadata(&from)?;
 
-            if !is_scan_plan_buffered(&source) {
-                source = Plan::BufferedIter(BufferedIter::from(BufferedIterConfig {
+            if !is_scan_plan_collected(&source) {
+                source = Plan::Collect(Collect::from(CollectConfig {
                     source: Box::new(source),
                     work_dir,
                     mem_buf_size: page_size,
@@ -248,9 +248,9 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
 
 /// Returns `true` if the given scan buffers the tuples before returning
 /// them.
-fn is_scan_plan_buffered<F>(plan: &Plan<F>) -> bool {
+fn is_scan_plan_collected<F>(plan: &Plan<F>) -> bool {
     match plan {
-        Plan::Filter(filter) => is_scan_plan_buffered(&filter.source),
+        Plan::Filter(filter) => is_scan_plan_collected(&filter.source),
         Plan::KeyScan(_) | Plan::ExactMatch(_) => true,
         Plan::SeqScan(_) | Plan::RangeScan(_) => false,
         _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
@@ -292,12 +292,6 @@ mod tests {
         }
     }
 
-    impl AsMut<Database<MemBuf>> for DbCtx {
-        fn as_mut(&mut self) -> &mut Database<MemBuf> {
-            &mut self.inner
-        }
-    }
-
     fn init_db(ctx: &[&str]) -> Result<DbCtx, DbError> {
         let mut pager = Pager::<MemBuf>::builder().wrap(io::Cursor::new(Vec::<u8>::new()));
         pager.init()?;
@@ -336,12 +330,9 @@ mod tests {
         })
     }
 
-    fn gen_plan(
-        db: &mut impl AsMut<Database<MemBuf>>,
-        query: &str,
-    ) -> Result<Plan<MemBuf>, DbError> {
-        let statement = sql::pipeline(query, db.as_mut())?;
-        super::generate_plan(statement, db.as_mut())
+    fn gen_plan(db: &mut DbCtx, query: &str) -> Result<Plan<MemBuf>, DbError> {
+        let statement = sql::pipeline(query, &mut db.inner)?;
+        super::generate_plan(statement, &mut db.inner)
     }
 
     fn parse_expr(expr: &str) -> Expression {
@@ -477,6 +468,7 @@ mod tests {
             gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
             Plan::ExactMatch(ExactMatch {
                 key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
+                expr: parse_expr("id = 5"),
                 pager: db.pager(),
                 relation: Relation::Table(db.tables["users"].to_owned()),
                 done: false,
@@ -504,6 +496,7 @@ mod tests {
                 source: Box::new(Plan::ExactMatch(ExactMatch {
                     pager: db.pager(),
                     relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+                    expr: parse_expr("email = 'bob@email.com'"),
                     key: tuple::serialize_key(
                         &DataType::Varchar(255),
                         &Value::String("bob@email.com".into())
@@ -525,6 +518,7 @@ mod tests {
             Plan::RangeScan(RangeScan::from(RangeScanConfig {
                 pager: db.pager(),
                 relation: Relation::Table(db.tables["users"].to_owned()),
+                expr: parse_expr("id < 5"),
                 range: (
                     Bound::Unbounded,
                     Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
@@ -549,6 +543,7 @@ mod tests {
                 schema: db.tables["users"].schema.to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
                     pager: db.pager(),
+                    expr: parse_expr("id < 5"),
                     relation: Relation::Table(db.tables["users"].to_owned()),
                     range: (
                         Bound::Unbounded,

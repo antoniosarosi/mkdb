@@ -35,6 +35,10 @@ pub(crate) fn optimize(statement: &mut Statement) -> Result<(), SqlError> {
             simplify_all(columns.iter_mut().map(|col| &mut col.value))?;
         }
 
+        Statement::Explain(inner) => {
+            optimize(&mut *inner)?;
+        }
+
         _ => {}
     };
 

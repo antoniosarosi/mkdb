@@ -15,8 +15,8 @@ use crate::{
     sql::statement::{BinaryOperator, Expression},
     storage::{tuple, Cursor},
     vm::plan::{
-        BufferedIter, BufferedIterConfig, ExactMatch, Filter, KeyScan, Plan, RangeScan,
-        RangeScanConfig, Scan, SeqScan, Sort, SortConfig, TuplesComparator,
+        Collect, CollectConfig, ExactMatch, Filter, KeyScan, Plan, RangeScan, RangeScanConfig,
+        Scan, SeqScan, Sort, SortConfig, TuplesComparator,
     },
 };
 
@@ -85,12 +85,16 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
             .map(|index| (index.column.name.clone(), index.clone())),
     );
 
+    let Some(expr) = find_indexed_expr(&table, &indexes, filter) else {
+        return Ok(None);
+    };
+
     // Find expression that's using an indexed column or the primary key.
-    let Some(Expression::BinaryOperation {
+    let Expression::BinaryOperation {
         left,
         operator,
         right,
-    }) = find_indexed_expr(&table, &indexes, filter)
+    } = expr
     else {
         return Ok(None);
     };
@@ -184,6 +188,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         Scan::Match(key) => Plan::ExactMatch(ExactMatch {
             key,
             relation,
+            expr: expr.clone(),
             done: false,
             pager: Rc::clone(&db.pager),
         }),
@@ -191,6 +196,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         Scan::Range(range) => Plan::RangeScan(RangeScan::from(RangeScanConfig {
             relation,
             range,
+            expr: expr.clone(),
             pager: Rc::clone(&db.pager),
         })),
     };
@@ -205,7 +211,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         source = Plan::Sort(Sort::from(SortConfig {
             page_size,
             work_dir: work_dir.clone(),
-            source: BufferedIter::from(BufferedIterConfig {
+            collection: Collect::from(CollectConfig {
                 source: Box::new(source),
                 work_dir: work_dir.clone(),
                 schema: index.schema.clone(),

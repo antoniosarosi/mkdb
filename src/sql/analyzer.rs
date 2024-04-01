@@ -203,6 +203,10 @@ pub(crate) fn analyze(
             analyze_where(&metadata.schema, r#where)?;
         }
 
+        Statement::Explain(inner) => {
+            analyze(inner, ctx)?;
+        }
+
         _ => {
             // Rest of statements that we support don't require any analysis.
         }

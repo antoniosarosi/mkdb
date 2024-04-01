@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
@@ -429,6 +429,20 @@ impl Relation {
             Self::Table(table) => &table.schema,
         }
     }
+
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Index(_) => "index",
+            Self::Table(_) => "table",
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Index(index) => &index.name,
+            Self::Table(table) => &table.name,
+        }
+    }
 }
 
 impl TableMetadata {
@@ -846,11 +860,27 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 
         let mut schema = Schema::empty();
 
-        let exec = match &statement {
+        let exec = match statement {
             Statement::Create(_)
             | Statement::StartTransaction
             | Statement::Commit
             | Statement::Rollback => Exec::Statement(statement),
+
+            Statement::Explain(inner) => match &*inner {
+                Statement::Select { .. }
+                | Statement::Insert { .. }
+                | Statement::Update { .. }
+                | Statement::Delete { .. } => {
+                    schema = Schema::new(vec![Column::new("Query Plan", DataType::Varchar(255))]);
+                    Exec::Explain(query::planner::generate_plan(*inner, self)?)
+                }
+
+                _ => {
+                    return Err(DbError::Other(String::from(
+                        "EXPLAIN only works with SELECT, UPDATE, DELETE and INSERT statements",
+                    )));
+                }
+            },
 
             _ => {
                 let plan = query::planner::generate_plan(statement, self)?;
@@ -891,6 +921,8 @@ enum Exec<F> {
     Statement(Statement),
     /// Complex statements that require [`Plan`] trees executed by [`vm::plan`].
     Plan(Plan<F>),
+    /// Return a string that describes the generated plan.
+    Explain(Plan<F>),
 }
 
 /// A prepared statement is a statement that has been successfully parsed and
@@ -985,6 +1017,28 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                     return Err(e);
                 }
             },
+
+            Exec::Explain(plan) => {
+                let mut strings = Vec::new();
+                strings.push(plan.display());
+
+                let mut node = &*plan;
+                while let Some(child) = node.child() {
+                    strings.push(child.display());
+                    node = child;
+                }
+
+                let mut string = String::new();
+                string.push_str(&strings.pop().unwrap());
+                while let Some(next) = strings.pop() {
+                    string.push('\n');
+                    string.push_str(&next);
+                }
+
+                self.exec.take();
+
+                Some(vec![Value::String(string)])
+            }
         };
 
         // If this block runs then everything executed successfully. End the
@@ -2918,7 +2972,7 @@ mod tests {
         assert_index_contains(&mut db, "name_idx", &[])
     }
 
-    // Test the buffered iter.
+    // Test the collect plan.
     #[cfg(not(miri))]
     #[test]
     fn delete_many() -> Result<(), DbError> {
@@ -3079,7 +3133,7 @@ mod tests {
         Ok(())
     }
 
-    // Test the buffered iter.
+    // Test the collect plan.
     #[cfg(not(miri))]
     #[test]
     fn update_many() -> Result<(), DbError> {

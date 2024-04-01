@@ -64,6 +64,7 @@ pub(crate) enum Keyword {
     Transaction,
     Rollback,
     Commit,
+    Explain,
     /// Not a keyword, used for convenience. See [`super::tokenizer::Tokenizer`].
     None,
 }
@@ -166,6 +167,7 @@ impl Display for Keyword {
             Self::Transaction => "TRANSACTION",
             Self::Rollback => "ROLLBACK",
             Self::Commit => "COMMIT",
+            Self::Explain => "EXPLAIN",
             Self::None => "_",
         })
     }

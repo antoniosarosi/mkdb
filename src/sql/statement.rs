@@ -41,6 +41,8 @@ pub(crate) enum Statement {
     Rollback,
 
     Commit,
+
+    Explain(Box<Self>),
 }
 
 /// Expressions used in select, update, delete and insert statements.
@@ -200,13 +202,20 @@ pub(crate) enum Drop {
 
 /// Optimized version of [`std::slice::Join`] with no intermediary [`Vec`] and
 /// strings.
-fn join<T: Display>(values: &[T], separator: &str) -> String {
+pub(crate) fn join<'t, T: Display + 't>(
+    values: impl IntoIterator<Item = &'t T>,
+    separator: &str,
+) -> String {
     let mut joined = String::new();
 
-    // TODO: What exactly can fail here? Out of memory?
-    write!(joined, "{}", &values[0]).unwrap();
+    let mut iter = values.into_iter();
 
-    for value in values[1..].iter() {
+    if let Some(value) = iter.next() {
+        // TODO: What exactly can fail here? Out of memory?
+        write!(joined, "{}", &value).unwrap();
+    }
+
+    while let Some(value) = iter.next() {
         joined.push_str(separator);
         write!(joined, "{value}").unwrap();
     }
@@ -406,6 +415,8 @@ impl Display for Statement {
             Statement::Rollback => {
                 f.write_str("ROLLBACK")?;
             }
+
+            Statement::Explain(statement) => write!(f, "EXPLAIN {statement}")?,
         };
 
         f.write_char(';')

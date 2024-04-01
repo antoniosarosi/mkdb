@@ -93,6 +93,10 @@ pub(crate) fn prepare(
             }
         }
 
+        Statement::Explain(inner) => {
+            prepare(&mut *inner, ctx)?;
+        }
+
         _ => {} // Nothing to do here.
     };
 

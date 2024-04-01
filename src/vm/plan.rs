@@ -38,16 +38,16 @@
 //! deleting from the BTree would invalidate that cursor.
 //!
 //! So, in order to deal with such cases, there's a special type of iterator
-//! which is the [`BufferedIter`]. The [`BufferedIter`] contains an in-memory
+//! which is the [`Collect`]. The [`Collect`] contains an in-memory
 //! buffer of configurable size that is written to a file once it fills up.
-//! That way the [`BufferedIter`] can collect as many tuples as necessary
+//! That way the [`Collect`] can collect as many tuples as necessary
 //! without memory concerns. Once all the tuples are collected, they are
 //! returned one by one just like any other normal iterator would return them.
 use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::{HashMap, VecDeque},
-    fmt::Debug,
+    fmt::{self, Debug, Display},
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
     ops::{Bound, Index, RangeBounds},
@@ -61,7 +61,7 @@ use crate::{
         io::FileOps,
         pager::{PageNumber, Pager},
     },
-    sql::statement::{Assignment, Expression, Value},
+    sql::statement::{join, Assignment, Expression, Value},
     storage::{
         reassemble_payload, tuple, BTree, BTreeKeyComparator, BytesCmp, Cursor, FixedSizeMemCmp,
     },
@@ -107,7 +107,7 @@ pub(crate) enum Plan<F> {
     /// Helper for the main [`Plan::Sort`] plan.
     SortKeysGen(SortKeysGen<F>),
     /// Helper for various plans.
-    BufferedIter(BufferedIter<F>),
+    Collect(Collect<F>),
 }
 
 // TODO: As mentioned at [`crate::paging::pager::get_as`], we could also use
@@ -131,7 +131,7 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
             Self::Delete(delete) => delete.try_next(),
             Self::Sort(sort) => sort.try_next(),
             Self::SortKeysGen(sort_keys_gen) => sort_keys_gen.try_next(),
-            Self::BufferedIter(buffered_iter) => buffered_iter.try_next(),
+            Self::Collect(collect) => collect.try_next(),
         }
     }
 }
@@ -155,12 +155,46 @@ impl<F> Plan<F> {
             Self::SeqScan(seq_scan) => &seq_scan.table.schema,
             Self::RangeScan(range_scan) => &range_scan.schema,
             Self::ExactMatch(exact_match) => &exact_match.relation.schema(),
-            Self::Sort(sort) => &sort.source.schema,
+            Self::Sort(sort) => &sort.collection.schema,
             Self::Filter(filter) => return filter.source.schema(),
             _ => return None,
         };
 
         Some(schema.to_owned())
+    }
+
+    /// Returns the child node of this plan.
+    pub fn child(&self) -> Option<&Self> {
+        Some(match self {
+            Self::KeyScan(index_scan) => &index_scan.source,
+            Self::Filter(filter) => &filter.source,
+            Self::Project(project) => &project.source,
+            Self::Insert(insert) => &insert.source,
+            Self::Update(update) => &update.source,
+            Self::Delete(delete) => &delete.source,
+            Self::Sort(sort) => &sort.collection.source,
+            Self::SortKeysGen(sort_keys_gen) => &sort_keys_gen.source,
+            Self::Collect(collect) => &collect.source,
+            _ => return None,
+        })
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            Self::SeqScan(seq_scan) => format!("{seq_scan}"),
+            Self::ExactMatch(exact_match) => format!("{exact_match}"),
+            Self::RangeScan(range_scan) => format!("{range_scan}"),
+            Self::KeyScan(index_scan) => format!("{index_scan}"),
+            Self::Values(values) => format!("{values}"),
+            Self::Filter(filter) => format!("{filter}"),
+            Self::Project(project) => format!("{project}"),
+            Self::Insert(insert) => format!("{insert}"),
+            Self::Update(update) => format!("{update}"),
+            Self::Delete(delete) => format!("{delete}"),
+            Self::Sort(sort) => format!("{sort}"),
+            Self::SortKeysGen(sort_keys_gen) => format!("{sort_keys_gen}"),
+            Self::Collect(collect) => format!("{collect}"),
+        }
     }
 }
 
@@ -192,6 +226,12 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
     }
 }
 
+impl<F> Display for SeqScan<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SeqScan on table '{}'", self.table.name)
+    }
+}
+
 /// Scans that are not "sequential" fall into two categories:
 /// 1. Exact key match.
 /// 2. Range scan.
@@ -205,6 +245,7 @@ pub(crate) enum Scan {
 pub(crate) struct ExactMatch<F> {
     pub relation: Relation,
     pub key: Vec<u8>,
+    pub expr: Expression,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub done: bool,
 }
@@ -232,11 +273,24 @@ impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
     }
 }
 
+impl<F> Display for ExactMatch<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ExactMatch ({}) on {} '{}'",
+            self.expr,
+            self.relation.kind(),
+            self.relation.name()
+        )
+    }
+}
+
 /// Parameters for constructing [`RangeScan`] objects.
 pub(crate) struct RangeScanConfig<F> {
     pub relation: Relation,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    pub expr: Expression,
 }
 
 /// BTree range scan.
@@ -270,6 +324,7 @@ pub(crate) struct RangeScan<F> {
     pager: Rc<RefCell<Pager<F>>>,
     range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     comparator: BTreeKeyComparator,
+    expr: Expression,
     cursor: Cursor,
     init: bool,
     done: bool,
@@ -281,6 +336,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
             relation,
             pager,
             range,
+            expr,
         }: RangeScanConfig<F>,
     ) -> Self {
         Self {
@@ -288,6 +344,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
             comparator: relation.comparator(),
             root: relation.root(),
             cursor: Cursor::new(relation.root(), 0),
+            expr,
             pager,
             range,
             relation,
@@ -389,6 +446,18 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
     }
 }
 
+impl<F> Display for RangeScan<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RangeScan ({}) on {} '{}'",
+            self.expr,
+            self.relation.kind(),
+            self.relation.name()
+        )
+    }
+}
+
 /// Index scan uses an indexed column to retrieve data from a table.
 ///
 /// An index is a BTree that maps a column value to the primary key or row ID of
@@ -440,7 +509,7 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 /// +--------------+
 /// ```
 ///
-/// These tuples will be buffered by [`BufferedIter`] and stored in a file if
+/// These tuples will be buffered by [`Collect`] and stored in a file if
 /// necessary. Remember that we can never assume that something fits in memory
 /// when writing a database.
 ///
@@ -514,6 +583,16 @@ impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
     }
 }
 
+impl<F> Display for KeyScan<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "KeyScan ({}) on table '{}'",
+            self.table.schema.columns[0].name, self.table.name
+        )
+    }
+}
+
 /// Raw values from `INSERT INTO table (c1, c2) VALUES (v1, v2)`.
 ///
 /// This supports multiple values but the parser does not currently parse
@@ -538,6 +617,12 @@ impl Values {
     }
 }
 
+impl Display for Values {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Values ({})", join(&self.values[0], ", "))
+    }
+}
+
 /// Applies a filter [`Expression`] to its source returning only tuples that
 /// evaluate to `true`.
 ///
@@ -558,6 +643,12 @@ impl<F: Seek + Read + Write + FileOps> Filter<F> {
         }
 
         Ok(None)
+    }
+}
+
+impl<F> Display for Filter<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Filter ({})", self.filter)
     }
 }
 
@@ -594,6 +685,12 @@ impl<F: Seek + Read + Write + FileOps> Project<F> {
                 .map(|expr| vm::resolve_expression(&tuple, &self.input_schema, expr))
                 .collect::<Result<Tuple, _>>()?,
         ))
+    }
+}
+
+impl<F> Display for Project<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Project ({})", join(&self.projection, ", "))
     }
 }
 
@@ -644,6 +741,12 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
         }
 
         Ok(Some(vec![]))
+    }
+}
+
+impl<F> Display for Insert<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Insert on table '{}'", self.table.name)
     }
 }
 
@@ -747,6 +850,17 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
     }
 }
 
+impl<F> Display for Update<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Update ({}) on table '{}'",
+            join(&self.assignments, ", "),
+            self.table.name
+        )
+    }
+}
+
 /// Removes values from a table BTree and from all the necessary index BTrees.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Delete<F> {
@@ -787,6 +901,12 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
     }
 }
 
+impl<F> Display for Delete<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Delete from table '{}'", self.table.name)
+    }
+}
+
 /// See [`TupleBuffer`].
 const TUPLE_PAGE_HEADER_SIZE: usize = mem::size_of::<u32>();
 
@@ -794,7 +914,7 @@ const TUPLE_PAGE_HEADER_SIZE: usize = mem::size_of::<u32>();
 ///
 /// This structure stores [`Tuple`] instances (AKA rows) and can be written to
 /// a file once it reaches a certain preconfigured threshold. The
-/// [`TupleBuffer`] is used by the [`BufferedIter`] and [`Sort`] plans to store
+/// [`TupleBuffer`] is used by the [`Collect`] and [`Sort`] plans to store
 /// large query sets in the file system for queries like `SELECT * FROM table`
 /// which might not fit in RAM. Depending on the use case the tuple buffer can
 /// be configured with two different modes: fixed size and packed.
@@ -863,7 +983,7 @@ const TUPLE_PAGE_HEADER_SIZE: usize = mem::size_of::<u32>();
 /// +-----------------+          <---+
 /// ```
 ///
-/// This format is used by the [`BufferedIter`] plan to simply store the
+/// This format is used by the [`Collect`] plan to simply store the
 /// results of a large query like `SELECT * FROM table` in a file and then
 /// "stream" the rows one by one. Again, we don't need any information about the
 /// size of anything because the table [`Schema`] already tells us exactly how
@@ -946,7 +1066,7 @@ impl TupleBuffer {
     ///
     /// It doesn't panic or return any error if the buffer overflows
     /// [`Self::page_size`], this function won't fail. This is useful because
-    /// the [`BufferedIter`] needs to be able to process tuples of any size even
+    /// the [`Collect`] needs to be able to process tuples of any size even
     /// if they are larger than the maximum buffer size. The [`Sort`] plan has
     /// its own tricks to avoid working with tuples that wouldn't fit in the
     /// buffer.
@@ -1080,7 +1200,7 @@ impl TupleBuffer {
 /// This structure consumes all the tuples from its source through the
 /// [`Self::collect`] operation and writes them to a "collection" file if they
 /// don't fit in memory. Once tuples have been successfully collected,
-/// [`BufferedIter`] acts like a normal iterator that returns tuples one at a
+/// [`Collect`] acts like a normal iterator that returns tuples one at a
 /// time. If the collected tuples fit in memory there is no IO, so that's the
 /// best case scenario.
 ///
@@ -1118,7 +1238,7 @@ impl TupleBuffer {
 /// we can just read sequentially from the file indefinitely until there are no
 /// more bytes.
 #[derive(Debug)]
-pub(crate) struct BufferedIter<F> {
+pub(crate) struct Collect<F> {
     /// Tuple source. This is where we collect from.
     source: Box<Plan<F>>,
     /// Tuple schema.
@@ -1135,14 +1255,24 @@ pub(crate) struct BufferedIter<F> {
     file_path: PathBuf,
 }
 
+impl<F> Display for Collect<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Collect ({})",
+            join(self.schema.columns.iter().map(|col| &col.name), ", ")
+        )
+    }
+}
+
 // Can't derive because of the BufReader<F>.
-impl<F: PartialEq> PartialEq for BufferedIter<F> {
+impl<F: PartialEq> PartialEq for Collect<F> {
     fn eq(&self, other: &Self) -> bool {
         self.source == other.source && self.schema == other.schema
     }
 }
 
-impl<F: FileOps> BufferedIter<F> {
+impl<F: FileOps> Collect<F> {
     /// Drops the IO resource and deletes it from the file system.
     fn drop_file(&mut self) -> io::Result<()> {
         drop(self.file.take());
@@ -1152,7 +1282,7 @@ impl<F: FileOps> BufferedIter<F> {
 }
 
 // TODO: Requires defining the struct as BufferdIter<F: FileOps>
-// impl<F: FileOps> Drop for BufferedIter<F> {
+// impl<F: FileOps> Drop for Collect<F> {
 //     fn drop(&mut self) {
 //         if self.file.is_some() {
 //             self.drop_file();
@@ -1160,22 +1290,22 @@ impl<F: FileOps> BufferedIter<F> {
 //     }
 // }
 
-/// Used to build [`BufferedIter`] objects.
-pub(crate) struct BufferedIterConfig<F> {
+/// Used to build [`Collect`] objects.
+pub(crate) struct CollectConfig<F> {
     pub source: Box<Plan<F>>,
     pub schema: Schema,
     pub work_dir: PathBuf,
     pub mem_buf_size: usize,
 }
 
-impl<F> From<BufferedIterConfig<F>> for BufferedIter<F> {
+impl<F> From<CollectConfig<F>> for Collect<F> {
     fn from(
-        BufferedIterConfig {
+        CollectConfig {
             source,
             schema,
             work_dir,
             mem_buf_size,
-        }: BufferedIterConfig<F>,
+        }: CollectConfig<F>,
     ) -> Self {
         // TODO: Use uuid or tempfile or something. This is poor man's random
         // file name.
@@ -1193,7 +1323,7 @@ impl<F> From<BufferedIterConfig<F>> for BufferedIter<F> {
     }
 }
 
-impl<F: Seek + Read + Write + FileOps> BufferedIter<F> {
+impl<F: Seek + Read + Write + FileOps> Collect<F> {
     /// Collects all the tuples from [`Self::source`].
     fn collect(&mut self) -> Result<(), DbError> {
         // Buffer tuples in-memory until we have no space left. At that point
@@ -1277,13 +1407,19 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
     }
 }
 
+impl<F> Display for SortKeysGen<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SortKeysGen ({})", join(&self.gen_exprs, ", "))
+    }
+}
+
 /// Used to build [`Sort`] objects.
 ///
 /// Building objects ain't easy these days...
 pub(crate) struct SortConfig<F> {
     pub page_size: usize,
     pub work_dir: PathBuf,
-    pub source: BufferedIter<F>,
+    pub collection: Collect<F>,
     pub comparator: TuplesComparator,
     pub input_buffers: usize,
 }
@@ -1315,7 +1451,7 @@ pub(crate) struct SortConfig<F> {
 /// expression that needs to be evaluated. The second sort key corresponds to
 /// the expression `price`, which is a simple column that we already have value
 /// for, we don't need to generate it. The sort keys that need to be generated
-/// are computed by [`SortKeysGen`] before the [`BufferedIter`] writes the tuple
+/// are computed by [`SortKeysGen`] before the [`Collect`] writes the tuple
 /// to a file or an in-memory buffer and they are appended to the end of the
 /// tuple after all its other columns. That format is then used by
 /// [`TuplesComparator`] to determine the final [`Ordering`].
@@ -1330,17 +1466,17 @@ pub(crate) struct SortConfig<F> {
 /// buffer by the scan plan. So we only work with complete data here, there are
 /// no partial rows.
 ///
-/// Once the [`BufferedIter`] has successfully collected all the tuples modified
+/// Once the [`Collect`] has successfully collected all the tuples modified
 /// by [`SortKeysGen`] we can finally start sorting.
 ///
 /// There are two main cases:
 ///
-/// 1. The [`BufferedIter`] did not use any files because all the tuples fit
+/// 1. The [`Collect`] did not use any files because all the tuples fit
 /// in its in-memory buffer. In that case, move the buffer out of the
-/// [`BufferedIter`] into the [`Sort`] plan and just do an in-memory sorting.
+/// [`Collect`] into the [`Sort`] plan and just do an in-memory sorting.
 /// No IO required.
 ///
-/// 2. The [`BufferedIter`] had to create a file in order to collect all
+/// 2. The [`Collect`] had to create a file in order to collect all
 /// tuples. This is the complicated case.
 ///
 /// # External 2-Way Merge Sort With Variable Length Data
@@ -1701,7 +1837,7 @@ pub(crate) struct SortConfig<F> {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Sort<F> {
     /// Tuple input.
-    source: BufferedIter<F>,
+    collection: Collect<F>,
     /// Tuples comparator used to obtain [`Ordering`] instances.
     comparator: TuplesComparator,
     /// `true` if we already sorted the tuples.
@@ -1729,7 +1865,7 @@ impl<F> From<SortConfig<F>> for Sort<F> {
         SortConfig {
             page_size,
             work_dir,
-            source,
+            collection,
             comparator,
             input_buffers,
         }: SortConfig<F>,
@@ -1737,7 +1873,7 @@ impl<F> From<SortConfig<F>> for Sort<F> {
         Self {
             page_size,
             work_dir,
-            source,
+            collection,
             comparator,
             input_buffers,
             sorted: false,
@@ -1835,8 +1971,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
     fn sort(&mut self) -> Result<(), DbError> {
         // Mem only sorting, didn't need files. Early return wishing that
         // everything was as simple as this.
-        if self.source.reader.is_none() {
-            self.output_buffer = mem::replace(&mut self.source.mem_buf, TupleBuffer::empty());
+        if self.collection.reader.is_none() {
+            self.output_buffer = mem::replace(&mut self.collection.mem_buf, TupleBuffer::empty());
             self.sort_output_buffer();
 
             return Ok(());
@@ -1844,7 +1980,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // We need files to sort.
         // TODO: Again, this project has no dependencies but we could use tempfile.
-        let input_file_name = format!("{}.mkdb.sort", &self.source as *const _ as usize);
+        let input_file_name = format!("{}.mkdb.sort", &self.collection as *const _ as usize);
         self.input_file_path = self.work_dir.join(input_file_name);
         self.input_file = Some(F::create(&self.input_file_path)?);
 
@@ -1854,7 +1990,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // Figure out the page size.
         self.page_size = std::cmp::max(
-            TupleBuffer::page_size_needed_for(self.source.mem_buf.largest_tuple_size),
+            TupleBuffer::page_size_needed_for(self.collection.mem_buf.largest_tuple_size),
             self.page_size,
         );
 
@@ -1872,7 +2008,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
 
         let mut input_pages = 0;
-        while let Some(tuple) = self.source.try_next()? {
+        while let Some(tuple) = self.collection.try_next()? {
             // Write output page if full.
             if !self.output_buffer.can_fit(&tuple) {
                 self.sort_output_buffer();
@@ -2028,7 +2164,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
         if !self.sorted {
-            self.source.collect()?;
+            self.collection.collect()?;
             self.sort()?;
             self.sorted = true;
         }
@@ -2050,6 +2186,18 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             tuple.drain(self.comparator.schema.len()..);
             tuple
         }))
+    }
+}
+
+impl<F> Display for Sort<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sort_col_names = self
+            .comparator
+            .sort_keys_indexes
+            .iter()
+            .map(|i| &self.comparator.sort_schema.columns[*i].name);
+
+        write!(f, "Sort ({})", join(sort_col_names, ", "))
     }
 }
 

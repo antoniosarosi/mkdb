@@ -278,6 +278,8 @@ impl<'i> Parser<'i> {
 
             Keyword::Rollback => Statement::Rollback,
 
+            Keyword::Explain => return Ok(Statement::Explain(Box::new(self.parse_statement()?))),
+
             _ => unreachable!(),
         };
 
@@ -732,6 +734,7 @@ impl<'i> Parser<'i> {
             Keyword::Start,
             Keyword::Rollback,
             Keyword::Commit,
+            Keyword::Explain,
         ]
     }
 
@@ -1121,6 +1124,24 @@ mod tests {
                     order_by: vec![],
                 }
             ])
+        )
+    }
+
+    #[test]
+    fn parse_explain() {
+        let sql = "EXPLAIN SELECT name, email FROM users ORDER BY email;";
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Ok(Statement::Explain(Box::new(Statement::Select {
+                columns: vec![
+                    Expression::Identifier("name".into()),
+                    Expression::Identifier("email".into())
+                ],
+                from: "users".into(),
+                r#where: None,
+                order_by: vec![Expression::Identifier("email".into())]
+            })))
         )
     }
 
