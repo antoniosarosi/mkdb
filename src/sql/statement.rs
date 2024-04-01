@@ -215,7 +215,7 @@ pub(crate) fn join<'t, T: Display + 't>(
         write!(joined, "{}", &value).unwrap();
     }
 
-    while let Some(value) = iter.next() {
+    for value in iter {
         joined.push_str(separator);
         write!(joined, "{value}").unwrap();
     }

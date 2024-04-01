@@ -170,7 +170,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             // BTree but as of right now it seems pretty complicated because the
             // BTree is not a self contained unit that can be passed around like
             // the pager.
-            if !is_scan_plan_collected(&source) {
+            if needs_collection(&source) {
                 source = Plan::Collect(Collect::from(CollectConfig {
                     source: Box::new(source),
                     work_dir,
@@ -194,7 +194,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             let page_size = db.pager.borrow().page_size;
             let metadata = db.table_metadata(&from)?;
 
-            if !is_scan_plan_collected(&source) {
+            if needs_collection(&source) {
                 source = Plan::Collect(Collect::from(CollectConfig {
                     source: Box::new(source),
                     work_dir,
@@ -246,14 +246,18 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
     })
 }
 
-/// Returns `true` if the given scan buffers the tuples before returning
-/// them.
-fn is_scan_plan_collected<F>(plan: &Plan<F>) -> bool {
+/// Returns `true` if the given plan needs collection to avoid destroying its
+/// cursor.
+fn needs_collection<F>(plan: &Plan<F>) -> bool {
     match plan {
-        Plan::Filter(filter) => is_scan_plan_collected(&filter.source),
-        Plan::KeyScan(_) | Plan::ExactMatch(_) => true,
-        Plan::SeqScan(_) | Plan::RangeScan(_) => false,
-        _ => unreachable!("is_scan_plan_buffered() called with plan that is not a 'scan' plan"),
+        Plan::Filter(filter) => needs_collection(&filter.source),
+        // KeyScan has a sorter behind it which buffers all the tuples and
+        // ExactMatch only returns one tuple.
+        Plan::KeyScan(_) | Plan::ExactMatch(_) => false,
+        // Top-level SeqScan and RangeScan will need collection to preserve
+        // their cursor state.
+        Plan::SeqScan(_) | Plan::RangeScan(_) => true,
+        _ => unreachable!("needs_collection() called with plan that is not a 'scan' plan"),
     }
 }
 

@@ -154,7 +154,7 @@ impl<F> Plan<F> {
             Self::KeyScan(index_scan) => &index_scan.table.schema,
             Self::SeqScan(seq_scan) => &seq_scan.table.schema,
             Self::RangeScan(range_scan) => &range_scan.schema,
-            Self::ExactMatch(exact_match) => &exact_match.relation.schema(),
+            Self::ExactMatch(exact_match) => exact_match.relation.schema(),
             Self::Sort(sort) => &sort.collection.schema,
             Self::Filter(filter) => return filter.source.schema(),
             _ => return None,
@@ -179,6 +179,7 @@ impl<F> Plan<F> {
         })
     }
 
+    /// String representation of a plan.
     pub fn display(&self) -> String {
         match self {
             Self::SeqScan(seq_scan) => format!("{seq_scan}"),
@@ -430,10 +431,8 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
         let bound = self.range.end_bound();
         if let Bound::Excluded(key) | Bound::Included(key) = bound {
             let ordering = self.comparator.bytes_cmp(tuple.as_ref(), key);
-
             if let Ordering::Equal | Ordering::Greater = ordering {
                 self.done = true;
-
                 if matches!(bound, Bound::Excluded(_))
                     || matches!(bound, Bound::Included(_)) && ordering == Ordering::Greater
                 {
