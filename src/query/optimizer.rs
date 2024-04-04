@@ -722,7 +722,7 @@ mod tests {
     struct IndexedExprs<'i> {
         indexes: &'i [&'i str],
         expr: &'i str,
-        expected: &'i [&'i [(&'i str, &'i [&'i str])]],
+        expected: Vec<HashMap<&'i str, Vec<&'i str>>>,
     }
 
     fn parse_indexed_expr(expr: &str, indexes: &[&str]) -> (Expression, HashSet<String>) {
@@ -800,7 +800,7 @@ mod tests {
     struct BuildBounds<'i> {
         indexes: &'i [&'i str],
         expr: &'i str,
-        expected: &'i [&'i [(&'i str, &'i [(Bound<&'i Value>, Bound<&'i Value>)])]],
+        expected: Vec<HashMap<&'i str, Vec<(Bound<&'i Value>, Bound<&'i Value>)>>>,
     }
 
     fn assert_build_range_bounds(
@@ -811,14 +811,6 @@ mod tests {
         }: BuildBounds,
     ) {
         let (tree, indexes) = parse_indexed_expr(expr, indexes);
-
-        let expected: Vec<HashMap<&str, Vec<(Bound<&Value>, Bound<&Value>)>>> = expected
-            .iter()
-            .copied()
-            .map(|group| {
-                HashMap::from_iter(group.iter().map(|(col, bounds)| (*col, Vec::from(*bounds))))
-            })
-            .collect();
 
         assert_eq!(
             &build_range_bounds(&find_indexed_exprs(&indexes, &tree)),
@@ -831,7 +823,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5",
-            expected: &[&[("id", &["id < 5"])]],
+            expected: vec![HashMap::from([("id", vec!["id < 5"])])],
         })
     }
 
@@ -840,7 +832,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5 AND name > 'test' AND age < 30",
-            expected: &[&[("id", &["id < 5"])]],
+            expected: vec![HashMap::from([("id", vec!["id < 5"])])],
         })
     }
 
@@ -849,7 +841,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id > 5 AND id < 10",
-            expected: &[&[("id", &[("id > 5"), ("id < 10")])]],
+            expected: vec![HashMap::from([("id", vec![("id > 5"), ("id < 10")])])],
         })
     }
 
@@ -858,7 +850,10 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5 OR id > 10",
-            expected: &[&[("id", &["id < 5"])], &[("id", &["id > 10"])]],
+            expected: vec![
+                HashMap::from([("id", vec!["id < 5"])]),
+                HashMap::from([("id", vec!["id > 10"])]),
+            ],
         })
     }
 
@@ -867,7 +862,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5 AND name > 'test' AND id < 3",
-            expected: &[&[("id", &[("id < 5"), ("id < 3")])]],
+            expected: vec![HashMap::from([("id", vec![("id < 5"), ("id < 3")])])],
         })
     }
 
@@ -876,10 +871,10 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70)",
-            expected: &[&[("id", &[("id > 10"), ("id < 20")])], &[("id", &[
-                ("id > 50"),
-                ("id < 70"),
-            ])]],
+            expected: vec![
+                HashMap::from([("id", vec![("id > 10"), ("id < 20")])]),
+                HashMap::from([("id", vec![("id > 50"), ("id < 70")])]),
+            ],
         })
     }
 
@@ -888,12 +883,12 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "(id < 20 OR id > 50) AND (id < 100 OR id > 200)",
-            expected: &[&[("id", &[
+            expected: vec![HashMap::from([("id", vec![
                 ("id < 20"),
                 ("id > 50"),
                 ("id < 100"),
                 ("id > 200"),
-            ])]],
+            ])])],
         })
     }
 
@@ -902,11 +897,11 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70) OR (id > 100 AND id < 200) OR (id > 500 AND id < 600)",
-            expected: &[
-                &[("id", &[("id > 10"), ("id < 20")])],
-                &[("id", &[("id > 50"), ("id < 70")])],
-                &[("id", &[("id > 100"), ("id < 200")])],
-                &[("id", &[("id > 500"), ("id < 600")])],
+            expected: vec![
+                HashMap::from([("id", vec![("id > 10"), ("id < 20")])]),
+                HashMap::from([("id", vec![("id > 50"), ("id < 70")])]),
+                HashMap::from([("id", vec![("id > 100"), ("id < 200")])]),
+                HashMap::from([("id", vec![("id > 500"), ("id < 600")])]),
             ],
         })
     }
@@ -916,11 +911,11 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id", "email", "uuid"],
             expr: "id < 5 AND uuid < 'ffff' AND email = 'test@test.com'",
-            expected: &[&[
-                ("id", &["id < 5"]),
-                ("uuid", &[r#"uuid < "ffff""#]),
-                ("email", &[r#"email = "test@test.com""#]),
-            ]],
+            expected: vec![HashMap::from([
+                ("id", vec!["id < 5"]),
+                ("uuid", vec![r#"uuid < "ffff""#]),
+                ("email", vec![r#"email = "test@test.com""#]),
+            ])],
         })
     }
 
@@ -929,10 +924,11 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id", "email"],
             expr: "id < 5 OR id > 10 OR email = 'test@test.com'",
-            expected: &[&[("id", &["id < 5"])], &[("id", &["id > 10"])], &[(
-                "email",
-                &[r#"email = "test@test.com""#],
-            )]],
+            expected: vec![
+                HashMap::from([("id", vec!["id < 5"])]),
+                HashMap::from([("id", vec!["id > 10"])]),
+                HashMap::from([("email", vec![r#"email = "test@test.com""#])]),
+            ],
         })
     }
 
@@ -941,7 +937,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id", "email"],
             expr: "id > 5 AND id < 10 OR name = 'Some Name'",
-            expected: &[],
+            expected: vec![],
         })
     }
 
@@ -950,10 +946,10 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "id > 5",
-            expected: &[&[("id", &[(
+            expected: vec![HashMap::from([("id", vec![(
                 Bound::Excluded(&Value::Number(5)),
                 Bound::Unbounded,
-            )])]],
+            )])])],
         })
     }
 
@@ -962,10 +958,10 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "id = 5",
-            expected: &[&[("id", &[(
+            expected: vec![HashMap::from([("id", vec![(
                 Bound::Included(&Value::Number(5)),
                 Bound::Included(&Value::Number(5)),
-            )])]],
+            )])])],
         })
     }
 
@@ -974,10 +970,10 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "id > 5 AND id <= 10",
-            expected: &[&[("id", &[(
+            expected: vec![HashMap::from([("id", vec![(
                 Bound::Excluded(&Value::Number(5)),
                 Bound::Included(&Value::Number(10)),
-            )])]],
+            )])])],
         })
     }
 
@@ -986,10 +982,10 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "id <= 5 OR id > 10",
-            expected: &[&[("id", &[
+            expected: vec![HashMap::from([("id", vec![
                 (Bound::Unbounded, Bound::Included(&Value::Number(5))),
                 (Bound::Excluded(&Value::Number(10)), Bound::Unbounded),
-            ])]],
+            ])])],
         })
     }
 
@@ -998,10 +994,10 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "(id > 5 AND id < 20) AND (id > 15 AND id < 25)",
-            expected: &[&[("id", &[(
+            expected: vec![HashMap::from([("id", vec![(
                 Bound::Excluded(&Value::Number(15)),
                 Bound::Excluded(&Value::Number(20)),
-            )])]],
+            )])])],
         })
     }
 
@@ -1010,10 +1006,82 @@ mod tests {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
             expr: "(id < 10 OR id > 20) OR (id < 15 OR id > 25)",
-            expected: &[&[("id", &[
+            expected: vec![HashMap::from([("id", vec![
                 (Bound::Unbounded, Bound::Excluded(&Value::Number(15))),
                 (Bound::Excluded(&Value::Number(20)), Bound::Unbounded),
-            ])]],
+            ])])],
+        })
+    }
+
+    #[test]
+    fn build_range_bound_multiple_columns_and() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id", "email"],
+            expr: "id <= 5 AND email = 'test@test.com'",
+            expected: vec![HashMap::from([
+                ("id", vec![(
+                    Bound::Unbounded,
+                    Bound::Included(&Value::Number(5)),
+                )]),
+                ("email", vec![(
+                    Bound::Included(&Value::String("test@test.com".into())),
+                    Bound::Included(&Value::String("test@test.com".into())),
+                )]),
+            ])],
+        })
+    }
+
+    #[test]
+    fn build_range_bound_multiple_columns_or() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id", "email"],
+            expr: "id <= 5 OR email = 'test@test.com'",
+            expected: vec![
+                HashMap::from([("id", vec![(
+                    Bound::Unbounded,
+                    Bound::Included(&Value::Number(5)),
+                )])]),
+                HashMap::from([("email", vec![(
+                    Bound::Included(&Value::String("test@test.com".into())),
+                    Bound::Included(&Value::String("test@test.com".into())),
+                )])]),
+            ],
+        })
+    }
+
+    #[test]
+    fn intersect_and_bounds_with_multiple_columns() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id", "email"],
+            expr: "(id > 5 AND id < 20) AND (id > 15 AND id < 25) AND email < 'test@test.com'",
+            expected: vec![HashMap::from([
+                ("id", vec![(
+                    Bound::Excluded(&Value::Number(15)),
+                    Bound::Excluded(&Value::Number(20)),
+                )]),
+                ("email", vec![(
+                    Bound::Unbounded,
+                    Bound::Excluded(&Value::String("test@test.com".into())),
+                )]),
+            ])],
+        })
+    }
+
+    #[test]
+    fn join_or_bounds_with_multiple_columns() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id", "email"],
+            expr: "(id > 10 AND id < 30) OR (id > 5 AND id < 20) AND (email < 'test@test.com' OR email > 'a')",
+            expected: vec![
+                HashMap::from([("id", vec![(
+                    Bound::Excluded(&Value::Number(5)),
+                    Bound::Excluded(&Value::Number(30)),
+                )])]),
+                HashMap::from([("email", vec![(
+                    Bound::Excluded(&Value::String("a".into())),
+                    Bound::Excluded(&Value::String("test@test.com".into())),
+                )])]),
+            ],
         })
     }
 
@@ -1047,83 +1115,3 @@ mod tests {
         })
     }
 }
-
-// id > 5 AND id < 10
-// Left:  [5..]
-// Right: [..10]
-// Intersection: [5..10] <- Max(start)..Min(end)
-//
-//
-// id < 5 AND id > 10
-// Left:  [..5]
-// Right: [10..]
-// Intersection: [] <- If Max(start) > Min(end) -> SeqScan
-
-// id < 5 OR id > 10
-// Left:  [..5]
-// Right: [10..]
-// Union: [..5, 10..] <- Join
-
-// id < 5 OR id < 10
-// Left:  [..5]
-// Right: [..10]
-// Union: [..10] <- If right.bound.contains(left.bound.end) -> Merge
-
-// id > 5 OR id < 10
-// Left:  [5..]
-// Right: [..10]
-// Union: [5.., ..10] <- If r1.end.unbounded && r2.start unbouned -> SeqScan
-
-// Complicated Cases
-
-// (id < 2 OR id > 25) AND (id < 20 OR id > 30)
-// LEFT   [..2, 25..]
-// RIGHT: [..20, 30..]
-// SORT:  [..2, ..20, 25.., 30..]
-// Intersection : [..2, 30..] <- Intersect with last one in vec or push
-
-// (id < 2 OR id > 15) AND (id < 20 OR id > 30)
-// LEFT   [..2, 15..]
-// RIGHT: [..20, 30..]
-// SORT:  [..2, ..20, 15.., 30..]
-// Intersection : [..2, 15..]
-
-// (id < 2 OR id < 15) AND (id < 20 OR id < 40)
-// LEFT   [..15]
-// RIGHT: [..40]
-// Intersection : [..15]
-
-// (id < 2 OR id < 30) AND (id > 20 OR id > 25)
-// LEFT   [..30]
-// RIGHT: [20..]
-// Intersection : [20..30]
-
-// (id > 10 AND id < 20) OR (id > 30 AND id < 40)
-// LEFT:  [10..20]
-// RIGHT: [30..40]
-// SORT: [10..20, 30..40]
-
-// (id > 10 AND id < 20) OR (id > 15 AND id < 35)
-// LEFT:  [10..20]
-// RIGHT: [15..35]
-// SORT: [10..35] <- Merge
-
-// id < 5 AND email > '1'
-// { "id": 0..5, "email" > '1' }
-
-// id < 5 OR email > '1'
-// [{ "id": 0..5 }, { "email": '1' }]
-
-// (id > 10 AND id < 30) OR (id > 40 AND id < 50) AND (email > '1' OR email < '2')
-// LEFT:  {"id": [10..30, 40..50]}
-// RIGHT: {"email": [0..2]}
-// MERGE: {"id": [10..30, 40..50], "email": [0..2]}
-
-// (id > 10 AND id < 30) OR (id > 40 AND id < 50) OR (email > '1' OR email < '2')
-// LEFT:  {"id": [10..30, 40..50]}
-// RIGHT: {"email": [0..2]}
-// MERGE: [{"id": [10..30, 40..50]}, {"email": [0..2]}]
-
-// (id > 10 AND id < 30) OR (email > 40 AND email < 50) AND (email > 60 OR email < 70)
-// LEFT:  [{"id": 10..30}, {"email": 40..50}]
-// RIGHT: [{"email": 60..70}]
