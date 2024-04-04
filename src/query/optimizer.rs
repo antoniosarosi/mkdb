@@ -3,13 +3,16 @@
 //! See the module level documentation of [`crate::vm::plan`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::{self, Ordering},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     io::{Read, Seek, Write},
     mem,
-    ops::Bound,
+    ops::{Bound, RangeBounds},
     ptr,
     rc::Rc,
 };
+
+use libc::group;
 
 use crate::{
     db::{Database, DatabaseContext, DbError, IndexMetadata, Relation, SqlError, TableMetadata},
@@ -232,7 +235,7 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
 //     })))
 // }
 
-/// Finds expressions that are applied to an indexed column.
+/// Finds all the combinations of expressions applied to indexed columns.
 ///
 /// The expressions can't be "any" expression that contains an indexed column.
 /// Consider this case:
@@ -268,17 +271,21 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
 /// SELECT * FROM users WHERE (id < 5 AND name < 'c') OR id > 1000;
 /// ```
 ///
-/// So basically we have to build a list of AND expressions separated by OR
-/// expressions. In the example above we'd build something like this:
+/// If an `OR` expression contains another indexed column we can use two
+/// indexes:
 ///
-/// ```text
-/// [[id < 5], [id > 1000]]
+/// ```sql
+/// SELECT * FROM users WHERE id < 5 OR email = "test@test.com";
 /// ```
+///
+/// So this function ends up producing "groups" of expressions that we can use.
+/// Each "group" is separated by an `OR` expression and the groups themselves
+/// can contain multiple expressions for multiple indexes. See the tests below
+/// in the [`tests`] module for examples.
 fn find_indexed_exprs<'e>(
     indexes: &HashSet<String>,
-    output: &mut HashMap<String, Vec<Vec<&'e Expression>>>,
     expr: &'e Expression,
-) {
+) -> Vec<HashMap<&'e str, Vec<&'e Expression>>> {
     println!("{expr}");
 
     match expr {
@@ -287,11 +294,12 @@ fn find_indexed_exprs<'e>(
             operator,
             right,
         } => match (&**left, &**right) {
-            // Case 1. Simple expressions:
+            // Case 1: Base case.
             //
             // SELECT * FROM t WHERE x >= 5
             //
-            // These are the leaves of the expression tree.
+            // These are the leaves of the expression tree, we start from here
+            // and build upwards.
             (Expression::Identifier(col), Expression::Value(_))
             | (Expression::Value(_), Expression::Identifier(col))
                 if indexes.contains(col)
@@ -304,77 +312,424 @@ fn find_indexed_exprs<'e>(
                             | BinaryOperator::GtEq
                     ) =>
             {
-                output.insert(col.into(), vec![vec![expr]]);
+                vec![HashMap::from([(col.as_str(), vec![expr])])]
             }
 
-            // Case 2. AND | OR expressions.
-            //
-            // Subcase A: AND expression:
-            // SELECT * FROM t WHERE (x < 10 OR x > 20) AND (x < 50 OR x > 70)
-            //
-            // Join the expressions in a single vec: [[x > 10, x < 20, x < 50, x > 70]]
-            //
-            // Subcase B: OR expressions:
-            // SELECT * FROM t WHERE x > 10 AND x < 20 OR x > 50 AND x < 70
-            //
-            // Separate the expressions in two vecs: [[x > 10, x < 20], [x > 50, x < 70]]
-            //
-            // This is the complicated case.
+            // Case 2: AND | OR expressions.
             (left, right) if matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
-                let mut left_output = HashMap::new();
-                find_indexed_exprs(indexes, &mut left_output, left);
+                let mut left_groups = find_indexed_exprs(indexes, left);
+                let mut right_groups = find_indexed_exprs(indexes, right);
 
-                let mut right_output = HashMap::new();
-                find_indexed_exprs(indexes, &mut right_output, right);
+                match operator {
+                    // Subcase A: AND expression.
+                    //
+                    // We have to join all the groups into one single group to
+                    // produce the intersection.
+                    //
+                    // This algorithm is O(n^2) or worse (didn't do the math,
+                    // probably something like depth of expr tree * number of
+                    // groups * number of indexes), but query trees in general
+                    // shouldn't be that deep and tables in general won't have
+                    // hundreds of indexes to consider. Should be safe for
+                    // general use cases.
+                    BinaryOperator::And => {
+                        let mut intersection: HashMap<&str, Vec<&Expression>> = HashMap::new();
 
-                for (col, mut left_exprs) in left_output.into_iter() {
-                    let mut both_branches_contain_column = false;
-
-                    if let Some(mut right_exprs) = right_output.remove(&col) {
-                        both_branches_contain_column = true;
-                        left_exprs.append(&mut right_exprs);
-                    }
-
-                    match operator {
-                        BinaryOperator::And => {
-                            output.insert(col, vec![left_exprs.into_iter().flatten().collect()]);
-                        }
-                        BinaryOperator::Or => {
-                            if both_branches_contain_column {
-                                output.insert(col, left_exprs);
+                        for group in left_groups.into_iter().chain(right_groups.into_iter()) {
+                            for (column, mut bounds) in group.into_iter() {
+                                if let Some(existing) = intersection.get_mut(&column) {
+                                    existing.append(&mut bounds);
+                                } else {
+                                    intersection.insert(column, bounds);
+                                }
                             }
                         }
-                        _ => unreachable!(),
+
+                        vec![intersection]
                     }
+
+                    // Subcase B: OR expression.
+                    //
+                    // In this case we append the groups of the right side to
+                    // the groups of the left side to produce the union. If
+                    // either of the sides contains no groups then we return
+                    // nothing because one side of the OR statement invalidates
+                    // the indexes found on the other.
+                    BinaryOperator::Or => {
+                        if left_groups.is_empty() || right_groups.is_empty() {
+                            return vec![];
+                        }
+
+                        left_groups.append(&mut right_groups);
+
+                        left_groups
+                    }
+                    _ => unreachable!(),
                 }
             }
 
-            _ => {}
+            // Anything else produces 0 groups, which means there is no indexed
+            // expression that can be used.
+            _ => vec![],
         },
 
-        Expression::Nested(inner) => find_indexed_exprs(indexes, output, inner),
+        Expression::Nested(inner) => find_indexed_exprs(indexes, inner),
 
-        _ => {}
+        // Expressions that are not binary will produce 0 groups as well.
+        _ => vec![],
+    }
+}
+
+fn cmp_start_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering {
+    match (bound1, bound2) {
+        (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
+        (Bound::Unbounded, _) => Ordering::Less,
+        (_, Bound::Unbounded) => Ordering::Greater,
+        (
+            Bound::Excluded(value1) | Bound::Included(value1),
+            Bound::Excluded(value2) | Bound::Included(value2),
+        ) => {
+            let ordering = value1.partial_cmp(value2).unwrap_or_else(|| {
+                panic!(
+                    "Type errors at this point should be impossible: cmp {value1} against {value2}"
+                )
+            });
+
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+
+            match (bound1, bound2) {
+                (Bound::Included(_), Bound::Excluded(_)) => Ordering::Less,
+                (Bound::Excluded(_), Bound::Included(_)) => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        }
+    }
+}
+
+fn cmp_end_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering {
+    let ordering = cmp_start_bounds(bound1, bound2);
+
+    if let (Bound::Unbounded, _) | (_, Bound::Unbounded) = (bound1, bound2) {
+        return ordering.reverse();
+    }
+
+    ordering
+}
+
+fn cmp_start_end_bounds(start: &Bound<&Value>, end: &Bound<&Value>) -> Ordering {
+    if *start == Bound::Unbounded {
+        return Ordering::Less;
+    }
+
+    cmp_end_bounds(start, end)
+}
+
+fn range_intersection<'v>(
+    (start1, end1): (Bound<&'v Value>, Bound<&'v Value>),
+    (start2, end2): (Bound<&'v Value>, Bound<&'v Value>),
+) -> Option<(Bound<&'v Value>, Bound<&'v Value>)> {
+    let intersection_start = cmp::max_by(start1, start2, cmp_start_bounds);
+    let intersection_end = cmp::min_by(end1, end2, cmp_end_bounds);
+
+    if cmp_start_end_bounds(&intersection_start, &intersection_end) == Ordering::Greater {
+        return None;
+    }
+
+    Some((intersection_start, intersection_end))
+}
+
+// [0..20, 40..50]
+fn range_union<'v>(
+    (start1, end1): (Bound<&'v Value>, Bound<&'v Value>),
+    (start2, end2): (Bound<&'v Value>, Bound<&'v Value>),
+) -> Option<(Bound<&'v Value>, Bound<&'v Value>)> {
+    debug_assert!(
+        cmp_start_bounds(&start1, &start2) != Ordering::Greater,
+        "ranges should be sorted at this point to reduce comparisons: {:?} > {:?}",
+        (start1, end1),
+        (start2, end2),
+    );
+
+    if cmp_start_end_bounds(&start2, &end1) == Ordering::Greater {
+        return None;
+    }
+
+    let union_start = cmp::min_by(start1, start2, cmp_start_bounds);
+    let union_end = cmp::max_by(end1, end2, cmp_end_bounds);
+
+    Some((union_start, union_end))
+}
+
+fn build_range_bounds<'g>(
+    groups: &'g [HashMap<&str, Vec<&Expression>>],
+) -> Vec<HashMap<&'g str, Vec<(Bound<&'g Value>, Bound<&'g Value>)>>> {
+    let intersections = groups.iter().map(|group| {
+        group.iter().filter_map(|(col, exprs)| {
+            let mut bounds = exprs
+                .iter()
+                .copied()
+                .map(determine_bounds)
+                .collect::<VecDeque<_>>();
+
+            bounds
+                .make_contiguous()
+                .sort_by(|(start1, end1), (start2, end2)| {
+                    let start_bound_ordering = cmp_start_bounds(start1, start2);
+
+                    if cmp_start_bounds(start1, start2) != Ordering::Equal {
+                        start_bound_ordering
+                    } else {
+                        cmp_end_bounds(end1, end2)
+                    }
+                });
+
+            let mut intersection = bounds.pop_front().unwrap();
+
+            while let Some(range) = bounds.pop_front() {
+                // Short circuit if AND expression produces no intersection.
+                // That means the AND expression will never evaluate to true.
+                // Something like this for example: id < 5 AND id > 10.
+                let Some(sub_intersection) = range_intersection(intersection, range) else {
+                    return None;
+                };
+
+                intersection = sub_intersection;
+            }
+
+            Some((*col, vec![intersection]))
+        })
+    });
+
+    let mut unions = intersections
+        .filter_map(|group| {
+            let map = HashMap::from_iter(group);
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    println!("{unions:?}");
+
+    for i in 0..unions.len() - 1 {
+        let mut merge: HashMap<&str, VecDeque<(Bound<&Value>, Bound<&Value>)>> = HashMap::new();
+
+        for j in (i + 1)..unions.len() {
+            let [current, next] = unions.get_many_mut([i, j]).unwrap();
+            for col in current.keys() {
+                if let Some(intersection) = next.remove(*col) {
+                    if let Some(existing) = merge.get_mut(col) {
+                        existing.extend(intersection);
+                    } else {
+                        merge.insert(*col, VecDeque::from(intersection));
+                    }
+                }
+            }
+        }
+
+        println!("{merge:?}");
+
+        if merge.is_empty() {
+            continue;
+        }
+
+        let group = &mut unions[i];
+
+        for (col, mut ranges) in merge.into_iter() {
+            ranges.extend(group.get_mut(col).unwrap().drain(..));
+
+            ranges
+                .make_contiguous()
+                .sort_by(|(start1, end1), (start2, end2)| {
+                    let start_bound_ordering = cmp_start_bounds(start1, start2);
+
+                    if cmp_start_bounds(start1, start2) != Ordering::Equal {
+                        start_bound_ordering
+                    } else {
+                        cmp_end_bounds(end1, end2)
+                    }
+                });
+
+            println!("{ranges:?}");
+
+            let mut unions = Vec::new();
+
+            while let Some(range) = ranges.pop_front() {
+                if let Some(last) = unions.last_mut() {
+                    if let Some(union) = range_union(*last, range) {
+                        *last = union;
+                    } else {
+                        unions.push(range);
+                    }
+                } else {
+                    unions.push(range);
+                }
+                println!("{unions:?}");
+            }
+
+            group.insert(col, unions);
+        }
+    }
+
+    unions.retain(|u| !u.is_empty());
+
+    unions
+}
+
+/// Returns the indexed columns that should be used in each group.
+///
+/// For now, this only attempts to use the primary key as much as possible
+/// because it doesn't require an external index. But if we had more metadata
+/// about tables such as the current number of rows, maximum/minimum key value
+/// in each index, etc, we could determine if it's actually worth it to use an
+/// index or fallback to sequential scan like Postgres does for example.
+///
+/// If the primary key can't be used then we'll resort to the index that appears
+/// the most amount of times throughout the groups. That's not the best index
+/// to use, it's just the index that will probably produce the simplest query
+/// plan. Considering every single combination of indexes requires an
+/// exponential algorithm.
+fn find_best_path<'r>(
+    key_col: &str,
+    indexes_range_bounds: &'r [HashMap<&str, Vec<(Bound<&Value>, Bound<&Value>)>>],
+) -> Vec<&'r str> {
+    debug_assert!(
+        !indexes_range_bounds.is_empty(),
+        "find_best_path() called with empty vec"
+    );
+
+    let mut index_frequency = HashMap::new();
+
+    indexes_range_bounds
+        .iter()
+        .flat_map(|group| group.iter())
+        .for_each(|(col, _)| {
+            if let Some(frequency) = index_frequency.get_mut(col) {
+                *frequency = 1;
+            } else {
+                index_frequency.insert(col, 1);
+            };
+        });
+
+    indexes_range_bounds
+        .iter()
+        .map(|group| {
+            if let Some((col, _)) = group.get_key_value(key_col) {
+                return *col;
+            }
+
+            group
+                .iter()
+                .max_by(|(col1, _), (col2, _)| index_frequency[*col1].cmp(&index_frequency[*col2]))
+                .map(|(col, _)| col)
+                .unwrap_or_else(|| panic!("find_best_path() called with empty group: {group:?}"))
+        })
+        .collect()
+}
+
+fn determine_bounds(expr: &Expression) -> (Bound<&Value>, Bound<&Value>) {
+    let Expression::BinaryOperation {
+        left,
+        operator,
+        right,
+    } = expr
+    else {
+        unreachable!();
+    };
+
+    match (&**left, operator, &**right) {
+        // Case 1:
+        // SELECT * FROM t WHERE x = 5;
+        // SELECT * FROM t WHERE 5 = x;
+        //
+        // Position the cursor at key 5 and stop after returning that key.
+        (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
+            (Bound::Included(value), Bound::Included(value))
+        }
+
+        // Case 2:
+        // SELECT * FROM t WHERE x > 5;
+        // SELECT * FROM t WHERE 5 < x;
+        //
+        // Position the cursor at key 5, consume key 5 which will cause the
+        // cursor to move to the successor and return keys until finished.
+        (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
+            (Bound::Excluded(value), Bound::Unbounded)
+        }
+
+        // Case 3:
+        // SELECT * FROM t WHERE x < 5;
+        // SELECT * FROM t WHERE 5 > x;
+        //
+        // Allow the cursor to initialize normally (at the smallest key) and
+        // tell it to stop once it finds a key >= 5.
+        (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Excluded(value))
+        }
+
+        // Case 4:
+        // SELECT * FROM t WHERE x >= 5;
+        // SELECT * FROM t WHERE 5 <= x;
+        //
+        // Position the cursor at key 5 and assume it's already initialized. The
+        // cursor will then return key 5 and everything after.
+        (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
+            (Bound::Included(value), Bound::Unbounded)
+        }
+
+        // Case 5:
+        // SELECT * FROM t WHERE x <= 5;
+        // SELECT * FROM t WHERE 5 >= x;
+        //
+        // Allow the cursor to initialize normally (at the smallest key) and
+        // tell it to stop once it finds a key > 5
+        (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Included(value))
+        }
+
+        // Fallback to sequential scan in case we mess up here trying to
+        // optimize the expressions.
+        _ => unreachable!(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        ops::Bound,
+    };
 
     use super::find_indexed_exprs;
     use crate::{
         db::{IndexMetadata, Schema},
+        query::optimizer::{build_range_bounds, find_best_path},
         sql::{
             parser::Parser,
-            statement::{Column, DataType},
+            statement::{Column, DataType, Expression, Value},
         },
     };
 
     struct IndexedExprs<'i> {
         indexes: &'i [&'i str],
         expr: &'i str,
-        expected: &'i [(&'i str, &'i [&'i [&'i str]])],
+        expected: &'i [&'i [(&'i str, &'i [&'i str])]],
+    }
+
+    fn parse_indexed_expr(expr: &str, indexes: &[&str]) -> (Expression, HashSet<String>) {
+        let tree = Parser::new(expr).parse_expression().unwrap();
+        let indexes = HashSet::from_iter(indexes.iter().map(|name| String::from(*name)));
+
+        (tree, indexes)
     }
 
     fn assert_indexed_exprs(
@@ -384,38 +739,91 @@ mod tests {
             expected,
         }: IndexedExprs,
     ) {
-        let tree = Parser::new(expr).parse_expression().unwrap();
-        let indexes = HashSet::from_iter(indexes.iter().map(|name| String::from(*name)));
-        let mut output = HashMap::new();
+        let (tree, indexes) = parse_indexed_expr(expr, indexes);
+        let expressions = find_indexed_exprs(&indexes, &tree);
 
-        find_indexed_exprs(&indexes, &mut output, &tree);
-
-        let output: HashMap<String, Vec<Vec<String>>> =
-            HashMap::from_iter(output.iter().map(|(name, exprs)| {
-                let strings = exprs
-                    .iter()
-                    .map(|segment| segment.iter().map(|expr| format!("{expr}")).collect())
-                    .collect();
-
-                (name.to_owned(), strings)
-            }));
-
-        let expected: HashMap<String, Vec<Vec<String>>> =
-            HashMap::from_iter(expected.into_iter().copied().map(|(name, str_exprs)| {
-                let strings = str_exprs
-                    .iter()
-                    .map(|strs| {
-                        strs.iter()
-                            .copied()
-                            .map(|s| Parser::new(s).parse_expression().unwrap().to_string())
-                            .collect()
+        let output: Vec<HashMap<String, Vec<String>>> = expressions
+            .iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(col, exprs)| {
+                        let expr_strings = exprs.iter().map(|expr| expr.to_string()).collect();
+                        (col.to_string(), expr_strings)
                     })
-                    .collect();
+                    .collect()
+            })
+            .collect();
 
-                (name.to_owned(), strings)
-            }));
+        let expected: Vec<HashMap<String, Vec<String>>> = expected
+            .iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(col, exprs)| {
+                        let expr_strings = exprs.iter().map(|expr| expr.to_string()).collect();
+                        (col.to_string(), expr_strings)
+                    })
+                    .collect()
+            })
+            .collect();
 
         assert_eq!(output, expected);
+    }
+
+    struct BestPath<'i> {
+        pk: &'i str,
+        indexes: &'i [&'i str],
+        expr: &'i str,
+        expected: &'i [&'i str],
+    }
+
+    fn assert_best_path(
+        BestPath {
+            pk,
+            indexes,
+            expr,
+            expected,
+        }: BestPath,
+    ) {
+        let (tree, indexes) = parse_indexed_expr(expr, indexes);
+
+        assert_eq!(
+            find_best_path(
+                pk,
+                &build_range_bounds(&find_indexed_exprs(&indexes, &tree))
+            ),
+            expected
+        )
+    }
+
+    struct BuildBounds<'i> {
+        indexes: &'i [&'i str],
+        expr: &'i str,
+        expected: &'i [&'i [(&'i str, &'i [(Bound<&'i Value>, Bound<&'i Value>)])]],
+    }
+
+    fn assert_build_range_bounds(
+        BuildBounds {
+            indexes,
+            expr,
+            expected,
+        }: BuildBounds,
+    ) {
+        let (tree, indexes) = parse_indexed_expr(expr, indexes);
+
+        let expected: Vec<HashMap<&str, Vec<(Bound<&Value>, Bound<&Value>)>>> = expected
+            .iter()
+            .copied()
+            .map(|group| {
+                HashMap::from_iter(group.iter().map(|(col, bounds)| (*col, Vec::from(*bounds))))
+            })
+            .collect();
+
+        assert_eq!(
+            &build_range_bounds(&find_indexed_exprs(&indexes, &tree)),
+            &expected
+        );
     }
 
     #[test]
@@ -423,7 +831,7 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5",
-            expected: &[("id", &[&["id < 5"]])],
+            expected: &[&[("id", &["id < 5"])]],
         })
     }
 
@@ -432,16 +840,16 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5 AND name > 'test' AND age < 30",
-            expected: &[("id", &[&["id < 5"]])],
+            expected: &[&[("id", &["id < 5"])]],
         })
     }
 
     #[test]
-    fn find_multiple_indexed_exprs_with_ands() {
+    fn find_simple_and_indexed_expr() {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
-            expr: "id < 5 AND name > 'test' AND id < 3",
-            expected: &[("id", &[&[("id < 5"), ("id < 3")]])],
+            expr: "id > 5 AND id < 10",
+            expected: &[&[("id", &[("id > 5"), ("id < 10")])]],
         })
     }
 
@@ -450,7 +858,16 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "id < 5 OR id > 10",
-            expected: &[("id", &[&["id < 5"], &["id > 10"]])],
+            expected: &[&[("id", &["id < 5"])], &[("id", &["id > 10"])]],
+        })
+    }
+
+    #[test]
+    fn find_distributed_and_indexed_exprs() {
+        assert_indexed_exprs(IndexedExprs {
+            indexes: &["id"],
+            expr: "id < 5 AND name > 'test' AND id < 3",
+            expected: &[&[("id", &[("id < 5"), ("id < 3")])]],
         })
     }
 
@@ -458,11 +875,11 @@ mod tests {
     fn find_indexed_expr_and_or() {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
-            expr: "id > 10 AND id < 20 OR id > 50 AND id < 70",
-            expected: &[("id", &[&[("id > 10"), ("id < 20")], &[
+            expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70)",
+            expected: &[&[("id", &[("id > 10"), ("id < 20")])], &[("id", &[
                 ("id > 50"),
                 ("id < 70"),
-            ]])],
+            ])]],
         })
     }
 
@@ -471,32 +888,242 @@ mod tests {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "(id < 20 OR id > 50) AND (id < 100 OR id > 200)",
-            expected: &[("id", &[&["id < 20", "id > 50", "id < 100", "id > 200"]])],
+            expected: &[&[("id", &[
+                ("id < 20"),
+                ("id > 50"),
+                ("id < 100"),
+                ("id > 200"),
+            ])]],
         })
     }
 
     #[test]
-    fn find_complicated_and_or_indexed_expr() {
+    fn find_multiple_and_or_indexed_expr() {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id"],
             expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70) OR (id > 100 AND id < 200) OR (id > 500 AND id < 600)",
             expected: &[
-                ("id", &[
-                    &[("id > 10"), ("id < 20")],
-                    &[("id > 50"), ("id < 70")],
-                    &[("id > 100"), ("id < 200")],
-                    &[("id > 500"), ("id < 600")]
-                ])
+                &[("id", &[("id > 10"), ("id < 20")])],
+                &[("id", &[("id > 50"), ("id < 70")])],
+                &[("id", &[("id > 100"), ("id < 200")])],
+                &[("id", &[("id > 500"), ("id < 600")])],
             ],
         })
     }
 
     #[test]
-    fn dont_use_any_column_if_not_possible() {
+    fn find_multiple_indexed_columns_and() {
+        assert_indexed_exprs(IndexedExprs {
+            indexes: &["id", "email", "uuid"],
+            expr: "id < 5 AND uuid < 'ffff' AND email = 'test@test.com'",
+            expected: &[&[
+                ("id", &["id < 5"]),
+                ("uuid", &[r#"uuid < "ffff""#]),
+                ("email", &[r#"email = "test@test.com""#]),
+            ]],
+        })
+    }
+
+    #[test]
+    fn find_multiple_indexed_columns_or() {
         assert_indexed_exprs(IndexedExprs {
             indexes: &["id", "email"],
             expr: "id < 5 OR id > 10 OR email = 'test@test.com'",
+            expected: &[&[("id", &["id < 5"])], &[("id", &["id > 10"])], &[(
+                "email",
+                &[r#"email = "test@test.com""#],
+            )]],
+        })
+    }
+
+    #[test]
+    fn short_circuit_on_or_expr() {
+        assert_indexed_exprs(IndexedExprs {
+            indexes: &["id", "email"],
+            expr: "id > 5 AND id < 10 OR name = 'Some Name'",
             expected: &[],
         })
     }
+
+    #[test]
+    fn build_simple_range_bound() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "id > 5",
+            expected: &[&[("id", &[(
+                Bound::Excluded(&Value::Number(5)),
+                Bound::Unbounded,
+            )])]],
+        })
+    }
+
+    #[test]
+    fn build_exact_match_range_bound() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "id = 5",
+            expected: &[&[("id", &[(
+                Bound::Included(&Value::Number(5)),
+                Bound::Included(&Value::Number(5)),
+            )])]],
+        })
+    }
+
+    #[test]
+    fn build_simple_and_range_bound() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "id > 5 AND id <= 10",
+            expected: &[&[("id", &[(
+                Bound::Excluded(&Value::Number(5)),
+                Bound::Included(&Value::Number(10)),
+            )])]],
+        })
+    }
+
+    #[test]
+    fn build_simple_or_range_bound() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "id <= 5 OR id > 10",
+            expected: &[&[("id", &[
+                (Bound::Unbounded, Bound::Included(&Value::Number(5))),
+                (Bound::Excluded(&Value::Number(10)), Bound::Unbounded),
+            ])]],
+        })
+    }
+
+    #[test]
+    fn intersect_and_range_bounds() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "(id > 5 AND id < 20) AND (id > 15 AND id < 25)",
+            expected: &[&[("id", &[(
+                Bound::Excluded(&Value::Number(15)),
+                Bound::Excluded(&Value::Number(20)),
+            )])]],
+        })
+    }
+
+    #[test]
+    fn join_or_range_bounds() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "(id < 10 OR id > 20) OR (id < 15 OR id > 25)",
+            expected: &[&[("id", &[
+                (Bound::Unbounded, Bound::Excluded(&Value::Number(15))),
+                (Bound::Excluded(&Value::Number(20)), Bound::Unbounded),
+            ])]],
+        })
+    }
+
+    #[test]
+    fn simple_best_path() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email"],
+            expr: "id > 5",
+            expected: &["id"],
+        })
+    }
+
+    #[test]
+    fn best_path_or() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email"],
+            expr: "id < 5 OR id > 10",
+            expected: &["id"],
+        })
+    }
+
+    #[test]
+    fn best_path_and() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email"],
+            expr: "id > 5 AND id < 10",
+            expected: &["id"],
+        })
+    }
 }
+
+// id > 5 AND id < 10
+// Left:  [5..]
+// Right: [..10]
+// Intersection: [5..10] <- Max(start)..Min(end)
+//
+//
+// id < 5 AND id > 10
+// Left:  [..5]
+// Right: [10..]
+// Intersection: [] <- If Max(start) > Min(end) -> SeqScan
+
+// id < 5 OR id > 10
+// Left:  [..5]
+// Right: [10..]
+// Union: [..5, 10..] <- Join
+
+// id < 5 OR id < 10
+// Left:  [..5]
+// Right: [..10]
+// Union: [..10] <- If right.bound.contains(left.bound.end) -> Merge
+
+// id > 5 OR id < 10
+// Left:  [5..]
+// Right: [..10]
+// Union: [5.., ..10] <- If r1.end.unbounded && r2.start unbouned -> SeqScan
+
+// Complicated Cases
+
+// (id < 2 OR id > 25) AND (id < 20 OR id > 30)
+// LEFT   [..2, 25..]
+// RIGHT: [..20, 30..]
+// SORT:  [..2, ..20, 25.., 30..]
+// Intersection : [..2, 30..] <- Intersect with last one in vec or push
+
+// (id < 2 OR id > 15) AND (id < 20 OR id > 30)
+// LEFT   [..2, 15..]
+// RIGHT: [..20, 30..]
+// SORT:  [..2, ..20, 15.., 30..]
+// Intersection : [..2, 15..]
+
+// (id < 2 OR id < 15) AND (id < 20 OR id < 40)
+// LEFT   [..15]
+// RIGHT: [..40]
+// Intersection : [..15]
+
+// (id < 2 OR id < 30) AND (id > 20 OR id > 25)
+// LEFT   [..30]
+// RIGHT: [20..]
+// Intersection : [20..30]
+
+// (id > 10 AND id < 20) OR (id > 30 AND id < 40)
+// LEFT:  [10..20]
+// RIGHT: [30..40]
+// SORT: [10..20, 30..40]
+
+// (id > 10 AND id < 20) OR (id > 15 AND id < 35)
+// LEFT:  [10..20]
+// RIGHT: [15..35]
+// SORT: [10..35] <- Merge
+
+// id < 5 AND email > '1'
+// { "id": 0..5, "email" > '1' }
+
+// id < 5 OR email > '1'
+// [{ "id": 0..5 }, { "email": '1' }]
+
+// (id > 10 AND id < 30) OR (id > 40 AND id < 50) AND (email > '1' OR email < '2')
+// LEFT:  {"id": [10..30, 40..50]}
+// RIGHT: {"email": [0..2]}
+// MERGE: {"id": [10..30, 40..50], "email": [0..2]}
+
+// (id > 10 AND id < 30) OR (id > 40 AND id < 50) OR (email > '1' OR email < '2')
+// LEFT:  {"id": [10..30, 40..50]}
+// RIGHT: {"email": [0..2]}
+// MERGE: [{"id": [10..30, 40..50]}, {"email": [0..2]}]
+
+// (id > 10 AND id < 30) OR (email > 40 AND email < 50) AND (email > 60 OR email < 70)
+// LEFT:  [{"id": 10..30}, {"email": 40..50}]
+// RIGHT: [{"email": 60..70}]

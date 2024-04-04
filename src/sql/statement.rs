@@ -224,6 +224,14 @@ pub(crate) fn join<'t, T: Display + 't>(
 }
 
 impl PartialOrd for Value {
+    /// [`PartialOrd`] impl for [`Value`] always returns [`std::cmp::Ordering`]
+    /// except when types do not match.
+    ///
+    /// The codebases uses the [`None`] value as a "type error" when comparing
+    /// values, but type errors should never happen because the
+    /// [`super::analyzer`] must catch all of them. If we add a float type
+    /// (which does not form a total order) then we should add a custom
+    /// `try_partial_cmp` method to values in order to avoid confusion.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
