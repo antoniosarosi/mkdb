@@ -6,7 +6,7 @@ use std::{
     cmp::{self, Ordering},
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     io::{Read, Seek, Write},
-    mem,
+    iter, mem,
     ops::{Bound, RangeBounds},
     ptr,
     rc::Rc,
@@ -440,7 +440,6 @@ fn range_intersection<'v>(
     Some((intersection_start, intersection_end))
 }
 
-// [0..20, 40..50]
 fn range_union<'v>(
     (start1, end1): (Bound<&'v Value>, Bound<&'v Value>),
     (start2, end2): (Bound<&'v Value>, Bound<&'v Value>),
@@ -462,101 +461,77 @@ fn range_union<'v>(
     Some((union_start, union_end))
 }
 
-fn build_range_bounds<'g>(
+fn cmp_ranges(
+    (start1, end1): &(Bound<&Value>, Bound<&Value>),
+    (start2, end2): &(Bound<&Value>, Bound<&Value>),
+) -> Ordering {
+    let start_bound_ordering = cmp_start_bounds(start1, start2);
+
+    if cmp_start_bounds(&start1, &start2) != Ordering::Equal {
+        start_bound_ordering
+    } else {
+        cmp_end_bounds(end1, end2)
+    }
+}
+
+/// Computes the minimum set of bounds that have to be checked for each index.
+///
+/// Again, this algorithm is pretty expensive but we shouldn't be working many
+/// indexes at once. If we implement JOINs then large queries that join many
+/// tables together using different indexes might run into some performance
+/// issues, but then we can probably implement some heuristics or figure out
+/// if this computation is worth it.
+fn fold_range_bounds<'g>(
     groups: &'g [HashMap<&str, Vec<&Expression>>],
 ) -> Vec<HashMap<&'g str, Vec<(Bound<&'g Value>, Bound<&'g Value>)>>> {
-    let intersections = groups.iter().map(|group| {
-        group.iter().filter_map(|(col, exprs)| {
-            let mut bounds = exprs
-                .iter()
-                .copied()
-                .map(determine_bounds)
-                .collect::<VecDeque<_>>();
+    // Compute the intersections of all ranges first.
+    let mut fold = groups
+        .iter()
+        .map(|group| {
+            group.iter().filter_map(|(col, exprs)| {
+                let mut bounds = exprs.iter().copied().map(determine_bounds);
+                let mut intersection = bounds.next()?;
 
-            bounds
-                .make_contiguous()
-                .sort_by(|(start1, end1), (start2, end2)| {
-                    let start_bound_ordering = cmp_start_bounds(start1, start2);
-
-                    if cmp_start_bounds(start1, start2) != Ordering::Equal {
-                        start_bound_ordering
-                    } else {
-                        cmp_end_bounds(end1, end2)
-                    }
-                });
-
-            let mut intersection = bounds.pop_front().unwrap();
-
-            while let Some(range) = bounds.pop_front() {
                 // Short circuit if AND expression produces no intersection.
                 // That means the AND expression will never evaluate to true.
                 // Something like this for example: id < 5 AND id > 10.
-                let Some(sub_intersection) = range_intersection(intersection, range) else {
-                    return None;
-                };
+                for range in bounds {
+                    intersection = range_intersection(intersection, range)?;
+                }
 
-                intersection = sub_intersection;
-            }
-
-            Some((*col, vec![intersection]))
+                Some((*col, vec![intersection]))
+            })
         })
-    });
-
-    let mut unions = intersections
-        .filter_map(|group| {
-            let map = HashMap::from_iter(group);
-            if map.is_empty() {
-                None
-            } else {
-                Some(map)
-            }
-        })
+        .map(HashMap::from_iter)
+        .filter(|map| !map.is_empty())
         .collect::<Vec<_>>();
 
-    println!("{unions:?}");
-
-    for i in 0..unions.len() - 1 {
+    // Now compute the union of all individual columns.
+    for i in 0..fold.len().saturating_sub(1) {
         let mut merge: HashMap<&str, VecDeque<(Bound<&Value>, Bound<&Value>)>> = HashMap::new();
 
-        for j in (i + 1)..unions.len() {
-            let [current, next] = unions.get_many_mut([i, j]).unwrap();
-            for col in current.keys() {
+        for j in (i + 1)..fold.len() {
+            let [group, next] = fold.get_many_mut([i, j]).unwrap();
+            for (col, ranges) in group.iter_mut() {
                 if let Some(intersection) = next.remove(*col) {
                     if let Some(existing) = merge.get_mut(col) {
                         existing.extend(intersection);
                     } else {
-                        merge.insert(*col, VecDeque::from(intersection));
+                        merge.insert(
+                            *col,
+                            VecDeque::from_iter(ranges.drain(..).chain(intersection.into_iter())),
+                        );
                     }
                 }
             }
         }
 
-        println!("{merge:?}");
-
-        if merge.is_empty() {
-            continue;
-        }
-
-        let group = &mut unions[i];
+        let group = &mut fold[i];
 
         for (col, mut ranges) in merge.into_iter() {
-            ranges.extend(group.get_mut(col).unwrap().drain(..));
+            let unions = group.get_mut(col).unwrap();
 
-            ranges
-                .make_contiguous()
-                .sort_by(|(start1, end1), (start2, end2)| {
-                    let start_bound_ordering = cmp_start_bounds(start1, start2);
-
-                    if cmp_start_bounds(start1, start2) != Ordering::Equal {
-                        start_bound_ordering
-                    } else {
-                        cmp_end_bounds(end1, end2)
-                    }
-                });
-
-            println!("{ranges:?}");
-
-            let mut unions = Vec::new();
+            ranges.make_contiguous().sort_by(cmp_ranges);
 
             while let Some(range) = ranges.pop_front() {
                 if let Some(last) = unions.last_mut() {
@@ -570,14 +545,12 @@ fn build_range_bounds<'g>(
                 }
                 println!("{unions:?}");
             }
-
-            group.insert(col, unions);
         }
     }
 
-    unions.retain(|u| !u.is_empty());
+    fold.retain(|range| !range.is_empty());
 
-    unions
+    fold
 }
 
 /// Returns the indexed columns that should be used in each group.
@@ -609,11 +582,13 @@ fn find_best_path<'r>(
         .flat_map(|group| group.iter())
         .for_each(|(col, _)| {
             if let Some(frequency) = index_frequency.get_mut(col) {
-                *frequency = 1;
+                *frequency += 1;
             } else {
                 index_frequency.insert(col, 1);
             };
         });
+
+    println!("\n{index_frequency:?}");
 
     indexes_range_bounds
         .iter()
@@ -712,7 +687,7 @@ mod tests {
     use super::find_indexed_exprs;
     use crate::{
         db::{IndexMetadata, Schema},
-        query::optimizer::{build_range_bounds, find_best_path},
+        query::optimizer::{find_best_path, fold_range_bounds},
         sql::{
             parser::Parser,
             statement::{Column, DataType, Expression, Value},
@@ -789,10 +764,7 @@ mod tests {
         let (tree, indexes) = parse_indexed_expr(expr, indexes);
 
         assert_eq!(
-            find_best_path(
-                pk,
-                &build_range_bounds(&find_indexed_exprs(&indexes, &tree))
-            ),
+            find_best_path(pk, &fold_range_bounds(&find_indexed_exprs(&indexes, &tree))),
             expected
         )
     }
@@ -813,7 +785,7 @@ mod tests {
         let (tree, indexes) = parse_indexed_expr(expr, indexes);
 
         assert_eq!(
-            &build_range_bounds(&find_indexed_exprs(&indexes, &tree)),
+            &fold_range_bounds(&find_indexed_exprs(&indexes, &tree)),
             &expected
         );
     }
@@ -990,6 +962,15 @@ mod tests {
     }
 
     #[test]
+    fn short_circuit_on_no_intersection() {
+        assert_build_range_bounds(BuildBounds {
+            indexes: &["id"],
+            expr: "id < 5 AND id > 10",
+            expected: vec![],
+        })
+    }
+
+    #[test]
     fn intersect_and_range_bounds() {
         assert_build_range_bounds(BuildBounds {
             indexes: &["id"],
@@ -1086,6 +1067,46 @@ mod tests {
     }
 
     #[test]
+    fn or_bounds_union_with_multiple_columns() {
+        assert_build_range_bounds(BuildBounds {
+            expr: "id > 5 OR (email > 'a' AND email < 'c') OR (email = 'test' AND uuid = 'aaaa' AND name = 'what') OR (name = 'test')",
+            indexes: &["id", "email", "uuid", "name"],
+            expected: vec![
+                HashMap::from([("id", vec![(
+                    Bound::Excluded(&Value::Number(5)),
+                    Bound::Unbounded,
+                )])]),
+                HashMap::from([("email", vec![
+                    (
+                        Bound::Excluded(&Value::String("a".into())),
+                        Bound::Excluded(&Value::String("c".into())),
+                    ),
+                    (
+                        Bound::Included(&Value::String("test".into())),
+                        Bound::Included(&Value::String("test".into())),
+                    ),
+                ])]),
+                HashMap::from([
+                    ("uuid", vec![(
+                        Bound::Included(&Value::String("aaaa".into())),
+                        Bound::Included(&Value::String("aaaa".into())),
+                    )]),
+                    ("name", vec![
+                        (
+                            Bound::Included(&Value::String("test".into())),
+                            Bound::Included(&Value::String("test".into())),
+                        ),
+                        (
+                            Bound::Included(&Value::String("what".into())),
+                            Bound::Included(&Value::String("what".into())),
+                        ),
+                    ]),
+                ]),
+            ],
+        })
+    }
+
+    #[test]
     fn simple_best_path() {
         assert_best_path(BestPath {
             pk: "id",
@@ -1112,6 +1133,36 @@ mod tests {
             indexes: &["id", "email"],
             expr: "id > 5 AND id < 10",
             expected: &["id"],
+        })
+    }
+
+    #[test]
+    fn best_path_and_two_columns() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email"],
+            expr: "id > 5 AND email = 'test@test.com'",
+            expected: &["id"],
+        })
+    }
+
+    #[test]
+    fn best_path_or_two_columns() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email"],
+            expr: "id > 5 OR email = 'test@test.com'",
+            expected: &["id", "email"],
+        })
+    }
+
+    #[test]
+    fn best_path_or_multiple_columns() {
+        assert_best_path(BestPath {
+            pk: "id",
+            indexes: &["id", "email", "uuid", "name"],
+            expr: "id > 5 OR (email > 'a' AND email < 'c') OR (email = 'test' AND uuid = 'aaaa' AND name = 'what') OR (name = 'test')",
+            expected: &["id", "email", "name"],
         })
     }
 }
