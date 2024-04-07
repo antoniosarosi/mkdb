@@ -134,7 +134,6 @@ pub(crate) fn serialize<'v>(
         "length of schema and values must the same",
     );
 
-    // TODO: Alignment.
     for (col, val) in schema.columns.iter().zip(values.into_iter()) {
         serialize_value_into(&mut buf, &col.data_type, val);
     }
@@ -147,6 +146,8 @@ pub(crate) fn serialize<'v>(
 /// This one takes a reference instead of producing a new [`Vec<u8>`] because
 /// that would be expensive for serializing complete tuples as we'd have to
 /// allocate multiple vectors and join them together.
+///
+/// TODO: Alignment.
 fn serialize_value_into(buf: &mut Vec<u8>, data_type: &DataType, value: &Value) {
     match (data_type, value) {
         (DataType::Varchar(_), Value::String(string)) => {
@@ -194,6 +195,8 @@ pub fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
 ///
 /// This will call [`Read::read_exact`] many times so make sure the reader is
 /// buffered or is an in-memory array such as [`io::Cursor<Vec<u8>>`].
+///
+/// TODO: Alignment.
 pub fn read_from(reader: &mut impl Read, schema: &Schema) -> io::Result<Vec<Value>> {
     let values = schema.columns.iter().map(|column| {
         Ok(match column.data_type {

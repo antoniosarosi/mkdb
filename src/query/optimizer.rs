@@ -12,16 +12,20 @@ use std::{
     rc::Rc,
 };
 
-use libc::group;
-
 use crate::{
-    db::{Database, DatabaseContext, DbError, IndexMetadata, Relation, SqlError, TableMetadata},
+    db::{
+        Database, DatabaseContext, DbError, IndexMetadata, Relation, Schema, SqlError,
+        TableMetadata,
+    },
     paging::io::FileOps,
-    sql::statement::{BinaryOperator, Expression, Value},
+    sql::{
+        parser::Parser,
+        statement::{BinaryOperator, Expression, Value},
+    },
     storage::{tuple, Cursor},
     vm::plan::{
-        Collect, CollectConfig, ExactMatch, Filter, KeyScan, Plan, RangeScan, RangeScanConfig,
-        Scan, SeqScan, Sort, SortConfig, TuplesComparator,
+        Collect, CollectConfig, ExactMatch, Filter, KeyScan, LogicalOrScan, Plan, RangeScan,
+        RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
     },
 };
 
@@ -35,14 +39,11 @@ pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     filter: Option<Expression>,
     db: &mut Database<F>,
 ) -> Result<Plan<F>, DbError> {
-    // let source = if let Some(optimized_scan) = generate_optimized_scan_plan(table, db, &mut filter)?
-    // {
-    //     optimized_scan
-    // } else {
-    //     generate_sequential_scan_plan(table, db)?
-    // };
-
-    let source = generate_sequential_scan_plan(table, db)?;
+    let source = if let Some(optimized_scan) = generate_optimized_scan_plan(table, db, &filter)? {
+        optimized_scan
+    } else {
+        generate_sequential_scan_plan(table, db)?
+    };
 
     let Some(expr) = filter else {
         return Ok(source);
@@ -69,223 +70,372 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
     }))
 }
 
-/// Attempts to generate a [`RangeScan`] or an [`ExactMatch`] plan.
+fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
+    table_name: &str,
+    db: &mut Database<F>,
+    filter: &Option<Expression>,
+) -> Result<Option<Plan<F>>, DbError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+
+    let table = db.table_metadata(table_name)?.clone();
+
+    // Build index map (column name -> index metadata)
+    let indexes = HashSet::from_iter(table.indexes.iter().map(|index| index.name.to_owned()));
+
+    let index_paths = find_index_paths(&table.schema.columns[0].name, &indexes, filter);
+
+    if index_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut indexes_metadata = HashMap::new();
+
+    for index in &table.indexes {
+        if index_paths.contains_key(index.name.as_str()) {
+            indexes_metadata.insert(index.name.as_str(), index);
+        }
+    }
+
+    let mut index_ranges = Vec::new();
+
+    for (col, ranges) in index_paths {
+        let relation = if let Some(index) = indexes_metadata.get(col).copied() {
+            Relation::Index(index.clone())
+        } else {
+            Relation::Table(table.clone())
+        };
+
+        let data_type = table.schema.columns[table.schema.index_of(col).unwrap()].data_type;
+
+        let bounds = ranges.iter().map(|range| {
+            let expr = range_to_expr(col, *range);
+            let pager = Rc::clone(&db.pager.clone());
+
+            let start = range.0.map(|v| tuple::serialize_key(&data_type, v));
+            let end = range.1.map(|v| tuple::serialize_key(&data_type, v));
+
+            if is_exact_match(*range) {
+                let Bound::Included(key) = start else {
+                    unreachable!();
+                };
+                Plan::ExactMatch(ExactMatch {
+                    key,
+                    relation: relation.clone(),
+                    expr,
+                    done: false,
+                    pager,
+                    emit_key_only: true,
+                })
+            } else {
+                Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                    range: (start, end),
+                    relation: relation.clone(),
+                    expr,
+                    pager,
+                    emit_key_only: true,
+                }))
+            }
+        });
+
+        index_ranges.push((col, bounds.collect::<VecDeque<_>>()));
+    }
+
+    index_ranges.sort_by_key(|(col, _)| {
+        if let Some(index) = indexes_metadata.get(col) {
+            index.root
+        } else {
+            0
+        }
+    });
+
+    let work_dir = db.work_dir.clone();
+    let page_size = db.pager.borrow().page_size;
+
+    let mut source = if index_ranges.len() == 1 {
+        let (col, mut ranges) = index_ranges.remove(0);
+
+        if col == table.schema.columns[0].name {
+            for r in &mut ranges {
+                match r {
+                    Plan::RangeScan(s) => s.emit_key_only = false,
+                    Plan::ExactMatch(e) => e.emit_key_only = false,
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let plan = if ranges.len() == 1 {
+            ranges.remove(0).unwrap()
+        } else {
+            Plan::LogicalOrScan(LogicalOrScan { scans: ranges })
+        };
+
+        if col == table.schema.columns[0].name {
+            return Ok(Some(plan));
+        }
+
+        plan
+    } else {
+        Plan::LogicalOrScan(LogicalOrScan {
+            scans: index_ranges
+                .into_iter()
+                .map(|(_, scan)| scan)
+                .flatten()
+                .collect(),
+        })
+    };
+
+    if let Plan::RangeScan(_) | Plan::LogicalOrScan(_) = source {
+        source = Plan::Sort(Sort::from(SortConfig {
+            page_size,
+            work_dir: work_dir.clone(),
+            collection: Collect::from(CollectConfig {
+                source: Box::new(source),
+                work_dir: work_dir.clone(),
+                schema: Schema::new(vec![table.schema.columns[0].clone()]),
+                mem_buf_size: page_size,
+            }),
+            comparator: TuplesComparator {
+                schema: Schema::new(vec![table.schema.columns[0].clone()]),
+                sort_schema: Schema::new(vec![table.schema.columns[0].clone()]),
+                sort_keys_indexes: vec![0],
+            },
+            input_buffers: 4,
+        }));
+    };
+
+    Ok(Some(Plan::KeyScan(KeyScan {
+        comparator: table.comparator()?,
+        table,
+        pager: Rc::clone(&db.pager),
+        source: Box::new(source),
+    })))
+}
+
+type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
+
+/// Index path finding recursive algorithm inspired by Postgres.
 ///
-/// It's only possible to do so if we find an expression that contains an
-/// indexed column or the table primary key column and must always be executed.
-/// Otherwise we'll fallback to sequential scans.
-// fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
-//     table_name: &str,
-//     db: &mut Database<F>,
-//     filter: &mut Option<Expression>,
-// ) -> Result<Option<Plan<F>>, DbError> {
-//     let Some(filter) = filter else {
-//         return Ok(None);
-//     };
-
-//     let table = db.table_metadata(table_name)?.clone();
-
-//     // Build index map (column name -> index metadata)
-//     let mut indexes = HashMap::from_iter(
-//         table
-//             .indexes
-//             .iter()
-//             .map(|index| (index.column.name.clone(), index.clone())),
-//     );
-
-//     let exprs = find_indexed_exprs(&table, &indexes, filter) else {
-//         return Ok(None);
-//     };
-
-//     // This shouldn't fail at this point.
-//     let col = table.schema.index_of(expr.c).ok_or(DbError::Other(format!(
-//         "found invalid column {indexed_col} while generating query plan"
-//     )))?;
-
-//     let relation = if let Some(index) = indexes.get(indexed_col) {
-//         Relation::Index(index.clone())
-//     } else {
-//         Relation::Table(table.clone())
-//     };
-
-//     // Preserialize keys.
-//     let (start, end) = match (&**left, &**right) {
-//         (Expression::Identifier(_col), Expression::Value(value))
-//         | (Expression::Value(value), Expression::Identifier(_col)) => (
-//             tuple::serialize_key(&table.schema.columns[col].data_type, value),
-//             vec![],
-//         ),
-
-//         _ => unreachable!(),
-//     };
-
-//     let scan = match (left.as_ref(), operator, right.as_ref()) {
-//         // Case 1:
-//         // SELECT * FROM t WHERE x = 5;
-//         // SELECT * FROM t WHERE 5 = x;
-//         //
-//         // Position the cursor at key 5 and stop after returning that key.
-//         (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(value))
-//         | (Expression::Value(value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-//             Scan::Match(key)
-//         }
-
-//         // Case 2:
-//         // SELECT * FROM t WHERE x > 5;
-//         // SELECT * FROM t WHERE 5 < x;
-//         //
-//         // Position the cursor at key 5, consume key 5 which will cause the
-//         // cursor to move to the successor and return keys until finished.
-//         (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(_value))
-//         | (Expression::Value(_value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-//             Scan::Range((Bound::Excluded(key), Bound::Unbounded))
-//         }
-
-//         // Case 3:
-//         // SELECT * FROM t WHERE x < 5;
-//         // SELECT * FROM t WHERE 5 > x;
-//         //
-//         // Allow the cursor to initialize normally (at the smallest key) and
-//         // tell it to stop once it finds a key >= 5.
-//         (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(_value))
-//         | (Expression::Value(_value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
-//             Scan::Range((Bound::Unbounded, Bound::Excluded(key)))
-//         }
-
-//         // Case 4:
-//         // SELECT * FROM t WHERE x >= 5;
-//         // SELECT * FROM t WHERE 5 <= x;
-//         //
-//         // Position the cursor at key 5 and assume it's already initialized. The
-//         // cursor will then return key 5 and everything after.
-//         (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(_value))
-//         | (Expression::Value(_value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-//             Scan::Range((Bound::Included(key), Bound::Unbounded))
-//         }
-
-//         // Case 5:
-//         // SELECT * FROM t WHERE x <= 5;
-//         // SELECT * FROM t WHERE 5 >= x;
-//         //
-//         // Allow the cursor to initialize normally (at the smallest key) and
-//         // tell it to stop once it finds a key > 5
-//         (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(_value))
-//         | (Expression::Value(_value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
-//             Scan::Range((Bound::Unbounded, Bound::Included(key)))
-//         }
-
-//         // Fallback to sequential scan in case we mess up here trying to
-//         // optimize the expressions.
-//         _ => return Ok(None),
-//     };
-
-//     let work_dir = db.work_dir.clone();
-//     let page_size = db.pager.borrow().page_size;
-
-//     let maybe_index = indexes.remove(&table.schema.columns[col].name);
-
-//     let mut source = match scan {
-//         Scan::Match(key) => Plan::ExactMatch(ExactMatch {
-//             key,
-//             relation,
-//             expr: expr.clone(),
-//             done: false,
-//             pager: Rc::clone(&db.pager),
-//         }),
-
-//         Scan::Range(range) => Plan::RangeScan(RangeScan::from(RangeScanConfig {
-//             relation,
-//             range,
-//             expr: expr.clone(),
-//             pager: Rc::clone(&db.pager),
-//         })),
-//     };
-
-//     // Table BTree scan, no additional index needed.
-//     let Some(index) = maybe_index else {
-//         return Ok(Some(source));
-//     };
-
-//     // Sort the keys in ascending order to favor sequential IO.
-//     if let Plan::RangeScan(_) = source {
-//         source = Plan::Sort(Sort::from(SortConfig {
-//             page_size,
-//             work_dir: work_dir.clone(),
-//             collection: Collect::from(CollectConfig {
-//                 source: Box::new(source),
-//                 work_dir: work_dir.clone(),
-//                 schema: index.schema.clone(),
-//                 mem_buf_size: page_size,
-//             }),
-//             comparator: TuplesComparator {
-//                 schema: index.schema.clone(),
-//                 sort_schema: index.schema.clone(),
-//                 sort_keys_indexes: vec![1],
-//             },
-//             input_buffers: 4,
-//         }));
-//     }
-
-//     Ok(Some(Plan::KeyScan(KeyScan {
-//         comparator: table.comparator()?,
-//         table,
-//         index,
-//         pager: Rc::clone(&db.pager),
-//         source: Box::new(source),
-//     })))
-// }
-
-/// Finds all the combinations of expressions applied to indexed columns.
+/// See the [indxpath.c] file in the Postgres source.
 ///
-/// The expressions can't be "any" expression that contains an indexed column.
-/// Consider this case:
+/// [indxpath.c]: https://github.com/postgres/postgres/blob/REL_14_STABLE/src/backend/optimizer/path/indxpath.c#L1255
+///
+/// This algorithm attempts to find the "best" index path that we can follow to
+/// retrieve the tuples specified by a query.
+///
+/// # Base Cases
+///
+/// The simplest possible case is a single expression with a single index:
 ///
 /// ```sql
 /// CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));
 ///
+/// SELECT * FROM users WHERE id < 5;
+/// ```
+///
+/// In this case we only need to scan the BTree table using [`RangeScan`] from
+/// the beginning of the BTree until key 5 excluded.
+///
+/// # AND Expressions
+///
+/// AND clauses allow us to choose either side of the expression tree. Consider
+/// this case:
+///
+/// ```sql
+/// CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255));
+///
+/// SELECT * FROM users WHERE id = 5 AND email = 'test@test.com';
+/// ```
+///
+/// We can either use the primary key direct table index or the external email
+/// unique index. In this case the primary key would be better because it
+/// doesn't require scanning a separate BTree. However, if we tweak the
+/// expression a bit:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 100 AND email = 'test@test.com';
+/// ```
+///
+/// Now the external email index is better because it will only produce one
+/// tuple whereas the key index will produce a range of tuples.
+///
+/// Regardless of which option we pick, the other one will act as a filter.
+/// Same holds true when only one of the branches contains an index. For
+/// example:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 100 AND name = 'Some Name';
+/// ```
+///
+/// The name column is not indexed, so we'll use the id key index to scan the
+/// table BTree and apply the `name = 'Some Name'` filter to returned tuples.
+///
+/// ## Intersection
+///
+/// When both sides of the AND clause use the same index they can be intersected
+/// to reduce the number of visited tuples:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id > 10 AND id < 20;
+/// ```
+///
+/// In this case a [`RangeScan`] from 10 to 20 will do. Everything else will
+/// never be true on both sides of the AND clause. We can also get rid of the
+/// [`Filter`] plan completely because the [`RangeScan`] is already filtering
+/// out evrything we need.
+///
+/// Last but not least, we can short circuit if there is no intersection. For
+/// instance:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 10 AND id > 20;
+/// ```
+///
+/// A number can never be less than 10 while being greater than 20 at the same
+/// time, so there's no point in using indexes. We'll fallback to sequential
+/// scan in such case and apply the filter even though no tuple will ever
+/// evaluate to true.
+///
+/// # OR Expressions
+///
+/// OR clauses come with two important characteristics:
+///
+/// 1. When both branches of the clause contain index columns we must visit them
+/// all, we can't pick one or the other. For example:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 10 OR email = 'test@test.com';
+/// ```
+///
+/// We can't visit only the id index because `email = 'test@test.com'` might
+/// evaluate to true outside of the id range. Both indexes must be visited and
+/// the entire expression will act as a [`Filter`].
+///
+/// 2. If either of the branches contains no indexes the OR clause becomes a
+/// sequential scan. Example:
+///
+/// ```sql
 /// SELECT * FROM users WHERE id < 5 OR name < 'c';
 /// ```
 ///
-/// We can't use the "id" primary key index because the OR expression can
-/// evaluate to true even if `id < 5` evaluates to false. However, we can use
-/// the index if the logical operator is AND instead of OR:
+/// The name column is not an index and it might evaluate to true anywhere in
+/// the users table, so this becomes a sequential scan.
+///
+/// ## Union
+///
+/// Just like AND clauses, when we see the same column on both sides of an OR
+/// expression we can compute the union instead of the intersection. Example:
 ///
 /// ```sql
-/// SELECT * FROM users WHERE id < 5 AND name < 'c';
+/// SELECT * FROM users WHERE id < 100 OR id < 1000;
 /// ```
 ///
-/// In the case of AND the WHERE clause will never evaluate to true unless
-/// `id < 5`, so we can safely use the index.
+/// This expression doesn't make sense from a logical perspective because it's
+/// redundant, but precisly because of that we have to compute the union of the
+/// ranges `[..100, ..1000]` and conclude that we only need to scan `..1000`
+/// once instead of scanning the same index twice.
 ///
-/// Now consider this:
+/// # Combinations Of AND | OR sub-expressions.
+///
+/// This is where it gets interesting. Consider an expression like this one:
 ///
 /// ```sql
-/// SELECT * FROM users WHERE (id < 5 AND name < 'c') OR name > 'd';
+/// SELECT * FROM users WHERE (id < 10 AND email > 't@t.com') OR (id > 100 AND email < 'b@b.com');
 /// ```
 ///
-/// The OR expression makes the indexed column irrelevant again because
-/// `name > 'd'` can evaluate to true anywhere in the table. But if the OR
-/// expression contains the same indexed column we can still use the index:
+/// What should we do in this case? Well, we can't skip any of the branches
+/// because this is an OR statement. Each branch is an AND statement that
+/// offers two possible options for scanning, so there are 4 total combinations:
+///
+/// - Scan id in the range `..10` and email in the range `..'b@b.com'`
+/// - Scan id in the range `100..` and email in the range `'t@t.com'..`
+/// - Scan id in the ranges `[..10, 100..]`
+/// - Scan email in the ranges `[..'b@b.com', 't@t.com'..]`
+///
+/// Choosing the best combination is very complicated. We discuss
+/// "choosing rules" at the end.
+///
+/// What about this case?
 ///
 /// ```sql
-/// SELECT * FROM users WHERE (id < 5 AND name < 'c') OR id > 1000;
+/// SELECT * FROM users WHERE (id < 10 OR email > 't@t.com') AND (id > 1000 OR email < 'b@b.com');
 /// ```
 ///
-/// If an `OR` expression contains another indexed column we can use two
-/// indexes:
+/// In this case we must pick one of the sides and compute that one while using
+/// the other one as a filter, there's no intersection that can help us because
+/// one column invalidates the other. The expression could evaluate to true
+/// on something like `id = 5, email = 'a@a.com'`, so instead of trying to
+/// figure out exactly the best path with the minimum ranges on every single
+/// column we'll just prefer simplicity.
+///
+/// Intersections are only computed on simple cases such as:
 ///
 /// ```sql
-/// SELECT * FROM users WHERE id < 5 OR email = "test@test.com";
+/// SELECT * FROM users WHERE id > 5 AND id < 10;
+/// SELECT * FROM users WHERE id > 5 AND (id < 20 OR id > 30);
 /// ```
 ///
-/// So this function ends up producing "groups" of expressions that we can use.
-/// Each "group" is separated by an `OR` expression and the groups themselves
-/// can contain multiple expressions for multiple indexes. See the tests below
-/// in the [`tests`] module for examples.
-fn find_indexed_exprs<'e>(
+/// Both sides of the AND must use the same column and one of them must use it
+/// only once (no OR), because if it's used multiple times the intersection is
+/// harder to compute:
+///
+/// ```sql
+/// SELECT * FROM users WHERE (id < 20 OR id > 50) AND (id < 100 OR id > 200);
+/// ```
+///
+/// In this case we'd have to "multiply everything". You can imagine something
+/// like this: `(x + y) * (a + b)`. The result is `xa + xb + ya + yb`. We could
+/// definitely do that, but not even production level databases do that. Or at
+/// least Postgres doesn't, it just picks one side of the AND branch (from
+/// my non-scientific testing, I don't know what I'm doing anyway).
+///
+/// # AND Rules
+///
+/// As mentioned earlier, when we find AND expressions that are not simple we
+/// have to choose one of the sides and use the other one as a filter. These are
+/// the rules that we will follow for choosing:
+///
+/// 1. If either of the sides contains less columns, return that side because
+/// it will produce a simpler query plan that visits less indexes overall.
+///
+/// 2. If the AND expression is simple enough and we can compute the
+/// intersection of the ranges, return a new path that doesn't appear in the
+/// original query but is described by the computed intersection.
+///
+/// 3. When both sides have the same number of columns, prefer exact matches
+/// over ranges. Example:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 100 AND email = 'test@test.com';
+/// ```
+///
+/// We would choose the right side with the email expression.
+///
+/// 4. If we can't rely on exact matches, then prefer the table BTree key over
+/// external indexes. Example:
+///
+/// ```sql
+/// SELECT * FROM users WHERE id < 100 AND email > 'test@test.com';
+/// ```
+///
+/// We choose the left side because it doesn't require visiting external BTrees.
+///
+/// These rules will not always choose the "best" path at all, they will simply
+/// choose some reliable path without producing an overcomplicated query plan.
+/// Choosing the real "best" path would require storing additional metadata
+/// about tables such as the number of rows, maximum & minimum key value in each
+/// index, etc. With such metadata we could compute cost estimates of visiting
+/// indexes and try to pick based on the costs, which is what Postgres does. But
+/// even then, considering every single combination of indexes that can be used
+/// requires an exponential algorithm, so it's almost impossible to know for
+/// sure which one is the "best" path.
+fn find_index_paths<'e>(
+    key_col: &str,
     indexes: &HashSet<String>,
     expr: &'e Expression,
-) -> Vec<HashMap<&'e str, Vec<&'e Expression>>> {
+) -> HashMap<&'e str, VecDeque<IndexRangeBounds<'e>>> {
     println!("{expr}");
 
     match expr {
@@ -302,7 +452,7 @@ fn find_indexed_exprs<'e>(
             // and build upwards.
             (Expression::Identifier(col), Expression::Value(_))
             | (Expression::Value(_), Expression::Identifier(col))
-                if indexes.contains(col)
+                if (indexes.contains(col) || col == key_col)
                     && matches!(
                         operator,
                         BinaryOperator::Eq
@@ -312,74 +462,329 @@ fn find_indexed_exprs<'e>(
                             | BinaryOperator::GtEq
                     ) =>
             {
-                vec![HashMap::from([(col.as_str(), vec![expr])])]
+                HashMap::from([(col.as_str(), VecDeque::from([determine_bounds(expr)]))])
             }
 
             // Case 2: AND | OR expressions.
             (left, right) if matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
-                let mut left_groups = find_indexed_exprs(indexes, left);
-                let mut right_groups = find_indexed_exprs(indexes, right);
+                let mut left_paths = find_index_paths(key_col, indexes, left);
+                let mut right_paths = find_index_paths(key_col, indexes, right);
 
                 match operator {
                     // Subcase A: AND expression.
                     //
-                    // We have to join all the groups into one single group to
-                    // produce the intersection.
+                    // Either simple AND expressions such as:
+                    // SELECT * FROM t WHERE x > 5 AND x < 10
                     //
-                    // This algorithm is O(n^2) or worse (didn't do the math,
-                    // probably something like depth of expr tree * number of
-                    // groups * number of indexes), but query trees in general
-                    // shouldn't be that deep and tables in general won't have
-                    // hundreds of indexes to consider. Should be safe for
-                    // general use cases.
+                    // Or AND clauses involving deeper expression branches:
+                    // SELECT * FROM t WHERE (x > 5 AND x < 10) AND (y < 10 OR y > 20)
+                    //
+                    // The Rules applied to AND clauses are described below and
+                    // also in the function documentation.
                     BinaryOperator::And => {
-                        let mut intersection: HashMap<&str, Vec<&Expression>> = HashMap::new();
-
-                        for group in left_groups.into_iter().chain(right_groups.into_iter()) {
-                            for (column, mut bounds) in group.into_iter() {
-                                if let Some(existing) = intersection.get_mut(&column) {
-                                    existing.append(&mut bounds);
-                                } else {
-                                    intersection.insert(column, bounds);
-                                }
-                            }
+                        // Rule 1: Return the branch with less columns.
+                        if right_paths.len() == 0
+                            || left_paths.len() > 0 && left_paths.len() < right_paths.len()
+                        {
+                            return left_paths;
                         }
 
-                        vec![intersection]
+                        if left_paths.len() == 0
+                            || right_paths.len() > 0 && right_paths.len() < left_paths.len()
+                        {
+                            return right_paths;
+                        }
+
+                        // Rule 2: If the expression is simple enough and we
+                        // can compute the intersection of the ranges, then
+                        // return the intersection.
+                        'intersection: {
+                            if left_paths.len() > 1 && right_paths.len() > 1 {
+                                break 'intersection;
+                            };
+
+                            let (col, left_bounds) = left_paths.iter_mut().next().unwrap();
+                            let Some(right_bounds) = right_paths.get_mut(col) else {
+                                break 'intersection;
+                            };
+
+                            if left_bounds.len() > 1 && right_bounds.len() > 1 {
+                                break 'intersection;
+                            }
+
+                            let factor = if left_bounds.len() == 1 {
+                                left_bounds.pop_front().unwrap()
+                            } else {
+                                right_bounds.pop_front().unwrap()
+                            };
+
+                            let mut intersections = VecDeque::new();
+
+                            for range in left_bounds.drain(..).chain(right_bounds.drain(..)) {
+                                if let Some(intersection) = range_intersection(factor, range) {
+                                    intersections.push_back(intersection);
+                                }
+                            }
+
+                            // No intersection at all. Something like
+                            // id < 5 AND id > 10. Fallback to sequential scan.
+                            if intersections.is_empty() {
+                                return HashMap::new();
+                            }
+
+                            *left_bounds = intersections;
+
+                            return left_paths;
+                        };
+
+                        // Rule 3: If a branch is composed of only exact
+                        // matches, prefer that branch over ranges. If both
+                        // contain exact matches, prefer the one that contains
+                        // the primary key.
+                        //
+                        // Rule 4: Otherwise prefer anything that contains the
+                        // primary key or default to the left branch.
+                        let left_is_exact_match = left_paths
+                            .iter()
+                            .all(|(_, bounds)| bounds.iter().copied().all(is_exact_match));
+
+                        let right_is_exact_match = right_paths
+                            .iter()
+                            .all(|(_, bounds)| bounds.iter().copied().all(is_exact_match));
+
+                        let right_contains_key_col = right_paths.contains_key(key_col);
+
+                        // Check all the cases in which we would prefer the
+                        // right branch first. This will allow us to to write
+                        // only 2 return statements.
+                        if right_is_exact_match && right_contains_key_col
+                            || right_is_exact_match && !left_is_exact_match
+                            || right_contains_key_col
+                                && !left_is_exact_match
+                                && !right_contains_key_col
+                        {
+                            return right_paths;
+                        }
+
+                        return left_paths;
                     }
 
                     // Subcase B: OR expression.
                     //
-                    // In this case we append the groups of the right side to
-                    // the groups of the left side to produce the union. If
-                    // either of the sides contains no groups then we return
-                    // nothing because one side of the OR statement invalidates
-                    // the indexes found on the other.
+                    // We only need to compute the union of the ranges in each
+                    // column and return the result. For that we need to sort
+                    // the ranges first. Picture this convoluted case:
+                    //
+                    // (id > 10 AND id < 20) OR (id < 40 AND id > 30) OR (id < 25 AND id > 15) OR (id > 35 AND id < 45)
+                    //
+                    // We would obtain these ranges: [10..20, 30..40, 15..25, 35..45]
+                    //
+                    // It looks like we can't merge them at first. However, once
+                    // we sort them by start bound and then end bound:
+                    //
+                    // [10..20, 15..25, 30..40, 35..45]
+                    //
+                    // Now it's pretty clear that [10..20, 15..25] becomes
+                    // [10..25] and [30..40, 35..45] becomes [30..45], so we end
+                    // up with this range list:
+                    //
+                    // [10..25, 30..45]
+                    //
+                    // which makes everything simpler. It also makes this
+                    // algorithm quite expensive because we have to visit every
+                    // single range of every single column, so it's probably
+                    // O(n^2) or a little worse than that. Not 100% sure, didn't
+                    // do the math, but probably something like
+                    // O(expression_tree_nodes * index_columns * ranges_per_col).
+                    //
+                    // But expression trees shouldn't be that deep in general
+                    // and we shouldn't be working with hundreds of indexes in
+                    // one single expression, so this should be fine for general
+                    // use cases.
                     BinaryOperator::Or => {
-                        if left_groups.is_empty() || right_groups.is_empty() {
-                            return vec![];
+                        if left_paths.is_empty() || right_paths.is_empty() {
+                            return HashMap::new();
                         }
 
-                        left_groups.append(&mut right_groups);
+                        let mut merged: HashMap<&str, VecDeque<IndexRangeBounds>> = HashMap::new();
 
-                        left_groups
+                        for (col, mut left_bounds) in left_paths.into_iter() {
+                            let Some(mut right_bounds) = right_paths.remove(col) else {
+                                merged.insert(col, left_bounds);
+                                continue;
+                            };
+
+                            let mut sorted_bounds = VecDeque::new();
+
+                            // This is some sort of implicit merge sort. Since
+                            // the expression tree is already a "tree" we don't
+                            // have to divide anything, we straight up merge.
+                            while !left_bounds.is_empty() && !right_bounds.is_empty() {
+                                sorted_bounds.push_back(
+                                    if cmp_ranges(&left_bounds[0], &right_bounds[0])
+                                        != Ordering::Greater
+                                    {
+                                        left_bounds.pop_front().unwrap()
+                                    } else {
+                                        right_bounds.pop_front().unwrap()
+                                    },
+                                );
+                            }
+
+                            sorted_bounds.append(&mut left_bounds);
+                            sorted_bounds.append(&mut right_bounds);
+
+                            let mut bounds_union = VecDeque::new();
+
+                            for range in sorted_bounds {
+                                if let Some(previous) = bounds_union.back_mut() {
+                                    if let Some(union) = range_union(*previous, range) {
+                                        *previous = union;
+                                    } else {
+                                        bounds_union.push_back(range);
+                                    }
+                                } else {
+                                    bounds_union.push_back(range);
+                                }
+                            }
+
+                            // This is basically a sequential scan, doesn't make
+                            // sense to use an index.
+                            if bounds_union[0] != (Bound::Unbounded, Bound::Unbounded) {
+                                merged.insert(col, bounds_union);
+                            }
+                        }
+
+                        // Push columns that were not present on both sides.
+                        merged.extend(right_paths);
+
+                        merged
                     }
+
                     _ => unreachable!(),
                 }
             }
 
-            // Anything else produces 0 groups, which means there is no indexed
-            // expression that can be used.
-            _ => vec![],
+            // Anything else will just fallback to sequential scan.
+            _ => HashMap::new(),
         },
 
-        Expression::Nested(inner) => find_indexed_exprs(indexes, inner),
+        Expression::Nested(inner) => find_index_paths(key_col, indexes, inner),
 
-        // Expressions that are not binary will produce 0 groups as well.
-        _ => vec![],
+        // Expressions that are not binary will produce nothing.
+        _ => HashMap::new(),
     }
 }
 
+/// Transforms a simple binary expression into range bounds.
+///
+/// The caller must guarantee that `expr` is a simple binary expression with
+/// comparison operators. This only exists to avoid further nesting in
+/// [`find_index_paths`] and it's only called there.
+fn determine_bounds(expr: &Expression) -> (Bound<&Value>, Bound<&Value>) {
+    let Expression::BinaryOperation {
+        left,
+        operator,
+        right,
+    } = expr
+    else {
+        unreachable!("determine_bounds() called with non-binary expression: {expr}");
+    };
+
+    match (&**left, operator, &**right) {
+        // Case 1:
+        // SELECT * FROM t WHERE x = 5;
+        // SELECT * FROM t WHERE 5 = x;
+        //
+        // Exact match on a key.
+        (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
+            (Bound::Included(value), Bound::Included(value))
+        }
+
+        // Case 2:
+        // SELECT * FROM t WHERE x > 5;
+        // SELECT * FROM t WHERE 5 < x;
+        //
+        // Excluded start bound and unknown end bound.
+        (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
+            (Bound::Excluded(value), Bound::Unbounded)
+        }
+
+        // Case 3:
+        // SELECT * FROM t WHERE x < 5;
+        // SELECT * FROM t WHERE 5 > x;
+        //
+        // Unkown start bound and excluded end bound.
+        (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Excluded(value))
+        }
+
+        // Case 4:
+        // SELECT * FROM t WHERE x >= 5;
+        // SELECT * FROM t WHERE 5 <= x;
+        //
+        // Included start bound and unknown end bound.
+        (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
+            (Bound::Included(value), Bound::Unbounded)
+        }
+
+        // Case 5:
+        // SELECT * FROM t WHERE x <= 5;
+        // SELECT * FROM t WHERE 5 >= x;
+        //
+        // Unknown start bound and included end bound.
+        (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(value))
+        | (Expression::Value(value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
+            (Bound::Unbounded, Bound::Included(value))
+        }
+
+        _ => unreachable!("determine_bounds() called with wrong operator: {expr}"),
+    }
+}
+
+/// Inverse of [`determine_bounds`].
+fn range_to_expr(col: &str, (start, end): (Bound<&Value>, Bound<&Value>)) -> Expression {
+    let expr = match (start, end) {
+        (Bound::Unbounded, Bound::Excluded(v)) => format!("{col} < {v}"),
+        (Bound::Unbounded, Bound::Included(v)) => format!("{col} <= {v}"),
+        (Bound::Excluded(v), Bound::Unbounded) => format!("{col} > {v}"),
+        (Bound::Included(v), Bound::Unbounded) => format!("{col} >= {v}"),
+        (Bound::Excluded(v1), Bound::Excluded(v2)) => format!("{col} > {v1} AND {col} < {v2}"),
+        (Bound::Included(v1), Bound::Included(v2)) => format!("{col} >= {v1} AND {col} <= {v2}"),
+        (Bound::Excluded(v1), Bound::Included(v2)) => format!("{col} > {v1} AND {col} <= {v2}"),
+        (Bound::Included(v1), Bound::Excluded(v2)) => format!("{col} >= {v1} AND {col} < {v2}"),
+        _ => unreachable!("can't build expr from range {:?}", (start, end)),
+    };
+
+    Parser::new(&expr).parse_expression().unwrap()
+}
+
+/// Returns true if a range is an exact match like `id = 5`.
+fn is_exact_match(range: IndexRangeBounds) -> bool {
+    let (Bound::Included(v1), Bound::Included(v2)) = range else {
+        return false;
+    };
+
+    // See determine_bounds(). We point to the same [`Value`] when building
+    // exact match bounds.
+    if ptr::eq(v1, v2) {
+        return true;
+    }
+
+    // Fallback to comparisons if we can't immediately determine that this is
+    // an exact match. Cases like (id <= 30) AND (id >= 30) produce an exact
+    // match but we point to different values in memory.
+    v1 == v2
+}
+
+/// Compares two "start bounds".
+///
+/// [`Bound::Unbounded`] is treated as "0" or initial value, which means it's
+/// always [`Ordering::Less`] than anything.
 fn cmp_start_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering {
     match (bound1, bound2) {
         (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
@@ -408,6 +813,10 @@ fn cmp_start_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering 
     }
 }
 
+/// Compares two "end bounds".
+///
+/// [`Bound::Unbounded`] is treated as "infinite" or "last value", which means
+/// it's always [`Ordering::Greater`] than anything else.
 fn cmp_end_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering {
     let ordering = cmp_start_bounds(bound1, bound2);
 
@@ -418,6 +827,7 @@ fn cmp_end_bounds(bound1: &Bound<&Value>, bound2: &Bound<&Value>) -> Ordering {
     ordering
 }
 
+/// Compares a "start bound" with an "end bound".
 fn cmp_start_end_bounds(start: &Bound<&Value>, end: &Bound<&Value>) -> Ordering {
     if *start == Bound::Unbounded {
         return Ordering::Less;
@@ -426,6 +836,31 @@ fn cmp_start_end_bounds(start: &Bound<&Value>, end: &Bound<&Value>) -> Ordering 
     cmp_end_bounds(start, end)
 }
 
+/// Compares two complete ranges and returns an [`Ordering`] variant.
+///
+/// The rules for comparing are as follows:
+///
+/// If comparing the start bounds yields [`Ordering::Less`] or [`Ordering::Greater`]
+/// then that's the [`Ordering`] of the ranges. On the other hand, if the start
+/// bounds are [`Ordering::Equal`] then the [`Ordering`] of the ranges is that
+/// of the end bounds. That way ranges can be sorted based on which one "starts"
+/// earlier.
+fn cmp_ranges(
+    (start1, end1): &(Bound<&Value>, Bound<&Value>),
+    (start2, end2): &(Bound<&Value>, Bound<&Value>),
+) -> Ordering {
+    let start_bound_ordering = cmp_start_bounds(start1, start2);
+
+    if cmp_start_bounds(start1, start2) != Ordering::Equal {
+        start_bound_ordering
+    } else {
+        cmp_end_bounds(end1, end2)
+    }
+}
+
+/// Intersects two ranges together and returns a new range if possible.
+///
+/// Range don't need to be sorted.
 fn range_intersection<'v>(
     (start1, end1): (Bound<&'v Value>, Bound<&'v Value>),
     (start2, end2): (Bound<&'v Value>, Bound<&'v Value>),
@@ -440,6 +875,13 @@ fn range_intersection<'v>(
     Some((intersection_start, intersection_end))
 }
 
+/// Computes the union of two ranges and returns a new range only if they can be
+/// joined.
+///
+/// If they can't be joined together then the union is simply both of them. For
+/// example, the ranges `[5..15, 10..25]` can be merged to produce `[5..25]`,
+/// but the ranges `[5..15, 20..30]` cannot be merged to produce a new one.
+/// Ranges must already be sorted.
 fn range_union<'v>(
     (start1, end1): (Bound<&'v Value>, Bound<&'v Value>),
     (start2, end2): (Bound<&'v Value>, Bound<&'v Value>),
@@ -461,708 +903,274 @@ fn range_union<'v>(
     Some((union_start, union_end))
 }
 
-fn cmp_ranges(
-    (start1, end1): &(Bound<&Value>, Bound<&Value>),
-    (start2, end2): &(Bound<&Value>, Bound<&Value>),
-) -> Ordering {
-    let start_bound_ordering = cmp_start_bounds(start1, start2);
-
-    if cmp_start_bounds(&start1, &start2) != Ordering::Equal {
-        start_bound_ordering
-    } else {
-        cmp_end_bounds(end1, end2)
-    }
-}
-
-/// Computes the minimum set of bounds that have to be checked for each index.
-///
-/// Again, this algorithm is pretty expensive but we shouldn't be working many
-/// indexes at once. If we implement JOINs then large queries that join many
-/// tables together using different indexes might run into some performance
-/// issues, but then we can probably implement some heuristics or figure out
-/// if this computation is worth it.
-fn fold_range_bounds<'g>(
-    groups: &'g [HashMap<&str, Vec<&Expression>>],
-) -> Vec<HashMap<&'g str, Vec<(Bound<&'g Value>, Bound<&'g Value>)>>> {
-    // Compute the intersections of all ranges first.
-    let mut fold = groups
-        .iter()
-        .map(|group| {
-            group.iter().filter_map(|(col, exprs)| {
-                let mut bounds = exprs.iter().copied().map(determine_bounds);
-                let mut intersection = bounds.next()?;
-
-                // Short circuit if AND expression produces no intersection.
-                // That means the AND expression will never evaluate to true.
-                // Something like this for example: id < 5 AND id > 10.
-                for range in bounds {
-                    intersection = range_intersection(intersection, range)?;
-                }
-
-                Some((*col, vec![intersection]))
-            })
-        })
-        .map(HashMap::from_iter)
-        .filter(|map| !map.is_empty())
-        .collect::<Vec<_>>();
-
-    // Now compute the union of all individual columns.
-    for i in 0..fold.len().saturating_sub(1) {
-        let mut merge: HashMap<&str, VecDeque<(Bound<&Value>, Bound<&Value>)>> = HashMap::new();
-
-        for j in (i + 1)..fold.len() {
-            let [group, next] = fold.get_many_mut([i, j]).unwrap();
-            for (col, ranges) in group.iter_mut() {
-                if let Some(intersection) = next.remove(*col) {
-                    if let Some(existing) = merge.get_mut(col) {
-                        existing.extend(intersection);
-                    } else {
-                        merge.insert(
-                            *col,
-                            VecDeque::from_iter(ranges.drain(..).chain(intersection.into_iter())),
-                        );
-                    }
-                }
-            }
-        }
-
-        let group = &mut fold[i];
-
-        for (col, mut ranges) in merge.into_iter() {
-            let unions = group.get_mut(col).unwrap();
-
-            ranges.make_contiguous().sort_by(cmp_ranges);
-
-            while let Some(range) = ranges.pop_front() {
-                if let Some(last) = unions.last_mut() {
-                    if let Some(union) = range_union(*last, range) {
-                        *last = union;
-                    } else {
-                        unions.push(range);
-                    }
-                } else {
-                    unions.push(range);
-                }
-                println!("{unions:?}");
-            }
-        }
-    }
-
-    fold.retain(|range| !range.is_empty());
-
-    fold
-}
-
-/// Returns the indexed columns that should be used in each group.
-///
-/// For now, this only attempts to use the primary key as much as possible
-/// because it doesn't require an external index. But if we had more metadata
-/// about tables such as the current number of rows, maximum/minimum key value
-/// in each index, etc, we could determine if it's actually worth it to use an
-/// index or fallback to sequential scan like Postgres does for example.
-///
-/// If the primary key can't be used then we'll resort to the index that appears
-/// the most amount of times throughout the groups. That's not the best index
-/// to use, it's just the index that will probably produce the simplest query
-/// plan. Considering every single combination of indexes requires an
-/// exponential algorithm.
-fn find_best_path<'r>(
-    key_col: &str,
-    indexes_range_bounds: &'r [HashMap<&str, Vec<(Bound<&Value>, Bound<&Value>)>>],
-) -> Vec<&'r str> {
-    debug_assert!(
-        !indexes_range_bounds.is_empty(),
-        "find_best_path() called with empty vec"
-    );
-
-    let mut index_frequency = HashMap::new();
-
-    indexes_range_bounds
-        .iter()
-        .flat_map(|group| group.iter())
-        .for_each(|(col, _)| {
-            if let Some(frequency) = index_frequency.get_mut(col) {
-                *frequency += 1;
-            } else {
-                index_frequency.insert(col, 1);
-            };
-        });
-
-    println!("\n{index_frequency:?}");
-
-    indexes_range_bounds
-        .iter()
-        .map(|group| {
-            if let Some((col, _)) = group.get_key_value(key_col) {
-                return *col;
-            }
-
-            group
-                .iter()
-                .max_by(|(col1, _), (col2, _)| index_frequency[*col1].cmp(&index_frequency[*col2]))
-                .map(|(col, _)| col)
-                .unwrap_or_else(|| panic!("find_best_path() called with empty group: {group:?}"))
-        })
-        .collect()
-}
-
-fn determine_bounds(expr: &Expression) -> (Bound<&Value>, Bound<&Value>) {
-    let Expression::BinaryOperation {
-        left,
-        operator,
-        right,
-    } = expr
-    else {
-        unreachable!();
-    };
-
-    match (&**left, operator, &**right) {
-        // Case 1:
-        // SELECT * FROM t WHERE x = 5;
-        // SELECT * FROM t WHERE 5 = x;
-        //
-        // Position the cursor at key 5 and stop after returning that key.
-        (Expression::Identifier(_col), BinaryOperator::Eq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Eq, Expression::Identifier(_col)) => {
-            (Bound::Included(value), Bound::Included(value))
-        }
-
-        // Case 2:
-        // SELECT * FROM t WHERE x > 5;
-        // SELECT * FROM t WHERE 5 < x;
-        //
-        // Position the cursor at key 5, consume key 5 which will cause the
-        // cursor to move to the successor and return keys until finished.
-        (Expression::Identifier(_col), BinaryOperator::Gt, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Lt, Expression::Identifier(_col)) => {
-            (Bound::Excluded(value), Bound::Unbounded)
-        }
-
-        // Case 3:
-        // SELECT * FROM t WHERE x < 5;
-        // SELECT * FROM t WHERE 5 > x;
-        //
-        // Allow the cursor to initialize normally (at the smallest key) and
-        // tell it to stop once it finds a key >= 5.
-        (Expression::Identifier(_col), BinaryOperator::Lt, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::Gt, Expression::Identifier(_col)) => {
-            (Bound::Unbounded, Bound::Excluded(value))
-        }
-
-        // Case 4:
-        // SELECT * FROM t WHERE x >= 5;
-        // SELECT * FROM t WHERE 5 <= x;
-        //
-        // Position the cursor at key 5 and assume it's already initialized. The
-        // cursor will then return key 5 and everything after.
-        (Expression::Identifier(_col), BinaryOperator::GtEq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::LtEq, Expression::Identifier(_col)) => {
-            (Bound::Included(value), Bound::Unbounded)
-        }
-
-        // Case 5:
-        // SELECT * FROM t WHERE x <= 5;
-        // SELECT * FROM t WHERE 5 >= x;
-        //
-        // Allow the cursor to initialize normally (at the smallest key) and
-        // tell it to stop once it finds a key > 5
-        (Expression::Identifier(_col), BinaryOperator::LtEq, Expression::Value(value))
-        | (Expression::Value(value), BinaryOperator::GtEq, Expression::Identifier(_col)) => {
-            (Bound::Unbounded, Bound::Included(value))
-        }
-
-        // Fallback to sequential scan in case we mess up here trying to
-        // optimize the expressions.
-        _ => unreachable!(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         ops::Bound,
     };
 
-    use super::find_indexed_exprs;
+    use super::{find_index_paths, IndexRangeBounds};
     use crate::{
         db::{IndexMetadata, Schema},
-        query::optimizer::{find_best_path, fold_range_bounds},
         sql::{
             parser::Parser,
             statement::{Column, DataType, Expression, Value},
         },
     };
 
-    struct IndexedExprs<'i> {
-        indexes: &'i [&'i str],
-        expr: &'i str,
-        expected: Vec<HashMap<&'i str, Vec<&'i str>>>,
-    }
-
-    fn parse_indexed_expr(expr: &str, indexes: &[&str]) -> (Expression, HashSet<String>) {
-        let tree = Parser::new(expr).parse_expression().unwrap();
-        let indexes = HashSet::from_iter(indexes.iter().map(|name| String::from(*name)));
-
-        (tree, indexes)
-    }
-
-    fn assert_indexed_exprs(
-        IndexedExprs {
-            indexes,
-            expr,
-            expected,
-        }: IndexedExprs,
-    ) {
-        let (tree, indexes) = parse_indexed_expr(expr, indexes);
-        let expressions = find_indexed_exprs(&indexes, &tree);
-
-        let output: Vec<HashMap<String, Vec<String>>> = expressions
-            .iter()
-            .map(|group| {
-                group
-                    .into_iter()
-                    .map(|(col, exprs)| {
-                        let expr_strings = exprs.iter().map(|expr| expr.to_string()).collect();
-                        (col.to_string(), expr_strings)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let expected: Vec<HashMap<String, Vec<String>>> = expected
-            .iter()
-            .map(|group| {
-                group
-                    .into_iter()
-                    .map(|(col, exprs)| {
-                        let expr_strings = exprs.iter().map(|expr| expr.to_string()).collect();
-                        (col.to_string(), expr_strings)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        assert_eq!(output, expected);
-    }
-
-    struct BestPath<'i> {
+    struct IndexPath<'i> {
         pk: &'i str,
         indexes: &'i [&'i str],
         expr: &'i str,
-        expected: &'i [&'i str],
+        expected: HashMap<&'i str, VecDeque<IndexRangeBounds<'i>>>,
     }
 
-    fn assert_best_path(
-        BestPath {
+    fn assert_find_index_path(
+        IndexPath {
             pk,
             indexes,
             expr,
             expected,
-        }: BestPath,
+        }: IndexPath,
     ) {
-        let (tree, indexes) = parse_indexed_expr(expr, indexes);
+        let tree = Parser::new(expr).parse_expression().unwrap();
+        let indexes = HashSet::from_iter(indexes.iter().map(|name| String::from(*name)));
 
-        assert_eq!(
-            find_best_path(pk, &fold_range_bounds(&find_indexed_exprs(&indexes, &tree))),
-            expected
-        )
-    }
-
-    struct BuildBounds<'i> {
-        indexes: &'i [&'i str],
-        expr: &'i str,
-        expected: Vec<HashMap<&'i str, Vec<(Bound<&'i Value>, Bound<&'i Value>)>>>,
-    }
-
-    fn assert_build_range_bounds(
-        BuildBounds {
-            indexes,
-            expr,
-            expected,
-        }: BuildBounds,
-    ) {
-        let (tree, indexes) = parse_indexed_expr(expr, indexes);
-
-        assert_eq!(
-            &fold_range_bounds(&find_indexed_exprs(&indexes, &tree)),
-            &expected
-        );
+        assert_eq!(find_index_paths(pk, &indexes, &tree), expected);
     }
 
     #[test]
-    fn find_simple_indexed_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
+    fn find_simple_key_path() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &[],
             expr: "id < 5",
-            expected: vec![HashMap::from([("id", vec!["id < 5"])])],
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([(Bound::Unbounded, Bound::Excluded(&Value::Number(5)))]),
+            )]),
         })
     }
 
     #[test]
-    fn find_leaf_indexed_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "id < 5 AND name > 'test' AND age < 30",
-            expected: vec![HashMap::from([("id", vec!["id < 5"])])],
-        })
-    }
-
-    #[test]
-    fn find_simple_and_indexed_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "id > 5 AND id < 10",
-            expected: vec![HashMap::from([("id", vec![("id > 5"), ("id < 10")])])],
-        })
-    }
-
-    #[test]
-    fn find_simple_or_indexed_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "id < 5 OR id > 10",
-            expected: vec![
-                HashMap::from([("id", vec!["id < 5"])]),
-                HashMap::from([("id", vec!["id > 10"])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn find_distributed_and_indexed_exprs() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "id < 5 AND name > 'test' AND id < 3",
-            expected: vec![HashMap::from([("id", vec![("id < 5"), ("id < 3")])])],
-        })
-    }
-
-    #[test]
-    fn find_indexed_expr_and_or() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70)",
-            expected: vec![
-                HashMap::from([("id", vec![("id > 10"), ("id < 20")])]),
-                HashMap::from([("id", vec![("id > 50"), ("id < 70")])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn find_indexed_expr_or_and() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "(id < 20 OR id > 50) AND (id < 100 OR id > 200)",
-            expected: vec![HashMap::from([("id", vec![
-                ("id < 20"),
-                ("id > 50"),
-                ("id < 100"),
-                ("id > 200"),
-            ])])],
-        })
-    }
-
-    #[test]
-    fn find_multiple_and_or_indexed_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id"],
-            expr: "(id > 10 AND id < 20) OR (id > 50 AND id < 70) OR (id > 100 AND id < 200) OR (id > 500 AND id < 600)",
-            expected: vec![
-                HashMap::from([("id", vec![("id > 10"), ("id < 20")])]),
-                HashMap::from([("id", vec![("id > 50"), ("id < 70")])]),
-                HashMap::from([("id", vec![("id > 100"), ("id < 200")])]),
-                HashMap::from([("id", vec![("id > 500"), ("id < 600")])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn find_multiple_indexed_columns_and() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id", "email", "uuid"],
-            expr: "id < 5 AND uuid < 'ffff' AND email = 'test@test.com'",
-            expected: vec![HashMap::from([
-                ("id", vec!["id < 5"]),
-                ("uuid", vec![r#"uuid < "ffff""#]),
-                ("email", vec![r#"email = "test@test.com""#]),
-            ])],
-        })
-    }
-
-    #[test]
-    fn find_multiple_indexed_columns_or() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id", "email"],
-            expr: "id < 5 OR id > 10 OR email = 'test@test.com'",
-            expected: vec![
-                HashMap::from([("id", vec!["id < 5"])]),
-                HashMap::from([("id", vec!["id > 10"])]),
-                HashMap::from([("email", vec![r#"email = "test@test.com""#])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn short_circuit_on_or_expr() {
-        assert_indexed_exprs(IndexedExprs {
-            indexes: &["id", "email"],
-            expr: "id > 5 AND id < 10 OR name = 'Some Name'",
-            expected: vec![],
-        })
-    }
-
-    #[test]
-    fn build_simple_range_bound() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "id > 5",
-            expected: vec![HashMap::from([("id", vec![(
-                Bound::Excluded(&Value::Number(5)),
-                Bound::Unbounded,
-            )])])],
-        })
-    }
-
-    #[test]
-    fn build_exact_match_range_bound() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "id = 5",
-            expected: vec![HashMap::from([("id", vec![(
-                Bound::Included(&Value::Number(5)),
-                Bound::Included(&Value::Number(5)),
-            )])])],
-        })
-    }
-
-    #[test]
-    fn build_simple_and_range_bound() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "id > 5 AND id <= 10",
-            expected: vec![HashMap::from([("id", vec![(
-                Bound::Excluded(&Value::Number(5)),
-                Bound::Included(&Value::Number(10)),
-            )])])],
-        })
-    }
-
-    #[test]
-    fn build_simple_or_range_bound() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "id <= 5 OR id > 10",
-            expected: vec![HashMap::from([("id", vec![
-                (Bound::Unbounded, Bound::Included(&Value::Number(5))),
-                (Bound::Excluded(&Value::Number(10)), Bound::Unbounded),
-            ])])],
-        })
-    }
-
-    #[test]
-    fn short_circuit_on_no_intersection() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "id < 5 AND id > 10",
-            expected: vec![],
-        })
-    }
-
-    #[test]
-    fn intersect_and_range_bounds() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "(id > 5 AND id < 20) AND (id > 15 AND id < 25)",
-            expected: vec![HashMap::from([("id", vec![(
-                Bound::Excluded(&Value::Number(15)),
-                Bound::Excluded(&Value::Number(20)),
-            )])])],
-        })
-    }
-
-    #[test]
-    fn join_or_range_bounds() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id"],
-            expr: "(id < 10 OR id > 20) OR (id < 15 OR id > 25)",
-            expected: vec![HashMap::from([("id", vec![
-                (Bound::Unbounded, Bound::Excluded(&Value::Number(15))),
-                (Bound::Excluded(&Value::Number(20)), Bound::Unbounded),
-            ])])],
-        })
-    }
-
-    #[test]
-    fn build_range_bound_multiple_columns_and() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id", "email"],
-            expr: "id <= 5 AND email = 'test@test.com'",
-            expected: vec![HashMap::from([
-                ("id", vec![(
+    fn find_simple_index_path() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &["email"],
+            expr: "email > 'test@test.com'",
+            expected: HashMap::from([(
+                "email",
+                VecDeque::from([(
+                    Bound::Excluded(&Value::String("test@test.com".into())),
                     Bound::Unbounded,
-                    Bound::Included(&Value::Number(5)),
                 )]),
-                ("email", vec![(
-                    Bound::Included(&Value::String("test@test.com".into())),
-                    Bound::Included(&Value::String("test@test.com".into())),
-                )]),
-            ])],
+            )]),
         })
     }
 
     #[test]
-    fn build_range_bound_multiple_columns_or() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id", "email"],
-            expr: "id <= 5 OR email = 'test@test.com'",
-            expected: vec![
-                HashMap::from([("id", vec![(
-                    Bound::Unbounded,
-                    Bound::Included(&Value::Number(5)),
-                )])]),
-                HashMap::from([("email", vec![(
-                    Bound::Included(&Value::String("test@test.com".into())),
-                    Bound::Included(&Value::String("test@test.com".into())),
-                )])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn intersect_and_bounds_with_multiple_columns() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id", "email"],
-            expr: "(id > 5 AND id < 20) AND (id > 15 AND id < 25) AND email < 'test@test.com'",
-            expected: vec![HashMap::from([
-                ("id", vec![(
-                    Bound::Excluded(&Value::Number(15)),
+    fn intersect_simple_and_key_path() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &[],
+            expr: "id > 10 AND id < 20",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([(
+                    Bound::Excluded(&Value::Number(10)),
                     Bound::Excluded(&Value::Number(20)),
                 )]),
-                ("email", vec![(
-                    Bound::Unbounded,
-                    Bound::Excluded(&Value::String("test@test.com".into())),
-                )]),
-            ])],
+            )]),
         })
     }
 
     #[test]
-    fn join_or_bounds_with_multiple_columns() {
-        assert_build_range_bounds(BuildBounds {
-            indexes: &["id", "email"],
-            expr: "(id > 10 AND id < 30) OR (id > 5 AND id < 20) AND (email < 'test@test.com' OR email > 'a')",
-            expected: vec![
-                HashMap::from([("id", vec![(
-                    Bound::Excluded(&Value::Number(5)),
-                    Bound::Excluded(&Value::Number(30)),
-                )])]),
-                HashMap::from([("email", vec![(
-                    Bound::Excluded(&Value::String("a".into())),
-                    Bound::Excluded(&Value::String("test@test.com".into())),
-                )])]),
-            ],
-        })
-    }
-
-    #[test]
-    fn or_bounds_union_with_multiple_columns() {
-        assert_build_range_bounds(BuildBounds {
-            expr: "id > 5 OR (email > 'a' AND email < 'c') OR (email = 'test' AND uuid = 'aaaa' AND name = 'what') OR (name = 'test')",
-            indexes: &["id", "email", "uuid", "name"],
-            expected: vec![
-                HashMap::from([("id", vec![(
-                    Bound::Excluded(&Value::Number(5)),
-                    Bound::Unbounded,
-                )])]),
-                HashMap::from([("email", vec![
-                    (
-                        Bound::Excluded(&Value::String("a".into())),
-                        Bound::Excluded(&Value::String("c".into())),
-                    ),
-                    (
-                        Bound::Included(&Value::String("test".into())),
-                        Bound::Included(&Value::String("test".into())),
-                    ),
-                ])]),
-                HashMap::from([
-                    ("uuid", vec![(
-                        Bound::Included(&Value::String("aaaa".into())),
-                        Bound::Included(&Value::String("aaaa".into())),
-                    )]),
-                    ("name", vec![
-                        (
-                            Bound::Included(&Value::String("test".into())),
-                            Bound::Included(&Value::String("test".into())),
-                        ),
-                        (
-                            Bound::Included(&Value::String("what".into())),
-                            Bound::Included(&Value::String("what".into())),
-                        ),
-                    ]),
+    fn merge_simple_or_key_path() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &[],
+            expr: "id < 10 OR id > 20",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([
+                    (Bound::Unbounded, Bound::Excluded(&Value::Number(10))),
+                    (Bound::Excluded(&Value::Number(20)), Bound::Unbounded),
                 ]),
-            ],
+            )]),
         })
     }
 
     #[test]
-    fn simple_best_path() {
-        assert_best_path(BestPath {
+    fn short_circuit_when_and_never_evaluates_to_true() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email"],
-            expr: "id > 5",
-            expected: &["id"],
+            indexes: &[],
+            expr: "id < 10 AND id > 20",
+            expected: HashMap::new(),
         })
     }
 
     #[test]
-    fn best_path_or() {
-        assert_best_path(BestPath {
+    fn short_circuit_when_or_always_evaluates_to_true() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email"],
-            expr: "id < 5 OR id > 10",
-            expected: &["id"],
+            indexes: &[],
+            expr: "id > 10 OR id < 20",
+            expected: HashMap::new(),
         })
     }
 
     #[test]
-    fn best_path_and() {
-        assert_best_path(BestPath {
+    fn intersect_multiple_and_key_paths() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email"],
-            expr: "id > 5 AND id < 10",
-            expected: &["id"],
+            indexes: &[],
+            expr: "(id > 10 AND id < 30) AND (id > 15 AND id < 45)",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([(
+                    Bound::Excluded(&Value::Number(15)),
+                    Bound::Excluded(&Value::Number(30)),
+                )]),
+            )]),
         })
     }
 
     #[test]
-    fn best_path_and_two_columns() {
-        assert_best_path(BestPath {
+    fn merge_multiple_or_key_paths() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email"],
-            expr: "id > 5 AND email = 'test@test.com'",
-            expected: &["id"],
+            indexes: &[],
+            expr: "(id < 10 OR id > 30) OR (id > 20 OR id < 5)",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([
+                    (Bound::Unbounded, Bound::Excluded(&Value::Number(10))),
+                    (Bound::Excluded(&Value::Number(20)), Bound::Unbounded),
+                ]),
+            )]),
         })
     }
 
     #[test]
-    fn best_path_or_two_columns() {
-        assert_best_path(BestPath {
+    fn intersect_one_and_range_with_multiple_or_ranges() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email"],
-            expr: "id > 5 OR email = 'test@test.com'",
-            expected: &["id", "email"],
+            indexes: &[],
+            expr: "id < 20 AND (id < 5 OR id > 10)",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([
+                    (Bound::Unbounded, Bound::Excluded(&Value::Number(5))),
+                    (
+                        Bound::Excluded(&Value::Number(10)),
+                        Bound::Excluded(&Value::Number(20)),
+                    ),
+                ]),
+            )]),
         })
     }
 
     #[test]
-    fn best_path_or_multiple_columns() {
-        assert_best_path(BestPath {
+    fn merge_multiple_indexes_on_or_clause() {
+        assert_find_index_path(IndexPath {
             pk: "id",
-            indexes: &["id", "email", "uuid", "name"],
-            expr: "id > 5 OR (email > 'a' AND email < 'c') OR (email = 'test' AND uuid = 'aaaa' AND name = 'what') OR (name = 'test')",
-            expected: &["id", "email", "name"],
+            indexes: &["email", "uuid"],
+            expr: "id = 5 OR email = 'test@test.com' OR uuid <= 'ffaa'",
+            expected: HashMap::from([
+                (
+                    "id",
+                    VecDeque::from([(
+                        Bound::Included(&Value::Number(5)),
+                        Bound::Included(&Value::Number(5)),
+                    )]),
+                ),
+                (
+                    "email",
+                    VecDeque::from([(
+                        Bound::Included(&Value::String("test@test.com".into())),
+                        Bound::Included(&Value::String("test@test.com".into())),
+                    )]),
+                ),
+                (
+                    "uuid",
+                    VecDeque::from([(
+                        Bound::Unbounded,
+                        Bound::Included(&Value::String("ffaa".into())),
+                    )]),
+                ),
+            ]),
+        })
+    }
+
+    #[test]
+    fn choose_key_range_over_index_range() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &["email"],
+            expr: "id < 10 AND email < 'test@test.com'",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([(Bound::Unbounded, Bound::Excluded(&Value::Number(10)))]),
+            )]),
+        })
+    }
+
+    #[test]
+    fn choose_index_exact_match_over_key_range() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &["email"],
+            expr: "id < 10 AND email = 'test@test.com'",
+            expected: HashMap::from([(
+                "email",
+                VecDeque::from([(
+                    Bound::Included(&Value::String("test@test.com".into())),
+                    Bound::Included(&Value::String("test@test.com".into())),
+                )]),
+            )]),
+        })
+    }
+
+    #[test]
+    fn choose_key_exact_match_over_index_exact_match() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &["email"],
+            expr: "email = 'test@test.com' AND id = 10",
+            expected: HashMap::from([(
+                "id",
+                VecDeque::from([(
+                    Bound::Included(&Value::Number(10)),
+                    Bound::Included(&Value::Number(10)),
+                )]),
+            )]),
+        })
+    }
+
+    #[test]
+    fn choose_branch_with_less_columns() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &["email", "uuid", "test", "col", "idk"],
+            expr: "(idk < 5 OR col > 10 OR test = 'test') AND (email = 'test@test.com' OR uuid >= 'ffaa')",
+            expected: HashMap::from([
+                (
+                    "email",
+                    VecDeque::from([(
+                        Bound::Included(&Value::String("test@test.com".into())),
+                        Bound::Included(&Value::String("test@test.com".into())),
+                    )]),
+                ),
+                (
+                    "uuid",
+                    VecDeque::from([(
+                        Bound::Included(&Value::String("ffaa".into())),
+                        Bound::Unbounded,
+                    )]),
+                ),
+            ]),
         })
     }
 }

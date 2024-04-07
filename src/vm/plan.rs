@@ -90,6 +90,8 @@ pub(crate) enum Plan<F> {
     RangeScan(RangeScan<F>),
     /// Uses primary keys or row IDs to scan a table BTree.
     KeyScan(KeyScan<F>),
+    /// Multi-index or multi-range scan.
+    LogicalOrScan(LogicalOrScan<F>),
     /// Returns raw values from `INSERT INTO` statements.
     Values(Values),
     /// Executes `WHERE` clauses and filters rows.
@@ -123,6 +125,7 @@ impl<F: Seek + Read + Write + FileOps> Plan<F> {
             Self::ExactMatch(exact_match) => exact_match.try_next(),
             Self::RangeScan(range_scan) => range_scan.try_next(),
             Self::KeyScan(index_scan) => index_scan.try_next(),
+            Self::LogicalOrScan(or_scan) => or_scan.try_next(),
             Self::Values(values) => values.try_next(),
             Self::Filter(filter) => filter.try_next(),
             Self::Project(project) => project.try_next(),
@@ -186,6 +189,7 @@ impl<F> Plan<F> {
             Self::ExactMatch(exact_match) => format!("{exact_match}"),
             Self::RangeScan(range_scan) => format!("{range_scan}"),
             Self::KeyScan(index_scan) => format!("{index_scan}"),
+            Self::LogicalOrScan(or_scan) => format!("{or_scan}"),
             Self::Values(values) => format!("{values}"),
             Self::Filter(filter) => format!("{filter}"),
             Self::Project(project) => format!("{project}"),
@@ -233,14 +237,6 @@ impl<F> Display for SeqScan<F> {
     }
 }
 
-/// Scans that are not "sequential" fall into two categories:
-/// 1. Exact key match.
-/// 2. Range scan.
-pub(crate) enum Scan {
-    Match(Vec<u8>),
-    Range((Bound<Vec<u8>>, Bound<Vec<u8>>)),
-}
-
 /// Exact key match for expressions like `SELECT * FROM table WHERE id = 5;`.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ExactMatch<F> {
@@ -249,6 +245,7 @@ pub(crate) struct ExactMatch<F> {
     pub expr: Expression,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub done: bool,
+    pub emit_key_only: bool,
 }
 
 impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
@@ -267,10 +264,26 @@ impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
             return Ok(None);
         };
 
-        Ok(Some(tuple::deserialize(
-            entry.as_ref(),
-            self.relation.schema(),
-        )))
+        let mut tuple = tuple::deserialize(entry.as_ref(), self.relation.schema());
+
+        if self.emit_key_only {
+            match &self.relation {
+                Relation::Table(_) => {
+                    tuple.drain(1..);
+                }
+                Relation::Index(index) => {
+                    if tuple.len() != 2 {
+                        return Err(DbError::Corrupted(format!(
+                            "tuple from index {} contains more than two entries: {tuple:?}",
+                            index.name
+                        )));
+                    }
+                    tuple.swap_remove(0);
+                }
+            }
+        }
+
+        Ok(Some(tuple))
     }
 }
 
@@ -292,6 +305,7 @@ pub(crate) struct RangeScanConfig<F> {
     pub pager: Rc<RefCell<Pager<F>>>,
     pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     pub expr: Expression,
+    pub emit_key_only: bool,
 }
 
 /// BTree range scan.
@@ -320,6 +334,7 @@ pub(crate) struct RangeScanConfig<F> {
 #[derive(Debug, PartialEq)]
 pub(crate) struct RangeScan<F> {
     relation: Relation,
+    pub emit_key_only: bool,
     root: PageNumber,
     schema: Schema,
     pager: Rc<RefCell<Pager<F>>>,
@@ -335,6 +350,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
     fn from(
         RangeScanConfig {
             relation,
+            emit_key_only,
             pager,
             range,
             expr,
@@ -345,6 +361,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
             comparator: relation.comparator(),
             root: relation.root(),
             cursor: Cursor::new(relation.root(), 0),
+            emit_key_only,
             expr,
             pager,
             range,
@@ -426,11 +443,11 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
             return Ok(None);
         };
 
-        let tuple = reassemble_payload(&mut pager, page, slot)?;
+        let entry = reassemble_payload(&mut pager, page, slot)?;
 
         let bound = self.range.end_bound();
         if let Bound::Excluded(key) | Bound::Included(key) = bound {
-            let ordering = self.comparator.bytes_cmp(tuple.as_ref(), key);
+            let ordering = self.comparator.bytes_cmp(entry.as_ref(), key);
             if let Ordering::Equal | Ordering::Greater = ordering {
                 self.done = true;
                 if matches!(bound, Bound::Excluded(_))
@@ -441,12 +458,31 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
             }
         }
 
-        Ok(Some(tuple::deserialize(tuple.as_ref(), &self.schema)))
+        let mut tuple = tuple::deserialize(entry.as_ref(), &self.schema);
+
+        if self.emit_key_only {
+            match &self.relation {
+                Relation::Table(_) => {
+                    tuple.drain(1..);
+                }
+                Relation::Index(index) => {
+                    if tuple.len() != 2 {
+                        return Err(DbError::Corrupted(format!(
+                            "tuple from index {} contains more than two entries: {tuple:?}",
+                            index.name
+                        )));
+                    }
+                    tuple.swap_remove(0);
+                }
+            }
+        }
+
+        Ok(Some(tuple::deserialize(entry.as_ref(), &self.schema)))
     }
 }
 
 impl<F> Display for RangeScan<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "RangeScan ({}) on {} '{}'",
@@ -529,7 +565,6 @@ impl<F> Display for RangeScan<F> {
 /// so scanning the table BTree will be a little bit more predictable.
 #[derive(Debug, PartialEq)]
 pub(crate) struct KeyScan<F> {
-    pub index: IndexMetadata,
     pub comparator: FixedSizeMemCmp,
     pub table: TableMetadata,
     pub pager: Rc<RefCell<Pager<F>>>,
@@ -538,40 +573,25 @@ pub(crate) struct KeyScan<F> {
 
 impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
     fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
-        let Some(index_entry) = self.source.try_next()? else {
+        let Some(key_only_tuple) = self.source.try_next()? else {
             return Ok(None);
         };
 
-        debug_assert!(
-            index_entry.len() == 2,
-            "index entries must always have two values: index key -> primary key but found {index_entry:?}"
-        );
+        debug_assert!(key_only_tuple.len() == 1, "needs key only");
 
         let mut pager = self.pager.borrow_mut();
-
-        let Value::Number(primary_key) = index_entry[1] else {
-            return Err(DbError::Corrupted(format!(
-                "indexes should always map to primary keys or row IDs but index {} at root {} doesn't: {index_entry:?}",
-                self.index.name,
-                self.index.root,
-            )));
-        };
 
         let mut btree = BTree::new(&mut pager, self.table.root, self.comparator);
 
         let table_entry = btree
             .get(&tuple::serialize_key(
-                &self.index.schema.columns[1].data_type,
-                &Value::Number(primary_key),
+                &self.table.schema.columns[0].data_type,
+                &key_only_tuple[0],
             ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
-                    "index {} at root {} maps to primary key or row ID {} that doesn't exist in table {} at root {}",
-                    self.index.name,
-                    self.index.root,
-                    primary_key,
-                    self.table.name,
-                    self.table.root,
+                    "found key that doesn't exist on table {} at root {}",
+                    self.table.name, self.table.root,
                 ))
             })?;
 
@@ -589,6 +609,47 @@ impl<F> Display for KeyScan<F> {
             "KeyScan ({}) on table '{}'",
             self.table.schema.columns[0].name, self.table.name
         )
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct LogicalOrScan<F> {
+    pub scans: VecDeque<Plan<F>>,
+}
+
+impl<F: Seek + Read + Write + FileOps> LogicalOrScan<F> {
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        let Some(mut scan) = self.scans.front_mut() else {
+            return Ok(None);
+        };
+
+        // Optimistic approach, suppose the current scan has more tuples to
+        // return.
+        let mut tuple = scan.try_next()?;
+
+        // If it's not the case then find the next scan with tuples available.
+        while tuple.is_none() {
+            self.scans.pop_front();
+            let Some(next) = self.scans.front_mut() else {
+                return Ok(None);
+            };
+            scan = next;
+            tuple = scan.try_next()?;
+        }
+
+        Ok(Some(tuple.unwrap()))
+    }
+}
+
+impl<F> Display for LogicalOrScan<F> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "LogicalOrScan")?;
+
+        for scan in &self.scans {
+            write!(f, "\n    -> {}", scan.display())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -617,7 +678,7 @@ impl Values {
 }
 
 impl Display for Values {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Values ({})", join(&self.values[0], ", "))
     }
 }
@@ -1371,6 +1432,32 @@ impl<F: Seek + Read + Write + FileOps> Collect<F> {
         // Tuples that were not written to the file because it wasn't necessary
         // are also returned here.
         Ok(self.mem_buf.pop_front())
+    }
+}
+
+/// Same as [`std::iter::Peekable`] but fallible.
+///
+/// Maintains an intermediate buffer of capacity 1 that holds a [`Tuple`] until
+/// it is consumed through [`Self::try_next`]. It is somewhat similar to
+/// [`Collect`] but much simpler.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Peek<F> {
+    source: Box<Plan<F>>,
+    tuple: Option<Tuple>,
+}
+
+impl<F: Seek + Read + Write + FileOps> Peek<F> {
+    fn try_peek(&mut self) -> Result<Option<&Tuple>, DbError> {
+        if self.tuple.is_none() {
+            self.tuple = self.source.try_next()?;
+        }
+
+        Ok(self.tuple.as_ref())
+    }
+
+    fn try_next(&mut self) -> Result<Option<Tuple>, DbError> {
+        self.try_peek()?;
+        Ok(self.tuple.take())
     }
 }
 
