@@ -548,7 +548,7 @@ mod tests {
                 filter: parse_expr("id < 5 AND name = 'Bob'"),
                 schema: db.tables["users"].schema.to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
-                    emit_key_only: false,
+                    emit_table_key_only: false,
                     pager: db.pager(),
                     expr: parse_expr("id < 5"),
                     relation: Relation::Table(db.tables["users"].to_owned()),

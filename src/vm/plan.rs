@@ -56,7 +56,7 @@ use std::{
 };
 
 use crate::{
-    db::{DbError, IndexMetadata, Relation, Schema, SqlError, TableMetadata},
+    db::{DbError, Relation, Schema, SqlError, TableMetadata},
     paging::{
         io::FileOps,
         pager::{PageNumber, Pager},
@@ -245,7 +245,7 @@ pub(crate) struct ExactMatch<F> {
     pub expr: Expression,
     pub pager: Rc<RefCell<Pager<F>>>,
     pub done: bool,
-    pub emit_key_only: bool,
+    pub emit_table_key_only: bool,
 }
 
 impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
@@ -266,21 +266,10 @@ impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
 
         let mut tuple = tuple::deserialize(entry.as_ref(), self.relation.schema());
 
-        if self.emit_key_only {
-            match &self.relation {
-                Relation::Table(_) => {
-                    tuple.drain(1..);
-                }
-                Relation::Index(index) => {
-                    if tuple.len() != 2 {
-                        return Err(DbError::Corrupted(format!(
-                            "tuple from index {} contains more than two entries: {tuple:?}",
-                            index.name
-                        )));
-                    }
-                    tuple.swap_remove(0);
-                }
-            }
+        if self.emit_table_key_only {
+            let table_key_index = self.relation.index_of_table_key();
+            tuple.drain(table_key_index + 1..);
+            tuple.drain(..table_key_index);
         }
 
         Ok(Some(tuple))
@@ -305,7 +294,7 @@ pub(crate) struct RangeScanConfig<F> {
     pub pager: Rc<RefCell<Pager<F>>>,
     pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     pub expr: Expression,
-    pub emit_key_only: bool,
+    pub emit_table_key_only: bool,
 }
 
 /// BTree range scan.
@@ -333,8 +322,9 @@ pub(crate) struct RangeScanConfig<F> {
 /// then it will use [`RangeBounds::end_bound`] to know when to stop.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RangeScan<F> {
+    pub emit_table_key_only: bool,
+    key_index: usize,
     relation: Relation,
-    pub emit_key_only: bool,
     root: PageNumber,
     schema: Schema,
     pager: Rc<RefCell<Pager<F>>>,
@@ -350,7 +340,7 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
     fn from(
         RangeScanConfig {
             relation,
-            emit_key_only,
+            emit_table_key_only,
             pager,
             range,
             expr,
@@ -361,7 +351,8 @@ impl<F> From<RangeScanConfig<F>> for RangeScan<F> {
             comparator: relation.comparator(),
             root: relation.root(),
             cursor: Cursor::new(relation.root(), 0),
-            emit_key_only,
+            key_index: relation.index_of_table_key(),
+            emit_table_key_only,
             expr,
             pager,
             range,
@@ -460,24 +451,12 @@ impl<F: Seek + Read + Write + FileOps> RangeScan<F> {
 
         let mut tuple = tuple::deserialize(entry.as_ref(), &self.schema);
 
-        if self.emit_key_only {
-            match &self.relation {
-                Relation::Table(_) => {
-                    tuple.drain(1..);
-                }
-                Relation::Index(index) => {
-                    if tuple.len() != 2 {
-                        return Err(DbError::Corrupted(format!(
-                            "tuple from index {} contains more than two entries: {tuple:?}",
-                            index.name
-                        )));
-                    }
-                    tuple.swap_remove(0);
-                }
-            }
+        if self.emit_table_key_only {
+            tuple.drain(self.key_index + 1..);
+            tuple.drain(..self.key_index);
         }
 
-        Ok(Some(tuple::deserialize(entry.as_ref(), &self.schema)))
+        Ok(Some(tuple))
     }
 }
 

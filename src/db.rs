@@ -443,6 +443,13 @@ impl Relation {
             Self::Table(table) => &table.name,
         }
     }
+
+    pub fn index_of_table_key(&self) -> usize {
+        match self {
+            Self::Index(_) => 1,
+            Self::Table(_) => 0,
+        }
+    }
 }
 
 impl TableMetadata {

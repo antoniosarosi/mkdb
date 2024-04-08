@@ -97,7 +97,12 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
     let paths = find_index_paths(
         &table.schema.columns[0].name,
-        &HashSet::from_iter(table.indexes.iter().map(|index| index.name.to_owned())),
+        &HashSet::from_iter(
+            table
+                .indexes
+                .iter()
+                .map(|index| index.column.name.to_owned()),
+        ),
         filter,
     );
 
@@ -107,12 +112,12 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         return Ok(None);
     };
 
-    // Map index name to index metadata.
+    // Map index column name to index metadata.
     let indexes = table
         .indexes
         .iter()
-        .filter(|index| paths.contains_key(index.name.as_str()))
-        .map(|index| (index.name.as_str(), index))
+        .filter(|index| paths.contains_key(index.column.name.as_str()))
+        .map(|index| (index.column.name.as_str(), index))
         .collect::<HashMap<&str, &IndexMetadata>>();
 
     // Turn the paths map into a list of plan nodes. We'll sort the list later.
@@ -150,7 +155,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
                         relation,
                         expr,
                         pager,
-                        emit_key_only: true,
+                        emit_table_key_only: true,
                         done: false,
                     })
                 } else {
@@ -159,7 +164,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
                         relation,
                         expr,
                         pager,
-                        emit_key_only: true,
+                        emit_table_key_only: true,
                     }))
                 }
             });
@@ -195,8 +200,8 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     // tuple.
     if is_table_only_scan {
         plans.iter_mut().for_each(|plan| match plan {
-            Plan::RangeScan(range_scan) => range_scan.emit_key_only = false,
-            Plan::ExactMatch(extact_match) => extact_match.emit_key_only = false,
+            Plan::RangeScan(range_scan) => range_scan.emit_table_key_only = false,
+            Plan::ExactMatch(extact_match) => extact_match.emit_table_key_only = false,
             _ => unreachable!(),
         });
     }
