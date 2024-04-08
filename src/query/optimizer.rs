@@ -6,6 +6,7 @@ use std::{
     cmp::{self, Ordering},
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Seek, Write},
+    mem,
     ops::{Bound, RangeBounds},
     ptr,
     rc::Rc,
@@ -32,10 +33,11 @@ use crate::{
 /// query looks like.
 pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
-    filter: Option<Expression>,
+    mut filter: Option<Expression>,
     db: &mut Database<F>,
 ) -> Result<Plan<F>, DbError> {
-    let source = if let Some(optimized_scan) = generate_optimized_scan_plan(table, db, &filter)? {
+    let source = if let Some(optimized_scan) = generate_optimized_scan_plan(table, db, &mut filter)?
+    {
         optimized_scan
     } else {
         generate_sequential_scan_plan(table, db)?
@@ -87,9 +89,9 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
 fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     table_name: &str,
     db: &mut Database<F>,
-    filter: &Option<Expression>,
+    filter: &mut Option<Expression>,
 ) -> Result<Option<Plan<F>>, DbError> {
-    let Some(filter) = filter else {
+    let Some(expr) = filter else {
         return Ok(None);
     };
 
@@ -103,7 +105,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
                 .iter()
                 .map(|index| index.column.name.to_owned()),
         ),
-        filter,
+        expr,
     );
 
     // No usable indexes or PK found in the expression tree. SeqScan is all we
@@ -183,11 +185,17 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         }
     });
 
+    // We're only scanning one index. This will open te door for some
+    // optimizations.
+    let maybe_scan_only_one_index = index_scans
+        .get(0)
+        .take_if(|_| index_scans.len() == 1)
+        .map(|(col, _)| String::from(*col));
+
     // No external indexes. This makes the query plan a little simpler.
-    let is_table_only_scan = index_scans.len() == 1
-        && index_scans
-            .first()
-            .is_some_and(|(col, _)| *col == table.schema.columns[0].name);
+    let is_table_only_scan = maybe_scan_only_one_index
+        .as_ref()
+        .is_some_and(|col| col == &table.schema.columns[0].name);
 
     // Flatten all the nesting. Build one sequential list of scan plans.
     let mut plans: VecDeque<Plan<F>> = index_scans
@@ -212,6 +220,17 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     } else {
         Plan::LogicalOrScan(LogicalOrScan { scans: plans })
     };
+
+    // If we're only scanning one index we don't need to recheck conditions
+    // applied to that index. Otherwise keys might overlap so we will, but for
+    // simple queries we can skip some or all the filters.
+    if let Some(col) = maybe_scan_only_one_index {
+        skip_col_conditions(&col, expr);
+        // Drop the filter entirely if there's nothing left to check.
+        if *expr == Expression::Wildcard {
+            *filter = None;
+        }
+    }
 
     // No need for additional plans on top of the base source if it's already
     // scanning the BTree table.
@@ -248,9 +267,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     // Finally add the [`KeyScan`] plan on top of everything.
     Ok(Some(Plan::KeyScan(KeyScan {
         comparator: table.comparator()?,
-        table,
         pager: Rc::clone(&db.pager),
         source: Box::new(source),
+        table,
     })))
 }
 
@@ -477,7 +496,8 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 ///
 /// # Data Structure
 ///
-/// A "path" will be represented by a [`HashMap`] of index to ranges. Visually:
+/// A full "path" will be represented by a [`HashMap`] of index to ranges.
+/// Visually:
 ///
 /// ```text
 /// {
@@ -627,8 +647,8 @@ fn find_index_paths<'e>(
                         let right_contains_key_col = right_paths.contains_key(key_col);
 
                         // Check all the cases in which we would prefer the
-                        // right branch first. This will allow us to to write
-                        // only 2 return statements.
+                        // right branch first. This will allow us to write only
+                        // 2 return statements.
                         if right_is_exact_match && right_contains_key_col
                             || right_is_exact_match && !left_is_exact_match
                             || right_contains_key_col
@@ -820,15 +840,23 @@ fn determine_bounds(expr: &Expression) -> (Bound<&Value>, Bound<&Value>) {
 
 /// Inverse of [`determine_bounds`].
 fn range_to_expr(col: &str, (start, end): (Bound<&Value>, Bound<&Value>)) -> Expression {
+    // We'll use the parser to generate the expressions for us because writing
+    // every single combination manually is tedious.
     let expr = match (start, end) {
         (Bound::Unbounded, Bound::Excluded(v)) => format!("{col} < {v}"),
         (Bound::Unbounded, Bound::Included(v)) => format!("{col} <= {v}"),
         (Bound::Excluded(v), Bound::Unbounded) => format!("{col} > {v}"),
         (Bound::Included(v), Bound::Unbounded) => format!("{col} >= {v}"),
         (Bound::Excluded(v1), Bound::Excluded(v2)) => format!("{col} > {v1} AND {col} < {v2}"),
-        (Bound::Included(v1), Bound::Included(v2)) => format!("{col} >= {v1} AND {col} <= {v2}"),
         (Bound::Excluded(v1), Bound::Included(v2)) => format!("{col} > {v1} AND {col} <= {v2}"),
         (Bound::Included(v1), Bound::Excluded(v2)) => format!("{col} >= {v1} AND {col} < {v2}"),
+        (Bound::Included(v1), Bound::Included(v2)) => {
+            if is_exact_match((start, end)) {
+                format!("{col} = {v1}")
+            } else {
+                format!("{col} >= {v1} AND {col} <= {v2}")
+            }
+        }
         _ => unreachable!("can't build expr from range {:?}", (start, end)),
     };
 
@@ -973,6 +1001,40 @@ fn range_union<'v>(
     let union_end = cmp::max_by(end1, end2, cmp_end_bounds);
 
     Some((union_start, union_end))
+}
+
+/// Drop some parts of the `WHERE` clause that we don't need to re-evaluate.
+fn skip_col_conditions(col: &str, expr: &mut Expression) {
+    match expr {
+        Expression::BinaryOperation {
+            left,
+            operator,
+            right,
+        } => match operator {
+            BinaryOperator::And | BinaryOperator::Or => {
+                skip_col_conditions(col, left);
+                skip_col_conditions(col, right);
+
+                if **left == Expression::Wildcard {
+                    *expr = mem::replace(right, Expression::Wildcard);
+                } else if **right == Expression::Wildcard {
+                    *expr = mem::replace(left, Expression::Wildcard);
+                }
+            }
+
+            _ => match (&**left, &**right) {
+                (Expression::Identifier(ident), _) | (_, Expression::Identifier(ident))
+                    if ident == col =>
+                {
+                    *expr = Expression::Wildcard;
+                }
+
+                _ => {}
+            },
+        },
+
+        _ => {}
+    }
 }
 
 #[cfg(test)]

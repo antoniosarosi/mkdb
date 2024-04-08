@@ -12,6 +12,7 @@
 #![feature(trait_alias)]
 #![feature(pointer_is_aligned)]
 #![feature(buf_read_has_data_left)]
+#![feature(option_take_if)]
 
 mod db;
 mod os;

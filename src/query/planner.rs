@@ -464,76 +464,76 @@ mod tests {
         Ok(())
     }
 
-    // #[test]
-    // fn generate_exact_match_on_auto_index() -> Result<(), DbError> {
-    //     let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+    #[test]
+    fn generate_exact_match_on_auto_index() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
 
-    //     assert_eq!(
-    //         gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
-    //         Plan::ExactMatch(ExactMatch {
-    //             emit_key_only: false,
-    //             key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
-    //             expr: parse_expr("id = 5"),
-    //             pager: db.pager(),
-    //             relation: Relation::Table(db.tables["users"].to_owned()),
-    //             done: false,
-    //         })
-    //     );
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE id = 5;")?,
+            Plan::ExactMatch(ExactMatch {
+                emit_table_key_only: false,
+                key: tuple::serialize_key(&DataType::Int, &Value::Number(5)),
+                expr: parse_expr("id = 5"),
+                pager: db.pager(),
+                relation: Relation::Table(db.tables["users"].to_owned()),
+                done: false,
+            })
+        );
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 
-    // #[test]
-    // fn generate_exact_match_on_external_index() -> Result<(), DbError> {
-    //     let mut db =
-    //         init_db(&["CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE);"])?;
+    #[test]
+    fn generate_exact_match_on_external_index() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE);"])?;
 
-    //     assert_eq!(
-    //         gen_plan(
-    //             &mut db,
-    //             "SELECT * FROM users WHERE email = 'bob@email.com';"
-    //         )?,
-    //         Plan::KeyScan(KeyScan {
-    //             pager: db.pager(),
-    //             comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
-    //             table: db.tables["users"].to_owned(),
-    //             source: Box::new(Plan::ExactMatch(ExactMatch {
-    //                 emit_key_only: true,
-    //                 pager: db.pager(),
-    //                 relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
-    //                 expr: parse_expr("email = 'bob@email.com'"),
-    //                 key: tuple::serialize_key(
-    //                     &DataType::Varchar(255),
-    //                     &Value::String("bob@email.com".into())
-    //                 ),
-    //                 done: false,
-    //             }))
-    //         })
-    //     );
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE email = 'bob@email.com';"
+            )?,
+            Plan::KeyScan(KeyScan {
+                pager: db.pager(),
+                comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
+                table: db.tables["users"].to_owned(),
+                source: Box::new(Plan::ExactMatch(ExactMatch {
+                    emit_table_key_only: true,
+                    pager: db.pager(),
+                    relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+                    expr: parse_expr("email = 'bob@email.com'"),
+                    key: tuple::serialize_key(
+                        &DataType::Varchar(255),
+                        &Value::String("bob@email.com".into())
+                    ),
+                    done: false,
+                }))
+            })
+        );
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 
-    // #[test]
-    // fn skip_filter_on_simple_range_scan() -> Result<(), DbError> {
-    //     let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+    #[test]
+    fn skip_filter_on_simple_range_scan() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
 
-    //     assert_eq!(
-    //         gen_plan(&mut db, "SELECT * FROM users WHERE id < 5;")?,
-    //         Plan::RangeScan(RangeScan::from(RangeScanConfig {
-    //             emit_key_only: false,
-    //             pager: db.pager(),
-    //             relation: Relation::Table(db.tables["users"].to_owned()),
-    //             expr: parse_expr("id < 5"),
-    //             range: (
-    //                 Bound::Unbounded,
-    //                 Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
-    //             ),
-    //         }))
-    //     );
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE id < 5;")?,
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: false,
+                pager: db.pager(),
+                relation: Relation::Table(db.tables["users"].to_owned()),
+                expr: parse_expr("id < 5"),
+                range: (
+                    Bound::Unbounded,
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
+                ),
+            }))
+        );
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 
     #[test]
     fn apply_filter_if_cant_be_skipped() -> Result<(), DbError> {
@@ -545,7 +545,7 @@ mod tests {
                 "SELECT * FROM users WHERE id < 5 AND name = 'Bob';"
             )?,
             Plan::Filter(Filter {
-                filter: parse_expr("id < 5 AND name = 'Bob'"),
+                filter: parse_expr("name = 'Bob'"),
                 schema: db.tables["users"].schema.to_owned(),
                 source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
                     emit_table_key_only: false,
