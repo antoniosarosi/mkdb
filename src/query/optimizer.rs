@@ -4,19 +4,15 @@
 
 use std::{
     cmp::{self, Ordering},
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Seek, Write},
-    iter, mem,
     ops::{Bound, RangeBounds},
     ptr,
     rc::Rc,
 };
 
 use crate::{
-    db::{
-        Database, DatabaseContext, DbError, IndexMetadata, Relation, Schema, SqlError,
-        TableMetadata,
-    },
+    db::{Database, DatabaseContext, DbError, IndexMetadata, Relation, Schema},
     paging::io::FileOps,
     sql::{
         parser::Parser,
@@ -70,6 +66,24 @@ fn generate_sequential_scan_plan<F: Seek + Read + Write + FileOps>(
     }))
 }
 
+/// Attempts to generate a scan plan that uses indexes to search for tuples.
+///
+/// The generated plan will be one of the following:
+///
+/// - [`RangeScan`] or [`ExactMatch`] on the table BTree.
+///
+/// - [`RangeScan`] or [`ExactMatch`] on external index BTrees followed by
+/// [`KeyScan`] on the table BTree.
+///
+/// - [`LogicalOrScan`] composed of [`RangeScan`] or [`ExactMatch`] on the
+/// table BTree.
+///
+/// - [`LogicalOrScan`] composed of [`RangeScan`] or [`ExactMatch`] on external
+/// indexes and the table BTree followed by [`KeyScan`] on the table BTree.
+///
+/// There are so many combinations because we have to exploit the fact that
+/// primary keys are not external indexes and can be used to retrieve tuples
+/// directly from the table.
 fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     table_name: &str,
     db: &mut Database<F>,
@@ -81,131 +95,152 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
     let table = db.table_metadata(table_name)?.clone();
 
-    // Build index map (column name -> index metadata)
-    let indexes = HashSet::from_iter(table.indexes.iter().map(|index| index.name.to_owned()));
+    let paths = find_index_paths(
+        &table.schema.columns[0].name,
+        &HashSet::from_iter(table.indexes.iter().map(|index| index.name.to_owned())),
+        filter,
+    );
 
-    let index_paths = find_index_paths(&table.schema.columns[0].name, &indexes, filter);
-
-    if index_paths.is_empty() {
+    // No usable indexes or PK found in the expression tree. SeqScan is all we
+    // can do.
+    if paths.is_empty() {
         return Ok(None);
-    }
+    };
 
-    let mut indexes_metadata = HashMap::new();
+    // Map index name to index metadata.
+    let indexes = table
+        .indexes
+        .iter()
+        .filter(|index| paths.contains_key(index.name.as_str()))
+        .map(|index| (index.name.as_str(), index))
+        .collect::<HashMap<&str, &IndexMetadata>>();
 
-    for index in &table.indexes {
-        if index_paths.contains_key(index.name.as_str()) {
-            indexes_metadata.insert(index.name.as_str(), index);
-        }
-    }
-
-    let mut index_ranges = Vec::new();
-
-    for (col, ranges) in index_paths {
-        let relation = if let Some(index) = indexes_metadata.get(col).copied() {
-            Relation::Index(index.clone())
-        } else {
-            Relation::Table(table.clone())
-        };
-
-        let data_type = table.schema.columns[table.schema.index_of(col).unwrap()].data_type;
-
-        let bounds = ranges.iter().map(|range| {
-            let expr = range_to_expr(col, *range);
-            let pager = Rc::clone(&db.pager.clone());
-
-            let start = range.0.map(|v| tuple::serialize_key(&data_type, v));
-            let end = range.1.map(|v| tuple::serialize_key(&data_type, v));
-
-            if is_exact_match(*range) {
-                let Bound::Included(key) = start else {
-                    unreachable!();
-                };
-                Plan::ExactMatch(ExactMatch {
-                    key,
-                    relation: relation.clone(),
-                    expr,
-                    done: false,
-                    pager,
-                    emit_key_only: true,
-                })
+    // Turn the paths map into a list of plan nodes. We'll sort the list later.
+    let mut index_scans: Vec<(&str, VecDeque<Plan<F>>)> = paths
+        .into_iter()
+        .map(|(col, ranges)| {
+            let relation = if let Some(index) = indexes.get(col).copied() {
+                Relation::Index(index.clone())
             } else {
-                Plan::RangeScan(RangeScan::from(RangeScanConfig {
-                    range: (start, end),
-                    relation: relation.clone(),
-                    expr,
-                    pager,
-                    emit_key_only: true,
-                }))
-            }
-        });
+                Relation::Table(table.clone())
+            };
 
-        index_ranges.push((col, bounds.collect::<VecDeque<_>>()));
-    }
+            let col_position = table.schema.index_of(col).unwrap();
+            let data_type = table.schema.columns[col_position].data_type;
 
-    index_ranges.sort_by_key(|(col, _)| {
-        if let Some(index) = indexes_metadata.get(col) {
+            let bounds = ranges.iter().map(|range| {
+                let start = range
+                    .start_bound()
+                    .map(|value| tuple::serialize_key(&data_type, value));
+
+                let end = range
+                    .end_bound()
+                    .map(|value| tuple::serialize_key(&data_type, value));
+
+                let expr = range_to_expr(col, *range);
+                let pager = Rc::clone(&db.pager.clone());
+                let relation = relation.clone();
+
+                if is_exact_match(*range) {
+                    let Bound::Included(key) = start else {
+                        unreachable!();
+                    };
+                    Plan::ExactMatch(ExactMatch {
+                        key,
+                        relation,
+                        expr,
+                        pager,
+                        emit_key_only: true,
+                        done: false,
+                    })
+                } else {
+                    Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                        range: (start, end),
+                        relation,
+                        expr,
+                        pager,
+                        emit_key_only: true,
+                    }))
+                }
+            });
+
+            (col, bounds.collect())
+        })
+        .collect();
+
+    // Scans are sorted by the root of their index. The primary key direct table
+    // index will always be first.
+    index_scans.sort_by_key(|(col, _)| {
+        if let Some(index) = indexes.get(col) {
             index.root
         } else {
             0
         }
     });
 
+    // No external indexes. This makes the query plan a little simpler.
+    let is_table_only_scan = index_scans.len() == 1
+        && index_scans
+            .first()
+            .is_some_and(|(col, _)| *col == table.schema.columns[0].name);
+
+    // Flatten all the nesting. Build one sequential list of scan plans.
+    let mut plans: VecDeque<Plan<F>> = index_scans
+        .into_iter()
+        .map(|(_, scan)| scan)
+        .flatten()
+        .collect();
+
+    // If we're not scanning external indexes we're going to emit the entire
+    // tuple.
+    if is_table_only_scan {
+        plans.iter_mut().for_each(|plan| match plan {
+            Plan::RangeScan(range_scan) => range_scan.emit_key_only = false,
+            Plan::ExactMatch(extact_match) => extact_match.emit_key_only = false,
+            _ => unreachable!(),
+        });
+    }
+
+    // Base source plan. Either [`RangeScan`], [`ExactMatch`] or [`LogicalOrScan`].
+    let mut source = if plans.len() == 1 {
+        plans.pop_front().unwrap()
+    } else {
+        Plan::LogicalOrScan(LogicalOrScan { scans: plans })
+    };
+
+    // No need for additional plans on top of the base source if it's already
+    // scanning the BTree table.
+    if is_table_only_scan {
+        return Ok(Some(source));
+    }
+
     let work_dir = db.work_dir.clone();
     let page_size = db.pager.borrow().page_size;
 
-    let mut source = if index_ranges.len() == 1 {
-        let (col, mut ranges) = index_ranges.remove(0);
-
-        if col == table.schema.columns[0].name {
-            for r in &mut ranges {
-                match r {
-                    Plan::RangeScan(s) => s.emit_key_only = false,
-                    Plan::ExactMatch(e) => e.emit_key_only = false,
-                    _ => unreachable!(),
-                }
-            }
-        }
-
-        let plan = if ranges.len() == 1 {
-            ranges.remove(0).unwrap()
-        } else {
-            Plan::LogicalOrScan(LogicalOrScan { scans: ranges })
-        };
-
-        if col == table.schema.columns[0].name {
-            return Ok(Some(plan));
-        }
-
-        plan
-    } else {
-        Plan::LogicalOrScan(LogicalOrScan {
-            scans: index_ranges
-                .into_iter()
-                .map(|(_, scan)| scan)
-                .flatten()
-                .collect(),
-        })
-    };
-
+    // Add sorter if we're scanning external indexes and we're going to return
+    // more than one key.
     if let Plan::RangeScan(_) | Plan::LogicalOrScan(_) = source {
+        let id_only_schema = Schema::new(vec![table.schema.columns[0].clone()]);
+
         source = Plan::Sort(Sort::from(SortConfig {
             page_size,
             work_dir: work_dir.clone(),
             collection: Collect::from(CollectConfig {
                 source: Box::new(source),
-                work_dir: work_dir.clone(),
-                schema: Schema::new(vec![table.schema.columns[0].clone()]),
+                work_dir,
+                schema: id_only_schema.clone(),
                 mem_buf_size: page_size,
             }),
             comparator: TuplesComparator {
-                schema: Schema::new(vec![table.schema.columns[0].clone()]),
-                sort_schema: Schema::new(vec![table.schema.columns[0].clone()]),
+                schema: id_only_schema.clone(),
+                sort_schema: id_only_schema,
                 sort_keys_indexes: vec![0],
             },
             input_buffers: 4,
         }));
     };
 
+    // Finally add the [`KeyScan`] plan on top of everything.
     Ok(Some(Plan::KeyScan(KeyScan {
         comparator: table.comparator()?,
         table,
@@ -214,6 +249,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     })))
 }
 
+/// Reference to bounds in the [`Expression`] tree.
+///
+/// We use this to avoid cloning/serializing keys until the last moment.
 type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 
 /// Index path finding recursive algorithm inspired by Postgres.
@@ -354,8 +392,8 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// - Scan id in the ranges `[..10, 100..]`
 /// - Scan email in the ranges `[..'b@b.com', 't@t.com'..]`
 ///
-/// Choosing the best combination is very complicated. We discuss
-/// "choosing rules" at the end.
+/// Choosing the best combination is very complicated. We discuss "choosing
+/// rules" at the end.
 ///
 /// What about this case?
 ///
@@ -370,7 +408,7 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// figure out exactly the best path with the minimum ranges on every single
 /// column we'll just prefer simplicity.
 ///
-/// Intersections are only computed on simple cases such as:
+/// Intersections are only computed on two simple cases:
 ///
 /// ```sql
 /// SELECT * FROM users WHERE id > 5 AND id < 10;
@@ -431,6 +469,35 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// even then, considering every single combination of indexes that can be used
 /// requires an exponential algorithm, so it's almost impossible to know for
 /// sure which one is the "best" path.
+///
+/// # Data Structure
+///
+/// A "path" will be represented by a [`HashMap`] of index to ranges. Visually:
+///
+/// ```text
+/// {
+///     "id": [(..20), (40..60), (100..)],
+///     "email": [(20..=25)],
+/// }
+/// ```
+///
+/// You could think of this hash map as a matrix of OR clauses where we have to
+/// apply the logical OR operator both vertially and horizontally (web devs
+/// centering divs both vertically and horizontally must feel right at home).
+///
+/// The has map above would translate to something like this:
+///
+/// ```sql
+/// (id < 20) OR (id > 40 AND id < 60) OR (id > 100) OR (email > 20 AND email <= 25)
+/// ```
+///
+/// There is no representation of `AND` clauses because we never scan two
+/// indexes when there's an `AND` statement. Postgres for example does that
+/// sometimes through their BitmapAnd plan, where they scan two indexes and then
+/// scan only the pages where both are true. We could do that as well, but
+/// supporting OR statements is already complex enough for a toy database. In
+/// the case of AND statements on separate indexes we'll just scan one of them
+/// and call it a day.
 fn find_index_paths<'e>(
     key_col: &str,
     indexes: &HashSet<String>,
@@ -911,13 +978,7 @@ mod tests {
     };
 
     use super::{find_index_paths, IndexRangeBounds};
-    use crate::{
-        db::{IndexMetadata, Schema},
-        sql::{
-            parser::Parser,
-            statement::{Column, DataType, Expression, Value},
-        },
-    };
+    use crate::sql::{parser::Parser, statement::Value};
 
     struct IndexPath<'i> {
         pk: &'i str,

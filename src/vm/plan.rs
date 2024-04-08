@@ -493,7 +493,7 @@ impl<F> Display for RangeScan<F> {
     }
 }
 
-/// Index scan uses an indexed column to retrieve data from a table.
+/// [`KeyScan`] uses an indexed column to retrieve data from a table.
 ///
 /// An index is a BTree that maps a column value to the primary key or row ID of
 /// the table. It makes it easy to find all the primary keys we need without
@@ -590,7 +590,7 @@ impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
             ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
-                    "found key that doesn't exist on table {} at root {}",
+                    "attempt to scan key {key_only_tuple:?} that doesn't exist on table {} at root {}",
                     self.table.name, self.table.root,
                 ))
             })?;
@@ -612,6 +612,10 @@ impl<F> Display for KeyScan<F> {
     }
 }
 
+/// [`LogicalOrScan`] returns tuples from multiple indexes, multiple ranges
+/// within the same index or a combination of both.
+///
+/// Ranges should be sorted for efficiency.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LogicalOrScan<F> {
     pub scans: VecDeque<Plan<F>>,
