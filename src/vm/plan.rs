@@ -2091,11 +2091,11 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }
 
         // We need files to sort.
-        let (input_file_path, input_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort")?;
+        let (input_file_path, input_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort.input")?;
         self.input_file = Some(input_file);
         self.input_file_path = input_file_path;
 
-        let (output_file_path, output_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort")?;
+        let (output_file_path, output_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort.output")?;
         self.output_file = Some(output_file);
         self.output_file_path = output_file_path;
 
