@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::{
-    db::{Database, DatabaseContext, DbError, IndexMetadata, Relation, Schema},
+    db::{Database, DatabaseContext, DbError, IndexMetadata, Relation},
     paging::io::FileOps,
     sql::{
         parser::Parser,

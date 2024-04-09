@@ -17,7 +17,7 @@ use std::{
 
 use super::{
     cache::{Cache, FrameId},
-    io::{BlockIo, FileOps, MemBuf},
+    io::{BlockIo, FileOps},
 };
 use crate::{
     db::{DbError, DEFAULT_PAGE_SIZE},

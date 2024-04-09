@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
