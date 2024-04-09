@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    os::{DiskBlockSize, Open},
+    os::{FileSystemBlockSize, Open},
     paging::{
         io::FileOps,
         pager::{PageNumber, Pager},
@@ -102,7 +102,7 @@ impl Database<File> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "not a file").into());
         }
 
-        let block_size = crate::os::Fs::disk_block_size(&path)?;
+        let block_size = crate::os::Fs::block_size(&path)?;
 
         let full_db_file_path = path.as_ref().canonicalize()?;
         let work_dir = full_db_file_path.parent().unwrap().to_path_buf();

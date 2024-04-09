@@ -1085,7 +1085,6 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
     /// will need to allocate an extra page.
     ///
     /// ```text
-    /// 
     ///                                    +---+ +---+ +----+ +----+
     ///     In-memory copies of each cell: | 4 | | 8 | | 12 | | 16 |
     ///                                    +---+ +---+ +----+ +----+
@@ -2426,7 +2425,7 @@ mod tests {
         },
         storage::{
             btree::Payload,
-            page::{Cell, Page, CELL_HEADER_SIZE, MEM_ALIGNMENT, PAGE_HEADER_SIZE, SLOT_SIZE},
+            page::{Cell, Page, CELL_ALIGNMENT, CELL_HEADER_SIZE, PAGE_HEADER_SIZE, SLOT_SIZE},
         },
     };
 
@@ -2615,11 +2614,11 @@ mod tests {
     /// `max` amount of payload.
     fn optimal_page_size_for_max_payload(max: usize, min_keys: usize) -> usize {
         let cell_storage_size =
-            CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, MEM_ALIGNMENT) as u16;
+            CELL_HEADER_SIZE + SLOT_SIZE + align_upwards(max, CELL_ALIGNMENT) as u16;
 
         let total_size = PAGE_HEADER_SIZE + cell_storage_size * min_keys as u16;
 
-        align_upwards(total_size as usize, MEM_ALIGNMENT)
+        align_upwards(total_size as usize, CELL_ALIGNMENT)
     }
 
     impl<'p> TryFrom<BTree<'p, MemBuf, FixedSizeMemCmp>> for Node {
@@ -3818,7 +3817,7 @@ mod tests {
                     .map(|size| size + CELL_HEADER_SIZE + SLOT_SIZE)
                     .sum::<u16>();
 
-            align_upwards(space_needed as usize, MEM_ALIGNMENT)
+            align_upwards(space_needed as usize, CELL_ALIGNMENT)
         };
 
         let pager = &mut pager_with_page_size(page_size)?;

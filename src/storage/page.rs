@@ -140,13 +140,13 @@ pub(crate) const MAX_PAGE_SIZE: usize = 64 << 10;
 ///
 /// When in debug mode the minimum value of the page size is calculated so that
 /// a normal [`Page`] instance can store at least one valid [`Cell`], which is
-/// an aligned cell that can fit [`MEM_ALIGNMENT`] bytes.
+/// an aligned cell that can fit [`CELL_ALIGNMENT`] bytes.
 ///
 /// In numbers, at the moment of writing this the page header is 12 bytes, a
 /// slot pointer is 2 bytes, and the cell header is 8 bytes. This gives us a
 /// total of 22 bytes of metadata for one single payload.
 ///
-/// [`MEM_ALIGNMENT`] is 8 bytes, so we'll consider that to be the minimum
+/// [`CELL_ALIGNMENT`] is 8 bytes, so we'll consider that to be the minimum
 /// payload. Essentially what we do is add 8 bytes to 22 bytes, giving us 30
 /// bytes, and then we align upwards to 32 bytes. So the minimum page size in
 /// debug mode can store only 8 bytes worth of data, but we allow this because
@@ -155,8 +155,8 @@ pub(crate) const MAX_PAGE_SIZE: usize = 64 << 10;
 ///
 /// In release mode we'll consider the minimum size to be 512 bytes.
 pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(debug_assertions) {
-    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * MEM_ALIGNMENT as u16 - 1) as usize
-        & !(MEM_ALIGNMENT - 1)
+    (PAGE_HEADER_SIZE + SLOT_SIZE + CELL_HEADER_SIZE + 2 * CELL_ALIGNMENT as u16 - 1) as usize
+        & !(CELL_ALIGNMENT - 1)
 } else {
     512
 };
@@ -176,8 +176,29 @@ pub(crate) const SLOT_SIZE: u16 = mem::size_of::<u16>() as _;
 /// See the "Alignment" section of the [`Page`] documentation for alignment
 /// details.
 ///
-/// Briefly, all pages must be aligned to 8 bytes for simplicity.
-pub(crate) const MEM_ALIGNMENT: usize = mem::align_of::<CellHeader>();
+/// Briefly, cells in each [`Page`] must be aligned to 8 bytes for simplicity.
+pub(crate) const CELL_ALIGNMENT: usize = mem::align_of::<CellHeader>();
+
+/// Page memory buffer alignment.
+///
+/// We're using the `O_DIRECT` flag on Linux to bypass the OS cache. `O_DIRECT`
+/// requires that buffers are aligned to at least the logical block size of the
+/// block device, which is usually 512 bytes. We're going to align all the pages
+/// to the file system block size, which is typically 4096 bytes.
+///
+/// TODO: This should be a parameter that we supply at runtime when we
+/// initialize the database and check the file system block size, but right now
+/// that requires a lot of changes throughout the codebase so we'll just use
+/// this patch instead.
+///
+/// Basically [`BufferWithHeader::alloc`] should take a [`Layout`] as a
+/// parameter instead of only the page size, but all the builders for structs
+/// in the codebase where written assuming that the page alignment is the same
+/// as the [`CELL_ALIGNMENT`] before discovering the `O_DIRECT` alignment bug.
+/// The kernel raises Os Error 22 if memory buffers are not aligned to block
+/// sizes when using `O_DIRECT`, check the man page for open(). Anyway, this
+/// needs refactoring, TODO.
+pub(crate) const PAGE_ALIGNMENT: usize = 4096;
 
 /// The slot array can be indexed using 2 bytes, since it will never be bigger
 /// than [`MAX_PAGE_SIZE`].
@@ -215,7 +236,7 @@ struct BufferWithHeader<H> {
 }
 
 impl<H> BufferWithHeader<H> {
-    /// Allocates a pointer that can fit a buffer of the given `size`.
+    /// Allocates a pointer that can fit a page buffer of the given `size`.
     ///
     /// `size` in this case refers to the complete size of the buffer, not the
     /// size of the content or size of the header, but the sum of both. The
@@ -229,8 +250,10 @@ impl<H> BufferWithHeader<H> {
     ///
     /// Additionally this function also panics if `size` does not meet the
     /// requirements of [`alloc::Layout::from_size_align`]. Basically, make sure
-    /// that `size` rounded up to [`MEM_ALIGNMENT`] does not overflow
+    /// that `size` rounded up to [`PAGE_ALIGNMENT`] does not overflow.
     /// [`isize::MAX`].
+    ///
+    /// TODO: See [`PAGE_ALIGNMENT`], this needs refactoring.
     pub fn alloc(size: usize) -> NonNull<[u8]> {
         assert!(
             size > mem::size_of::<H>(),
@@ -244,7 +267,7 @@ impl<H> BufferWithHeader<H> {
         // TODO: We can probably handle the alloc error by rolling back the
         // database and returning an error to the client.
         alloc::Global
-            .allocate_zeroed(alloc::Layout::from_size_align(size, MEM_ALIGNMENT).unwrap())
+            .allocate_zeroed(alloc::Layout::from_size_align(size, PAGE_ALIGNMENT).unwrap())
             .expect("could not allocate BufferWithHeader<H>")
     }
 
@@ -255,7 +278,7 @@ impl<H> BufferWithHeader<H> {
     pub fn new(size: usize) -> Self {
         // SAFETY: [`Self::alloc`] meets all the requirements of
         // [`Self::from_non_null`] since it checks the pointer size and it uses
-        // [`MEM_ALIGNMENT`].
+        // [`PAGE_ALIGNMENT`].
         unsafe { Self::from_non_null(Self::alloc(size)) }
     }
 
@@ -288,7 +311,7 @@ impl<H> BufferWithHeader<H> {
     /// and deallocate it after it goes out of scope then `pointer` must have
     /// been allocated using [`BufferWithHeader::alloc`] to ensure the memory
     /// layout is correct. Mainly, the pointer should be aligned to
-    /// [`MEM_ALIGNMENT`].
+    /// [`PAGE_ALIGNMENT`].
     ///
     /// ## Case 2: Buffer Contained Within Larger Buffer
     ///
@@ -300,10 +323,15 @@ impl<H> BufferWithHeader<H> {
     /// 2. After the larger buffer or allocation is dropped, this inner buffer
     /// cannot be used anymore since that would be a use after free.
     ///
+    /// 3. Alignment in this must still be at least [`CELL_ALIGNMENT`] to
+    /// satisfy the alignment requirements of BTree pages. [`PageZero`] stores
+    /// an instance of [`Page`] inside its buffer so that's why we check the
+    /// [`CELL_ALIGNMENT`].
+    ///
     /// # Panics
     ///
     /// Panics if the pointer has insufficient length or is not aligned to
-    /// [`MEM_ALIGNMENT`].
+    /// [`CELL_ALIGNMENT`].
     pub unsafe fn from_non_null(pointer: NonNull<[u8]>) -> Self {
         assert!(
             pointer.len() > mem::size_of::<H>(),
@@ -315,7 +343,7 @@ impl<H> BufferWithHeader<H> {
         );
 
         assert!(
-            pointer.is_aligned_to(MEM_ALIGNMENT),
+            pointer.is_aligned_to(CELL_ALIGNMENT),
             "attempt to create {} from unaligned pointer {:?}",
             any::type_name::<Self>(),
             pointer
@@ -482,7 +510,7 @@ impl<H> Drop for BufferWithHeader<H> {
         unsafe {
             alloc::Global.deallocate(
                 self.header.cast(),
-                alloc::Layout::from_size_align(self.size, MEM_ALIGNMENT).unwrap(),
+                alloc::Layout::from_size_align(self.size, PAGE_ALIGNMENT).unwrap(),
             )
         }
     }
@@ -712,7 +740,7 @@ impl Cell {
 
     /// See [`Page`] for details.
     pub fn aligned_size_of(data: &[u8]) -> u16 {
-        Layout::from_size_align(data.len(), MEM_ALIGNMENT)
+        Layout::from_size_align(data.len(), CELL_ALIGNMENT)
             .unwrap()
             .pad_to_align()
             .size() as u16
@@ -966,13 +994,21 @@ impl PageHeader {
 ///
 /// # Alignment
 ///
-/// In-memory pages should be 64 bit aligned. This will allow the [`CellHeader`]
-/// instances to be 64 bit aligned as well, which in turn will make the first
-/// content byte of each cell 64 bit aligned. Further alignment within the
-/// content should be controlled on upper layers. For example, if we have some
-/// schema like `[Int, Varchar(255), Bool]`, we can't worry about individual
-/// column alignment here because we're only storing binary data, we know
-/// nothing about what's inside.
+/// In-memory pages need to be aligned to hardware block size or file system
+/// block sizes (which are multiples of the hardware block sizes). That's needed
+/// for DMA stuff when bypassing kernel buffering with flags like `O_DIRECT` on
+/// Linux.
+///
+/// On the other hand, [`CellHeader`] instances must be 64 bit aligned, which in
+/// turn will make the first content byte of each cell 64 bit aligned. And
+/// that's needed to make sure tuples (rows) are stored at aligned memory
+/// addresses so that we can interpret a column as a value without decoding any
+/// bytes. For example, if we have some schema like `[BigInt, Varchar(255), Bool]`
+/// we should make sure that the first `BigInt` number is aligned to 8 bytes.
+/// The [`Page`] API only ensures that the starting address of the row is
+/// aligned to 8 bytes, but alignment within the tuple itself must be controlled
+/// at upper layers. Inner tuple alignmnet is NOT YET implemented, see
+/// [`super::tuple`] for details.
 ///
 /// # Overflow
 ///
@@ -1111,10 +1147,10 @@ impl Page {
     ///
     /// It's calculated by substracting the cell header size and the slot
     /// pointer size from the usable space and then aligning the result
-    /// downwards to [`MEM_ALIGNMENT`]. This makes sure that at least one cell
+    /// downwards to [`CELL_ALIGNMENT`]. This makes sure that at least one cell
     /// can successfuly fit in the given space.
     fn max_payload_size_in(usable_space: u16) -> u16 {
-        (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(MEM_ALIGNMENT as u16 - 1)
+        (usable_space - CELL_HEADER_SIZE - SLOT_SIZE) & !(CELL_ALIGNMENT as u16 - 1)
     }
 
     /// Maximum size that the payload of a single [`Cell`] should take on the
@@ -2185,11 +2221,11 @@ mod tests {
     ///
     /// Note that after inserting all the cells in the page, the page might
     /// still contain some free bytes because we must align to
-    /// [`MEM_ALIGNMENT`].
+    /// [`CELL_ALIGNMENT`].
     fn optimal_page_size_to_fit(cells: &[Box<Cell>]) -> usize {
         let size = PAGE_HEADER_SIZE + cells.iter().map(|cell| cell.storage_size()).sum::<u16>();
 
-        Layout::from_size_align(size as usize, MEM_ALIGNMENT)
+        Layout::from_size_align(size as usize, CELL_ALIGNMENT)
             .unwrap()
             .pad_to_align()
             .size()

@@ -6,10 +6,10 @@ use std::{
     path::Path,
 };
 
-/// Necessary syscalls to get the storage hardware block size.
-pub(crate) trait DiskBlockSize {
+/// Necessary syscalls to get the file system block size.
+pub(crate) trait FileSystemBlockSize {
     /// Returns the underlying IO device block size or preferred IO buffer size.
-    fn disk_block_size(path: impl AsRef<Path>) -> io::Result<usize>;
+    fn block_size(path: impl AsRef<Path>) -> io::Result<usize>;
 }
 
 /// Trait for opening a file depending on the OS.
@@ -18,7 +18,7 @@ pub(crate) trait Open {
     fn open(self, path: impl AsRef<Path>) -> io::Result<File>;
 }
 
-/// Used to implement [`DiskBlockSize`] and [`Open`] traits on different
+/// Used to implement [`FileSystemBlockSize`] and [`Open`] traits on different
 /// operating systems.
 pub(crate) struct Fs;
 
@@ -125,10 +125,10 @@ mod unix {
         path::Path,
     };
 
-    use super::{DiskBlockSize, Fs, Open, OpenOptions};
+    use super::{FileSystemBlockSize, Fs, Open, OpenOptions};
 
-    impl DiskBlockSize for Fs {
-        fn disk_block_size(path: impl AsRef<Path>) -> io::Result<usize> {
+    impl FileSystemBlockSize for Fs {
+        fn block_size(path: impl AsRef<Path>) -> io::Result<usize> {
             Ok(File::open(&path)?.metadata()?.blksize() as usize)
         }
     }
@@ -183,8 +183,8 @@ mod windows {
 
     use super::{DiskBlockSize, Fs, Open, OpenOptions};
 
-    impl DiskBlockSize for Fs {
-        fn disk_block_size(path: impl AsRef<Path>) -> io::Result<usize> {
+    impl FileSystemBlockSize for Fs {
+        fn block_size(path: impl AsRef<Path>) -> io::Result<usize> {
             unsafe {
                 let mut volume = [0u16; MAX_PATH as usize];
 
