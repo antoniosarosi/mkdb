@@ -597,6 +597,40 @@ impl<F> Display for KeyScan<F> {
 /// within the same index or a combination of both.
 ///
 /// Ranges should be sorted for efficiency.
+///
+/// TODO: There's an optimization we can do here when scanning by primary key
+/// and external index keys at the same time. Instead of collecting all the keys
+/// and sorting them, then using [`KeyScan`] (which is what we do now), we could
+/// collect only external index keys, sort them, and switch between range key
+/// scanning and external index key scanning.
+///
+/// For example, imagine something like this:
+///
+/// ```text
+/// LogialOrScan
+///     -> RangeScan (id < 5) on table "users"
+///     -> RangeScan (id > 100 AND id < 200) on table "users"
+///
+///     -> RangeScan (email < 'test@test.com') on index "email"
+///     -> RangeScan (something < 'value') on index "some_index"
+/// ```
+///
+/// We could collect and sort all the keys returned by the email and some_index
+/// BTrees, discard all the keys that fall within the current table range, scan
+/// the table range until it's done and repeat. When keys returned by external
+/// indexes are "less than the starting bound of the current table range" then
+/// we scan those until we reach the table range again.
+///
+/// In the example above, imagine that external indexes returned the keys
+/// `[20, 30, 40, 500, 600]`. We start by scanning the range `..5` on the users
+/// BTree since the key 20 is after the range. Once we're done with range `..5`
+/// we have to scan range `100..200`, but we can pop keys `20, 30, 40` from the
+/// index queue and scan that before. Then scan the range `100..200` and finally
+/// keys `500, 600`.
+///
+/// We can use [`Peek`] to check the value of a plan without consuming it. This
+/// algorithm probably sounds more complicated than it actually is, it shouldn't
+/// be too hard to implement.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LogicalOrScan<F> {
     pub scans: VecDeque<Plan<F>>,
@@ -1425,6 +1459,9 @@ impl<F: Seek + Read + Write + FileOps> Collect<F> {
 /// Maintains an intermediate buffer of capacity 1 that holds a [`Tuple`] until
 /// it is consumed through [`Self::try_next`]. It is somewhat similar to
 /// [`Collect`] but much simpler.
+///
+/// Not used anywhere for now but we can use it to implement the optimization
+/// described in the documentation of [`LogicalOrScan`].
 #[derive(Debug, PartialEq)]
 pub(crate) struct Peek<F> {
     source: Box<Plan<F>>,

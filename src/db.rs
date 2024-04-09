@@ -2625,6 +2625,189 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn select_where_multiple_indexes_exact_match_and_ranges() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255) UNIQUE, email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'Mark', 'mark@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (5, 'Carla', 'carla@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (6, 'Mia', 'mia@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (7, 'Jay', 'jay@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (8, 'Lauren', 'lauren@email.com');")?;
+
+        let query = db.exec(
+            "SELECT * FROM users WHERE id < 4 OR email = 'mia@email.com' OR name = 'Lauren';",
+        )?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("alex@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("David".into()),
+                    Value::String("david@email.com".into()),
+                ],
+                vec![
+                    Value::Number(6),
+                    Value::String("Mia".into()),
+                    Value::String("mia@email.com".into()),
+                ],
+                vec![
+                    Value::Number(8),
+                    Value::String("Lauren".into()),
+                    Value::String("lauren@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_multiple_indexes_ranges_only() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', '1@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', '2@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', '3@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'Mark', '4@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (5, 'Carla', '5@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (6, 'Mia', '6@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (7, 'Jay', '7@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (8, 'Lauren', '8@email.com');")?;
+
+        let query = db.exec("SELECT * FROM users WHERE id >= 7 OR email < '3@email.com';")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("1@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("2@email.com".into()),
+                ],
+                vec![
+                    Value::Number(7),
+                    Value::String("Jay".into()),
+                    Value::String("7@email.com".into()),
+                ],
+                vec![
+                    Value::Number(8),
+                    Value::String("Lauren".into()),
+                    Value::String("8@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_multiple_indexes_multiple_ranges() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', '1@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', '2@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', '3@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'Mark', '4@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (5, 'Carla', '5@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (6, 'Mia', '6@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (7, 'Jay', '7@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (8, 'Lauren', '8@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (9, 'Jack', '9@email.com');")?;
+
+        #[rustfmt::skip]
+        let query = db.exec("
+            SELECT * FROM users
+            WHERE (id >= 4 AND id < 6)
+            OR email < '3@email.com'
+            OR (id > 6 AND id < 9)
+            OR email = '9@email.com';
+        ")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Alex".into()),
+                    Value::String("1@email.com".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("2@email.com".into()),
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("Mark".into()),
+                    Value::String("4@email.com".into()),
+                ],
+                vec![
+                    Value::Number(5),
+                    Value::String("Carla".into()),
+                    Value::String("5@email.com".into()),
+                ],
+                vec![
+                    Value::Number(7),
+                    Value::String("Jay".into()),
+                    Value::String("7@email.com".into()),
+                ],
+                vec![
+                    Value::Number(8),
+                    Value::String("Lauren".into()),
+                    Value::String("8@email.com".into()),
+                ],
+                vec![
+                    Value::Number(9),
+                    Value::String("Jack".into()),
+                    Value::String("9@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn large_auto_index_scan() -> Result<(), DbError> {
