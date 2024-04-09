@@ -26,11 +26,9 @@ use crate::{
     },
 };
 
-/// Generates an optimized scan plan.
+/// Attempts to generate an optimized scan plan.
 ///
-/// The generated plan will be either [`SeqScan`], [`RangeScan`] or
-/// [`IndexScan`] with an optional [`Filter`] on top of it, depending on how the
-/// query looks like.
+/// If it's not possible then this will simply generate a [`SeqScan`] plan.
 pub(crate) fn generate_scan_plan<F: Seek + Read + Write + FileOps>(
     table: &str,
     mut filter: Option<Expression>,
@@ -99,13 +97,9 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
 
     let paths = find_index_paths(
         &table.schema.columns[0].name,
-        &HashSet::from_iter(
-            table
-                .indexes
-                .iter()
-                .map(|index| index.column.name.to_owned()),
-        ),
+        &HashSet::from_iter(table.indexes.iter().map(|index| index.column.name.as_str())),
         expr,
+        &mut HashSet::new(),
     );
 
     // No usable indexes or PK found in the expression tree. SeqScan is all we
@@ -459,12 +453,12 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// have to choose one of the sides and use the other one as a filter. These are
 /// the rules that we will follow for choosing:
 ///
-/// 1. If either of the sides contains less columns, return that side because
-/// it will produce a simpler query plan that visits less indexes overall.
-///
-/// 2. If the AND expression is simple enough and we can compute the
+/// 1. If the AND expression is simple enough and we can compute the
 /// intersection of the ranges, return a new path that doesn't appear in the
 /// original query but is described by the computed intersection.
+///
+/// 2. If either of the sides contains less columns, return that side because
+/// it will produce a simpler query plan that visits less indexes overall.
 ///
 /// 3. When both sides have the same number of columns, prefer exact matches
 /// over ranges. Example:
@@ -473,10 +467,10 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// SELECT * FROM users WHERE id < 100 AND email = 'test@test.com';
 /// ```
 ///
-/// We would choose the right side with the email expression.
+/// We would choose the right side with the email expression. When both sides
+/// contain exact matches, apply rule 4.
 ///
-/// 4. If we can't rely on exact matches, then prefer the table BTree key over
-/// external indexes. Example:
+/// 4. Prefer the table BTree key over external indexes. Example:
 ///
 /// ```sql
 /// SELECT * FROM users WHERE id < 100 AND email > 'test@test.com';
@@ -525,11 +519,10 @@ type IndexRangeBounds<'v> = (Bound<&'v Value>, Bound<&'v Value>);
 /// and call it a day.
 fn find_index_paths<'e>(
     key_col: &str,
-    indexes: &HashSet<String>,
+    indexes: &HashSet<&str>,
     expr: &'e Expression,
+    cancel: &mut HashSet<&'e str>,
 ) -> HashMap<&'e str, VecDeque<IndexRangeBounds<'e>>> {
-    println!("{expr}");
-
     match expr {
         Expression::BinaryOperation {
             left,
@@ -544,7 +537,7 @@ fn find_index_paths<'e>(
             // and build upwards.
             (Expression::Identifier(col), Expression::Value(_))
             | (Expression::Value(_), Expression::Identifier(col))
-                if (indexes.contains(col) || col == key_col)
+                if (indexes.contains(col.as_str()) || col == key_col)
                     && matches!(
                         operator,
                         BinaryOperator::Eq
@@ -559,8 +552,8 @@ fn find_index_paths<'e>(
 
             // Case 2: AND | OR expressions.
             (left, right) if matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
-                let mut left_paths = find_index_paths(key_col, indexes, left);
-                let mut right_paths = find_index_paths(key_col, indexes, right);
+                let mut left_paths = find_index_paths(key_col, indexes, left, cancel);
+                let mut right_paths = find_index_paths(key_col, indexes, right, cancel);
 
                 match operator {
                     // Subcase A: AND expression.
@@ -571,34 +564,43 @@ fn find_index_paths<'e>(
                     // Or AND clauses involving deeper expression branches:
                     // SELECT * FROM t WHERE (x > 5 AND x < 10) AND (y < 10 OR y > 20)
                     //
-                    // The Rules applied to AND clauses are described below and
+                    // The rules applied to AND clauses are described below and
                     // also in the function documentation.
                     BinaryOperator::And => {
-                        // Rule 1: Return the branch with less columns.
-                        if right_paths.len() == 0
-                            || left_paths.len() > 0 && left_paths.len() < right_paths.len()
-                        {
+                        // Both empty, get rid of this case.
+                        if left_paths.len() == 0 && right_paths.len() == 0 {
                             return left_paths;
                         }
 
-                        if left_paths.len() == 0
-                            || right_paths.len() > 0 && right_paths.len() < left_paths.len()
-                        {
-                            return right_paths;
-                        }
-
-                        // Rule 2: If the expression is simple enough and we
-                        // can compute the intersection of the ranges, then
-                        // return the intersection.
+                        // Rule 1: Compute intersection if possible.
                         'intersection: {
                             if left_paths.len() > 1 && right_paths.len() > 1 {
                                 break 'intersection;
                             };
 
-                            let (col, left_bounds) = left_paths.iter_mut().next().unwrap();
-                            let Some(right_bounds) = right_paths.get_mut(col) else {
-                                break 'intersection;
+                            let (col, other_side) = {
+                                let left_col = left_paths.iter().next();
+                                let right_col = right_paths.iter().next();
+
+                                if let Some((col, _)) = left_col {
+                                    (*col, &right_paths)
+                                } else {
+                                    (*right_col.unwrap().0, &left_paths)
+                                }
                             };
+
+                            if cancel.contains(col)
+                                && (other_side.is_empty() || other_side.contains_key(col))
+                            {
+                                return HashMap::new();
+                            }
+
+                            if !other_side.contains_key(col) {
+                                break 'intersection;
+                            }
+
+                            let (_, left_bounds) = left_paths.iter_mut().next().unwrap();
+                            let (_, right_bounds) = right_paths.iter_mut().next().unwrap();
 
                             if left_bounds.len() > 1 && right_bounds.len() > 1 {
                                 break 'intersection;
@@ -621,6 +623,7 @@ fn find_index_paths<'e>(
                             // No intersection at all. Something like
                             // id < 5 AND id > 10. Fallback to sequential scan.
                             if intersections.is_empty() {
+                                cancel.insert(col);
                                 return HashMap::new();
                             }
 
@@ -629,6 +632,19 @@ fn find_index_paths<'e>(
                             return left_paths;
                         };
 
+                        // Rule 2: Return the branch with less columns.
+                        if right_paths.len() == 0
+                            || left_paths.len() > 0 && left_paths.len() < right_paths.len()
+                        {
+                            return left_paths;
+                        }
+
+                        if left_paths.len() == 0
+                            || right_paths.len() > 0 && right_paths.len() < left_paths.len()
+                        {
+                            return right_paths;
+                        }
+
                         // Rule 3: If a branch is composed of only exact
                         // matches, prefer that branch over ranges. If both
                         // contain exact matches, prefer the one that contains
@@ -636,6 +652,8 @@ fn find_index_paths<'e>(
                         //
                         // Rule 4: Otherwise prefer anything that contains the
                         // primary key or default to the left branch.
+                        //
+                        // We'll compute both of them at the same time.
                         let left_is_exact_match = left_paths
                             .iter()
                             .all(|(_, bounds)| bounds.iter().copied().all(is_exact_match));
@@ -761,7 +779,7 @@ fn find_index_paths<'e>(
             _ => HashMap::new(),
         },
 
-        Expression::Nested(inner) => find_index_paths(key_col, indexes, inner),
+        Expression::Nested(inner) => find_index_paths(key_col, indexes, inner, cancel),
 
         // Expressions that are not binary will produce nothing.
         _ => HashMap::new(),
@@ -1004,6 +1022,11 @@ fn range_union<'v>(
 }
 
 /// Drop some parts of the `WHERE` clause that we don't need to re-evaluate.
+///
+/// This basically moves expressions from the leaves of the tree upwards.
+/// Something like `id < 5 AND name = 'test' AND id = 1` becomes `name = 'test'`
+/// if we skip the `id` column. In case the entire expression has to be skipped
+/// it will be marked as [`Expression::Wildcard`].
 fn skip_col_conditions(col: &str, expr: &mut Expression) {
     match expr {
         Expression::BinaryOperation {
@@ -1063,9 +1086,12 @@ mod tests {
         }: IndexPath,
     ) {
         let tree = Parser::new(expr).parse_expression().unwrap();
-        let indexes = HashSet::from_iter(indexes.iter().map(|name| String::from(*name)));
+        let indexes = HashSet::from_iter(indexes.iter().copied());
 
-        assert_eq!(find_index_paths(pk, &indexes, &tree), expected);
+        assert_eq!(
+            find_index_paths(pk, &indexes, &tree, &mut HashSet::new()),
+            expected
+        );
     }
 
     #[test]
@@ -1145,6 +1171,20 @@ mod tests {
             pk: "id",
             indexes: &[],
             expr: "id > 10 OR id < 20",
+            expected: HashMap::new(),
+        })
+    }
+
+    /// This tests the "cancel" hash set used by the path finding function.
+    ///
+    /// Left branch returns nothing and marks "id" as canceled. Top level should
+    /// then return nothing.
+    #[test]
+    fn short_circuit_when_uneven_branches_dont_intersect() {
+        assert_find_index_path(IndexPath {
+            pk: "id",
+            indexes: &[],
+            expr: "(id < 10 AND id > 20) AND id > 30",
             expected: HashMap::new(),
         })
     }

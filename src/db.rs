@@ -2535,6 +2535,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn select_where_multiple_key_ranges() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'Mark', 'mark@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (5, 'Carla', 'carla@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (6, 'Mia', 'mia@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (7, 'Jay', 'jay@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (8, 'Lauren', 'lauren@email.com');")?;
+
+        let query = db.exec(
+            "SELECT * FROM users WHERE (id >= 2 AND id <= 3) OR (id > 4 AND id < 7) OR id >= 8;",
+        )?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(2),
+                    Value::String("Bob".into()),
+                    Value::String("bob@email.com".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("David".into()),
+                    Value::String("david@email.com".into()),
+                ],
+                vec![
+                    Value::Number(5),
+                    Value::String("Carla".into()),
+                    Value::String("carla@email.com".into()),
+                ],
+                vec![
+                    Value::Number(6),
+                    Value::String("Mia".into()),
+                    Value::String("mia@email.com".into()),
+                ],
+                vec![
+                    Value::Number(8),
+                    Value::String("Lauren".into()),
+                    Value::String("lauren@email.com".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_where_ranges_cancel() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
+        )?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (1, 'Alex', 'alex@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (2, 'Bob', 'bob@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (3, 'David', 'david@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (4, 'Mark', 'mark@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (5, 'Carla', 'carla@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (6, 'Mia', 'mia@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (7, 'Jay', 'jay@email.com');")?;
+        db.exec("INSERT INTO users(id, name, email) VALUES (8, 'Lauren', 'lauren@email.com');")?;
+
+        let query = db.exec(
+            "SELECT * FROM users WHERE (id >= 2 AND id <= 3) AND (id > 4 AND id < 7) AND id >= 8;",
+        )?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("email", DataType::Varchar(255)),
+            ]),
+            tuples: vec![]
+        });
+
+        Ok(())
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn large_auto_index_scan() -> Result<(), DbError> {

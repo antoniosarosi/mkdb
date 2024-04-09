@@ -160,6 +160,8 @@ impl<F> Plan<F> {
             Self::ExactMatch(exact_match) => exact_match.relation.schema(),
             Self::Sort(sort) => &sort.collection.schema,
             Self::Filter(filter) => return filter.source.schema(),
+
+            Self::LogicalOrScan(or_scan) => return or_scan.scans[0].schema().to_owned(),
             _ => return None,
         };
 
