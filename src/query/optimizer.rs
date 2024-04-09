@@ -182,7 +182,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     // We're only scanning one index. This will open te door for some
     // optimizations.
     let maybe_scan_only_one_index = index_scans
-        .get(0)
+        .first()
         .take_if(|_| index_scans.len() == 1)
         .map(|(col, _)| String::from(*col));
 
@@ -192,11 +192,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
         .is_some_and(|col| col == &table.schema.columns[0].name);
 
     // Flatten all the nesting. Build one sequential list of scan plans.
-    let mut plans: VecDeque<Plan<F>> = index_scans
-        .into_iter()
-        .map(|(_, scan)| scan)
-        .flatten()
-        .collect();
+    let mut plans: VecDeque<Plan<F>> = index_scans.into_iter().flat_map(|(_, scan)| scan).collect();
 
     // If we're not scanning external indexes we're going to emit the entire
     // tuple.
@@ -568,7 +564,7 @@ fn find_index_paths<'e>(
                     // also in the function documentation.
                     BinaryOperator::And => {
                         // Both empty, get rid of this case.
-                        if left_paths.len() == 0 && right_paths.len() == 0 {
+                        if left_paths.is_empty() && right_paths.is_empty() {
                             return left_paths;
                         }
 
@@ -633,14 +629,14 @@ fn find_index_paths<'e>(
                         };
 
                         // Rule 2: Return the branch with less columns.
-                        if right_paths.len() == 0
-                            || left_paths.len() > 0 && left_paths.len() < right_paths.len()
+                        if right_paths.is_empty()
+                            || !left_paths.is_empty() && left_paths.len() < right_paths.len()
                         {
                             return left_paths;
                         }
 
-                        if left_paths.len() == 0
-                            || right_paths.len() > 0 && right_paths.len() < left_paths.len()
+                        if left_paths.is_empty()
+                            || !right_paths.is_empty() && right_paths.len() < left_paths.len()
                         {
                             return right_paths;
                         }
@@ -667,16 +663,12 @@ fn find_index_paths<'e>(
                         // Check all the cases in which we would prefer the
                         // right branch first. This will allow us to write only
                         // 2 return statements.
-                        if right_is_exact_match && right_contains_key_col
-                            || right_is_exact_match && !left_is_exact_match
-                            || right_contains_key_col
-                                && !left_is_exact_match
-                                && !right_contains_key_col
+                        if right_is_exact_match && (!left_is_exact_match || right_contains_key_col)
                         {
                             return right_paths;
                         }
 
-                        return left_paths;
+                        left_paths
                     }
 
                     // Subcase B: OR expression.
@@ -1028,35 +1020,36 @@ fn range_union<'v>(
 /// if we skip the `id` column. In case the entire expression has to be skipped
 /// it will be marked as [`Expression::Wildcard`].
 fn skip_col_conditions(col: &str, expr: &mut Expression) {
-    match expr {
-        Expression::BinaryOperation {
-            left,
-            operator,
-            right,
-        } => match operator {
-            BinaryOperator::And | BinaryOperator::Or => {
-                skip_col_conditions(col, left);
-                skip_col_conditions(col, right);
+    let Expression::BinaryOperation {
+        left,
+        operator,
+        right,
+    } = expr
+    else {
+        return;
+    };
 
-                if **left == Expression::Wildcard {
-                    *expr = mem::replace(right, Expression::Wildcard);
-                } else if **right == Expression::Wildcard {
-                    *expr = mem::replace(left, Expression::Wildcard);
-                }
+    match operator {
+        BinaryOperator::And | BinaryOperator::Or => {
+            skip_col_conditions(col, left);
+            skip_col_conditions(col, right);
+
+            if **left == Expression::Wildcard {
+                *expr = mem::replace(right, Expression::Wildcard);
+            } else if **right == Expression::Wildcard {
+                *expr = mem::replace(left, Expression::Wildcard);
+            }
+        }
+
+        _ => match (&**left, &**right) {
+            (Expression::Identifier(ident), _) | (_, Expression::Identifier(ident))
+                if ident == col =>
+            {
+                *expr = Expression::Wildcard;
             }
 
-            _ => match (&**left, &**right) {
-                (Expression::Identifier(ident), _) | (_, Expression::Identifier(ident))
-                    if ident == col =>
-                {
-                    *expr = Expression::Wildcard;
-                }
-
-                _ => {}
-            },
+            _ => {}
         },
-
-        _ => {}
     }
 }
 

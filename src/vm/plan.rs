@@ -51,7 +51,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem,
     ops::{Bound, Index, RangeBounds},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
@@ -2317,7 +2317,7 @@ impl<F> Display for Sort<F> {
 /// We should use uuid or tempfile or something. This is poor man's random
 /// file name, but since only the client code is allowed to use dependencies
 /// we'll just roll Unix Epoch based files.
-fn tmp_file<F: FileOps>(work_dir: &PathBuf, extension: &str) -> io::Result<(PathBuf, F)> {
+fn tmp_file<F: FileOps>(work_dir: &Path, extension: &str) -> io::Result<(PathBuf, F)> {
     use std::time::SystemTime;
 
     let file_name = SystemTime::now()
