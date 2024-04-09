@@ -254,9 +254,9 @@ fn needs_collection<F>(plan: &Plan<F>) -> bool {
         // KeyScan has a sorter behind it which buffers all the tuples and
         // ExactMatch only returns one tuple.
         Plan::KeyScan(_) | Plan::ExactMatch(_) => false,
-        // Top-level SeqScan and RangeScan will need collection to preserve
-        // their cursor state.
-        Plan::SeqScan(_) | Plan::RangeScan(_) => true,
+        // Top-level SeqScan, RangeScan and LogicalOrScan will need collection
+        // to preserve their cursor state.
+        Plan::SeqScan(_) | Plan::RangeScan(_) | Plan::LogicalOrScan(_) => true,
         _ => unreachable!("needs_collection() called with plan that is not a 'scan' plan"),
     }
 }

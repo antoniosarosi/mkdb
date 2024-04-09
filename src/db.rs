@@ -3203,6 +3203,52 @@ mod tests {
         ])
     }
 
+    // Top level LogicalOrScan plan.
+    #[test]
+    fn delete_where_auto_index_multiple_ranges() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255) UNIQUE, age INT);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (1, 'john@email.com', 18);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (2, 'jane@email.com', 22);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (3, 'some_dude@email.com', 24);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (4, 'another_dude@email.com', 24);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (5, 'dude_five@email.com', 24);")?;
+        db.exec("INSERT INTO users(id, email, age) VALUES (6, 'dude_six@email.com', 24);")?;
+
+        db.exec("DELETE FROM users WHERE id >= 2 AND id <= 3 OR id > 4;")?;
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::unique("email", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("john@email.com".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(4),
+                    Value::String("another_dude@email.com".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        assert_index_contains(&mut db, "users_email_uq_index", &[
+            vec![
+                Value::String("another_dude@email.com".into()),
+                Value::Number(4),
+            ],
+            vec![Value::String("john@email.com".into()), Value::Number(1)],
+        ])
+    }
+
     #[test]
     fn delete_from_multiple_indexes() -> Result<(), DbError> {
         let mut db = init_database()?;
