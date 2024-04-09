@@ -1332,6 +1332,8 @@ pub(crate) struct Collect<F> {
     reader: Option<BufReader<F>>,
     /// Path of the collection file.
     file_path: PathBuf,
+    /// Working directory.
+    work_dir: PathBuf,
 }
 
 impl<F> Display for Collect<F> {
@@ -1386,16 +1388,13 @@ impl<F> From<CollectConfig<F>> for Collect<F> {
             mem_buf_size,
         }: CollectConfig<F>,
     ) -> Self {
-        // TODO: Use uuid or tempfile or something. This is poor man's random
-        // file name.
-        let file_path = work_dir.join(format!("{}.mkdb.query", &*source as *const _ as usize));
-
         Self {
             source,
             mem_buf: TupleBuffer::new(mem_buf_size, schema.clone(), true),
             schema,
             collected: false,
-            file_path,
+            file_path: PathBuf::new(),
+            work_dir,
             file: None,
             reader: None,
         }
@@ -1411,7 +1410,9 @@ impl<F: Seek + Read + Write + FileOps> Collect<F> {
         while let Some(tuple) = self.source.try_next()? {
             if !self.mem_buf.can_fit(&tuple) {
                 if self.file.is_none() {
-                    self.file = Some(F::create(&self.file_path)?);
+                    let (file_path, file) = tmp_file(&self.work_dir, "mkdb.query")?;
+                    self.file_path = file_path;
+                    self.file = Some(file);
                 }
                 self.mem_buf.write_to(self.file.as_mut().unwrap())?;
                 self.mem_buf.clear();
@@ -1531,6 +1532,9 @@ pub(crate) struct SortConfig<F> {
     pub comparator: TuplesComparator,
     pub input_buffers: usize,
 }
+
+/// Default value for [`Sort::input_buffers`].
+pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 
 /// External K-way merge sort implementation.
 ///
@@ -2087,14 +2091,13 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         }
 
         // We need files to sort.
-        // TODO: Again, this project has no dependencies but we could use tempfile.
-        let input_file_name = format!("{}.mkdb.sort", &self.collection as *const _ as usize);
-        self.input_file_path = self.work_dir.join(input_file_name);
-        self.input_file = Some(F::create(&self.input_file_path)?);
+        let (input_file_path, input_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort")?;
+        self.input_file = Some(input_file);
+        self.input_file_path = input_file_path;
 
-        let output_file_name = format!("{}.mkdb.sort", &self.output_buffer as *const _ as usize);
-        self.output_file_path = self.work_dir.join(output_file_name);
-        self.output_file = Some(F::create(&self.output_file_path)?);
+        let (output_file_path, output_file) = tmp_file::<F>(&self.work_dir, "mkdb.sort")?;
+        self.output_file = Some(output_file);
+        self.output_file_path = output_file_path;
 
         // Figure out the page size.
         self.page_size = std::cmp::max(
@@ -2307,6 +2310,26 @@ impl<F> Display for Sort<F> {
 
         write!(f, "Sort ({})", join(sort_col_names, ", "))
     }
+}
+
+/// Creates a temporary file.
+///
+/// We should use uuid or tempfile or something. This is poor man's random
+/// file name, but since only the client code is allowed to use dependencies
+/// we'll just roll Unix Epoch based files.
+fn tmp_file<F: FileOps>(work_dir: &PathBuf, extension: &str) -> io::Result<(PathBuf, F)> {
+    use std::time::SystemTime;
+
+    let file_name = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    let path = work_dir.join(format!("mkdb.tmp/{file_name:x}.{extension}"));
+
+    let file = F::create(&path)?;
+
+    Ok((path, file))
 }
 
 // TODO: All the code in this module is indirectly tested by

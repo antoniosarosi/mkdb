@@ -20,7 +20,7 @@ use crate::{
     vm::{
         plan::{
             Collect, CollectConfig, Delete, Insert, Plan, Project, Sort, SortConfig, SortKeysGen,
-            TuplesComparator, Update, Values,
+            TuplesComparator, Update, Values, DEFAULT_SORT_INPUT_BUFFERS,
         },
         VmDataType,
     },
@@ -117,7 +117,7 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
                         sort_schema,
                         sort_keys_indexes,
                     },
-                    input_buffers: 4,
+                    input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
                 }));
             }
 
@@ -263,7 +263,14 @@ fn needs_collection<F>(plan: &Plan<F>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, io, ops::Bound, path::PathBuf, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::{HashMap, VecDeque},
+        io,
+        ops::Bound,
+        path::PathBuf,
+        rc::Rc,
+    };
 
     use crate::{
         db::{Database, DatabaseContext, IndexMetadata, Relation, Schema, TableMetadata},
@@ -278,7 +285,9 @@ mod tests {
             Cursor, FixedSizeMemCmp,
         },
         vm::plan::{
-            ExactMatch, Filter, KeyScan, Plan, Project, RangeScan, RangeScanConfig, SeqScan,
+            Collect, CollectConfig, ExactMatch, Filter, KeyScan, LogicalOrScan, Plan, Project,
+            RangeScan, RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
+            DEFAULT_SORT_INPUT_BUFFERS,
         },
         DbError,
     };
@@ -293,6 +302,14 @@ mod tests {
     impl DbCtx {
         fn pager(&self) -> Rc<RefCell<Pager<MemBuf>>> {
             Rc::clone(&self.inner.pager)
+        }
+
+        fn work_dir(&self) -> PathBuf {
+            self.inner.work_dir.clone()
+        }
+
+        fn page_size(&self) -> usize {
+            self.inner.pager.borrow().page_size
         }
     }
 
@@ -340,7 +357,10 @@ mod tests {
     }
 
     fn parse_expr(expr: &str) -> Expression {
-        Parser::new(expr).parse_expression().unwrap()
+        let mut expr = Parser::new(expr).parse_expression().unwrap();
+        sql::optimizer::simplify(&mut expr).unwrap();
+
+        expr
     }
 
     #[test]
@@ -515,6 +535,78 @@ mod tests {
     }
 
     #[test]
+    fn generate_range_on_auto_index() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users WHERE id > 5 AND id < 10;")?,
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: false,
+                expr: parse_expr("id > 5 AND id < 10"),
+                pager: db.pager(),
+                range: (
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5))),
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(10))),
+                ),
+                relation: Relation::Table(db.tables["users"].to_owned())
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_range_on_external_index() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"])?;
+
+        let key_only_schema = Schema::new(vec![db.tables["users"].schema.columns[0].clone()]);
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE email <= 'test@test.com';"
+            )?,
+            Plan::KeyScan(KeyScan {
+                comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
+                table: db.tables["users"].to_owned(),
+                pager: db.pager(),
+                source: Box::new(Plan::Sort(Sort::from(SortConfig {
+                    input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
+                    page_size: db.page_size(),
+                    work_dir: db.work_dir(),
+                    comparator: TuplesComparator {
+                        schema: key_only_schema.clone(),
+                        sort_schema: key_only_schema.clone(),
+                        sort_keys_indexes: vec![0],
+                    },
+                    collection: Collect::from(CollectConfig {
+                        mem_buf_size: db.page_size(),
+                        schema: key_only_schema,
+                        work_dir: db.work_dir(),
+                        source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                            emit_table_key_only: true,
+                            expr: parse_expr("email <= 'test@test.com'"),
+                            pager: db.pager(),
+                            range: (
+                                Bound::Unbounded,
+                                Bound::Included(tuple::serialize_key(
+                                    &DataType::Varchar(255),
+                                    &Value::String("test@test.com".into())
+                                )),
+                            ),
+                            relation: Relation::Index(
+                                db.indexes["users_email_uq_index"].to_owned()
+                            )
+                        })))
+                    })
+                })))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn skip_filter_on_simple_range_scan() -> Result<(), DbError> {
         let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
 
@@ -557,6 +649,203 @@ mod tests {
                         Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5)))
                     )
                 })))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn decompose_filter_on_and_scans() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE id < 10 AND name = 'test';"
+            )?,
+            Plan::Filter(Filter {
+                filter: parse_expr("name = 'test'"),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                    emit_table_key_only: false,
+                    pager: db.pager(),
+                    relation: Relation::Table(db.tables["users"].to_owned()),
+                    expr: parse_expr("id < 10"),
+                    range: (
+                        Bound::Unbounded,
+                        Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(10)))
+                    ),
+                }))),
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_to_seq_scan_when_union_of_ranges_is_fully_unbounded() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);"])?;
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE (id > 5 OR id < 10) OR id > 15;"
+            )?,
+            Plan::Filter(Filter {
+                filter: parse_expr("(id > 5 OR id < 10) OR id > 15"),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::SeqScan(SeqScan {
+                    pager: db.pager(),
+                    cursor: Cursor::new(db.tables["users"].root, 0),
+                    table: db.tables["users"].to_owned(),
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_to_seq_scan_when_intersection_of_ranges_cancels_out() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);"])?;
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users WHERE (id < 5 OR id > 10) AND id = 7;"
+            )?,
+            Plan::Filter(Filter {
+                filter: parse_expr("(id < 5 OR id > 10) AND id = 7"),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::SeqScan(SeqScan {
+                    pager: db.pager(),
+                    cursor: Cursor::new(db.tables["users"].root, 0),
+                    table: db.tables["users"].to_owned(),
+                }))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_logical_or_scan_plan() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"])?;
+
+        #[rustfmt::skip]
+        let expr = "
+            (id > 5 AND id <= 10)
+            OR (id >= 50 AND id < 60)
+            OR id = 100
+            OR email < 'b@b.com'
+            OR email > 't@t.com'
+            OR email = 'f@f.com'
+        ";
+
+        let sql = format!("SELECT * FROM users WHERE {expr};");
+
+        let key_only_schema = Schema::new(vec![db.tables["users"].schema.columns[0].clone()]);
+
+        let expected_scans = [
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: true,
+                expr: parse_expr("id > 5 AND id <= 10"),
+                pager: db.pager(),
+                relation: Relation::Table(db.tables["users"].to_owned()),
+                range: (
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(5))),
+                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(10))),
+                ),
+            })),
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: true,
+                expr: parse_expr("id >= 50 AND id < 60"),
+                pager: db.pager(),
+                relation: Relation::Table(db.tables["users"].to_owned()),
+                range: (
+                    Bound::Included(tuple::serialize_key(&DataType::Int, &Value::Number(50))),
+                    Bound::Excluded(tuple::serialize_key(&DataType::Int, &Value::Number(60))),
+                ),
+            })),
+            Plan::ExactMatch(ExactMatch {
+                emit_table_key_only: true,
+                done: false,
+                expr: parse_expr("id = 100"),
+                key: tuple::serialize_key(&DataType::Int, &Value::Number(100)),
+                pager: db.pager(),
+                relation: Relation::Table(db.tables["users"].to_owned()),
+            }),
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: true,
+                expr: parse_expr("email < 'b@b.com'"),
+                pager: db.pager(),
+                relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+                range: (
+                    Bound::Unbounded,
+                    Bound::Excluded(tuple::serialize_key(
+                        &DataType::Varchar(255),
+                        &Value::String("b@b.com".into()),
+                    )),
+                ),
+            })),
+            Plan::ExactMatch(ExactMatch {
+                emit_table_key_only: true,
+                done: false,
+                expr: parse_expr("email = 'f@f.com'"),
+                key: tuple::serialize_key(
+                    &DataType::Varchar(255),
+                    &Value::String("f@f.com".into()),
+                ),
+                pager: db.pager(),
+                relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+            }),
+            Plan::RangeScan(RangeScan::from(RangeScanConfig {
+                emit_table_key_only: true,
+                expr: parse_expr("email > 't@t.com'"),
+                pager: db.pager(),
+                relation: Relation::Index(db.indexes["users_email_uq_index"].to_owned()),
+                range: (
+                    Bound::Excluded(tuple::serialize_key(
+                        &DataType::Varchar(255),
+                        &Value::String("t@t.com".into()),
+                    )),
+                    Bound::Unbounded,
+                ),
+            })),
+        ];
+
+        assert_eq!(
+            gen_plan(&mut db, &sql)?,
+            Plan::Filter(Filter {
+                filter: parse_expr(expr),
+                schema: db.tables["users"].schema.to_owned(),
+                source: Box::new(Plan::KeyScan(KeyScan {
+                    comparator: FixedSizeMemCmp(byte_length_of_integer_type(&DataType::Int)),
+                    table: db.tables["users"].to_owned(),
+                    pager: db.pager(),
+                    source: Box::new(Plan::Sort(Sort::from(SortConfig {
+                        comparator: TuplesComparator {
+                            schema: key_only_schema.clone(),
+                            sort_schema: key_only_schema.clone(),
+                            sort_keys_indexes: vec![0],
+                        },
+                        input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
+                        work_dir: db.work_dir(),
+                        page_size: db.page_size(),
+                        collection: Collect::from(CollectConfig {
+                            mem_buf_size: db.page_size(),
+                            work_dir: db.work_dir(),
+                            schema: key_only_schema,
+                            source: Box::new(Plan::LogicalOrScan(LogicalOrScan {
+                                scans: VecDeque::from(expected_scans)
+                            }))
+                        })
+                    })))
+                }))
             })
         );
 

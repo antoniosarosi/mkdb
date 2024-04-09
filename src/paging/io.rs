@@ -13,7 +13,8 @@ use super::pager::PageNumber;
 pub(crate) trait FileOps {
     /// Creates a file on the filesystem at the given `path`.
     ///
-    /// If the file already exists it should be truncated.
+    /// If the file already exists it should be truncated and if the parent
+    /// directories are not present they will be creates as well.
     fn create(path: impl AsRef<Path>) -> io::Result<Self>
     where
         Self: Sized;
@@ -43,6 +44,10 @@ pub(crate) trait FileOps {
 
 impl FileOps for File {
     fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent)?
+        }
+
         File::options()
             .create(true)
             .truncate(true)

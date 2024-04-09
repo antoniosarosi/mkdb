@@ -103,7 +103,7 @@ fn simplify_all<'e>(
 /// [`Option::take`], which basically moves to value out and leaves [`None`] in
 /// its place. We do the same thing but leave [`Expression::Wildcard`] in a box
 /// that's about to get dropped. Rust borrow checker and stuff ¯\_(ツ)_/¯
-fn simplify(expression: &mut Expression) -> Result<(), SqlError> {
+pub(crate) fn simplify(expression: &mut Expression) -> Result<(), SqlError> {
     match expression {
         Expression::UnaryOperation { expr, .. } => {
             simplify(expr)?;

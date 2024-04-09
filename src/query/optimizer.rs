@@ -22,7 +22,7 @@ use crate::{
     storage::{tuple, Cursor},
     vm::plan::{
         Collect, CollectConfig, ExactMatch, Filter, KeyScan, LogicalOrScan, Plan, RangeScan,
-        RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
+        RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator, DEFAULT_SORT_INPUT_BUFFERS,
     },
 };
 
@@ -254,7 +254,7 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
                 sort_schema: id_only_schema,
                 sort_keys_indexes: vec![0],
             },
-            input_buffers: 4,
+            input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
         }));
     };
 
