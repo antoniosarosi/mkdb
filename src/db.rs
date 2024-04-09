@@ -473,6 +473,13 @@ impl TableMetadata {
             ))
         })
     }
+
+    /// Generates a new schema that contains only the key of this table.
+    ///
+    /// This is useful for some query plans that only need to work with keys.
+    pub fn key_only_schema(&self) -> Schema {
+        Schema::new(vec![self.schema.columns[0].clone()])
+    }
 }
 
 /// API to obtain data about the database itself.

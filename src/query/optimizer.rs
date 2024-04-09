@@ -234,20 +234,18 @@ fn generate_optimized_scan_plan<F: Seek + Read + Write + FileOps>(
     // Add sorter if we're scanning external indexes and we're going to return
     // more than one key.
     if let Plan::RangeScan(_) | Plan::LogicalOrScan(_) = source {
-        let id_only_schema = Schema::new(vec![table.schema.columns[0].clone()]);
-
         source = Plan::Sort(Sort::from(SortConfig {
             page_size,
             work_dir: work_dir.clone(),
             collection: Collect::from(CollectConfig {
                 source: Box::new(source),
                 work_dir,
-                schema: id_only_schema.clone(),
+                schema: table.key_only_schema(),
                 mem_buf_size: page_size,
             }),
             comparator: TuplesComparator {
-                schema: id_only_schema.clone(),
-                sort_schema: id_only_schema,
+                schema: table.key_only_schema(),
+                sort_schema: table.key_only_schema(),
                 sort_keys_indexes: vec![0],
             },
             input_buffers: DEFAULT_SORT_INPUT_BUFFERS,

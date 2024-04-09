@@ -559,7 +559,7 @@ mod tests {
     fn generate_range_on_external_index() -> Result<(), DbError> {
         let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"])?;
 
-        let key_only_schema = Schema::new(vec![db.tables["users"].schema.columns[0].clone()]);
+        let key_only_schema = db.tables["users"].key_only_schema();
 
         assert_eq!(
             gen_plan(
@@ -748,7 +748,7 @@ mod tests {
 
         let sql = format!("SELECT * FROM users WHERE {expr};");
 
-        let key_only_schema = Schema::new(vec![db.tables["users"].schema.columns[0].clone()]);
+        let key_only_schema = db.tables["users"].key_only_schema();
 
         let expected_scans = [
             Plan::RangeScan(RangeScan::from(RangeScanConfig {
