@@ -46,6 +46,12 @@ pub(crate) const ROW_ID_COL: &str = "row_id";
 /// Root page of the meta-table.
 pub(crate) const MKDB_META_ROOT: PageNumber = 0;
 
+/// Max size that can be collected in memory for [`QuerySet`] structures. 1 GiB.
+///
+/// Mostly relevant for network code, as the database can process rows one at
+/// a time but we have no implementation of SQL cursors or anything like that.
+pub(crate) const MAX_QUERY_SET_SIZE: usize = 1 << 30;
+
 /// Rows are uniquely identified by an 8 byte key stored in big endian at the
 /// beginning of each tuple.
 ///
@@ -189,6 +195,8 @@ pub enum DbError {
     Sql(SqlError),
     /// Something in the database file or journal file is corrupted/unexpected.
     Corrupted(String),
+    /// Query too large or out of memory.
+    NoMem,
     /// Uncategorized custom error.
     Other(String),
 }
@@ -200,6 +208,7 @@ impl Display for DbError {
             Self::Parser(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
             Self::Corrupted(message) => f.write_str(message),
+            Self::NoMem => f.write_str("our of memory"),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -843,11 +852,11 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
     /// Highest level API in the entire system.
     ///
     /// Receives a SQL string and executes it, collecting the results in memory.
-    /// Of course this is not ideal for real work because the results might not
-    /// fit in memory, but it's nice for tests or queries that we know for sure
-    /// will return only a few rows.
+    /// Of course this is not ideal for internal work because the results might
+    /// not fit in memory, but it's nice for tests and network code that returns
+    /// one complete packet.
     ///
-    /// Otherwise [`Database::prepare`] must be used instead to obtain an
+    /// Internal APIs must use [`Database::prepare`] instead to obtain an
     /// iterator over the rows produced by the query. That will limit the memory
     /// usage to the size of internal buffers used the [`Plan`] execution engine
     /// at [`vm::plan`].
@@ -856,7 +865,15 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 
         let mut query_set = QuerySet::new(schema, vec![]);
 
+        let mut total_size = 0;
+
         while let Some(tuple) = preapred_staement.try_next()? {
+            total_size += tuple::size_of(&tuple, &query_set.schema);
+            if total_size > MAX_QUERY_SET_SIZE {
+                self.rollback()?;
+                return Err(DbError::NoMem);
+            }
+
             query_set.tuples.push(tuple);
         }
 

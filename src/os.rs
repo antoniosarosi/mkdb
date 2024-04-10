@@ -8,7 +8,8 @@ use std::{
 
 /// Necessary syscalls to get the file system block size.
 pub(crate) trait FileSystemBlockSize {
-    /// Returns the underlying IO device block size or preferred IO buffer size.
+    /// Returns the underlying file system block size or preferred IO buffer
+    /// size.
     fn block_size(path: impl AsRef<Path>) -> io::Result<usize>;
 }
 

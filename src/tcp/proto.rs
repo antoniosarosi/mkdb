@@ -189,9 +189,9 @@ impl fmt::Display for EncodingError {
 /// Response type. See the [`self`] module documentation.
 #[derive(Debug, PartialEq)]
 pub enum Response {
+    QuerySet(QuerySet),
     EmptySet(usize),
     Err(String),
-    QuerySet(QuerySet),
 }
 
 impl From<Result<QuerySet, DbError>> for Response {
