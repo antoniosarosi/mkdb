@@ -70,14 +70,14 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
 
                 // Precompute all the sort keys indexes so that the sorter
                 // doesn't waste time figuring out where the columns are.
-                for (i, expr) in order_by.iter().enumerate() {
+                for expr in &order_by {
                     let index = match expr {
                         Expression::Identifier(col) => table.schema.index_of(col).unwrap(),
 
                         _ => {
                             let index = sort_schema.len();
                             let data_type = resolve_unknown_type(&table.schema, expr)?;
-                            let col = Column::new(&format!("sort_key_{i}"), data_type);
+                            let col = Column::new(&format!("{expr}"), data_type);
                             sort_schema.push(col);
 
                             index

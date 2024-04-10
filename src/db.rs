@@ -5,8 +5,8 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
-    fmt::Display,
+    collections::{HashMap, VecDeque},
+    fmt::{format, Display},
     fs::File,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -903,7 +903,8 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
                 | Statement::Update { .. }
                 | Statement::Delete { .. } => {
                     schema = Schema::new(vec![Column::new("Query Plan", DataType::Varchar(255))]);
-                    Exec::Explain(query::planner::generate_plan(*inner, self)?)
+                    let plan = query::planner::generate_plan(*inner, self)?;
+                    Exec::Explain(format!("{plan}").lines().map(String::from).collect())
                 }
 
                 _ => {
@@ -953,7 +954,7 @@ enum Exec<F> {
     /// Complex statements that require [`Plan`] trees executed by [`vm::plan`].
     Plan(Plan<F>),
     /// Return a string that describes the generated plan.
-    Explain(Plan<F>),
+    Explain(VecDeque<String>),
 }
 
 /// A prepared statement is a statement that has been successfully parsed and
@@ -1049,26 +1050,14 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                 }
             },
 
-            Exec::Explain(plan) => {
-                let mut strings = Vec::new();
-                strings.push(plan.display());
+            Exec::Explain(lines) => {
+                let line = lines.pop_front().map(|line| vec![Value::String(line)]);
 
-                let mut node = &*plan;
-                while let Some(child) = node.child() {
-                    strings.push(child.display());
-                    node = child;
+                if line.is_none() {
+                    self.exec.take();
                 }
 
-                let mut string = String::new();
-                string.push_str(&strings.pop().unwrap());
-                while let Some(next) = strings.pop() {
-                    string.push('\n');
-                    string.push_str(&next);
-                }
-
-                self.exec.take();
-
-                Some(vec![Value::String(string)])
+                line
             }
         };
 

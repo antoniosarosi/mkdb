@@ -186,7 +186,11 @@ impl<F> Plan<F> {
 
     /// String representation of a plan.
     pub fn display(&self) -> String {
-        match self {
+        let prefix = "-> ";
+
+        // TODO: Can be optimized with write! macro and fmt::Write. Too lazy to
+        // change it, doesn't matter for now.
+        let display = match self {
             Self::SeqScan(seq_scan) => format!("{seq_scan}"),
             Self::ExactMatch(exact_match) => format!("{exact_match}"),
             Self::RangeScan(range_scan) => format!("{range_scan}"),
@@ -201,7 +205,28 @@ impl<F> Plan<F> {
             Self::Sort(sort) => format!("{sort}"),
             Self::SortKeysGen(sort_keys_gen) => format!("{sort_keys_gen}"),
             Self::Collect(collect) => format!("{collect}"),
+        };
+
+        format!("{prefix}{display}")
+    }
+}
+
+impl<F> Display for Plan<F> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut plans = vec![self.display()];
+
+        let mut node = self;
+        while let Some(child) = node.child() {
+            plans.push(child.display());
+            node = child;
         }
+
+        writeln!(f, "{}", plans.pop().unwrap())?;
+        while let Some(plan) = plans.pop() {
+            writeln!(f, "{plan}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -665,7 +690,7 @@ impl<F> Display for LogicalOrScan<F> {
         write!(f, "LogicalOrScan")?;
 
         for scan in &self.scans {
-            write!(f, "\n    -> {}", scan.display())?;
+            write!(f, "\n    {}", scan.display())?;
         }
 
         Ok(())

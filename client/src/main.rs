@@ -4,7 +4,7 @@ use std::{
     net::TcpStream,
 };
 
-use mkdb::tcp::proto::Response;
+use mkdb::{tcp::proto::Response, Value};
 use rustyline::{error::ReadlineError, DefaultEditor};
 
 const EXIT_CMD: &str = "quit";
@@ -122,7 +122,14 @@ fn ascii_table(query: mkdb::QuerySet) -> String {
     let rows: Vec<Vec<String>> = query
         .tuples
         .iter()
-        .map(|row| row.iter().map(ToString::to_string).collect())
+        .map(|row| {
+            row.iter()
+                .map(|col| match col {
+                    Value::String(string) => string.to_owned(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
         .collect();
 
     // Find the maximum width for each column.
