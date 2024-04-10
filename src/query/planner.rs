@@ -211,7 +211,11 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             })
         }
 
-        other => todo!("unhandled statement {other}"),
+        other => {
+            return Err(DbError::Other(format!(
+                "statement {other} not yet implemeted or supported"
+            )))
+        }
     })
 }
 

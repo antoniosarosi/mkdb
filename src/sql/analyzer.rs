@@ -265,13 +265,11 @@ fn analyze_assignment(
     }
 
     if let DataType::Varchar(max) = table.schema.columns[index].data_type {
-        let Expression::Value(Value::String(string)) = value else {
-            unreachable!();
+        if let Expression::Value(Value::String(string)) = value {
+            if string.chars().count() > max {
+                return Err(AnalyzerError::ValueTooLong(string.clone(), max).into());
+            }
         };
-
-        if string.chars().count() > max {
-            return Err(AnalyzerError::ValueTooLong(string.clone(), max).into());
-        }
     }
 
     Ok(())
