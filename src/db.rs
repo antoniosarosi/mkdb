@@ -6,7 +6,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    fmt::{format, Display},
+    fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -418,6 +418,7 @@ pub(crate) enum Relation {
 }
 
 impl Relation {
+    /// Root page.
     pub fn root(&self) -> PageNumber {
         match self {
             Self::Index(index) => index.root,
@@ -425,6 +426,7 @@ impl Relation {
         }
     }
 
+    /// Dynamically dispatched key comparator for the BTree.
     pub fn comparator(&self) -> BTreeKeyComparator {
         match self {
             Self::Index(index) => BTreeKeyComparator::from(&index.column.data_type),
@@ -432,6 +434,9 @@ impl Relation {
         }
     }
 
+    /// Schema of the relation.
+    ///
+    /// Indexes will always have 2 columns, the index key and the table key.
     pub fn schema(&self) -> &Schema {
         match self {
             Self::Index(index) => &index.schema,
@@ -439,6 +444,7 @@ impl Relation {
         }
     }
 
+    /// Type of relation as a string.
     pub fn kind(&self) -> &str {
         match self {
             Self::Index(_) => "index",
@@ -446,6 +452,9 @@ impl Relation {
         }
     }
 
+    /// Name of the relation.
+    ///
+    /// This is the name of the index or the table.
     pub fn name(&self) -> &str {
         match self {
             Self::Index(index) => &index.name,
@@ -453,6 +462,10 @@ impl Relation {
         }
     }
 
+    /// Returns the array index where the table key is located in the schema.
+    ///
+    /// For tables the key is always at index 0 while for indexes it's at index
+    /// 1.
     pub fn index_of_table_key(&self) -> usize {
         match self {
             Self::Index(_) => 1,

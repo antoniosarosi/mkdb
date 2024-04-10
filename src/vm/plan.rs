@@ -583,7 +583,10 @@ impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
             return Ok(None);
         };
 
-        debug_assert!(key_only_tuple.len() == 1, "needs key only");
+        debug_assert!(
+            key_only_tuple.len() == 1,
+            "KeyScan received tuple with more than one value: {key_only_tuple:?}"
+        );
 
         let mut pager = self.pager.borrow_mut();
 
@@ -596,7 +599,7 @@ impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
             ))?
             .ok_or_else(|| {
                 DbError::Corrupted(format!(
-                    "attempt to scan key {key_only_tuple:?} that doesn't exist on table {} at root {}",
+                    "KeyScan received key {key_only_tuple:?} that doesn't exist on table {} at root {}",
                     self.table.name, self.table.root,
                 ))
             })?;

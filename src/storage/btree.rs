@@ -2059,6 +2059,9 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
+    /// New uninitialized cursor located at `(page, slot)`.
+    ///
+    /// `page` is assumed to be the root of the subtree.
     pub fn new(page: PageNumber, slot: SlotId) -> Self {
         Self {
             page,
@@ -2069,6 +2072,10 @@ impl Cursor {
         }
     }
 
+    /// New initialized cursor located at `(page, slot)`.
+    ///
+    /// Needs a specific `descent` path to be able to backtrack. Usually the
+    /// path can be obtained using [`BTree::search`].
     pub fn initialized(page: PageNumber, slot: SlotId, descent: Vec<PageNumber>) -> Self {
         Self {
             page,
@@ -2079,6 +2086,7 @@ impl Cursor {
         }
     }
 
+    /// Initialized cursor that won't return any results.
     pub fn done() -> Self {
         Self {
             page: 0,
