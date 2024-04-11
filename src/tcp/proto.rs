@@ -4,11 +4,26 @@
 //!
 //! # Client Side
 //!
-//! Clients can only do 3 actions:
+//! Clients can only perform 3 actions:
 //!
 //! - Open connection.
 //! - Send one raw SQL statement (UTF-8 string) at a time.
 //! - Close connection.
+//!
+//! The SQL statement packet must start with a 4 byte little endian integer
+//! indicating the length in bytes of the SQL UTF-8 string. This header must be
+//! followed by the SQL statement. Visual example:
+//!
+//! ```text
+//!  SQL String
+//!     Len           SQL String
+//! +----------+-----------------------+
+//! | 20 0 0 0 |  SELECT * FROM table; |
+//! +----------+-----------------------+
+//!   4 bytes          20 bytes
+//!    Little           UTF-8
+//!    Endian
+//! ```
 //!
 //! # Server Side
 //!
@@ -138,7 +153,7 @@
 //! +-----------------+---------+---------------------+---------+
 //!  8 byte big endian  4 bytes         5 bytes         4 byte
 //! ```
-use std::{array::TryFromSliceError, fmt, io, mem, num::TryFromIntError, string::FromUtf8Error};
+use std::{array::TryFromSliceError, fmt, num::TryFromIntError, string::FromUtf8Error};
 
 use crate::{
     db::{DbError, QuerySet},

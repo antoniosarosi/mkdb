@@ -3,6 +3,7 @@
 use std::{
     fs::File,
     io::{Read, Write},
+    mem,
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{Mutex, MutexGuard},
@@ -20,7 +21,9 @@ pub fn start(addr: SocketAddr, file: impl AsRef<Path>) -> Result<(), DbError> {
     // We're leaking this because the database will never get dropped, so we
     // won't bother with Arc<T> and stuff. The program will either crash or
     // run forever.
-    let db = &*Box::leak(Box::new(Mutex::new(Database::init(file)?)));
+    let db = &*Box::leak(Box::new(Mutex::new(Database::init(&file)?)));
+    println!("Database file initialized: {}", file.as_ref().display());
+
     let pool = ThreadPool::new(8);
 
     let listener = TcpListener::bind(addr)?;
@@ -47,24 +50,34 @@ fn handle_client(
     let conn = stream.peer_addr().unwrap().to_string();
     println!("Connection from {}", conn);
 
-    let mut statement = String::new();
+    let mut payload_len_buf = [0; mem::size_of::<u32>()];
 
     // Db mutext guard. We'll set it to Some once we acquire it and then set it
     // back to None when the transaction ends.
     let mut guard: Option<MutexGuard<'_, Database<File>>> = None;
 
-    while let Some(result) = stream.bytes().next() {
-        let Ok(byte) = result else {
+    loop {
+        let mut payload_buf = Vec::new();
+
+        let result = stream.read_exact(&mut payload_len_buf).and_then(|_| {
+            let payload_len = u32::from_le_bytes(payload_len_buf);
+            payload_buf.resize(payload_len as usize, 0);
+            stream.read_exact(&mut payload_buf)
+        });
+
+        if result.is_err() {
             break;
-        };
-
-        statement.push(byte.into());
-
-        // Keep reading bytes until we find the SQL statement terminator and we
-        // can actually do something.
-        if byte != b';' {
-            continue;
         }
+
+        let statement = match String::from_utf8(payload_buf) {
+            Ok(string) => string,
+
+            Err(e) => {
+                let packet = proto::serialize(&Response::Err(format!("UTF-8 decode error: {e}")));
+                stream.write_all(&packet.unwrap())?;
+                continue;
+            }
+        };
 
         // We don't have a guard, try to acquire one.
         if guard.is_none() {
@@ -72,10 +85,7 @@ fn handle_client(
                 Ok(guard) => Some(guard),
 
                 Err(_) => {
-                    let packet = proto::serialize(&Response::Err(String::from(
-                        "database is locked by another connection, blocking until we can acquire the lock..."
-                    )));
-                    stream.write_all(&packet.unwrap())?;
+                    println!("Connection {} locked on mutex", conn);
                     Some(db_mutex.lock().unwrap())
                 }
             };
@@ -102,8 +112,6 @@ fn handle_client(
         if !db.transaction_in_progress() {
             drop(guard.take());
         }
-
-        statement = String::new();
     }
 
     println!("Close {conn} connection");

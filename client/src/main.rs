@@ -2,7 +2,7 @@ use std::{
     env,
     io::{Read, Write},
     net::TcpStream,
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 
 use mkdb::{tcp::proto::Response, Value};
@@ -82,6 +82,7 @@ fn main() -> rustyline::Result<()> {
         let packet_transmission = Instant::now();
 
         // Send the statement to the server.
+        stream.write_all(&(sql.len() as u32).to_le_bytes())?;
         stream.write_all(sql.as_bytes())?;
         sql.clear();
 
