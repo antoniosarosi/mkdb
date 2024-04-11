@@ -557,10 +557,11 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
             page
         } else {
             // Otherwise use one of the free pages.
-            let page = self.get_as::<FreePage>(header.last_free_page)?;
-            header.first_free_page = page.header().next;
+            let page = header.first_free_page;
+            let free_page = self.get_as::<FreePage>(page)?;
+            header.first_free_page = free_page.header().next;
             header.free_pages -= 1;
-            header.last_free_page
+            page
         };
 
         if header.first_free_page == 0 {

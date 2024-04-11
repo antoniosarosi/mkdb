@@ -20,7 +20,7 @@ use crate::{
         parser::Parser,
         statement::{Constraint, Create, Drop, Statement, Value},
     },
-    storage::{free_cell, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
+    storage::{free_cell, page::Page, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
 };
 
 /// Executes a SQL statement that doesn't require a query plan.
@@ -173,6 +173,8 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                     &tuple::serialize_key(&schema.columns[0].data_type, &tuple[0]),
                 )?;
             }
+
+            db.context.invalidate(&name);
         }
 
         other => {
@@ -190,7 +192,7 @@ fn alloc_root_page<F: Seek + Read + Write + FileOps>(
     db: &mut Database<F>,
 ) -> io::Result<PageNumber> {
     let mut pager = db.pager.borrow_mut();
-    let root = pager.alloc_disk_page()?;
+    let root = pager.alloc_page::<Page>()?;
 
     Ok(root)
 }

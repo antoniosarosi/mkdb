@@ -2041,7 +2041,16 @@ pub(crate) fn reassemble_payload<F: Seek + Read + Write + FileOps>(
     while overflow_page != 0 {
         let page = pager.get_as::<OverflowPage>(overflow_page)?;
         payload.extend_from_slice(page.payload());
-        overflow_page = page.header().next;
+
+        let next = page.header().next;
+
+        // Ah yes... bugs discovered at 3 AM.
+        debug_assert_ne!(
+            next, overflow_page,
+            "overflow page that points to itself causes infinite loop on reassemble_payload(): {:?}",
+            page.header(),
+        );
+        overflow_page = next;
     }
 
     Ok(Payload::Reassembled(payload.into()))

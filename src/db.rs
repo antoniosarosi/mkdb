@@ -3790,6 +3790,60 @@ mod tests {
     }
 
     #[test]
+    fn reuse_free_pages() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        // Populate pages with some data.
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(1024), email VARCHAR(255) UNIQUE);")?;
+        for i in 1..=5 {
+            db.exec(&format!(
+                "INSERT INTO users (id, name, email) VALUES ({i}, 'User{i}', 'user{i}@email.com');"
+            ))?;
+        }
+
+        // Free everything.
+        db.exec("DROP TABLE users;")?;
+
+        // Now verify that we can reuse free pages.
+        db.exec("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), slug VARCHAR(255) UNIQUE);")?;
+        db.exec("INSERT INTO products (id, name, slug) VALUES (1, 'Test', 'test');")?;
+        db.exec("INSERT INTO products (id, name, slug) VALUES (2, 'Mouse', 'mouse');")?;
+        db.exec("INSERT INTO products (id, name, slug) VALUES (3, 'Keyboard', 'keyboard');")?;
+
+        let query = db.exec("SELECT * FROM products;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("slug", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Test".into()),
+                    Value::String("test".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Mouse".into()),
+                    Value::String("mouse".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Keyboard".into()),
+                    Value::String("keyboard".into()),
+                ],
+            ]
+        });
+
+        Ok(())
+    }
+
+    #[test]
     fn select_invalid_column() -> Result<(), DbError> {
         let mut db = init_database()?;
 

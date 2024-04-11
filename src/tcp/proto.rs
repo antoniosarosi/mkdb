@@ -319,7 +319,7 @@ mod test {
     };
 
     #[test]
-    fn serialize_deserialize_results() -> Result<(), EncodingError> {
+    fn serialize_deserialize_query_set() -> Result<(), EncodingError> {
         let payload = Response::QuerySet(QuerySet::new(
             Schema::new(vec![
                 Column::new("id", DataType::UnsignedBigInt),
