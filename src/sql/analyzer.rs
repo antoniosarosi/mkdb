@@ -179,6 +179,9 @@ pub(crate) fn analyze(
                 if !duplicates.insert(col) {
                     return Err(AnalyzerError::DuplicatedColumn(col.into()).into());
                 }
+                if col == ROW_ID_COL {
+                    return Err(AnalyzerError::RowIdAssignment.into());
+                }
             }
 
             // The user can't manually set the special "row_id" the column.
@@ -514,6 +517,14 @@ mod tests {
             expected: Err(AnalyzerError::MissingColumns.into()),
         })
     }
+    #[test]
+    fn insert_duplicate_columns() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],
+            sql: "INSERT INTO users (id, name, name) VALUES (1, 'John Doe', 'John Doe');",
+            expected: Err(AnalyzerError::DuplicatedColumn("name".into()).into()),
+        })
+    }
 
     #[test]
     fn insert_wrong_data_types() -> Result<(), DbError> {
@@ -574,6 +585,24 @@ mod tests {
             ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],
             sql: "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);",
             expected: Err(DbError::from(AnalyzerError::AlreadyExists(AlreadyExists::Table("users".into())))),
+        })
+    }
+
+    #[test]
+    fn row_id_assignment_on_insert() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT, name VARCHAR(8));"],
+            sql: "INSERT INTO users (row_id, id, name) VALUES (1, 1, 'test');",
+            expected: Err(DbError::from(AnalyzerError::RowIdAssignment)),
+        })
+    }
+
+    #[test]
+    fn row_id_assignment_on_update() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT, name VARCHAR(8));"],
+            sql: "UPDATE users SET row_id = 5 WHERE id = 10;",
+            expected: Err(DbError::from(AnalyzerError::RowIdAssignment)),
         })
     }
 
