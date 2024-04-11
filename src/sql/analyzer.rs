@@ -10,7 +10,7 @@ use std::{collections::HashSet, fmt::Display};
 
 use super::statement::{Drop, UnaryOperator};
 use crate::{
-    db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, ROW_ID_COL},
+    db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, MKDB_META, ROW_ID_COL},
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
     storage::tuple,
     vm::{TypeError, VmDataType},
@@ -36,6 +36,8 @@ pub(crate) enum AnalyzerError {
     IntegerOutOfRange(i128, DataType),
     /// Attempt to change the special Row ID column manually.
     RowIdAssignment,
+    /// Attempt to modify the internal [`MKDB_META`] table.
+    MkdbMetaModification,
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,6 +74,10 @@ impl Display for AnalyzerError {
             Self::RowIdAssignment => write!(
                 f,
                 "'{ROW_ID_COL}' is reserved for internal use, it cannot be manually changed or created"
+            ),
+            Self::MkdbMetaModification => write!(
+                f,
+                "table '{MKDB_META}' is reserved for internal use, it cannot be manually changed or created"
             ),
         }
     }
@@ -152,6 +158,10 @@ pub(crate) fn analyze(
         } => {
             let metadata = ctx.table_metadata(into)?;
 
+            if into == MKDB_META {
+                return Err(AnalyzerError::MkdbMetaModification.into());
+            }
+
             let mut columns = columns.as_slice();
 
             // In case the user didn't specify any columns.
@@ -223,6 +233,11 @@ pub(crate) fn analyze(
 
         Statement::Delete { from, r#where } => {
             let metadata = ctx.table_metadata(from)?;
+
+            if from == MKDB_META {
+                return Err(AnalyzerError::MkdbMetaModification.into());
+            }
+
             analyze_where(&metadata.schema, r#where)?;
         }
 
@@ -232,6 +247,10 @@ pub(crate) fn analyze(
             r#where,
         } => {
             let metadata = ctx.table_metadata(table)?;
+
+            if table == MKDB_META {
+                return Err(AnalyzerError::MkdbMetaModification.into());
+            }
 
             for col in columns {
                 analyze_assignment(metadata, &col.identifier, &col.value, true)?;
