@@ -2,6 +2,7 @@ use std::{
     env,
     io::{Read, Write},
     net::TcpStream,
+    time::{Instant, SystemTime},
 };
 
 use mkdb::{tcp::proto::Response, Value};
@@ -18,14 +19,14 @@ fn main() -> rustyline::Result<()> {
         .parse::<u16>()
         .expect("port parse error");
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    println!("Welcome to the MKDB shell. Type SQL statements below or '{EXIT_CMD}' to exit the program.\n");
-
     let mut rl = DefaultEditor::new()?;
-    #[cfg(feature = "with-file-history")]
-    if rl.load_history("history.txt").is_err() {
+    if rl.load_history("history.mkdb").is_err() {
         println!("No previous history.");
     }
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    println!("Connected to {}.", stream.peer_addr()?);
+    println!("Welcome to the MKDB shell. Type SQL statements below or '{EXIT_CMD}' to exit the program.\n");
 
     let mut sql = String::new();
     let mut payload = Vec::new();
@@ -78,6 +79,8 @@ fn main() -> rustyline::Result<()> {
             continue;
         }
 
+        let packet_transmission = Instant::now();
+
         // Send the statement to the server.
         stream.write_all(sql.as_bytes())?;
         sql.clear();
@@ -93,23 +96,34 @@ fn main() -> rustyline::Result<()> {
 
         match mkdb::tcp::proto::deserialize(&payload) {
             Ok(response) => match response {
-                Response::EmptySet(affected_rows) => {
-                    println!("Query OK, {affected_rows} rows affected")
-                }
                 Response::Err(e) => println!("{e}"),
-                Response::QuerySet(collection) => println!("{}", ascii_table(collection)),
+
+                Response::EmptySet(affected_rows) => {
+                    println!(
+                        "Query OK, {affected_rows} rows affected ({:.2?})",
+                        packet_transmission.elapsed(),
+                    )
+                }
+
+                Response::QuerySet(collection) => {
+                    println!(
+                        "{}\n{} rows ({:.2?})",
+                        ascii_table(&collection),
+                        collection.tuples.len(),
+                        packet_transmission.elapsed(),
+                    );
+                }
             },
 
             Err(e) => println!("decode error: {e}"),
         };
     }
 
-    #[cfg(feature = "with-file-history")]
-    rl.save_history("history.txt");
+    rl.save_history("history.mkdb")?;
     Ok(())
 }
 
-fn ascii_table(query: mkdb::QuerySet) -> String {
+fn ascii_table(query: &mkdb::QuerySet) -> String {
     // Initialize width of each column to the length of the table headers.
     let mut widths: Vec<usize> = query
         .schema

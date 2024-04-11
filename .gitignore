@@ -1,1 +1,4 @@
 /target
+*.db
+*.mkdb
+/mkdb.tmp
