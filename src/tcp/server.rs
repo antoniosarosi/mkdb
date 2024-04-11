@@ -122,6 +122,7 @@ fn handle_client(
     // progress we must rollback because the client didn't commit.
     if let Some(mut db) = guard {
         if db.active_transaction() {
+            println!("Connection {conn} closed in the middle of an active transaction. Running automatic ROLLBACK.");
             db.rollback()?;
         }
     }
