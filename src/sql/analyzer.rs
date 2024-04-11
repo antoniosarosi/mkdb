@@ -539,6 +539,18 @@ mod tests {
     }
 
     #[test]
+    fn insert_wrong_data_types_without_specifying_columns() -> Result<(), DbError> {
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],
+            sql: "INSERT INTO users VALUES ('string', 5, 6);",
+            expected: Err(DbError::from(TypeError::ExpectedType {
+                expected: VmDataType::Number,
+                found: Expression::Value(Value::String("string".into()))
+            })),
+        })
+    }
+
+    #[test]
     fn select_where_invalid_expression() -> Result<(), DbError> {
         assert_analyze(Analyze {
             ctx: &["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255) UNIQUE);"],

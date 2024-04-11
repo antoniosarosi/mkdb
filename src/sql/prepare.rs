@@ -156,4 +156,13 @@ mod tests {
             prepared: "INSERT INTO users(row_id, id, name, age, email) VALUES (1, 1, 'John Doe', 20, 'john@mail.com');"
         })
     }
+
+    #[test]
+    fn prepare_insert_statement_with_optional_columns() -> Result<(), DbError> {
+        assert_prep(Prep {
+            setup: &["CREATE TABLE users (id INT, name VARCHAR(255), age INT UNSIGNED, email VARCHAR(255));"],
+            raw_stmt: "INSERT INTO users VALUES (1, 'John Doe', 20, 'john@mail.com');",
+            prepared: "INSERT INTO users(row_id, id, name, age, email) VALUES (1, 1, 'John Doe', 20, 'john@mail.com');"
+        })
+    }
 }
