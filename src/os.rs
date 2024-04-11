@@ -182,7 +182,7 @@ mod windows {
         Win32::{Foundation::MAX_PATH, Storage::FileSystem},
     };
 
-    use super::{DiskBlockSize, Fs, Open, OpenOptions};
+    use super::{FileSystemBlockSize, Fs, Open, OpenOptions};
 
     impl FileSystemBlockSize for Fs {
         fn block_size(path: impl AsRef<Path>) -> io::Result<usize> {

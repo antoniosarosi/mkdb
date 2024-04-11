@@ -630,9 +630,21 @@ impl Cell {
         // Add padding.
         payload.resize(size as _, 0);
 
-        let mut buf = BufferWithHeader::<CellHeader>::new((size + CELL_HEADER_SIZE) as usize);
+        // SAFETY: Read below, basically CELL_ALIGNMENT makes this "safe".
+        let mut buf = unsafe {
+            let layout =
+                Layout::from_size_align((size + CELL_HEADER_SIZE) as usize, CELL_ALIGNMENT)
+                    .unwrap();
 
-        // Buffer with header sets everything to 0, we only need to change this.
+            let ptr = alloc::Global
+                .allocate_zeroed(layout)
+                .expect("Cell allocatio error");
+
+            BufferWithHeader::<CellHeader>::from_non_null(ptr)
+        };
+
+        // Everything is set to 0 because we used allocate_zeroed, we only need
+        // to change this.
         buf.header_mut().size = size;
 
         // TODO: The public API requires a [`Vec`] as payload but that's not
@@ -657,10 +669,11 @@ impl Cell {
         // bounds. Everything else is known at compile time.
         //
         // The other tricky part is that we have to create a "fake" slice and
-        // then cast it to our DST. And then the other tricky part is that this
-        // code is probably buggy because we're boxing our DST pointer, and in
-        // order to do so "safely" we should meet the [`Box`] memory layout
-        // requirements. See here:
+        // then cast it to our DST. And then the other tricky part is that we
+        // must meet the [`Box`] memory layout requirements because we're
+        // boxing our DST pointer, so we better align those bytes if we want
+        // the deallocation to be "safe" when [`Drop`] is called on the [`Box`]
+        // instance. See here:
         //
         // <https://doc.rust-lang.org/std/boxed/index.html#memory-layout>
         //
@@ -668,15 +681,12 @@ impl Cell {
         // we can't do that because we don't have the value yet, we need to
         // build it first.
         //
-        // Miri doesn't complain about any of this and the allocator doesn't
-        // panic or seg fault, so we probably do meet the layout requirements.
-        // The alignment is not a problem because [`BufferWithHeader`] forces
-        // allocations to be 8-aligned (the alignment of the cell header, and in
-        // turn the alignment of [`Cell`]), and then the size of the allocation
-        // shouldn't be a problem either because we're adding padding manually.
-        // So when [`Box`] calls [`Layout::for_value`] to drop the allocation it
-        // probably obtains the exact same layout that [`BufferWithHeader`] uses
-        // for allocations.
+        // The alignment is not a problem because we use [`CELL_ALIGNMENT`] when
+        // allocating the pointer and then the size of the allocation shouldn't
+        // be a problem either because we're adding padding manually. So when
+        // [`Box`] calls [`Layout::for_value`] to drop the allocation it
+        // obtains the exact same layout that we used above to allocate the
+        // pointer originally.
         //
         // We could implement our own smart pointer that knows the exact layout
         // needed to deallocate and use that instead of [`Box`], but we're lazy
