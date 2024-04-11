@@ -626,7 +626,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
     /// it and then write it back instead of accessing it through the cache
     /// system, which requires making sure that the borrow rules are met and
     /// other details.
-    fn read_header(&mut self) -> io::Result<DbHeader> {
+    pub(crate) fn read_header(&mut self) -> io::Result<DbHeader> {
         self.get_as::<PageZero>(0).map(PageZero::header).copied()
     }
 

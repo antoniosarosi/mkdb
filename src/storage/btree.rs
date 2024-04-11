@@ -667,7 +667,7 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
             Ok(index) => {
                 new_cell.header.left_child = node.cell(index).header.left_child;
                 let old_cell = node.replace(index, new_cell);
-                self.free_cell(old_cell)?;
+                free_cell(self.pager, old_cell)?;
             }
             // Key not found, insert new entry.
             Err(index) => node.insert(index, new_cell),
@@ -1917,26 +1917,6 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
         Ok(cell)
     }
 
-    /// Frees the pages occupied by the given `cell`.
-    ///
-    /// Pretty much a no-op if the cell is not "overflow".
-    fn free_cell(&mut self, cell: Box<Cell>) -> io::Result<()> {
-        if !cell.header.is_overflow {
-            return Ok(());
-        }
-
-        let mut overflow_page = cell.overflow_page();
-
-        while overflow_page != 0 {
-            let unused_page = self.pager.get_as::<OverflowPage>(overflow_page)?;
-            let next = unused_page.header().next;
-            self.pager.free_page(overflow_page)?;
-            overflow_page = next;
-        }
-
-        Ok(())
-    }
-
     #[cfg(debug_assertions)]
     fn read_into_mem(
         &mut self,
@@ -2008,6 +1988,33 @@ impl<'p, F: Seek + Read + Write + FileOps, C: BytesCmp> BTree<'p, F, C> {
 
         Ok(string)
     }
+}
+
+/// Frees the pages occupied by the given `cell`.
+///
+/// Pretty much a no-op if the cell is not "overflow".
+///
+/// This function and [`reassemble_payload`] are declared outside of the
+/// [`BTree`] struct because they are reused in other modules like
+/// [`crate::vm::statement`] or [`crate::vm::plan`].
+pub(crate) fn free_cell<F: Seek + Read + Write + FileOps>(
+    pager: &mut Pager<F>,
+    cell: Box<Cell>,
+) -> io::Result<()> {
+    if !cell.header.is_overflow {
+        return Ok(());
+    }
+
+    let mut overflow_page = cell.overflow_page();
+
+    while overflow_page != 0 {
+        let unused_page = pager.get_as::<OverflowPage>(overflow_page)?;
+        let next = unused_page.header().next;
+        pager.free_page(overflow_page)?;
+        overflow_page = next;
+    }
+
+    Ok(())
 }
 
 /// Joins a split payload back into one contiguous memory region.

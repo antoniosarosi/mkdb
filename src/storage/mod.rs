@@ -8,6 +8,6 @@ pub(crate) mod page;
 pub(crate) mod tuple;
 
 pub(crate) use btree::{
-    reassemble_payload, BTree, BTreeKeyComparator, BytesCmp, Cursor, FixedSizeMemCmp, StringCmp,
-    DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
+    free_cell, reassemble_payload, BTree, BTreeKeyComparator, BytesCmp, Cursor, FixedSizeMemCmp,
+    StringCmp, DEFAULT_BALANCE_SIBLINGS_PER_SIDE,
 };

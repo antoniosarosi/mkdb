@@ -906,6 +906,7 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 
         let exec = match statement {
             Statement::Create(_)
+            | Statement::Drop(_)
             | Statement::StartTransaction
             | Statement::Commit
             | Statement::Rollback => Exec::Statement(statement),
@@ -1040,7 +1041,7 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                     Statement::Rollback => {
                         self.db.rollback()?;
                     }
-                    Statement::Create(_) => {
+                    Statement::Create(_) | Statement::Drop(_) => {
                         if let Err(e) = vm::statement::exec(statement, self.db) {
                             self.db.rollback()?;
                             return Err(e);
@@ -3687,6 +3688,105 @@ mod tests {
             vec![Value::String("john@email.com".into()), Value::Number(100)],
             vec![Value::String("some@dude.com".into()), Value::Number(300)],
         ])
+    }
+
+    #[test]
+    fn drop_table() -> Result<(), DbError> {
+        let page_size = 1024;
+
+        let mut db = init_database_with(DbConf {
+            page_size,
+            cache_size: page_size,
+        })?;
+
+        let create_products_table = "CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), slug VARCHAR(255) UNIQUE);";
+        db.exec(create_products_table)?;
+
+        // Add some stuff to the products table to verify that it is not tampered with.
+        db.exec("INSERT INTO products (id, name, slug) VALUES (1, 'Test', 'test');")?;
+        db.exec("INSERT INTO products (id, name, slug) VALUES (2, 'Mouse', 'mouse');")?;
+        db.exec("INSERT INTO products (id, name, slug) VALUES (3, 'Keyboard', 'keyboard');")?;
+
+        let expected_used_pages = db.pager.borrow_mut().read_header()?.total_pages;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(1024), email VARCHAR(255) UNIQUE);")?;
+        db.exec("CREATE UNIQUE INDEX name_idx ON users(name);")?;
+
+        // 4 large entries with overflow pages for each page. 10 BTree pages total.
+        for i in 1..=(4 * 10) {
+            let name = format!("User{i}{}", String::from("_").repeat(page_size / 4));
+            db.exec(&format!(
+                "INSERT INTO users (id, name, email) VALUES ({i}, '{name}', 'user{i}@email.com');"
+            ))?;
+        }
+
+        db.exec("DROP TABLE users;")?;
+
+        let mkdb_meta_query = db.exec("SELECT * FROM mkdb_meta;")?;
+        let products_query = db.exec("SELECT * FROM products;")?;
+
+        let db_header = db.pager.borrow_mut().read_header()?;
+        assert_eq!(
+            expected_used_pages,
+            db_header.total_pages - db_header.free_pages
+        );
+
+        assert_eq!(
+            mkdb_meta_query,
+            QuerySet::new(mkdb_meta_schema(), vec![
+                vec![
+                    Value::String("table".into()),
+                    Value::String("products".into()),
+                    Value::Number(1),
+                    Value::String("products".into()),
+                    Value::String(
+                        Parser::new(create_products_table)
+                            .parse_statement()?
+                            .to_string()
+                    )
+                ],
+                vec![
+                    Value::String("index".into()),
+                    Value::String("products_slug_uq_index".into()),
+                    Value::Number(2),
+                    Value::String("products".into()),
+                    Value::String(
+                        Parser::new(
+                            "CREATE UNIQUE INDEX products_slug_uq_index ON products(slug);"
+                        )
+                        .parse_statement()?
+                        .to_string()
+                    )
+                ]
+            ])
+        );
+
+        assert_eq!(products_query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::unique("slug", DataType::Varchar(255)),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("Test".into()),
+                    Value::String("test".into()),
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("Mouse".into()),
+                    Value::String("mouse".into()),
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Keyboard".into()),
+                    Value::String("keyboard".into()),
+                ],
+            ]
+        });
+
+        Ok(())
     }
 
     #[test]

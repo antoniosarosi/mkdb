@@ -1302,7 +1302,7 @@ impl Page {
     }
 
     /// Iterates over all the children pointers in this page.
-    pub fn iter_children(&self) -> impl Iterator<Item = PageNumber> + '_ {
+    pub fn iter_children(&self) -> impl DoubleEndedIterator<Item = PageNumber> + '_ {
         let len = if self.is_leaf() { 0 } else { self.len() + 1 };
 
         (0..len).map(|i| self.child(i))
@@ -1875,7 +1875,7 @@ impl OverflowPage {
 ///
 /// This is located at the beginning of the DB file and is used by the pager to
 /// keep track of free pages and other metadata.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C, align(8))]
 pub(crate) struct DbHeader {
     /// Magic number at the beginning of the file.

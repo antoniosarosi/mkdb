@@ -9,15 +9,18 @@ use std::{
     rc::Rc,
 };
 
-use super::plan::{Plan, SeqScan};
+use super::plan::{Collect, CollectConfig, Filter, Plan, SeqScan};
 use crate::{
     db::{
         has_btree_key, mkdb_meta_schema, Database, DatabaseContext, DbError, IndexMetadata, RowId,
         Schema, SqlError, MKDB_META, MKDB_META_ROOT,
     },
     paging::{io::FileOps, pager::PageNumber},
-    sql::statement::{Constraint, Create, Statement, Value},
-    storage::{tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
+    sql::{
+        parser::Parser,
+        statement::{Constraint, Create, Drop, Statement, Value},
+    },
+    storage::{free_cell, tuple, BTree, BytesCmp, Cursor, FixedSizeMemCmp},
 };
 
 /// Executes a SQL statement that doesn't require a query plan.
@@ -146,7 +149,37 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
             db.context.invalidate(&table);
         }
 
-        other => unreachable!("unhandled SQL statement: {other}"),
+        Statement::Drop(Drop::Table(name)) => {
+            let comparator = db.table_metadata(MKDB_META)?.comparator()?;
+
+            let mut plan = collect_from_mkdb_meta_where(db, &format!("table_name = '{name}'"))?;
+
+            let schema = plan.schema().ok_or(DbError::Corrupted(format!(
+                "could not obtain schema of {MKDB_META} table"
+            )))?;
+
+            while let Some(tuple) = plan.try_next()? {
+                let Some(Value::Number(root)) =
+                    schema.index_of("root").and_then(|index| tuple.get(index))
+                else {
+                    return Err(DbError::Corrupted(format!(
+                        "could not read root of table {name}"
+                    )));
+                };
+
+                free_btree(db, *root as PageNumber)?;
+
+                BTree::new(&mut db.pager.borrow_mut(), MKDB_META_ROOT, comparator).remove(
+                    &tuple::serialize_key(&schema.columns[0].data_type, &tuple[0]),
+                )?;
+            }
+        }
+
+        other => {
+            return Err(DbError::Other(format!(
+                "statement is not yet implemented or supported: {other}"
+            )))
+        }
     };
 
     Ok(())
@@ -160,6 +193,45 @@ fn alloc_root_page<F: Seek + Read + Write + FileOps>(
     let root = pager.alloc_disk_page()?;
 
     Ok(root)
+}
+
+/// Drops an entire BTree from disk.
+fn free_btree<F: Seek + Read + Write + FileOps>(
+    db: &mut Database<F>,
+    root: PageNumber,
+) -> io::Result<()> {
+    let mut stack = vec![root];
+    let mut pager = db.pager.borrow_mut();
+
+    // Depth first search. Once we visited a page we no longer need it for
+    // anythig, so we can safely drop it from disk. We reverse the children to
+    // imporve sequential IO. Won't be really sequential due to how the BTree
+    // is build and especially due to overflow pages but still, better than
+    // going straight to the end of the file and then backwards.
+    //
+    // TODO: Overall IO performance can be improved by writing a little plan
+    // type that returns all the pages including overflow pages one by one and
+    // using the Sort plan to sort them sequentially. This won't improve the
+    // "DROP TABLE" performance but it will allow the pager to build a huge
+    // free list of sequential pages. Not difficult to do at all, but laziness
+    // has won this time.
+    while let Some(page_num) = stack.pop() {
+        let page = pager.get_mut(page_num)?;
+        stack.extend(page.iter_children().rev());
+
+        // This part here hurts IO performance the most because it could
+        // potentially be random IO. Maybe there's a way to free only the first
+        // overflow page, since that page already links to the rest of them.
+        // However the last overflwo page doesn't link to anything and we have
+        // to link it to the free list somehow. Probably a circular list or
+        // something like that would do.
+        let mut cells = page.drain(..).collect::<Vec<_>>().into_iter();
+        cells.try_for_each(|cell| free_cell(&mut pager, cell))?;
+
+        pager.free_page(page_num)?;
+    }
+
+    Ok(())
 }
 
 /// Inserts data into the [`MKDB_META`] table.
@@ -212,4 +284,33 @@ fn insert_into_mkdb_meta<F: Seek + Read + Write + FileOps>(
     btree.insert(tuple::serialize(&schema, &values))?;
 
     Ok(())
+}
+
+/// Manual selection from meta table without parsing overhead and mutual
+/// recursion.
+///
+/// Results are automatically collected to allow update/delete operations.
+fn collect_from_mkdb_meta_where<F: Seek + Read + Write + FileOps>(
+    db: &mut Database<F>,
+    filter: &str,
+) -> Result<Plan<F>, DbError> {
+    let work_dir = db.work_dir.clone();
+    let page_size = db.pager.borrow_mut().page_size;
+
+    let table = db.table_metadata(MKDB_META)?;
+
+    Ok(Plan::Collect(Collect::from(CollectConfig {
+        work_dir,
+        mem_buf_size: page_size,
+        schema: table.schema.clone(),
+        source: Box::new(Plan::Filter(Filter {
+            filter: Parser::new(filter).parse_expression()?,
+            schema: table.schema.clone(),
+            source: Box::new(Plan::SeqScan(SeqScan {
+                table: table.to_owned(),
+                pager: Rc::clone(&db.pager),
+                cursor: Cursor::new(MKDB_META_ROOT, 0),
+            })),
+        })),
+    })))
 }

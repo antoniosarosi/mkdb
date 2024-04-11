@@ -159,6 +159,7 @@ impl<F> Plan<F> {
             Self::RangeScan(range_scan) => &range_scan.schema,
             Self::ExactMatch(exact_match) => exact_match.relation.schema(),
             Self::Sort(sort) => &sort.collection.schema,
+            Self::Collect(collect) => &collect.schema,
             Self::Filter(filter) => return filter.source.schema(),
 
             Self::LogicalOrScan(or_scan) => return or_scan.scans[0].schema().to_owned(),
