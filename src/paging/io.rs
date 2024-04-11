@@ -141,7 +141,7 @@ impl FileOps for MemBuf {
 pub(super) struct BlockIo<I> {
     /// Underlying IO resource handle.
     io: I,
-    /// Hardware block size or prefered IO read/write buffer size.
+    /// Hardware / file system block size or prefered IO read/write buffer size.
     pub block_size: usize,
     /// High level page size.
     pub page_size: usize,

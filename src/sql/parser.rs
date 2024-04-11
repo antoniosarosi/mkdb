@@ -239,7 +239,7 @@ impl<'i> Parser<'i> {
             Keyword::Insert => {
                 self.expect_keyword(Keyword::Into)?;
                 let into = self.parse_identifier()?;
-                let columns = self.parse_identifier_list()?;
+                let columns = self.parse_optional_identifier_list()?;
 
                 self.expect_keyword(Keyword::Values)?;
                 let values = self.parse_comma_separated(Self::parse_expression, true)?;
@@ -529,6 +529,15 @@ impl<'i> Parser<'i> {
     /// Expects a list of identifiers, not complete expressions.
     fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
         self.parse_comma_separated(Self::parse_identifier, true)
+    }
+
+    /// Expects a list of identifiers, not complete expressions.
+    fn parse_optional_identifier_list(&mut self) -> ParseResult<Vec<String>> {
+        if let Some(Ok(Token::LeftParen)) = self.peek_token() {
+            Ok(self.parse_identifier_list()?)
+        } else {
+            Ok(vec![])
+        }
     }
 
     /// Parses the entire `WHERE` clause if the next token is [`Keyword::Where`].
@@ -1078,6 +1087,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_insert_into_optional_columns() {
+        let sql = r#"INSERT INTO users VALUES (1, "Test", "test@test.com");"#;
+
+        assert_eq!(
+            Parser::new(sql).parse_statement(),
+            Ok(Statement::Insert {
+                into: "users".into(),
+                columns: vec![],
+                values: vec![
+                    Expression::Value(Value::Number(1)),
+                    Expression::Value(Value::String("Test".into())),
+                    Expression::Value(Value::String("test@test.com".into())),
+                ]
+            })
+        );
+    }
+
+    #[test]
     fn parse_drop_database() {
         let sql = "DROP DATABASE test;";
 
@@ -1480,16 +1507,16 @@ mod tests {
 
     #[test]
     fn required_parenthesis() {
-        let sql = "INSERT INTO test column VALUES 2;";
+        let sql = "CREATE TABLE users id INT PRIMARY KEY, name VARCHAR(255);";
 
         assert_eq!(
             Parser::new(sql).parse_statement(),
             Err(ParserError {
                 kind: ErrorKind::Expected {
                     expected: Token::LeftParen,
-                    found: Token::Identifier("column".into())
+                    found: Token::Identifier("id".into())
                 },
-                location: Location { line: 1, col: 18 }
+                location: Location { line: 1, col: 20 }
             })
         )
     }

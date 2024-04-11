@@ -397,10 +397,15 @@ impl Display for Statement {
                 columns,
                 values,
             } => {
+                let columns = if columns.is_empty() {
+                    String::from(" ")
+                } else {
+                    format!(" ({}) ", join(columns, ", "))
+                };
+
                 write!(
                     f,
-                    "INSERT INTO {into} ({}) VALUES ({})",
-                    join(columns, ", "),
+                    "INSERT INTO {into}{columns}VALUES ({})",
                     join(values, ", ")
                 )?;
             }

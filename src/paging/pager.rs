@@ -54,7 +54,7 @@ const DEFAULT_MAX_JOURNAL_BUFFERED_PAGES: usize = 10;
 pub(crate) struct Pager<F> {
     /// Wrapped IO/file handle/descriptor.
     file: BlockIo<F>,
-    /// Hardware block size or prefered IO read/write buffer size.
+    /// Hardware/ file system block size or prefered IO read/write buffer size.
     pub block_size: usize,
     /// High level page size.
     pub page_size: usize,

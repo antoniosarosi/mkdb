@@ -265,6 +265,8 @@ fn needs_collection<F>(plan: &Plan<F>) -> bool {
     }
 }
 
+// TODO: Tests here are kinda verbose, there's probably some pattern that can
+// help reduce clutter.
 #[cfg(test)]
 mod tests {
     use std::{

@@ -6,7 +6,7 @@
 //! overflow above [`i128::MAX`] (see [`Value`] for details), division by zero
 //! or similar edge cases.
 
-use std::fmt::Display;
+use std::{collections::HashSet, fmt::Display};
 
 use crate::{
     db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, ROW_ID_COL},
@@ -22,6 +22,8 @@ pub(crate) enum AnalyzerError {
     ColumnValueCountMismatch,
     /// Insert statements that don't specify all the columns in the table.
     MissingColumns,
+    /// Column specified more than once.
+    DuplicatedColumn(String),
     /// Multiple primary keys defined for the same table.
     MultiplePrimaryKeys,
     /// Table or index already exists.
@@ -55,6 +57,7 @@ impl Display for AnalyzerError {
             Self::MissingColumns => {
                 f.write_str("default values are not supported, all columns must be specified")
             }
+            Self::DuplicatedColumn(col) => write!(f, "column '{col}' specified more than once"),
             Self::AlreadyExists(already_exists) => write!(f, "{already_exists}"),
             Self::ValueTooLong(string, max) => {
                 write!(f, "string '{string}' too long for type VARCHAR({max})")
@@ -91,8 +94,13 @@ pub(crate) fn analyze(
             }
 
             let mut found_primary_key = false;
+            let mut duplicates = HashSet::new();
 
             for col in columns {
+                if !duplicates.insert(&col.name) {
+                    return Err(AnalyzerError::DuplicatedColumn(col.name.to_owned()).into());
+                }
+
                 if col.name == ROW_ID_COL {
                     return Err(AnalyzerError::RowIdAssignment.into());
                 }
@@ -137,13 +145,32 @@ pub(crate) fn analyze(
         } => {
             let metadata = ctx.table_metadata(into)?;
 
+            let mut columns = columns.as_slice();
+
+            // In case the user didn't specify any columns.
+            let schema_column_names_copy: Vec<String>;
+
+            if columns.is_empty() {
+                schema_column_names_copy = metadata.schema.column_identifiers();
+                columns = schema_column_names_copy.as_slice();
+                // User can't set row ID manually so remove it.
+                if columns[0] == ROW_ID_COL {
+                    columns = &schema_column_names_copy[1..];
+                }
+            }
+
             if columns.len() != values.len() {
                 return Err(AnalyzerError::ColumnValueCountMismatch.into());
             }
 
+            let mut duplicates = HashSet::new();
+
             for col in columns {
                 if metadata.schema.index_of(col).is_none() {
                     return Err(DbError::Sql(SqlError::InvalidColumn(col.clone())));
+                }
+                if !duplicates.insert(col) {
+                    return Err(AnalyzerError::DuplicatedColumn(col.into()).into());
                 }
             }
 

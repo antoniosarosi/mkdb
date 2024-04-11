@@ -80,9 +80,17 @@ pub(crate) fn prepare(
         } => {
             let metadata = ctx.table_metadata(into)?;
 
+            // Columns are optional so this means the user didn't specify them.
+            // We'll replace the empty Vec with the schema columns.
+            if columns.is_empty() {
+                *columns = metadata.schema.column_identifiers();
+            }
+
             if metadata.schema.columns[0].name == ROW_ID_COL {
+                if columns[0] != ROW_ID_COL {
+                    columns.insert(0, ROW_ID_COL.into());
+                }
                 let row_id = metadata.next_row_id();
-                columns.insert(0, ROW_ID_COL.into());
                 values.insert(0, Expression::Value(Value::Number(row_id.into())));
             }
 

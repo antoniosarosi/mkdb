@@ -292,6 +292,11 @@ impl Schema {
     pub fn has_btree_key(&self) -> bool {
         has_btree_key(&self.columns)
     }
+
+    /// Returns a list of owned [`Column::name`] strings.
+    pub fn column_identifiers(&self) -> Vec<String> {
+        self.columns.iter().map(|col| col.name.to_owned()).collect()
+    }
 }
 
 impl<'c, C: IntoIterator<Item = &'c Column>> From<C> for Schema {
