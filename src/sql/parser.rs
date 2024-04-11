@@ -95,23 +95,35 @@ impl Display for ErrorKind {
 pub(crate) struct ParserError {
     pub kind: ErrorKind,
     pub location: Location,
+    pub input: String,
 }
 
 impl Display for ParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.kind)
-    }
-}
+        writeln!(
+            f,
+            "Parse Error at line {} column {}: {}",
+            self.location.line, self.location.col, self.kind,
+        )?;
 
-impl ParserError {
-    fn new(kind: ErrorKind, location: Location) -> Self {
-        Self { kind, location }
+        f.write_str(self.input.lines().nth(self.location.line - 1).unwrap())?;
+
+        let white_spaces = String::from(" ").repeat(self.location.col - 1);
+
+        write!(f, "\n{white_spaces}^")
     }
 }
 
 impl From<TokenizerError> for ParserError {
-    fn from(TokenizerError { kind, location }: TokenizerError) -> Self {
+    fn from(
+        TokenizerError {
+            kind,
+            location,
+            input,
+        }: TokenizerError,
+    ) -> Self {
         Self {
+            input,
             kind: ErrorKind::TokenizerError(kind),
             location,
         }
@@ -130,6 +142,8 @@ pub(crate) type ParseResult<T> = Result<T, ParserError>;
 /// [tutorial]: https://eli.thegreenplace.net/2010/01/02/top-down-operator-precedence-parsing
 /// [sqlparser]: https://github.com/sqlparser-rs/sqlparser-rs
 pub(crate) struct Parser<'i> {
+    /// Original string input.
+    input: &'i str,
     /// [`Token`] peekable iterator.
     tokenizer: Peekable<tokenizer::IntoIter<'i>>,
     /// Location of the last token we've consumed from the iterator.
@@ -140,6 +154,7 @@ impl<'i> Parser<'i> {
     /// Creates a new parser for the given `input` string.
     pub fn new(input: &'i str) -> Self {
         Self {
+            input,
             tokenizer: Tokenizer::new(input).into_iter().peekable(),
             location: Location::default(),
         }
@@ -664,6 +679,7 @@ impl<'i> Parser<'i> {
     fn error(&self, kind: ErrorKind) -> ParserError {
         ParserError {
             kind,
+            input: self.input.to_owned(),
             location: self.location,
         }
     }
@@ -1321,7 +1337,8 @@ mod tests {
                     expected: Token::SemiColon,
                     found: Token::Eof
                 },
-                location: Location { line: 1, col: 20 }
+                location: Location { line: 1, col: 20 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1345,7 +1362,8 @@ mod tests {
                     ],
                     found: Token::Eof
                 },
-                location: Location { line: 1, col: 7 }
+                location: Location { line: 1, col: 7 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1361,7 +1379,8 @@ mod tests {
                     expected: Token::Keyword(Keyword::Into),
                     found: Token::Eof
                 },
-                location: Location { line: 1, col: 7 }
+                location: Location { line: 1, col: 7 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1377,7 +1396,8 @@ mod tests {
                     expected: Parser::tokens_from_keywords(&Parser::supported_statements()),
                     found: Token::Div,
                 },
-                location: Location { line: 1, col: 1 }
+                location: Location { line: 1, col: 1 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1393,7 +1413,8 @@ mod tests {
                     expected: Parser::tokens_from_keywords(&Parser::supported_statements()),
                     found: Token::Keyword(Keyword::Varchar),
                 },
-                location: Location { line: 1, col: 1 }
+                location: Location { line: 1, col: 1 },
+                input: sql.to_owned(),
             }),
         )
     }
@@ -1417,7 +1438,8 @@ mod tests {
                     ],
                     found: Token::RightParen,
                 },
-                location: Location { line: 1, col: 8 }
+                location: Location { line: 1, col: 8 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1433,7 +1455,8 @@ mod tests {
                     expected: Token::Keyword(Keyword::From),
                     found: Token::Keyword(Keyword::Values)
                 },
-                location: Location { line: 1, col: 10 }
+                location: Location { line: 1, col: 10 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1452,7 +1475,8 @@ mod tests {
                     ],
                     found: Token::Keyword(Keyword::Values)
                 },
-                location: Location { line: 1, col: 6 }
+                location: Location { line: 1, col: 6 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1468,7 +1492,8 @@ mod tests {
                     expected: Parser::tokens_from_keywords(&Parser::supported_data_types()),
                     found: Token::Identifier("INCORRECT".into())
                 },
-                location: Location { line: 1, col: 23 }
+                location: Location { line: 1, col: 23 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1484,7 +1509,8 @@ mod tests {
                     expected: Token::Identifier(Default::default()),
                     found: Token::Number("1".into())
                 },
-                location: Location { line: 1, col: 13 }
+                location: Location { line: 1, col: 13 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1500,7 +1526,8 @@ mod tests {
                     expected: Token::Number(Default::default()),
                     found: Token::Identifier("test".into())
                 },
-                location: Location { line: 1, col: 33 }
+                location: Location { line: 1, col: 33 },
+                input: sql.to_owned(),
             })
         )
     }
@@ -1516,7 +1543,8 @@ mod tests {
                     expected: Token::LeftParen,
                     found: Token::Identifier("id".into())
                 },
-                location: Location { line: 1, col: 20 }
+                location: Location { line: 1, col: 20 },
+                input: sql.to_owned(),
             })
         )
     }

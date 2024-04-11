@@ -44,6 +44,8 @@ impl TokenWithLocation {
 /// Wraps a [`Peekable<Chars>`] instance and allows reading the next character
 /// in the stream without consuming it.
 struct Stream<'i> {
+    /// Original string input.
+    input: &'i str,
     /// Current location in the stream.
     location: Location,
     /// Character input.
@@ -54,6 +56,7 @@ impl<'i> Stream<'i> {
     /// Creates a new stream over `input`.
     fn new(input: &'i str) -> Self {
         Self {
+            input,
             location: Location { line: 1, col: 1 },
             chars: input.chars().peekable(),
         }
@@ -163,12 +166,7 @@ impl Display for ErrorKind {
 pub(super) struct TokenizerError {
     pub kind: ErrorKind,
     pub location: Location,
-}
-
-impl TokenizerError {
-    fn new(kind: ErrorKind, location: Location) -> Self {
-        Self { kind, location }
-    }
+    pub input: String,
 }
 
 /// Main parsing structure. See [`Tokenizer::next_token`].
@@ -322,7 +320,11 @@ impl<'i> Tokenizer<'i> {
     /// Builds an instance of [`TokenizerError`] wrapped in [`Err`] giving it
     /// the current location of the stream.
     fn error(&self, kind: ErrorKind) -> TokenResult {
-        Err(TokenizerError::new(kind, self.stream.location()))
+        Err(TokenizerError {
+            kind,
+            location: self.stream.location(),
+            input: self.stream.input.to_owned(),
+        })
     }
 
     /// Parses a single quoted or double quoted string like `"this one"` into
@@ -728,7 +730,8 @@ mod tests {
                     unexpected: ' ',
                     operator: Token::Neq
                 },
-                location: Location { line: 1, col: 35 }
+                location: Location { line: 1, col: 35 },
+                input: sql.to_owned(),
             })
         );
     }
@@ -740,7 +743,8 @@ mod tests {
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
                 kind: ErrorKind::OperatorNotClosed(Token::Neq),
-                location: Location { line: 1, col: 35 }
+                location: Location { line: 1, col: 35 },
+                input: sql.to_owned(),
             })
         );
     }
@@ -752,7 +756,8 @@ mod tests {
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
                 kind: ErrorKind::StringNotClosed,
-                location: Location { line: 1, col: 47 }
+                location: Location { line: 1, col: 47 },
+                input: sql.to_owned(),
             })
         );
     }
@@ -764,7 +769,8 @@ mod tests {
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
                 kind: ErrorKind::StringNotClosed,
-                location: Location { line: 1, col: 47 }
+                location: Location { line: 1, col: 47 },
+                input: sql.to_owned(),
             })
         );
     }
@@ -776,7 +782,8 @@ mod tests {
             Tokenizer::new(sql).tokenize(),
             Err(TokenizerError {
                 kind: ErrorKind::UnexpectedOrUnsupportedToken('^'),
-                location: Location { line: 1, col: 15 }
+                location: Location { line: 1, col: 15 },
+                input: sql.to_owned(),
             })
         );
     }

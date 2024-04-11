@@ -399,7 +399,7 @@ pub(crate) fn analyze_expression(
         Expression::Nested(expr) => analyze_expression(schema, expr)?,
 
         Expression::Wildcard => {
-            unreachable!("analyze_expression() shouldn't come across wildcards")
+            return Err(SqlError::Other("unexpected wildcard expression (*)".into()))
         }
     })
 }

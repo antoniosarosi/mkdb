@@ -138,7 +138,7 @@
 //! +-----------------+---------+---------------------+---------+
 //!  8 byte big endian  4 bytes         5 bytes         4 byte
 //! ```
-use std::{array::TryFromSliceError, fmt, num::TryFromIntError, string::FromUtf8Error};
+use std::{array::TryFromSliceError, fmt, io, mem, num::TryFromIntError, string::FromUtf8Error};
 
 use crate::{
     db::{DbError, QuerySet},
