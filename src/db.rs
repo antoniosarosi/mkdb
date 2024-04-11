@@ -1769,6 +1769,47 @@ mod tests {
         Ok(())
     }
 
+    // We skip sorting when ordering only by primary key since the BTree is
+    // already sorted by key.
+    #[test]
+    fn select_order_by_primary_key() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (3, 'Some Dude', 24);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (2, 'John Doe', 22);")?;
+        db.exec("INSERT INTO users(id, name, age) VALUES (1, 'John Doe', 18);")?;
+
+        let query = db.exec("SELECT * FROM users ORDER BY id;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("age", DataType::Int),
+            ]),
+            tuples: vec![
+                vec![
+                    Value::Number(1),
+                    Value::String("John Doe".into()),
+                    Value::Number(18)
+                ],
+                vec![
+                    Value::Number(2),
+                    Value::String("John Doe".into()),
+                    Value::Number(22)
+                ],
+                vec![
+                    Value::Number(3),
+                    Value::String("Some Dude".into()),
+                    Value::Number(24)
+                ]
+            ]
+        });
+
+        Ok(())
+    }
+
     // Force the external merge sort algorithm to do some real work.
     #[cfg(not(miri))]
     #[test]

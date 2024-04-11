@@ -64,7 +64,9 @@ pub(crate) fn generate_plan<F: Seek + Read + Write + paging::io::FileOps>(
             let work_dir = db.work_dir.clone();
             let table = db.table_metadata(&from)?;
 
-            if !order_by.is_empty() {
+            if !order_by.is_empty()
+                && order_by != [Expression::Identifier(table.schema.columns[0].name.clone())]
+            {
                 let mut sort_schema = table.schema.clone();
                 let mut sort_keys_indexes = Vec::with_capacity(order_by.len());
 
@@ -265,8 +267,9 @@ fn needs_collection<F>(plan: &Plan<F>) -> bool {
     }
 }
 
-// TODO: Tests here are kinda verbose, there's probably some pattern that can
-// help reduce clutter.
+// TODO: Tests here are kinda verbose and it's hard to spot the difference
+// between left and right when assert_eq! fails. There's probably some pattern
+// that can help reduce clutter.
 #[cfg(test)]
 mod tests {
     use std::{
@@ -292,7 +295,7 @@ mod tests {
         },
         vm::plan::{
             Collect, CollectConfig, ExactMatch, Filter, KeyScan, LogicalOrScan, Plan, Project,
-            RangeScan, RangeScanConfig, SeqScan, Sort, SortConfig, TuplesComparator,
+            RangeScan, RangeScanConfig, SeqScan, Sort, SortConfig, SortKeysGen, TuplesComparator,
             DEFAULT_SORT_INPUT_BUFFERS,
         },
         DbError,
@@ -731,6 +734,98 @@ mod tests {
                     cursor: Cursor::new(db.tables["users"].root, 0),
                     table: db.tables["users"].to_owned(),
                 }))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_simple_sort_plan() -> Result<(), DbError> {
+        let mut db =
+            init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT);"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users ORDER by name, age;")?,
+            Plan::Sort(Sort::from(SortConfig {
+                page_size: db.page_size(),
+                work_dir: db.work_dir(),
+                input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
+                comparator: TuplesComparator {
+                    schema: db.tables["users"].schema.to_owned(),
+                    sort_schema: db.tables["users"].schema.to_owned(),
+                    sort_keys_indexes: vec![1, 2],
+                },
+                collection: Collect::from(CollectConfig {
+                    mem_buf_size: db.page_size(),
+                    schema: db.tables["users"].schema.clone(),
+                    work_dir: db.work_dir(),
+                    source: Box::new(Plan::SeqScan(SeqScan {
+                        pager: db.pager(),
+                        cursor: Cursor::new(db.tables["users"].root, 0),
+                        table: db.tables["users"].to_owned(),
+                    }))
+                })
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_sort_plan_with_expressions() -> Result<(), DbError> {
+        let mut db = init_db(&[
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), age INT, followers INT);",
+        ])?;
+
+        let mut sort_schema = db.tables["users"].schema.to_owned();
+        sort_schema.push(Column::new("age + 10", DataType::BigInt));
+        sort_schema.push(Column::new("followers * 2", DataType::BigInt));
+
+        assert_eq!(
+            gen_plan(
+                &mut db,
+                "SELECT * FROM users ORDER by name, age + 10, followers * 2;"
+            )?,
+            Plan::Sort(Sort::from(SortConfig {
+                page_size: db.page_size(),
+                work_dir: db.work_dir(),
+                input_buffers: DEFAULT_SORT_INPUT_BUFFERS,
+                comparator: TuplesComparator {
+                    schema: db.tables["users"].schema.to_owned(),
+                    sort_schema: sort_schema.clone(),
+                    sort_keys_indexes: vec![1, 4, 5],
+                },
+                collection: Collect::from(CollectConfig {
+                    mem_buf_size: db.page_size(),
+                    schema: sort_schema.clone(),
+                    work_dir: db.work_dir(),
+                    source: Box::new(Plan::SortKeysGen(SortKeysGen {
+                        gen_exprs: vec![parse_expr("age + 10"), parse_expr("followers * 2")],
+                        schema: db.tables["users"].schema.to_owned(),
+                        source: Box::new(Plan::SeqScan(SeqScan {
+                            pager: db.pager(),
+                            cursor: Cursor::new(db.tables["users"].root, 0),
+                            table: db.tables["users"].to_owned(),
+                        }))
+                    }))
+                })
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn skip_sorting_when_order_by_key_only() -> Result<(), DbError> {
+        let mut db = init_db(&["CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));"])?;
+
+        assert_eq!(
+            gen_plan(&mut db, "SELECT * FROM users ORDER BY id;")?,
+            Plan::SeqScan(SeqScan {
+                pager: db.pager(),
+                cursor: Cursor::new(db.tables["users"].root, 0),
+                table: db.tables["users"].to_owned(),
             })
         );
 
