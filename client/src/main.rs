@@ -20,13 +20,11 @@ const SINGLE_QUOTE_STR_PROMPT: &str = "string(')> ";
 const DOUBLE_QUOTE_STR_PROMPT: &str = "string(\")> ";
 
 fn main() -> rustyline::Result<()> {
-    // let port = env::args()
-    //     .nth(1)
-    //     .expect("port not provided")
-    //     .parse::<u16>()
-    //     .expect("port parse error");
-
-    let port = 8000;
+    let port = env::args()
+        .nth(1)
+        .expect("port not provided")
+        .parse::<u16>()
+        .expect("port parse error");
 
     let mut rl = DefaultEditor::new()?;
     if rl.load_history("history.mkdb").is_err() {
@@ -39,6 +37,7 @@ fn main() -> rustyline::Result<()> {
 
     let mut string_quote = None;
     let mut sql = String::new();
+    let mut cursor = 0;
     let mut payload = Vec::new();
     let mut prompt = PROMPT;
 
@@ -70,7 +69,7 @@ fn main() -> rustyline::Result<()> {
                     }
                 },
 
-                b';' => {
+                b';' if string_quote.is_none() => {
                     terminator_positions.push_back(index);
                 }
 
@@ -100,6 +99,8 @@ fn main() -> rustyline::Result<()> {
 
         sql.push_str(&line);
 
+        let mut clear_sql_buf = false;
+
         // Statement is not complete.
         if terminator_positions.is_empty()
             || terminator_positions
@@ -119,15 +120,14 @@ fn main() -> rustyline::Result<()> {
             // Now we have a full statement, add it to the history and reset prompt.
             prompt = PROMPT;
             rl.add_history_entry(&sql)?;
+            clear_sql_buf = true;
         }
 
-        let mut start = 0;
         while let Some(pos) = terminator_positions.pop_front() {
-            let packet_transmission = Instant::now();
-
-            let statement = &sql[start..=pos];
+            let statement = &sql[cursor..=pos];
 
             // Send the statement to the server.
+            let packet_transmission = Instant::now();
             stream.write_all(&(statement.len() as u32).to_le_bytes())?;
             stream.write_all(statement.as_bytes())?;
 
@@ -167,10 +167,13 @@ fn main() -> rustyline::Result<()> {
             };
 
             // Prepare next statement.
-            start = pos + 1;
+            cursor = pos + 1;
         }
 
-        sql.drain(..start);
+        if clear_sql_buf {
+            sql.clear();
+            cursor = 0;
+        }
     }
 
     rl.save_history("history.mkdb")?;
