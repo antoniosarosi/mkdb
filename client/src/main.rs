@@ -64,7 +64,7 @@ fn main() -> rustyline::Result<()> {
                 },
 
                 ';' => {
-                    if !string_quote.is_some() {
+                    if string_quote.is_none() {
                         terminators_found += 1;
                     }
                 }
@@ -107,7 +107,7 @@ fn main() -> rustyline::Result<()> {
         prompt = PROMPT;
         rl.add_history_entry(&sql)?;
 
-        if terminators_found > 1 || terminators_found == 1 && !line.trim_end().ends_with(";") {
+        if terminators_found > 1 || terminators_found == 1 && !line.trim_end().ends_with(';') {
             sql.clear();
             string_quote.take();
             println!("Only one SQL statement at a time terminated with ';' can be sent. Multiple statements are not supported.");
@@ -185,7 +185,7 @@ fn ascii_table(query: &mkdb::QuerySet) -> String {
         .map(|row| {
             row.iter()
                 .map(|col| match col {
-                    Value::String(string) => string.replace("\n", "\\n"),
+                    Value::String(string) => string.replace('\n', "\\n"),
                     other => other.to_string(),
                 })
                 .collect()
