@@ -60,6 +60,17 @@ pub(crate) const MAX_QUERY_SET_SIZE: usize = 1 << 30;
 /// was of course stolen from SQLite.
 pub(crate) type RowId = u64;
 
+/// State of the current transaction. There can only be one at a time.
+#[derive(Debug, PartialEq)]
+enum TransactionState {
+    /// Transaction is in progress, no errors so far.
+    InProgress,
+    /// Transaction was aborted due to an error.
+    Aborted,
+    /// There is no active transaction.
+    None,
+}
+
 /// Main entry point to everything.
 ///
 /// Provides the high level [`Database::exec`] API that receives SQL text and
@@ -76,7 +87,7 @@ pub(crate) struct Database<F> {
     /// Working directory (the directory of the file).
     pub work_dir: PathBuf,
     /// `true` if we are currently in a transaction.
-    pub transaction_in_progress: bool,
+    pub transaction_state: TransactionState,
 }
 
 /// Not really "Send" because of the [`Rc<RefCell>`], but we put the entire
@@ -675,13 +686,20 @@ impl<F> Database<F> {
             pager,
             work_dir,
             context: Context::with_max_size(DEFAULT_RELATION_CACHE_SIZE),
-            transaction_in_progress: false,
+            transaction_state: TransactionState::None,
         }
     }
 
-    /// Returns `true` if there's a transaction in progress at the moment.
-    pub fn transaction_in_progress(&self) -> bool {
-        self.transaction_in_progress
+    /// Returns `true` if there's a an active transaction at the moment.
+    pub fn active_transaction(&self) -> bool {
+        matches!(
+            self.transaction_state,
+            TransactionState::InProgress | TransactionState::Aborted
+        )
+    }
+
+    pub fn transaction_aborted(&self) -> bool {
+        self.transaction_state == TransactionState::Aborted
     }
 
     /// Starts a new transaction.
@@ -690,7 +708,7 @@ impl<F> Database<F> {
     /// or [`Database::commit`]. Otherwise the equivalent SQL statements can
     /// be used to terminate transactions.
     pub fn start_transaction(&mut self) {
-        self.transaction_in_progress = true;
+        self.transaction_state = TransactionState::InProgress;
     }
 }
 
@@ -953,13 +971,13 @@ impl<F: Seek + Read + Write + FileOps> Database<F> {
 
     /// Manually rolls back the database and stops the current transaction.
     pub fn rollback(&mut self) -> Result<usize, DbError> {
-        self.transaction_in_progress = false;
+        self.transaction_state = TransactionState::None;
         self.pager.borrow_mut().rollback()
     }
 
     /// Manually commits the changes and stops the current transaction.
     pub fn commit(&mut self) -> io::Result<()> {
-        self.transaction_in_progress = false;
+        self.transaction_state = TransactionState::None;
         self.pager.borrow_mut().commit()
     }
 }
@@ -1008,6 +1026,17 @@ pub(crate) struct PreparedStatement<'d, F> {
 }
 
 impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
+    /// Abort the current transaction.
+    fn abort_transaction(&mut self) -> Result<(), DbError> {
+        if self.auto_commit {
+            self.db.rollback()?;
+        } else {
+            self.db.transaction_state = TransactionState::Aborted;
+        }
+
+        Ok(())
+    }
+
     /// Returns the next tuple that the query produces.
     ///
     /// See the documentation of [`PreparedStatement`] for more details.
@@ -1016,10 +1045,23 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
             return Ok(None);
         };
 
+        // Transaction aborted due to errors.
+        if self.db.transaction_aborted()
+            && !matches!(
+                exec,
+                Exec::Statement(Statement::Commit) | Exec::Statement(Statement::Rollback)
+            )
+        {
+            return Err(DbError::Other(String::from(
+                "current transaction is aborted due to previous errors, commands ignored until end of transaction block",
+            )));
+        }
+
+        // Transaction started manually with `START TRANSACTION` statement.
         if let Exec::Statement(Statement::StartTransaction) = exec {
-            if self.db.transaction_in_progress() {
+            if self.db.active_transaction() {
                 return Err(DbError::Other(String::from(
-                    "There is already a transaction in progress",
+                    "there is already a transaction in progress",
                 )));
             }
 
@@ -1027,7 +1069,9 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
             return Ok(None);
         }
 
-        if !self.db.transaction_in_progress() {
+        // Single statement with no transaction. Start a transaction
+        // automatically and close it when the statement is done executing.
+        if !self.db.active_transaction() {
             self.db.start_transaction();
             self.auto_commit = true;
         }
@@ -1045,7 +1089,11 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
 
                 match statement {
                     Statement::Commit => {
-                        self.db.commit()?;
+                        if self.db.transaction_state == TransactionState::Aborted {
+                            self.db.rollback()?;
+                        } else {
+                            self.db.commit()?;
+                        }
                     }
                     Statement::Rollback => {
                         self.db.rollback()?;
@@ -1054,7 +1102,7 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                         match vm::statement::exec(statement, self.db) {
                             Ok(rows) => affected_rows = rows,
                             Err(e) => {
-                                self.db.rollback()?;
+                                self.abort_transaction()?;
                                 return Err(e);
                             }
                         }
@@ -1078,7 +1126,7 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                 Err(e) => {
                     // The iterator ends here, rollback and return the error.
                     self.exec.take();
-                    self.db.rollback()?;
+                    self.abort_transaction()?;
                     return Err(e);
                 }
             },

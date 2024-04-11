@@ -103,7 +103,7 @@ fn handle_client(
                 let packet =
                     proto::serialize(&Response::Err(format!("could not encode response {e}")));
                 stream.write_all(&packet.unwrap())?;
-                if db.transaction_in_progress() {
+                if db.active_transaction() {
                     db.rollback()?;
                 }
             }
@@ -111,7 +111,7 @@ fn handle_client(
 
         // We only drop the Mutex guard when the transaction ends. Otherwise we
         // keep the database locked so no other threads can access.
-        if !db.transaction_in_progress() {
+        if !db.active_transaction() {
             drop(guard.take());
         }
     }
@@ -121,7 +121,7 @@ fn handle_client(
     // If the connection is closed while a transaction is still in
     // progress we must rollback because the client didn't commit.
     if let Some(mut db) = guard {
-        if db.transaction_in_progress() {
+        if db.active_transaction() {
             db.rollback()?;
         }
     }
