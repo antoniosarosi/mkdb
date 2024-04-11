@@ -8,10 +8,11 @@
 
 use std::{collections::HashSet, fmt::Display};
 
-use super::statement::Drop;
+use super::statement::{Drop, UnaryOperator};
 use crate::{
     db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, ROW_ID_COL},
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
+    storage::tuple,
     vm::{TypeError, VmDataType},
 };
 
@@ -31,6 +32,8 @@ pub(crate) enum AnalyzerError {
     AlreadyExists(AlreadyExists),
     /// Number of characters exceeds `VARCHAR(max)`.
     ValueTooLong(String, usize),
+    /// Integer data type can't store this value.
+    IntegerOutOfRange(i128, DataType),
     /// Attempt to change the special Row ID column manually.
     RowIdAssignment,
 }
@@ -62,6 +65,9 @@ impl Display for AnalyzerError {
             Self::AlreadyExists(already_exists) => write!(f, "{already_exists}"),
             Self::ValueTooLong(string, max) => {
                 write!(f, "string '{string}' too long for type VARCHAR({max})")
+            }
+            Self::IntegerOutOfRange(num, data_type) => {
+                write!(f, "integer {num} out of range for data type {data_type}")
             }
             Self::RowIdAssignment => write!(
                 f,
@@ -201,14 +207,14 @@ pub(crate) fn analyze(
 
             for expr in columns {
                 if expr != &Expression::Wildcard {
-                    analyze_expression(&metadata.schema, expr)?;
+                    analyze_expression(&metadata.schema, None, expr)?;
                 }
             }
 
             analyze_where(&metadata.schema, r#where)?;
 
             for expr in order_by {
-                analyze_expression(&metadata.schema, expr)?;
+                analyze_expression(&metadata.schema, None, expr)?;
             }
         }
 
@@ -253,7 +259,7 @@ fn analyze_where(schema: &Schema, r#where: &Option<Expression>) -> Result<(), Db
         return Ok(());
     };
 
-    if let VmDataType::Bool = analyze_expression(schema, expr)? {
+    if let VmDataType::Bool = analyze_expression(schema, None, expr)? {
         return Ok(());
     };
 
@@ -282,11 +288,13 @@ fn analyze_assignment(
         .index_of(column)
         .ok_or(SqlError::InvalidColumn(column.into()))?;
 
-    let expected_data_type = VmDataType::from(table.schema.columns[index].data_type);
+    let data_type = table.schema.columns[index].data_type;
+
+    let expected_data_type = VmDataType::from(data_type);
     let pre_eval_data_type = if allow_identifiers {
-        analyze_expression(&table.schema, value)?
+        analyze_expression(&table.schema, Some(&data_type), value)?
     } else {
-        analyze_expression(&Schema::empty(), value)?
+        analyze_expression(&Schema::empty(), Some(&data_type), value)?
     };
 
     if expected_data_type != pre_eval_data_type {
@@ -296,7 +304,7 @@ fn analyze_assignment(
         }));
     }
 
-    if let DataType::Varchar(max) = table.schema.columns[index].data_type {
+    if let DataType::Varchar(max) = data_type {
         if let Expression::Value(Value::String(string)) = value {
             if string.chars().count() > max {
                 return Err(AnalyzerError::ValueTooLong(string.clone(), max).into());
@@ -318,13 +326,20 @@ fn analyze_assignment(
 /// schema then an error is returned.
 pub(crate) fn analyze_expression(
     schema: &Schema,
+    col_data_type: Option<&DataType>,
     expr: &Expression,
 ) -> Result<VmDataType, SqlError> {
     Ok(match expr {
         Expression::Value(value) => match value {
             Value::Bool(_) => VmDataType::Bool,
-            Value::Number(_) => VmDataType::Number,
             Value::String(_) => VmDataType::String,
+            Value::Number(num) => {
+                if let Some(data_type) = col_data_type {
+                    analyze_integer_range(num, data_type)?;
+                }
+
+                VmDataType::Number
+            }
         },
 
         Expression::Identifier(ident) => {
@@ -339,22 +354,32 @@ pub(crate) fn analyze_expression(
             }
         }
 
-        Expression::UnaryOperation { operator, expr } => match analyze_expression(schema, expr)? {
-            VmDataType::Number => VmDataType::Number,
+        Expression::UnaryOperation { operator, expr } => {
+            // Precompute negative numbers since the optimizer hasn't run yet.
+            if let (Some(data_type), UnaryOperator::Minus, Expression::Value(Value::Number(num))) =
+                (col_data_type, *operator, &**expr)
+            {
+                analyze_integer_range(&-num, data_type)?;
+                return Ok(VmDataType::Number);
+            }
 
-            _ => Err(TypeError::ExpectedType {
-                expected: VmDataType::Number,
-                found: *expr.clone(),
-            })?,
-        },
+            match analyze_expression(schema, col_data_type, expr)? {
+                VmDataType::Number => VmDataType::Number,
+
+                _ => Err(TypeError::ExpectedType {
+                    expected: VmDataType::Number,
+                    found: *expr.clone(),
+                })?,
+            }
+        }
 
         Expression::BinaryOperation {
             left,
             operator,
             right,
         } => {
-            let left_data_type = analyze_expression(schema, left)?;
-            let right_data_type = analyze_expression(schema, right)?;
+            let left_data_type = analyze_expression(schema, col_data_type, left)?;
+            let right_data_type = analyze_expression(schema, col_data_type, right)?;
 
             // TODO: We're lazily evaluating this because we have to clone.
             // Figure out if we can refactor this module to avoid cloning
@@ -396,12 +421,25 @@ pub(crate) fn analyze_expression(
             }
         }
 
-        Expression::Nested(expr) => analyze_expression(schema, expr)?,
+        Expression::Nested(expr) => analyze_expression(schema, col_data_type, expr)?,
 
         Expression::Wildcard => {
             return Err(SqlError::Other("unexpected wildcard expression (*)".into()))
         }
     })
+}
+
+/// Returns an error if the integer is out of range for the given data type.
+fn analyze_integer_range(integer: &i128, data_type: &DataType) -> Result<(), AnalyzerError> {
+    if let DataType::BigInt | DataType::Int | DataType::UnsignedBigInt | DataType::UnsignedInt =
+        data_type
+    {
+        if !tuple::integer_is_within_range(integer, data_type) {
+            return Err(AnalyzerError::IntegerOutOfRange(*integer, *data_type).into());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,7 +450,7 @@ mod tests {
         sql::{
             analyzer::analyze,
             parser::Parser,
-            statement::{BinaryOperator, Expression, Value},
+            statement::{BinaryOperator, DataType, Expression, Value},
         },
         vm::{TypeError, VmDataType},
     };
@@ -547,6 +585,20 @@ mod tests {
             expected: Err(DbError::from(AnalyzerError::ValueTooLong(
                 "123456789".into(),
                 8,
+            ))),
+        })
+    }
+
+    #[test]
+    fn integer_out_of_range() -> Result<(), DbError> {
+        let integer = i128::from(i32::MAX) + 1;
+
+        assert_analyze(Analyze {
+            ctx: &["CREATE TABLE users (id INT, name VARCHAR(8));"],
+            sql: &format!("INSERT INTO users (id, name) VALUES ({integer}, '1');"),
+            expected: Err(DbError::from(AnalyzerError::IntegerOutOfRange(
+                integer,
+                DataType::Int,
             ))),
         })
     }

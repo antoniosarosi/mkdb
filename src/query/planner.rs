@@ -242,7 +242,7 @@ fn resolve_unknown_type(schema: &Schema, expr: &Expression) -> Result<DataType, 
             schema.columns[index].data_type
         }
 
-        _ => match analyzer::analyze_expression(schema, expr)? {
+        _ => match analyzer::analyze_expression(schema, None, expr)? {
             VmDataType::Bool => DataType::Bool,
             VmDataType::Number => DataType::BigInt,
             VmDataType::String => DataType::Varchar(65535),

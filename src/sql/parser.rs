@@ -28,6 +28,8 @@ pub(crate) enum ErrorKind {
 
     UnexpectedEof,
 
+    IntegerOutOfRange(String),
+
     Other(String),
 }
 
@@ -83,6 +85,11 @@ impl Display for ErrorKind {
             }
 
             ErrorKind::UnexpectedEof => f.write_str("unexpected EOF"),
+
+            ErrorKind::IntegerOutOfRange(integer) => write!(
+                f,
+                "number too big, none of the supported SQL data types can store this: {integer}"
+            ),
 
             ErrorKind::Other(message) => f.write_str(message),
         }
@@ -337,10 +344,14 @@ impl<'i> Parser<'i> {
         match self.next_token()? {
             Token::Identifier(ident) => Ok(Expression::Identifier(ident)),
             Token::Mul => Ok(Expression::Wildcard),
-            Token::Number(num) => Ok(Expression::Value(Value::Number(num.parse().unwrap()))),
+
             Token::String(string) => Ok(Expression::Value(Value::String(string))),
             Token::Keyword(Keyword::True) => Ok(Expression::Value(Value::Bool(true))),
             Token::Keyword(Keyword::False) => Ok(Expression::Value(Value::Bool(false))),
+            Token::Number(num) => Ok(Expression::Value(Value::Number(
+                num.parse()
+                    .map_err(|_| self.error(ErrorKind::IntegerOutOfRange(num)))?,
+            ))),
 
             token @ (Token::Minus | Token::Plus) => {
                 let operator = match token {

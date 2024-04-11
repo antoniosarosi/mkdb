@@ -82,6 +82,20 @@ pub(crate) fn byte_length_of_integer_type(data_type: &DataType) -> usize {
     }
 }
 
+/// Checks if we can store an integer using one of the SQL [`DataType`]
+/// variants.
+pub(crate) fn integer_is_within_range(integer: &i128, integer_type: &DataType) -> bool {
+    let bounds = match integer_type {
+        DataType::Int => i32::MIN as i128..=i32::MAX as i128,
+        DataType::UnsignedInt => 0..=u32::MAX as i128,
+        DataType::BigInt => i64::MIN as i128..=i64::MAX as i128,
+        DataType::UnsignedBigInt => 0..=u64::MAX as i128,
+        other => unreachable!("is 'integer' not clear enough?: {other}"),
+    };
+
+    bounds.contains(integer)
+}
+
 /// Calculates the size that the given tuple would take on disk once serialized.
 pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
     schema
@@ -164,16 +178,8 @@ fn serialize_value_into(buf: &mut Vec<u8>, data_type: &DataType, value: &Value) 
         (DataType::Bool, Value::Bool(bool)) => buf.push(u8::from(*bool)),
 
         (integer_type, Value::Number(num)) => {
-            let bounds = match integer_type {
-                DataType::Int => i32::MIN as i128..=i32::MAX as i128,
-                DataType::UnsignedInt => 0..=u32::MAX as i128,
-                DataType::BigInt => i64::MIN as i128..=i64::MAX as i128,
-                DataType::UnsignedBigInt => 0..=u64::MAX as i128,
-                _ => unreachable!(),
-            };
-
             assert!(
-                bounds.contains(num),
+                integer_is_within_range(num, integer_type),
                 "integer overflow while serializing number {num} into data type {integer_type:?}"
             );
 
@@ -221,7 +227,16 @@ pub fn read_from(reader: &mut impl Read, schema: &Schema) -> io::Result<Vec<Valu
             integer_type => {
                 let byte_length = byte_length_of_integer_type(&integer_type);
                 let mut big_endian_buf = [0; mem::size_of::<i128>()];
-                reader.read_exact(&mut big_endian_buf[mem::size_of::<i128>() - byte_length..])?;
+
+                let start_index = mem::size_of::<i128>() - byte_length;
+                reader.read_exact(&mut big_endian_buf[start_index..])?;
+
+                // Adjustment for negative numbers. Gotta love two's complement.
+                if big_endian_buf[start_index] & 0x80 != 0
+                    && matches!(integer_type, DataType::BigInt | DataType::Int)
+                {
+                    big_endian_buf[..start_index].fill(u8::MAX);
+                }
 
                 Value::Number(i128::from_be_bytes(big_endian_buf))
             }
