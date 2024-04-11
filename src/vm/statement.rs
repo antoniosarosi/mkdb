@@ -32,8 +32,12 @@ use crate::{
 pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
     statement: Statement,
     db: &mut Database<F>,
-) -> Result<(), DbError> {
+) -> Result<usize, DbError> {
     let sql = statement.to_string();
+
+    // Most statements don't "affect" any user rows, only internal rows. The
+    // drop table statement does affect user rows.
+    let mut affected_rows = 0;
 
     match statement {
         Statement::Create(Create::Table { name, columns }) => {
@@ -167,7 +171,21 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
                     )));
                 };
 
-                free_btree(db, *root as PageNumber)?;
+                let removed_cells = free_btree(db, *root as PageNumber)?;
+
+                // Only rows removed from tables count. Index data doesn't
+                // count.
+                if affected_rows == 0 {
+                    schema
+                        .index_of("type")
+                        .and_then(|index| tuple.get(index))
+                        .inspect(|value| match value {
+                            Value::String(relation_type) if relation_type == "table" => {
+                                affected_rows = removed_cells;
+                            }
+                            _ => {}
+                        });
+                }
 
                 BTree::new(&mut db.pager.borrow_mut(), MKDB_META_ROOT, comparator).remove(
                     &tuple::serialize_key(&schema.columns[0].data_type, &tuple[0]),
@@ -184,7 +202,7 @@ pub(crate) fn exec<F: Seek + Read + Write + FileOps>(
         }
     };
 
-    Ok(())
+    Ok(affected_rows)
 }
 
 /// Allocates a page on disk that can be used as a table root.
@@ -201,9 +219,10 @@ fn alloc_root_page<F: Seek + Read + Write + FileOps>(
 fn free_btree<F: Seek + Read + Write + FileOps>(
     db: &mut Database<F>,
     root: PageNumber,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let mut stack = vec![root];
     let mut pager = db.pager.borrow_mut();
+    let mut removed_cells = 0;
 
     // Depth first search. Once we visited a page we no longer need it for
     // anythig, so we can safely drop it from disk. We reverse the children to
@@ -228,12 +247,13 @@ fn free_btree<F: Seek + Read + Write + FileOps>(
         // to link it to the free list somehow. Probably a circular list or
         // something like that would do.
         let mut cells = page.drain(..).collect::<Vec<_>>().into_iter();
+        removed_cells += cells.len();
         cells.try_for_each(|cell| free_cell(&mut pager, cell))?;
 
         pager.free_page(page_num)?;
     }
 
-    Ok(())
+    Ok(removed_cells)
 }
 
 /// Inserts data into the [`MKDB_META`] table.

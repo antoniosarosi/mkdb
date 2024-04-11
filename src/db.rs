@@ -1027,12 +1027,16 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
             self.auto_commit = true;
         }
 
+        // TODO: This type can be split into 2 or 3 different types to avoid
+        // this branch/jump table or whatever it is when running query plans.
         let tuple = match exec {
             Exec::Statement(_) => {
                 // Statements only run once, the iterator ends right here.
                 let Some(Exec::Statement(statement)) = self.exec.take() else {
                     unreachable!();
                 };
+
+                let mut affected_rows = 0;
 
                 match statement {
                     Statement::Commit => {
@@ -1042,15 +1046,25 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
                         self.db.rollback()?;
                     }
                     Statement::Create(_) | Statement::Drop(_) => {
-                        if let Err(e) = vm::statement::exec(statement, self.db) {
-                            self.db.rollback()?;
-                            return Err(e);
+                        match vm::statement::exec(statement, self.db) {
+                            Ok(rows) => affected_rows = rows,
+                            Err(e) => {
+                                self.db.rollback()?;
+                                return Err(e);
+                            }
                         }
                     }
                     _ => unreachable!(),
                 };
 
-                None
+                // Query sets without a schema are considered "empty sets".
+                // Usually the number of rows is represented by empty tuples
+                // returned by the query plan (all plans must return tuples),
+                // but the statements are not iterators that return tuples. So
+                // in order to inform the client about the number of affected
+                // rows we just use this hack here to allow the packet encoder
+                // to read how many tuples were modified.
+                Some(vec![Value::Number(affected_rows as i128)])
             }
 
             Exec::Plan(plan) => match plan.try_next() {
@@ -1077,7 +1091,7 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
 
         // If this block runs then everything executed successfully. End the
         // iterator and auto commit if necessary.
-        if tuple.is_none() {
+        if tuple.is_none() || self.exec.is_none() {
             self.exec.take();
             if self.auto_commit {
                 self.db.commit()?;
@@ -1088,6 +1102,10 @@ impl<'d, F: Seek + Read + Write + FileOps> PreparedStatement<'d, F> {
     }
 }
 
+// TODO: We can probably create a separate directory for integration tests and
+// move all these tests there, although we're using some internal functions that
+// shouldn't be exposed in `lib.rs`. We should also add tests with real files
+// instead of memory only.
 #[cfg(test)]
 mod tests {
     use std::{

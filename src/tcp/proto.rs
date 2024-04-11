@@ -144,6 +144,7 @@ use crate::{
     db::{DbError, QuerySet},
     sql::statement::{Column, DataType},
     storage::tuple,
+    Value,
 };
 
 /// Errors that we can find while serializing or deserializing packets.
@@ -198,7 +199,13 @@ impl From<Result<QuerySet, DbError>> for Response {
     fn from(result: Result<QuerySet, DbError>) -> Self {
         match result {
             Ok(empty_set) if empty_set.schema.columns.is_empty() => {
-                Response::EmptySet(empty_set.tuples.len())
+                // See [`crate::db::PreparedStatement::try_next`].
+                let affected_rows = match empty_set.tuples.first().map(|t| t.as_slice()) {
+                    Some([Value::Number(number)]) => *number as usize,
+                    _ => empty_set.tuples.len(),
+                };
+
+                Response::EmptySet(affected_rows)
             }
 
             Ok(query_set) => Response::QuerySet(query_set),
