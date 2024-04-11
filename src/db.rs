@@ -171,7 +171,7 @@ impl From<VmError> for SqlError {
 }
 
 impl Display for SqlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::InvalidTable(name) => write!(f, "invalid table '{name}'"),
             Self::InvalidColumn(name) => write!(f, "invalid column '{name}'"),
@@ -202,7 +202,7 @@ pub enum DbError {
 }
 
 impl Display for DbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::Parser(e) => write!(f, "{e}"),

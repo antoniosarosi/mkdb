@@ -19,7 +19,7 @@ pub(crate) enum VmDataType {
 }
 
 impl Display for VmDataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(match self {
             Self::Bool => "boolean",
             Self::Number => "number",
@@ -45,7 +45,7 @@ pub(crate) enum VmError {
 }
 
 impl Display for VmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::DivisionByZero(left, right) => write!(f, "division by zero: {left} / {right}"),
         }
@@ -75,7 +75,7 @@ pub(crate) enum TypeError {
 }
 
 impl Display for TypeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             TypeError::CannotApplyUnary { operator, value } => {
                 write!(f, "cannot apply unary operator '{operator}' to {value}")

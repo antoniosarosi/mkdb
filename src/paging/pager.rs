@@ -72,7 +72,7 @@ pub(crate) struct Pager<F> {
 // io Cursor buffer, every cache allocated page, etc). We'll just print some
 // basic configs, this is only needed for tests.
 impl<F> Debug for Pager<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("Pager")
             .field("page_size", &self.page_size)
             .field("cache_size", &self.cache.max_size())

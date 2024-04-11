@@ -495,7 +495,7 @@ impl<H> Clone for BufferWithHeader<H> {
 }
 
 impl<H: Debug> Debug for BufferWithHeader<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("BufferWithHeader")
             .field("size", &self.size)
             .field("header", self.header())
@@ -1721,7 +1721,7 @@ impl Page {
 }
 
 impl Debug for Page {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Page")
             .field("overflow", &self.overflow)
             .field("size", &self.size())

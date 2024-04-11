@@ -260,7 +260,7 @@ impl<F: Seek + Read + Write + FileOps> SeqScan<F> {
 }
 
 impl<F> Display for SeqScan<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SeqScan on table '{}'", self.table.name)
     }
 }
@@ -305,7 +305,7 @@ impl<F: Seek + Read + Write + FileOps> ExactMatch<F> {
 }
 
 impl<F> Display for ExactMatch<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "ExactMatch ({}) on {} '{}'",
@@ -613,7 +613,7 @@ impl<F: Seek + Read + Write + FileOps> KeyScan<F> {
 }
 
 impl<F> Display for KeyScan<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "KeyScan ({}) on table '{}'",
@@ -755,7 +755,7 @@ impl<F: Seek + Read + Write + FileOps> Filter<F> {
 }
 
 impl<F> Display for Filter<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Filter ({})", self.filter)
     }
 }
@@ -797,7 +797,7 @@ impl<F: Seek + Read + Write + FileOps> Project<F> {
 }
 
 impl<F> Display for Project<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Project ({})", join(&self.projection, ", "))
     }
 }
@@ -853,7 +853,7 @@ impl<F: Seek + Read + Write + FileOps> Insert<F> {
 }
 
 impl<F> Display for Insert<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Insert on table '{}'", self.table.name)
     }
 }
@@ -959,7 +959,7 @@ impl<F: Seek + Read + Write + FileOps> Update<F> {
 }
 
 impl<F> Display for Update<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "Update ({}) on table '{}'",
@@ -1010,7 +1010,7 @@ impl<F: Seek + Read + Write + FileOps> Delete<F> {
 }
 
 impl<F> Display for Delete<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Delete from table '{}'", self.table.name)
     }
 }
@@ -1366,7 +1366,7 @@ pub(crate) struct Collect<F> {
 }
 
 impl<F> Display for Collect<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "Collect ({})",
@@ -1546,7 +1546,7 @@ impl<F: Seek + Read + Write + FileOps> SortKeysGen<F> {
 }
 
 impl<F> Display for SortKeysGen<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SortKeysGen ({})", join(&self.gen_exprs, ", "))
     }
 }
@@ -2330,7 +2330,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 }
 
 impl<F> Display for Sort<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let sort_col_names = self
             .comparator
             .sort_keys_indexes

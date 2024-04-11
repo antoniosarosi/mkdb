@@ -176,7 +176,7 @@ impl From<FromUtf8Error> for EncodingError {
 }
 
 impl fmt::Display for EncodingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::IntConversion(e) => write!(f, "{e}"),
             Self::SliceConversion(message) => f.write_str(message),

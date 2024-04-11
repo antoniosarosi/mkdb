@@ -8,6 +8,7 @@
 
 use std::{collections::HashSet, fmt::Display};
 
+use super::statement::Drop;
 use crate::{
     db::{DatabaseContext, DbError, Schema, SqlError, TableMetadata, ROW_ID_COL},
     sql::statement::{BinaryOperator, Constraint, Create, DataType, Expression, Statement, Value},
@@ -41,7 +42,7 @@ pub(crate) enum AlreadyExists {
 }
 
 impl Display for AlreadyExists {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Index(index) => write!(f, "index {index} already exists"),
             Self::Table(table) => write!(f, "table {table} already exists"),
@@ -50,7 +51,7 @@ impl Display for AlreadyExists {
 }
 
 impl Display for AnalyzerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::ColumnValueCountMismatch => f.write_str("number of columns doesn't match values"),
             Self::MultiplePrimaryKeys => f.write_str("only one primary key per table is allowed"),
@@ -232,6 +233,10 @@ pub(crate) fn analyze(
 
         Statement::Explain(inner) => {
             analyze(inner, ctx)?;
+        }
+
+        Statement::Drop(Drop::Table(table)) => {
+            ctx.table_metadata(table)?;
         }
 
         _ => {

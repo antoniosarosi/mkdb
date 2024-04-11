@@ -243,7 +243,7 @@ impl PartialOrd for Value {
 }
 
 impl Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Value::Number(number) => write!(f, "{number}"),
             Value::String(string) => write!(f, "\"{string}\""),
@@ -253,7 +253,7 @@ impl Display for Value {
 }
 
 impl Display for DataType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             DataType::Int => f.write_str("INT"),
             DataType::UnsignedInt => f.write_str("INT UNSIGNED"),
@@ -266,7 +266,7 @@ impl Display for DataType {
 }
 
 impl Display for Column {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} {}", self.name, self.data_type)?;
 
         for constraint in &self.constraints {
@@ -282,13 +282,13 @@ impl Display for Column {
 }
 
 impl Display for Assignment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} = {}", self.identifier, self.value)
     }
 }
 
 impl Display for BinaryOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             BinaryOperator::Eq => "=",
             BinaryOperator::Neq => "!=",
@@ -307,7 +307,7 @@ impl Display for BinaryOperator {
 }
 
 impl Display for UnaryOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_char(match self {
             UnaryOperator::Minus => '-',
             UnaryOperator::Plus => '+',
@@ -316,7 +316,7 @@ impl Display for UnaryOperator {
 }
 
 impl Display for Expression {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Identifier(ident) => f.write_str(ident),
             Self::Value(value) => write!(f, "{value}"),
@@ -337,7 +337,7 @@ impl Display for Expression {
 }
 
 impl Display for Statement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Statement::Create(create) => match create {
                 Create::Table { name, columns } => {

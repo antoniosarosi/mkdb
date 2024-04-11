@@ -105,7 +105,7 @@ impl From<&Keyword> for Token {
 }
 
 impl Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Eof => f.write_str("EOF"),
             Self::Whitespace(whitespace) => write!(f, "{whitespace}"),
@@ -132,7 +132,7 @@ impl Display for Token {
 }
 
 impl Display for Keyword {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             Self::Select => "SELECT",
             Self::Create => "CREATE",
@@ -174,7 +174,7 @@ impl Display for Keyword {
 }
 
 impl Display for Whitespace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_char(match self {
             Self::Space => ' ',
             Self::Tab => '\t',
