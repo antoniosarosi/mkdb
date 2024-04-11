@@ -113,11 +113,17 @@ impl Display for ParserError {
             self.location.line, self.location.col, self.kind,
         )?;
 
-        f.write_str(self.input.lines().nth(self.location.line - 1).unwrap())?;
+        let white_spaces = if let Some(line) = self.input.lines().nth(self.location.line - 1) {
+            f.write_str(line)?;
+            self.location.col - 1
+        } else {
+            // Unexpected EOF
+            let line = self.input.lines().last().unwrap();
+            f.write_str(line)?;
+            line.chars().count()
+        };
 
-        let white_spaces = String::from(" ").repeat(self.location.col - 1);
-
-        write!(f, "\n{white_spaces}^")
+        write!(f, "\n{}^", String::from(" ").repeat(white_spaces))
     }
 }
 

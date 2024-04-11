@@ -1,4 +1,9 @@
+//! Simple CLI client for MKDB.
+//!
+//! See [`mkdb::tcp::proto`] for a detailed description of the network protocol.
+
 use std::{
+    collections::VecDeque,
     env,
     io::{Read, Write},
     net::TcpStream,
@@ -15,11 +20,13 @@ const SINGLE_QUOTE_STR_PROMPT: &str = "string(')> ";
 const DOUBLE_QUOTE_STR_PROMPT: &str = "string(\")> ";
 
 fn main() -> rustyline::Result<()> {
-    let port = env::args()
-        .nth(1)
-        .expect("port not provided")
-        .parse::<u16>()
-        .expect("port parse error");
+    // let port = env::args()
+    //     .nth(1)
+    //     .expect("port not provided")
+    //     .parse::<u16>()
+    //     .expect("port parse error");
+
+    let port = 8000;
 
     let mut rl = DefaultEditor::new()?;
     if rl.load_history("history.mkdb").is_err() {
@@ -50,23 +57,21 @@ fn main() -> rustyline::Result<()> {
             }
         };
 
-        let mut terminators_found = 0;
+        let mut terminator_positions = VecDeque::new();
 
-        for chr in line.chars() {
-            match chr {
-                '"' | '\'' => match string_quote {
-                    None => string_quote = Some(chr),
+        for (index, byte) in line.bytes().enumerate() {
+            match byte {
+                b'"' | b'\'' => match string_quote {
+                    None => string_quote = Some(byte),
                     Some(opening_quote) => {
-                        if opening_quote == chr {
+                        if opening_quote == byte {
                             string_quote.take();
                         }
                     }
                 },
 
-                ';' => {
-                    if string_quote.is_none() {
-                        terminators_found += 1;
-                    }
+                b';' => {
+                    terminator_positions.push_back(index);
                 }
 
                 _ => {}
@@ -87,12 +92,22 @@ fn main() -> rustyline::Result<()> {
         if !sql.is_empty() {
             sql.push('\n');
         }
+
+        // Adjust terminators.
+        terminator_positions
+            .iter_mut()
+            .for_each(|pos| *pos += sql.len());
+
         sql.push_str(&line);
 
         // Statement is not complete.
-        if terminators_found == 0 {
+        if terminator_positions.is_empty()
+            || terminator_positions
+                .back()
+                .is_some_and(|pos| !sql[*pos + 1..].trim_end().is_empty())
+        {
             prompt = if let Some(quote) = string_quote {
-                if quote == '"' {
+                if quote == b'"' {
                     DOUBLE_QUOTE_STR_PROMPT
                 } else {
                     SINGLE_QUOTE_STR_PROMPT
@@ -100,61 +115,62 @@ fn main() -> rustyline::Result<()> {
             } else {
                 CONTINUATION_PROMPT
             };
-            continue;
+        } else {
+            // Now we have a full statement, add it to the history and reset prompt.
+            prompt = PROMPT;
+            rl.add_history_entry(&sql)?;
         }
 
-        // Now we have a full statement, add it to the history and reset prompt.
-        prompt = PROMPT;
-        rl.add_history_entry(&sql)?;
+        let mut start = 0;
+        while let Some(pos) = terminator_positions.pop_front() {
+            let packet_transmission = Instant::now();
 
-        if terminators_found > 1 || terminators_found == 1 && !line.trim_end().ends_with(';') {
-            sql.clear();
-            string_quote.take();
-            println!("Only one SQL statement at a time terminated with ';' can be sent. Multiple statements are not supported.");
-            continue;
+            let statement = &sql[start..=pos];
+
+            // Send the statement to the server.
+            stream.write_all(&(statement.len() as u32).to_le_bytes())?;
+            stream.write_all(statement.as_bytes())?;
+
+            // Read header.
+            let mut payload_len_buf = [0; 4];
+            stream.read_exact(&mut payload_len_buf)?;
+            let payload_len = u32::from_le_bytes(payload_len_buf) as usize;
+
+            // Read payload.
+            payload.resize(payload_len, 0);
+            stream.read_exact(&mut payload)?;
+
+            match mkdb::tcp::proto::deserialize(&payload) {
+                Ok(response) => match response {
+                    Response::Err(e) => println!("{e}"),
+
+                    Response::EmptySet(affected_rows) => {
+                        println!(
+                            "Query OK, {affected_rows} {} affected ({:.2?})",
+                            plural("row", affected_rows),
+                            packet_transmission.elapsed(),
+                        )
+                    }
+
+                    Response::QuerySet(collection) => {
+                        println!(
+                            "{}\n{} {} ({:.2?})",
+                            ascii_table(&collection),
+                            collection.tuples.len(),
+                            plural("row", collection.tuples.len()),
+                            packet_transmission.elapsed(),
+                        );
+                    }
+                },
+
+                Err(e) => println!("decode error: {e}"),
+            };
+
+            // Prepare next statement.
+            start = pos + 1;
         }
 
-        let packet_transmission = Instant::now();
-
-        // Send the statement to the server.
-        stream.write_all(&(sql.len() as u32).to_le_bytes())?;
-        stream.write_all(sql.as_bytes())?;
-        sql.clear();
-
-        // Read header.
-        let mut payload_len_buf = [0; 4];
-        stream.read_exact(&mut payload_len_buf)?;
-        let payload_len = u32::from_le_bytes(payload_len_buf) as usize;
-
-        // Read payload.
-        payload.resize(payload_len, 0);
-        stream.read_exact(&mut payload)?;
-
-        match mkdb::tcp::proto::deserialize(&payload) {
-            Ok(response) => match response {
-                Response::Err(e) => println!("{e}"),
-
-                Response::EmptySet(affected_rows) => {
-                    println!(
-                        "Query OK, {affected_rows} {} affected ({:.2?})",
-                        plural("row", affected_rows),
-                        packet_transmission.elapsed(),
-                    )
-                }
-
-                Response::QuerySet(collection) => {
-                    println!(
-                        "{}\n{} {} ({:.2?})",
-                        ascii_table(&collection),
-                        collection.tuples.len(),
-                        plural("row", collection.tuples.len()),
-                        packet_transmission.elapsed(),
-                    );
-                }
-            },
-
-            Err(e) => println!("decode error: {e}"),
-        };
+        sql.drain(..start);
     }
 
     rl.save_history("history.mkdb")?;
