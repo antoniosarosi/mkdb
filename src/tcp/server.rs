@@ -56,6 +56,8 @@ fn handle_client(
     // back to None when the transaction ends.
     let mut guard: Option<MutexGuard<'_, Database<File>>> = None;
 
+    // TODO: Gracefull shutdown. We have to use the ctrlc crate and drop the
+    // thread pool instance.
     loop {
         let mut payload_buf = Vec::new();
 

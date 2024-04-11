@@ -11,6 +11,8 @@ use rustyline::{error::ReadlineError, DefaultEditor};
 const EXIT_CMD: &str = "quit";
 const PROMPT: &str = "mkdb> ";
 const CONTINUATION_PROMPT: &str = "sql> ";
+const SINGLE_QUOTE_STR_PROMPT: &str = "string(')> ";
+const DOUBLE_QUOTE_STR_PROMPT: &str = "string(\")> ";
 
 fn main() -> rustyline::Result<()> {
     let port = env::args()
@@ -28,6 +30,7 @@ fn main() -> rustyline::Result<()> {
     println!("Connected to {}.", stream.peer_addr()?);
     println!("Welcome to the MKDB shell. Type SQL statements below or '{EXIT_CMD}' to exit the program.\n");
 
+    let mut string_quote = None;
     let mut sql = String::new();
     let mut payload = Vec::new();
     let mut prompt = PROMPT;
@@ -47,6 +50,29 @@ fn main() -> rustyline::Result<()> {
             }
         };
 
+        let mut terminators_found = 0;
+
+        for chr in line.chars() {
+            match chr {
+                '"' | '\'' => match string_quote {
+                    None => string_quote = Some(chr),
+                    Some(opening_quote) => {
+                        if opening_quote == chr {
+                            string_quote.take();
+                        }
+                    }
+                },
+
+                ';' => {
+                    if !string_quote.is_some() {
+                        terminators_found += 1;
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
         // quit
         if sql.is_empty() && line.trim() == EXIT_CMD {
             break;
@@ -64,8 +90,16 @@ fn main() -> rustyline::Result<()> {
         sql.push_str(&line);
 
         // Statement is not complete.
-        if !line.contains(";") {
-            prompt = CONTINUATION_PROMPT;
+        if terminators_found == 0 {
+            prompt = if let Some(quote) = string_quote {
+                if quote == '"' {
+                    DOUBLE_QUOTE_STR_PROMPT
+                } else {
+                    SINGLE_QUOTE_STR_PROMPT
+                }
+            } else {
+                CONTINUATION_PROMPT
+            };
             continue;
         }
 
@@ -73,9 +107,10 @@ fn main() -> rustyline::Result<()> {
         prompt = PROMPT;
         rl.add_history_entry(&sql)?;
 
-        if !sql.ends_with(";") {
+        if terminators_found > 1 || terminators_found == 1 && !line.trim_end().ends_with(";") {
             sql.clear();
-            println!("Only one SQL statement at a time terminated with ';' can be sent");
+            string_quote.take();
+            println!("Only one SQL statement at a time terminated with ';' can be sent. Multiple statements are not supported.");
             continue;
         }
 
@@ -101,16 +136,18 @@ fn main() -> rustyline::Result<()> {
 
                 Response::EmptySet(affected_rows) => {
                     println!(
-                        "Query OK, {affected_rows} rows affected ({:.2?})",
+                        "Query OK, {affected_rows} {} affected ({:.2?})",
+                        plural("row", affected_rows),
                         packet_transmission.elapsed(),
                     )
                 }
 
                 Response::QuerySet(collection) => {
                     println!(
-                        "{}\n{} rows ({:.2?})",
+                        "{}\n{} {} ({:.2?})",
                         ascii_table(&collection),
                         collection.tuples.len(),
+                        plural("row", collection.tuples.len()),
                         packet_transmission.elapsed(),
                     );
                 }
@@ -122,6 +159,14 @@ fn main() -> rustyline::Result<()> {
 
     rl.save_history("history.mkdb")?;
     Ok(())
+}
+
+fn plural(word: &str, length: usize) -> String {
+    if length == 1 {
+        String::from(word)
+    } else {
+        format!("{word}s")
+    }
 }
 
 fn ascii_table(query: &mkdb::QuerySet) -> String {
@@ -140,7 +185,7 @@ fn ascii_table(query: &mkdb::QuerySet) -> String {
         .map(|row| {
             row.iter()
                 .map(|col| match col {
-                    Value::String(string) => string.to_owned(),
+                    Value::String(string) => string.replace("\n", "\\n"),
                     other => other.to_string(),
                 })
                 .collect()
