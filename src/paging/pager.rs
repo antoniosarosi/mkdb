@@ -348,6 +348,7 @@ impl<F: Seek + Read + Write + FileOps> Pager<F> {
         while let Some((page_number, content)) = journal_pages.try_next()? {
             self.file.write(page_number, content)?;
             self.cache.invalidate(page_number);
+            self.dirty_pages.remove(&page_number);
             num_pages_rolled_back += 1;
         }
 

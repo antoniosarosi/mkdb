@@ -6,6 +6,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    ffi::OsString,
     fmt::Display,
     fs::File,
     io::{self, Read, Seek, Write},
@@ -124,7 +125,11 @@ impl Database<File> {
         let full_db_file_path = path.as_ref().canonicalize()?;
         let work_dir = full_db_file_path.parent().unwrap().to_path_buf();
 
-        let mut extension = full_db_file_path.extension().unwrap().to_os_string();
+        let mut extension = full_db_file_path
+            .extension()
+            .unwrap_or(&OsString::new())
+            .to_os_string();
+
         extension.push(".journal");
 
         let journal_file_path = full_db_file_path.with_extension(extension);
