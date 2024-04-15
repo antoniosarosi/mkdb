@@ -1572,7 +1572,7 @@ pub(crate) struct SortConfig<F> {
 /// Default value for [`Sort::input_buffers`].
 pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 
-/// External K-way merge sort implementation.
+/// K-way external merge sort implementation.
 ///
 /// Check this [lecture] for the basic idea:
 ///
@@ -1580,14 +1580,14 @@ pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 ///
 /// # Algorithm
 ///
-/// Variable length data makes this algorithm a little bit more complicated than
-/// the lecture suggests but the core concepts are the same. The first thing we
-/// do is we generate the "sort keys" for all the tuples and collect them into
-/// a file or in-memory buffer if we're lucky enough and they fit. Sort keys are
-/// basically the resolved values of `ORDER BY` expressions. In the case of
-/// simple columns we already have the value in the database. However, in the
-/// case of more complicated expressions *that are NOT simple columns* we have
-/// to compute the value. For example:
+/// Variable length data makes this algorithm more complex than the lecture
+/// suggests but the core concepts are the same. The first thing we do is we
+/// generate the "sort keys" for all the tuples and collect them into a file or
+/// in-memory buffer if we're lucky enough and they fit. Sort keys are basically
+/// the resolved values of `ORDER BY` expressions. In the case of simple columns
+/// we already have the value in the database. However, in the case of more
+/// complicated expressions *that are NOT simple columns* we have to compute the
+/// value. For example:
 ///
 /// ```sql
 /// CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(255), price INT, discount INT);
@@ -1597,11 +1597,11 @@ pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 ///
 /// In the example above the first sort key is `price * discount`, which is an
 /// expression that needs to be evaluated. The second sort key corresponds to
-/// the expression `price`, which is a simple column that we already have value
-/// for, we don't need to generate it. The sort keys that need to be generated
-/// are computed by [`SortKeysGen`] before the [`Collect`] writes the tuple
-/// to a file or an in-memory buffer and they are appended to the end of the
-/// tuple after all its other columns. That format is then used by
+/// the expression `price`, which is a simple column that we already have a
+/// value for, we don't need to generate it. The sort keys that need to be
+/// generated are computed by [`SortKeysGen`] before the [`Collect`] writes the
+/// tuple to a file or an in-memory buffer and they are appended to the end of
+/// the tuple after all its other columns. That format is then used by
 /// [`TuplesComparator`] to determine the final [`Ordering`].
 ///
 /// The reason we need to generate the sort keys so early is because they change
@@ -1619,318 +1619,246 @@ pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 ///
 /// There are two main cases:
 ///
-/// 1. The [`Collect`] did not use any files because all the tuples fit
+/// 1. The [`Collect`] plan did not use any files because all the tuples fit
 /// in its in-memory buffer. In that case, move the buffer out of the
-/// [`Collect`] into the [`Sort`] plan and just do an in-memory sorting.
+/// [`Collect`] struct into the [`Sort`] plan and just do an in-memory sorting.
 /// No IO required.
 ///
-/// 2. The [`Collect`] had to create a file in order to collect all
-/// tuples. This is the complicated case.
+/// 2. The [`Collect`] plan had to create a file in order to collect all tuples.
+/// This is the complicated case.
 ///
-/// # External 2-Way Merge Sort With Variable Length Data
+/// # K-Way External Merge Sort With Variable Length Data
 ///
 /// As mentioned earlier, we keep track of the largest tuple in order to compute
 /// the page size that we need for sorting. The page size is either that of the
 /// [`Pager`] or the closest power of two that can fit the largest tuple.
 ///
-/// Once we know the exact page size we can start the "pass 0" or "1 page runs".
-/// In this step we collect tuples into one page, sort them in-memory, write the
-/// page to a file, fill the page again, sort it, write it to the file again and
-/// so on until there are no more tuples. The file ends up looking roughly like
-/// this:
+/// Once we know the exact page size we can start the "pass 0" or "precomputed
+/// page runs". In this step we fill all the input buffers that we have
+/// available with tuples comming from the source plan, sort all the buffers in
+/// memory, merge them using the K-way merge algorithm and output all the
+/// produced pages to a new file. Suppose `K = 2`, then pass 0 produces a file
+/// roughly similar to this one:
 ///
 /// ```text
-///       40     20        20    20    20         30      30               60
-///     bytes   bytes     bytes bytes bytes      bytes   bytes            bytes
-/// +-------------------+--------------------+--------------------+--------------------+
-/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
-/// | |   T3   | T5 |   | | T1 | T7 | T8 |   | |  T4   |  T6  |   | |      T2      |   |
-/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
-/// +-------------------+--------------------+--------------------+--------------------+
-///        PAGE 0               PAGE 1               PAGE 2               PAGE 3
-///       64 bytes             64 bytes             64 bytes             64 bytes
+///    20       40         20   20    20             60              30      30
+///   bytes   bytes      bytes bytes bytes          bytes           bytes   bytes
+/// +-------------------+-------------------+-------------------+-------------------+
+/// | +----+---------+  | +----+----+----+  | +--------------+  | +-------+-------+ |
+/// | | T1 |    T3   |  | | T5 | T7 | T8 |  | |      T2      |  | |  T4   |  T6   | |
+/// | +----+---------+  | +----+----+----+  | +--------------+  | +-------+-------+ |
+/// +-------------------+-------------------+-------------------+-------------------+
+///         PAGE 0              PAGE 1              PAGE 2             PAGE 3
+///        64 bytes            64 bytes            64 bytes           64 bytes
 /// ```
 ///
-/// As you can see, tuples are sorted within every page but they are not sorted
-/// as a whole, so there is still a lot of work to do. After pass 0 is done we
-/// don't actually need to do any more "sorting" per se, we only need to "merge"
-/// pages together.
+/// As you can see, every segment of K pages is sorted by itself. In this case,
+/// pages 0 and 1 are fully sorted while pages 2 and 3 are also fully sorted.
+/// Now that we have segments of K sorted pages, the second pass can produce
+/// segments of K^2 sorted pages on average. Variable length tuples make it
+/// impossible to calculate exactly how many pages we'll produce, but with fixed
+/// size tuples and 2 buffers, if each buffer can load 2 sorted pages then we'll
+/// produce 4 sorted pages. After that, in the next pass each buffer will be
+/// able to load 4 sorted pages, which means that with 2 buffers we can produce
+/// 8 sorted pages in total. So the number of produced pages multiplies by K on
+/// each iteration (on average).
+///
+/// It should also be noted that we never load more than one page at a time in
+/// each buffer, that's not possible as the buffer size is the same as the page
+/// size. We load pages one at a time, it's just that one single buffer can load
+/// many pages during a single iteration or pass. After pass 0 is done we don't
+/// actually need to do any more "sorting" per se, we only need to "merge" pages
+/// together.
 ///
 /// ## The Merge Sub-algorithm
 ///
-/// Once we've completed the "1 page runs" we do the "2 page runs". Basically
-/// we load two pages into memory, and since they are already sorted on their
-/// own we can create a new set of pages that are fully sorted from start to
-/// finish. Continuing with the example above, we start by loading page 0 and
-/// page 1 into memory and merging them together:
+/// Once we've completed the "precomputed runs" or "pass 0" we start merging
+/// pages. Continuing with the example above, we produced a couple runs of 2
+/// sorted pages, so now each of the buffers will load a single "run" from the
+/// previous iteration and we'll merge the tuples to produce a new run in the
+/// current iteration. For that we need a couple cursors:
 ///
 /// ```text
-///       40     20
-///     bytes   bytes
-/// +--------------------+
-/// | +--------+----+    |
-/// | |   T3   | T5 |    | ------+
-/// | +--------+----+    |       |            20       40
-/// +--------------------+       |           bytes    bytes
-///        PAGE 0                |         +--------------------+
-///       64 bytes               |         | +----+---------+   |
-///                              +-------> | | T1 |    T3   |   |
-///    20    20    20            |         | +----+---------+   |
-///   bytes bytes bytes          |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 0
-/// | +----+----+----+   |       |                64 bytes
-/// | | T1 | T7 | T8 |   | ------+
-/// | +----+----+----+   |
-/// +--------------------+
-///         PAGE 1
+///    20       40         20   20    20             60              30      30
+///   bytes   bytes      bytes bytes bytes          bytes           bytes   bytes
+/// +-------------------+-------------------+-------------------+-------------------+
+/// | +----+---------+  | +----+----+----+  | +--------------+  | +-------+-------+ |
+/// | | T1 |    T3   |  | | T5 | T7 | T8 |  | |      T2      |  | |  T4   |  T6   | |
+/// | +----+---------+  | +----+----+----+  | +--------------+  | +-------+-------+ |
+/// +-------------------+-------------------+-------------------+-------------------+
+///         PAGE 0              PAGE 1             PAGE 2              PAGE 3
+///        64 bytes            64 bytes           64 bytes            64 bytes
+///
+///            ^                                     ^
+///            |                                     |
+///         CURSOR 1                              CURSOR 2
+/// ```
+///
+/// The first input buffer will work with pages 0 and 1 while the second input
+/// buffer will work with pages 2 and 3. We start by loading the first page into
+/// each buffer and executing the K-way merge algorithm, which basically
+/// compares the first tuple in each input buffer and moves the smallest of them
+/// to the output buffer.
+///
+/// ```text
+///    20      40
+///   bytes   bytes
+/// +-------------------+
+/// | +----+---------+  |
+/// | | T1 |    T3   |  | ------+
+/// | +----+---------+  |       |            20
+/// +-------------------+       |           bytes
+///         PAGE 0              |         +--------------------+
+///        64 bytes             |         | +----+             |
+///                             +-------> | | T1 |             |
+///          60                 |         | +----+             |
+///         bytes               |         +--------------------+
+/// +-------------------+       |              MERGED PAGE 0
+/// | +--------------+  |       |                64 bytes
+/// | |      T2      |  | ------+
+/// | +--------------+  |
+/// +-------------------+
+///         PAGE 2
 ///        64 bytes
 /// ```
 ///
-/// Now that the first merged page is full, we write it to a new file and
-/// continue merging the rest of tuples:
-///
-/// ```text
-///     20
-///   bytes
-/// +--------------------+
-/// | +----+             |
-/// | | T5 |             | ------+
-/// | +----+             |       |            20    20    20
-/// +--------------------+       |           bytes bytes bytes
-///        PAGE 0                |         +--------------------+
-///       64 bytes               |         | +----+----+----+   |
-///                              +-------> | | T5 | T7 | T8 |   |
-///    20    20                  |         | +----+----+----+   |
-///   bytes bytes                |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 1
-/// | +----+----+        |       |                64 bytes
-/// | | T7 | T8 |        | ------+
-/// | +----+----+        |
-/// +--------------------+
-///         PAGE 1
-///        64 bytes
-/// ```
-///
-/// Pages 0 and 1 are now completely merged into two sorted pages. This is how
-/// the new file looks like so far:
-///
-/// ```text
-///     20       40          20    20    20
-///    bytes    bytes       bytes bytes bytes
-///  +--------------------+--------------------+
-///  | +----+---------+   | +----+----+----+   |
-///  | | T1 |    T3   |   | | T5 | T7 | T8 |   |
-///  | +----+---------+   | +----+----+----+   |
-///  +--------------------+--------------------+
-///       MERGED PAGE 0        MERGED PAGE 1
-///         64 bytes             64 bytes
-/// ```
-///
-/// As you can see, we have 2 pages that are fully sorted from start to finish.
-/// That's why this step is called a "2 page run". However, merging 2 pages
-/// won't always result in exactly 2 new pages due to the nature of variable
-/// length data, but we'll discuss that later. Now we load the next two pages in
-/// memory and repeat the process. We end up with this new file:
-///
-/// ```text
-///     20       40          20    20    20             60               30      30
-///    bytes    bytes       bytes bytes bytes          bytes            bytes   bytes
-///  +--------------------+--------------------+--------------------+--------------------+
-///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
-///  | | T1 |    T3   |   | | T5 | T7 | T8 |   | |      T2      |   | |  T4   |  T6  |   |
-///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
-///  +--------------------+--------------------+--------------------+--------------------+
-///       MERGED PAGE 0        MERGED PAGE 1       MERGED PAGE 2         MERGED PAGE 3
-///         64 bytes             64 bytes             64 bytes             64 bytes
-/// ```
-///
-/// ## Dealing With Variable Length Data
-///
-/// The new file has the same number of pages as the original "1 page runs"
-/// file. However, that is not always the case due to how variable length data
-/// fits in fixed size pages. There's a clear example in the next step of the
-/// algorithm: the "4 page runs". Now instead of taking 2 pages and merging
-/// them together we take 4 pages. We still load 2 pages at a time in memory,
-/// but we do so until we've merged 4 pages instead of 2. So we'll use two
-/// cursors for this task:
-///
-/// ```text
-///     20       40          20    20    20             60               30      30
-///    bytes    bytes       bytes bytes bytes          bytes            bytes   bytes
-///  +--------------------+--------------------+--------------------+--------------------+
-///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
-///  | | T1 |    T3   |   | | T5 | T7 | T8 |   | |      T2      |   | |  T4   |  T6  |   |
-///  | +----+---------+   | +----+----+----+   | +--------------+   | +-------+------+   |
-///  +--------------------+--------------------+--------------------+--------------------+
-///       MERGED PAGE 0        MERGED PAGE 1       MERGED PAGE 2         MERGED PAGE 3
-///         64 bytes             64 bytes             64 bytes             64 bytes
-///
-///            ^                                         ^
-///            |                                         |
-///         CURSOR 1                                 CURSOR 2
-/// ```
-///
-/// Cursor one starts pointing at 0 and cursor two points at 2. We start by
-/// merging pages 0 and 2 and then we move to pages 1 and 3. So, 0 and 2 first:
-///
-/// ```text
-///    20       40
-///   bytes    bytes
-/// +--------------------+
-/// | +----+---------+   |
-/// | | T1 |    T3   |   | ------+
-/// | +----+---------+   |       |            20
-/// +--------------------+       |           bytes
-///      MERGED PAGE 0           |         +--------------------+
-///        64 bytes              |         | +----+             |
-///                              +-------> | | T1 |             |
-///          60                  |         | +----+             |
-///         bytes                |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 0
-/// | +--------------+   |       |                64 bytes
-/// | |      T2      |   | ------+
-/// | +--------------+   |
-/// +--------------------+
-///     MERGED PAGE 2
-///        64 bytes
-/// ```
-///
-/// Notice how the first page that we produce can only fit tuple 1 because
-/// tuple 2 is 60 bytes in size and won't fit in the 64 byte page. So we write
-/// page 0 as is, with only one tuple, and produce the next one:
+/// Tuple T1 is less than T2 so we move it to the output buffer. The output
+/// buffer cannot fit tuple T2, so we have to write the output page to a new
+/// file and then move T2 into the output buffer:
 ///
 /// ```text
 ///       40
 ///      bytes
-/// +--------------------+
-/// | +---------+        |
-/// | |    T3   |        | ------+
-/// | +---------+        |       |                  60
-/// +--------------------+       |                 bytes
-///      MERGED PAGE 0           |         +--------------------+
-///        64 bytes              |         | +--------------+   |
-///                              +-------> | |      T2      |   |
-///          60                  |         | +--------------+   |
-///         bytes                |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 1
-/// | +--------------+   |       |                64 bytes
-/// | |      T2      |   | ------+
-/// | +--------------+   |
-/// +--------------------+
-///     MERGED PAGE 2
+/// +-------------------+
+/// | +---------+       |
+/// | |    T3   |       | ------+
+/// | +---------+       |       |                  60
+/// +-------------------+       |                 bytes
+///         PAGE 0              |         +-------------------+
+///        64 bytes             |         | +--------------+  |
+///                             +-------> | |      T2      |  |
+///                             |         | +--------------+  |
+///                             |         +-------------------+
+/// +-------------------+       |              MERGED PAGE 1
+/// |                   |       |                64 bytes
+/// |                   | ------+
+/// |                   |
+/// +-------------------+
+///         PAGE 2
 ///        64 bytes
 /// ```
 ///
-/// The second page we've produced is full again. So write it to the output file
-/// and produce the next one. Page 2 is also empty, it doesn't have any more
-/// tuples, so we'll move cursor two and load page 3 in its place:
-///
+/// With that the output buffer is full again, so we have to write the page to
+/// disk. On the other hand, input buffer 2 is empty, so we have to advance the
+/// cursor and load the next page in its segment chunk. A "segment" is a
+/// sequence of runs produced in the previous iteration. Since each input
+/// buffer has to load one of the previous runs we need to group the runs
+/// together somehow and for that we use "segments". The memory state will look
+/// like this after all the operations mentioned above are completed:
 ///
 /// ```text
 ///       40
 ///      bytes
-/// +--------------------+
-/// | +---------+        |
-/// | |    T3   |        | ------+
-/// | +---------+        |       |               40
-/// +--------------------+       |              bytes
-///      MERGED PAGE 0           |         +--------------------+
-///        64 bytes              |         | +---------+        |
-///                              +-------> | |    T3   |        |
-///      30      30              |         | +---------+        |
-///     bytes   bytes            |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 2
-/// | +-------+------+   |       |                64 bytes
-/// | |  T4   |  T6  |   | ------+
-/// | +-------+------+   |
-/// +--------------------+
-///      MERGED PAGE 3
+/// +-------------------+
+/// | +---------+       |
+/// | |    T3   |       | ------+
+/// | +---------+       |       |                  60
+/// +-------------------+       |                 bytes
+///         PAGE 0              |         +-------------------+
+///        64 bytes             |         |                   |
+///                             +-------> |                   |
+///      30      30             |         |                   |
+///     bytes   bytes           |         +-------------------+
+/// +-------------------+       |              MERGED PAGE 2
+/// | +-------+-------+ |       |                64 bytes
+/// | |  T4   |  T6   | | ------+
+/// | +-------+-------+ |
+/// +-------------------+
+///         PAGE 3
 ///        64 bytes
 /// ```
 ///
-/// See how we're facing the same issue again where the output page won't be
-/// able to fit tuple 4. No problem, just write the output page to the output
-/// file and continue repeating the process. Once we've written tuple 3 page 0
-/// becomes empty, so we'll shift its cursor to page 1:
+/// The output file so far looks like this:
 ///
 /// ```text
-///    20    20    20
-///   bytes bytes bytes
-/// +--------------------+
-/// | +----+----+----+   |
-/// | | T5 | T7 | T8 |   | ------+
-/// | +----+----+----+   |       |             30      20
-/// +--------------------+       |            bytes   bytes
-///      MERGED PAGE 1           |         +--------------------+
-///        64 bytes              |         | +-------+----+     |
-///                              +-------> | |  T4   | T5 |     |
-///      30      30              |         | +-------+----+     |
-///     bytes   bytes            |         +--------------------+
-/// +--------------------+       |              MERGED PAGE 3
-/// | +-------+------+   |       |                64 bytes
-/// | |  T4   |  T6  |   | ------+
-/// | +-------+------+   |
-/// +--------------------+
-///      MERGED PAGE 3
+///    20                        60
+///   bytes                     bytes
+/// +-------------------+-------------------+
+/// | +----+            | +--------------+  |
+/// | | T1 |            | |      T2      |  |
+/// | +----+            | +--------------+  |
+/// +-------------------+-------------------+
+///      MERGED PAGE 0      MERGED PAGE 1
+///        64 bytes            64 bytes
+/// ```
+///
+/// Now it should't be that hard to infer how the rest of the itearion will
+/// play. Currently we have tuples T3, T4 and T6 in the input buffers, we move
+/// T3 out into the output buffer, the first input buffer becomes empty so it
+/// loads page 1 and memory ends up like this:
+///
+/// ```text
+///    20    20   20
+///  bytes bytes bytes
+/// +-------------------+
+/// | +----+----+----+  |
+/// | | T5 | T7 | T8 |  | ------+
+/// | +----+----+----+  |       |               40
+/// +-------------------+       |              bytes
+///         PAGE 1              |         +-------------------+
+///        64 bytes             |         | +---------+       |
+///                             +-------> | |    T3   |       |
+///      30      30             |         | +---------+       |
+///     bytes   bytes           |         +-------------------+
+/// +-------------------+       |              MERGED PAGE 2
+/// | +-------+-------+ |       |                64 bytes
+/// | |  T4   |  T6   | | ------+
+/// | +-------+-------+ |
+/// +-------------------+
+///         PAGE 3
 ///        64 bytes
 /// ```
 ///
-/// We managed to squeeze tuples 4 and 5 into page 3. Now we still have to merge
-/// the rest of them. At the end, we'll end up with this new file:
+/// Again, T4 doesn't fit in the output page so we write the output buffer,
+/// clear it and repeat the merge algorithm. When we're done merging all the
+/// tuples in memory, the output file will look like this:
 ///
 /// ```text
-///     20                         60                40                 30      20           30      20          20
-///    bytes                      bytes             bytes              bytes   bytes        bytes   bytes       bytes
-///  +--------------------+--------------------+--------------------+--------------------+--------------------+--------------------+
-///  | +----+             | +--------------+   | +---------+        | +-------+----+     | +-------+----+     | +----+             |
-///  | | T1 |             | |      T2      |   | |    T3   |        | |  T4   | T5 |     | |  T6   | T7 |     | | T8 |             |
-///  | +----+             | +--------------+   | +---------+        | +-------+----+     | +-------+----+     | +----+             |
-///  +--------------------+--------------------+--------------------+--------------------+--------------------+--------------------+
-///       MERGED PAGE 0       MERGED PAGE 1         MERGED PAGE 2        MERGED PAGE 3        MERGED PAGE 4        MERGED PAGE 5
-///         64 bytes             64 bytes             64 bytes             64 bytes             64 bytes             64 bytes
+///    20                        60             40                  30     20            30     20           20
+///   bytes                     bytes          bytes               bytes  bytes         bytes  bytes        bytes
+/// +-------------------+-------------------+-------------------+--------------------+-------------------+-------------------+
+/// | +----+            | +--------------+  | +---------+       | +-------+----+     | +-------+----+    | +----+            |
+/// | | T1 |            | |      T2      |  | |   T3    |       | |  T4   | T5 |     | |  T6   | T7 |    | | T8 |            |
+/// | +----+            | +--------------+  | +---------+       | +-------+----+     | +-------+----+    | +----+            |
+/// +-------------------+-------------------+-------------------+--------------------+-------------------+-------------------+
+///      MERGED PAGE 0      MERGED PAGE 1        MERGED PAGE 2       MERGED PAGE 3        MERGED PAGE 4       MERGED PAGE 5
+///        64 bytes            64 bytes             64 bytes            64 bytes             64 bytes            64 bytes
 /// ```
 ///
-/// In theory, we should have produced 4 pages, that's why it'c called a
-/// "4 page run". But variable length data makes everything more interesting
-/// doesn't it? Anyway, if the original input file had more than 4 pages, we'd
-/// continue the 4 page run by shifting the cursor to pages 4-8. We'd merge 4
-/// and 6, then 5 and 7. And so on until there are no more pages. After that we
-/// duplicate the page runs every time. So after the "4 page runs" we'd do the
-/// "8 page runs", which is not necessary in this case because we don't even
-/// have 8 pages to begin with and everything is already sorted.
+/// This run has produced 6 sorted pages. A fixed size run would have produced
+/// 4 pages because each buffer loaded 2 pages in total, but variable length
+/// data makes everything more interesting doesn't it?
 ///
-/// But that's the idea, we keep duplicating the page runs until we're done. It
-/// doesn't matter whether the amount of pages changes or not in the process,
-/// the algorithm still works. The only caveat is that we need two files. We
-/// have an input file from which we read from and an output file where we write
-/// to. Once we've completed an entire pass, we swap the files so that the
-/// previous output file becomes the new input file and the previous input file
-/// is truncated and becomes the new output file.
+/// Now, these 6 pages would be processed by one single buffer in the next
+/// iteration, but in this case there is no next iteration becaue the file is
+/// already sorted. If there were more pages in the original input file we'd
+/// just shift the cursors and repeat the algorithm for the next segment. So
+/// input buffer one would now work with pages 4 and 5 while input buffer two
+/// would work with pages 6 and 7, producing another sorted run of somewhere
+/// between 3 to 6 pages, depending on how variable length data prefers to
+/// organize itself this time around.
 ///
-/// # K-Way Merge
+/// Once the entire input file is processed and we have a complete output file,
+/// we move to the next iteration and swap the files so that the previous output
+/// is now the input and viceversa. We can sort an entire table using only 2
+/// files. Technically 3 because [`PageRunsFifo`] can also use the disk but more
+/// on that later.
 ///
-/// The algorithm described above is a 2-way merge where we only use two input
-/// buffers or input pages and one output buffer. However, we can use more than
-/// two input buffers and generalize the algorithm to work for K buffers. In
-/// that case, after we do the 1 page runs to sort pages, we don't do a "2 page
-/// run", we do a "K page run" because we can load K pages at a time in memory.
+/// ## Number Of Input Buffers (K)
 ///
-/// Again, starting from the sorted file after we do the "1 page runs":
-///
-/// ```text
-///       40     20        20    20    20         30      30               60
-///     bytes   bytes     bytes bytes bytes      bytes   bytes            bytes
-/// +-------------------+--------------------+--------------------+--------------------+
-/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
-/// | |   T3   | T5 |   | | T1 | T7 | T8 |   | |  T4   |  T6  |   | |      T2      |   |
-/// | +--------+----+   | +----+----+----+   | +-------+------+   | +--------------+   |
-/// +-------------------+--------------------+--------------------+--------------------+
-///        PAGE 0               PAGE 1               PAGE 2               PAGE 3
-///       64 bytes             64 bytes             64 bytes             64 bytes
-/// ```
-///
-/// If we have 4 buffers instead of 2 we can load all these 4 pages into memory
-/// and merge them:
+/// If we increment the number of input buffers we will reduce IO at the cost of
+/// using more RAM. If we had 4 buffers instead of two for the previous example,
+/// the initial "pass 0" would sort the entire file:
 ///
 /// ```text
 ///       40     20
@@ -1974,14 +1902,57 @@ pub const DEFAULT_SORT_INPUT_BUFFERS: usize = 4;
 ///        64 bytes
 /// ```
 ///
-/// And so we'd produce the entire sorted file in one single run. The next run
-/// would be able to produce 16 pages because we already have segments of 4
-/// pages that are sorted. With a K-way algorithm each run multiplies the number
-/// or pages by K instead of doubling it, which results in fewer overall passes
-/// through the file and thus less IO. Check the [lecture] mentioned at the
-/// beginning for the IO complexity analysis and formulas, but basically the
-/// more buffers we have the less IO we have to do. The number of input buffers
-/// is configured through [`Self::input_buffers`].
+/// You can see how using 4 buffers would straight up produce the final output
+/// file of 6 pages that we discussed before. This depends on the order that
+/// tuples come from the source, fragmentation might cause the algorithm to
+/// require additional passes. But overall, the more buffers the less passes
+/// we need to do, because increasing K also increases the number of produced
+/// pages on average per run. For example with two buffers, on average we would
+/// produce runs of 4 pages in pass 1, then runs of 8 pages then 16 pages and
+/// so on. With 10 buffers however, we produce runs of 100 pages in pass 1, then
+/// runs of a 1000 pages, and so on. Check the [lecture] mentioned at the
+/// beginning for the IO complexity analysys.
+///
+/// # Dealing With Variable Length Records
+///
+/// In order to keep track of which previous run each buffer has to load in the
+/// next iteration, we maintain an instance of [`PageRunsFifo`] that stores the
+/// number of pages produced in each run. Initially, we will produce many runs,
+/// imagine we're sorting one million pages with 4 buffers: pass 0 will produce
+/// somewhere around 250,000 runs of 4 pages each. The number of pages in each
+/// run is stored as a 4 byte integer, so we would need aproximately one million
+/// bytes or almost one megabyte for this bookkeeping. Not a lot, but just in
+/// case we're sorting a billion pages, [`PageRunsFifo`] is prepared to work
+/// with fixed size memory and extend itself on the disk just like [`Collect`]
+/// does, so the memory consumption is always limited.
+///
+/// As the number of pages produced in each run grows, the bookkeeping data
+/// structure becomes smaller and smaller. At some point we'll produce 4 runs of
+/// 250,000 pages instead of 250,000 runs of 4 pages, so by then we will only
+/// need 4 integers to remember which previous run each buffer has to process.
+/// [`PageRunsFifo`] protects us from the inital explosion of runs that we
+/// produce, and even though it has to write to a file and read from it at the
+/// same time (unlike [`Collect`] which only writes and then reads), the IO
+/// operations will be very infrequent because each page stores many runs. A
+/// 4 KiB page can store 1024 different runs and the number of runs decreases
+/// by some power of K, so overall the time and space complexity seems pretty
+/// healthy (no math done to prove it so... basically buzzwords because we're
+/// smart programmers).
+///
+/// # Optimizations (TODO)
+///
+/// [`PageRunsFifo`] is pointless for fixed size tuples, and another
+/// optimization we could add here is getting rid of fixed size pages completely
+/// and just storing tuple offsets. We tell each buffer how many tuples to load
+/// and we produce "runs" of tuples instead of pages. It's the exact same
+/// algorithm and we would get rid of fragmentation as well, but now we have to
+/// deal with unaligned IO. We can probably circumvent that with [`BufReader`]
+/// and [`io::BufWriter`], though here it's not as easy as in [`Collect`].
+///
+/// But hey, we can't have it all, the current algorithm is pretty "simple" at
+/// the expense of using a little bit more memory and disk space. Having a
+/// "simple" and also "optimized" algorithm doesn't seem to apply to this
+/// particular problem.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Sort<F> {
     /// Tuple input.
@@ -2080,6 +2051,7 @@ impl TuplesComparator {
 }
 
 impl<F> Sort<F> {
+    /// Returns the index of the buffer that contains the minimum tuple.
     fn find_min_tuple_index(&self, input_buffers: &[TupleBuffer]) -> usize {
         let mut min = input_buffers
             .iter()
@@ -2129,6 +2101,7 @@ impl<F: FileOps> Sort<F> {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
+    /// Writes the output buffer to the output file.
     fn write_output_buffer(&mut self) -> io::Result<()> {
         self.output_buffer
             .write_to(self.output_file.as_mut().unwrap())?;
@@ -2137,6 +2110,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         Ok(())
     }
 
+    /// Output file becomes input and viceversa.
     fn swap_files(&mut self) -> io::Result<()> {
         let mut input_file = self.input_file.take().unwrap();
         let output_file = self.output_file.take().unwrap();
@@ -2149,20 +2123,26 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         Ok(())
     }
 
+    /// Sorts all the input buffers and merges the tuples into one "precomputed"
+    /// run.
+    ///
+    /// This is necessary for the first pass of the algorithm. Returns the
+    /// numbers of pages produces in this "run".
     fn precompute_sorted_run(&mut self, input_buffers: &mut [TupleBuffer]) -> io::Result<usize> {
-        println!("\nPRECOMPUTED RUN\n");
         let mut run = 0;
 
+        // Sort all buffers individually.
         for input_buffer in &mut *input_buffers {
             input_buffer.sort_by(|t1, t2| self.comparator.cmp(t1, t2));
         }
 
+        // Merge all the tuples.
         while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
             let min = self.find_min_tuple_index(&input_buffers);
             let next_tuple = input_buffers[min].pop_front().unwrap();
 
+            // Write output page.
             if !self.output_buffer.can_fit(&next_tuple) {
-                println!("{:?}", self.output_buffer.tuples);
                 self.write_output_buffer()?;
                 run += 1;
             }
@@ -2170,8 +2150,8 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.output_buffer.push(next_tuple);
         }
 
+        // Write output page.
         if !self.output_buffer.is_empty() {
-            println!("{:?}", self.output_buffer.tuples);
             self.write_output_buffer()?;
             run += 1;
         }
@@ -2225,7 +2205,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // Pass 0. Here we fill all the input buffers with tuples from the
         // source, sort all the buffers and then merge them into one
-        // pre-computed run. This will reduce the work necessary to do in the
+        // precomputed run. This will reduce the work necessary to do in the
         // "merge" part of the algorithm.
         while let Some(tuple) = self.collection.try_next()? {
             if let Some(available) = input_buffers.iter().position(|buf| buf.can_fit(&tuple)) {
@@ -2249,24 +2229,24 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             runs.push_back(run)?;
         }
 
+        // Output file becomes the input for the next iteration.
         self.swap_files()?;
 
-        // Cursors contains the "current page" of each input buffers and limits
+        // Cursors contains the "current page" of each input buffer and limits
         // tells us where to stop.
         let mut cursors = vec![0; input_buffers.len()];
         let mut limits = vec![0; input_buffers.len()];
 
         // Sorting ends when a single run produces all the pages. At that point
-        // there's nothing left to compare anymore.
+        // there's nothing left to compare anymore, so all the tuples are
+        // sorted. "Segment" here refers to a sequence of "runs" produced in the
+        // previous iteration.
         while runs.len() > 1 {
             let mut output_pages = 0;
             let mut segment = 0;
 
-            println!("\nNEXT RUN");
-
             while segment < input_pages {
-                println!("\nSEGMENT {segment}\n");
-
+                // Init cursors.
                 cursors[0] = segment;
                 limits[0] = cmp::min(segment + runs.pop_front()?.unwrap_or(0), input_pages);
                 for i in 1..self.input_buffers {
@@ -2278,6 +2258,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     };
                 }
 
+                // Load initial pages.
                 for i in 0..self.input_buffers {
                     if cursors[i] < limits[i] {
                         input_buffers[i]
@@ -2288,24 +2269,21 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                 let mut run = 0;
 
+                // Merge tuples.
                 while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
                     let min = self.find_min_tuple_index(&input_buffers);
                     let tuple = input_buffers[min].pop_front().unwrap();
 
-                    // Now check for empty pages. Load the next one if there
-                    // are more pages in the current run.
-                    for i in 0..self.input_buffers {
-                        if input_buffers[i].is_empty() && cursors[i] < limits[i] {
-                            input_buffers[i]
-                                .read_page(self.input_file.as_mut().unwrap(), cursors[i])?;
-                            cursors[i] += 1;
-                        }
+                    // Check for empty buffers. Load the next page if there is
+                    // one.
+                    if input_buffers[min].is_empty() && cursors[min] < limits[min] {
+                        input_buffers[min]
+                            .read_page(self.input_file.as_mut().unwrap(), cursors[min])?;
+                        cursors[min] += 1;
                     }
 
-                    // Write the output page if full. Otherwise just push the
-                    // tuple.
+                    // Write output page.
                     if !self.output_buffer.can_fit(&tuple) {
-                        println!("{:?}", self.output_buffer.tuples);
                         self.write_output_buffer()?;
                         run += 1;
                     }
@@ -2315,7 +2293,6 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                 // Write last page.
                 if !self.output_buffer.is_empty() {
-                    println!("{:?}", self.output_buffer.tuples);
                     self.write_output_buffer()?;
                     run += 1;
                 }
@@ -2323,7 +2300,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 output_pages += run;
                 runs.push_back(run)?;
 
-                // Now move to the next segment and repeat.
+                // Move to the next segment and repeat.
                 segment = limits[self.input_buffers - 1];
             }
 
@@ -2419,7 +2396,7 @@ impl<F> Display for Sort<F> {
 /// hard coded to store [`Tuple`]. A generic struct could probably take a
 /// "serialization function" or something like that. We'll just keep things
 /// simple for now, but there's probably a generic solution.
-struct PageRunsFifo<F> {
+struct PageRunsFifo<F: FileOps> {
     page_size: usize,
     input_buffer: VecDeque<u32>,
     output_buffer: VecDeque<u32>,
@@ -2431,7 +2408,26 @@ struct PageRunsFifo<F> {
     file_path: PathBuf,
 }
 
-impl<F> PageRunsFifo<F> {
+/// TODO: This is how all the structs that use files should look like but
+/// requiring [`FileOps`] on every definition seems unnecessary. We only need
+/// this for tests, otherwise we just use [`std::fs::remove_file`]. So until we
+/// figure out a solution the other structs won't drop files on deallocation.
+impl<F: FileOps> Drop for PageRunsFifo<F> {
+    fn drop(&mut self) {
+        let _ = self.drop_file();
+    }
+}
+
+impl<F: FileOps> PageRunsFifo<F> {
+    fn drop_file(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.take() {
+            drop(file);
+            F::remove(&self.file_path)?;
+        }
+
+        Ok(())
+    }
+
     fn new(page_size: usize, work_dir: &PathBuf) -> Self {
         debug_assert!(
             page_size % mem::size_of::<u32>() == 0,
