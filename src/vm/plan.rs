@@ -2149,7 +2149,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         self.output_buffer =
             TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
 
-        let mut runs = PageRunsDiskFifo::<F>::new(self.page_size, &self.work_dir);
+        let mut runs = PageRunsFifo::<F>::new(self.page_size, &self.work_dir);
 
         let mut input_pages = 0;
 
@@ -2191,11 +2191,9 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         let mut cursors = vec![0; input_buffers.len()];
         let mut limits = vec![0; input_buffers.len()];
 
-        // page_runs / input_buffers is the number of pages we processed in the
-        // previous iteration. If we processed all the pages then we won't go
-        // into another iteration. This is basically a hack for do while loops,
-        // it saves us from writing an "if break" block 100 lines later.
-        while page_runs / self.input_buffers < input_pages {
+        // Sorting ends when a single run produces all the pages. At that point
+        // there's nothing left to compare anymore.
+        while runs.len() > 1 {
             let mut output_pages = 0;
             let mut segment = 0;
 
@@ -2359,13 +2357,40 @@ impl<F> Display for Sort<F> {
 /// memory only with no IO, but the first few runs that produce 2 or 4 pages
 /// depending on [`DEFAULT_SORT_INPUT_BUFFERS`] will use IO on large datasets.
 ///
-/// TODO: This struct is very similar to [`Collect`], we can probably extract
-/// the similar functionality into a new struct called `FileBuffer` or something
-/// like that.
-struct PageRunsDiskFifo<F> {
+/// The FIFO consists of two buffers and one file, which is only created if we
+/// exceed the memory threshold (the buffer size):
+///
+/// ```text
+///            Input Buffer     File    Output Buffer
+///           +---+---+---+    +---+    +---+---+---+
+/// Inputs -> | 9 | 8 | 7 | -> | 1 | -> | 3 | 2 | 1 |
+///           +---+---+---+    +---+    +---+---+---+
+///                            | 2 |
+///                            +---+
+///                            | 3 |
+///                            +---+ <-- read_page cursor (next is [4, 5, 6])
+///                            | 4 |
+///                            +---+
+///                            | 5 |
+///                            +---+
+///                            | 6 |
+///                            +---+ <-- written_pages cursor (EOF)
+/// ```
+///
+/// TODO: This struct is somewhat similar to [`Collect`], we can probably
+/// extract shared functionality into a new struct called `FileBuffer` or
+/// something like that. The difference is that this one has to always be on
+/// "stand by" accepting new inputs and returning older ones at the same time
+/// while [`Collect`] can only read or write at any given moment. This struct
+/// is also hard coded to store 4 byte unsigned integers while [`Collect`] is
+/// hard coded to store [`Tuple`]. A generic struct could probably take a
+/// "serialization function" or something like that. We'll just keep things
+/// simple for now, but there's probably a generic solution.
+struct PageRunsFifo<F> {
     page_size: usize,
     input_buffer: VecDeque<u32>,
     output_buffer: VecDeque<u32>,
+    len: usize,
     work_dir: PathBuf,
     read_page: usize,
     written_pages: usize,
@@ -2373,8 +2398,13 @@ struct PageRunsDiskFifo<F> {
     file_path: PathBuf,
 }
 
-impl<F> PageRunsDiskFifo<F> {
+impl<F> PageRunsFifo<F> {
     fn new(page_size: usize, work_dir: &PathBuf) -> Self {
+        debug_assert!(
+            page_size % mem::size_of::<u32>() == 0,
+            "page_size must be a multiple of 4: {page_size}"
+        );
+
         Self {
             page_size,
             input_buffer: VecDeque::with_capacity(page_size),
@@ -2382,27 +2412,45 @@ impl<F> PageRunsDiskFifo<F> {
             work_dir: work_dir.clone(),
             read_page: 0,
             written_pages: 0,
+            len: 0,
             file: None,
             file_path: PathBuf::new(),
         }
     }
 }
 
-impl<F: Seek + Read + Write + FileOps> PageRunsDiskFifo<F> {
+impl<F: Seek + Read + Write + FileOps> PageRunsFifo<F> {
+    /// Total number of "runs" stored in this FIFO.
+    ///
+    /// This includes everything written to disk and currently in memory.
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Push a new record to the "end" of the FIFO.
     fn push_back(&mut self, run: usize) -> io::Result<()> {
         let run = u32::try_from(run).expect("page run greater than u32::MAX");
 
+        // We should set this after IO succeeds but if it fails we short circuit
+        // anyway and the entire plan stops executing.
+        self.len += 1;
+
+        // Use in-memory buffer until it can't fit more integers.
         if self.input_buffer.len() + 1 <= self.page_size / mem::size_of::<u32>() {
             self.input_buffer.push_back(run);
             return Ok(());
         }
 
+        // Create the file if it doesn't exist yet.
         if self.file.is_none() {
             let (path, file) = tmp_file::<F>(&self.work_dir, "mkdb.sort.runs")?;
             self.file = Some(file);
             self.file_path = path;
         }
 
+        // SAFETY: Just a cast to [u8]. We don't care about endianess here
+        // because this is a temporary file used only for sorting on the same
+        // machine.
         let slice = unsafe {
             slice::from_raw_parts(
                 ptr::from_ref(&self.input_buffer.make_contiguous()[0]).cast(),
@@ -2410,35 +2458,42 @@ impl<F: Seek + Read + Write + FileOps> PageRunsDiskFifo<F> {
             )
         };
 
+        // Write the memory page to the end of the file.
         let file = self.file.as_mut().unwrap();
-
         file.seek(io::SeekFrom::End(0))?;
         file.write(slice)?;
         self.written_pages += 1;
 
         self.input_buffer.clear();
-
         self.input_buffer.push_back(run);
 
         Ok(())
     }
 
+    /// Returns the first element that was pushed into the queue.
     fn pop_front(&mut self) -> io::Result<Option<usize>> {
+        // Again, should be set after IO succeeds but it doesn't matter. We use
+        // saturating sub just in case this is called before .push() (that
+        // should not happen).
+        self.len = self.len.saturating_sub(1);
+
+        // If the output buffers contains something it means we read from the
+        // file. This is always the "First In" part if it exists.
         if let Some(run) = self.output_buffer.pop_front() {
             return Ok(Some(run as usize));
         }
 
-        if self.read_page >= self.written_pages {
-            return Ok(self.input_buffer.pop_front().map(|run| run as usize));
-        }
-
-        let Some(file) = self.file.as_mut() else {
+        // If the output buffer is empty and we didn't write to the file then
+        // the FIFO queue is just the input buffer.
+        if self.written_pages == 0 {
             return Ok(self.input_buffer.pop_front().map(|run| run as usize));
         };
 
+        // We gotta read from the file otherwise.
         self.output_buffer
             .resize(self.page_size / mem::size_of::<u32>(), 0);
 
+        // SAFETY: Same as push_back()
         let slice = unsafe {
             slice::from_raw_parts_mut(
                 ptr::from_mut(&mut self.output_buffer.make_contiguous()[0]).cast(),
@@ -2446,18 +2501,25 @@ impl<F: Seek + Read + Write + FileOps> PageRunsDiskFifo<F> {
             )
         };
 
+        let file = self.file.as_mut().unwrap();
+
         file.seek(io::SeekFrom::Start(
             (self.page_size * self.read_page) as u64,
         ))?;
         self.read_page += 1;
 
-        if file.read(slice)? == 0 {
-            self.file = None;
-            F::remove(&self.file_path)?;
-            return Ok(None);
+        // Page read successful, return from the output buffer.
+        if file.read(slice)? > 0 {
+            return Ok(self.output_buffer.pop_front().map(|run| run as usize));
         }
 
-        Ok(self.output_buffer.pop_front().map(|run| run as usize))
+        // Reached EOF, reset state and return from the input buffer.
+        self.output_buffer.clear();
+        self.read_page = 0;
+        self.written_pages = 0;
+        file.truncate()?;
+
+        Ok(self.input_buffer.pop_front().map(|run| run as usize))
     }
 }
 
