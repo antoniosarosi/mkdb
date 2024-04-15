@@ -45,14 +45,16 @@
 //! returned one by one just like any other normal iterator would return them.
 use std::{
     cell::RefCell,
-    cmp::Ordering,
+    cmp::{self, Ordering},
     collections::{HashMap, VecDeque},
     fmt::{self, Debug, Display},
     io::{self, BufRead, BufReader, Read, Seek, Write},
-    mem,
+    iter, mem,
     ops::{Bound, Index, RangeBounds},
     path::{Path, PathBuf},
+    ptr,
     rc::Rc,
+    slice,
 };
 
 use crate::{
@@ -2129,7 +2131,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         self.output_file_path = output_file_path;
 
         // Figure out the page size.
-        self.page_size = std::cmp::max(
+        self.page_size = cmp::max(
             TupleBuffer::page_size_needed_for(self.collection.mem_buf.largest_tuple_size),
             self.page_size,
         );
@@ -2147,7 +2149,10 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         self.output_buffer =
             TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
 
+        let mut runs = PageRunsDiskFifo::<F>::new(self.page_size, &self.work_dir);
+
         let mut input_pages = 0;
+
         while let Some(tuple) = self.collection.try_next()? {
             // Write output page if full.
             if !self.output_buffer.can_fit(&tuple) {
@@ -2156,6 +2161,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     .write_to(self.input_file.as_mut().unwrap())?;
                 self.output_buffer.clear();
                 input_pages += 1;
+                runs.push_back(1)?;
             }
 
             self.output_buffer.push(tuple);
@@ -2168,6 +2174,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 .write_to(self.input_file.as_mut().unwrap())?;
             self.output_buffer.clear();
             input_pages += 1;
+            runs.push_back(1)?;
         }
 
         // Pass 0 completed, 1 page runs sort algorithm done. Now do the "merge"
@@ -2175,49 +2182,50 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         let mut page_runs = self.input_buffers;
 
         let mut input_buffers = Vec::from_iter(
-            std::iter::repeat_with(|| {
+            iter::repeat_with(|| {
                 TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false)
             })
             .take(self.input_buffers),
         );
 
         let mut cursors = vec![0; input_buffers.len()];
+        let mut limits = vec![0; input_buffers.len()];
 
         // page_runs / input_buffers is the number of pages we processed in the
         // previous iteration. If we processed all the pages then we won't go
         // into another iteration. This is basically a hack for do while loops,
         // it saves us from writing an "if break" block 100 lines later.
         while page_runs / self.input_buffers < input_pages {
-            // Number of output pages.
             let mut output_pages = 0;
+            let mut segment = 0;
 
-            // Beginning of the current "chunk" or "segment". If we do 2 page
-            // runs then this is gonna be 0, 2, 4... If we do 4 page runs it's
-            // gonna be 0, 4, 8... etc
-            let mut run = 0;
+            println!("\nPAGE RUNS {page_runs}");
 
-            // Loops through the page segments until we reach the end.
-            while run < input_pages {
-                // Initialize the cursors and load the first page for each
-                // buffer.
-                for (i, (input_buffer, cursor)) in
-                    input_buffers.iter_mut().zip(cursors.iter_mut()).enumerate()
-                {
-                    *cursor = run + page_runs / self.input_buffers * i;
-                    if *cursor < input_pages {
-                        input_buffer.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
-                        *cursor += 1;
+            while segment < input_pages {
+                println!("\nSEGMENT {segment}\n");
+
+                cursors[0] = segment;
+                limits[0] = cmp::min(segment + runs.pop_front()?.unwrap_or(0), input_pages);
+                for i in 1..self.input_buffers {
+                    cursors[i] = limits[i - 1];
+                    limits[i] = if cursors[i] < input_pages {
+                        cmp::min(cursors[i] + runs.pop_front()?.unwrap_or(0), input_pages)
+                    } else {
+                        input_pages
+                    };
+                }
+
+                for i in 0..self.input_buffers {
+                    if cursors[i] < input_pages {
+                        input_buffers[i]
+                            .read_page(self.input_file.as_mut().unwrap(), cursors[i])?;
+                        cursors[i] += 1;
                     }
                 }
 
-                // Now start merging. When the output page fills up we write it
-                // to a file. If one of the input pages is emptied we try to
-                // load the next one. We repeat until there are no more pages
-                // available in this run.
+                let mut run = 0;
+
                 while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
-                    // Find the input buffer that contains the smallest tuple.
-                    // That's gonna be the next tuple that we push into the
-                    // output buffer.
                     let mut min = input_buffers
                         .iter()
                         .position(|buffer| !buffer.is_empty())
@@ -2242,25 +2250,22 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                     // Now check for empty pages. Load the next one if there
                     // are more pages in the current run.
-                    for (i, (input_buffer, cursor)) in
-                        input_buffers.iter_mut().zip(cursors.iter_mut()).enumerate()
-                    {
-                        if input_buffer.is_empty()
-                            && *cursor < input_pages
-                            && *cursor < run + page_runs / self.input_buffers * (i + 1)
-                        {
-                            input_buffer.read_page(self.input_file.as_mut().unwrap(), *cursor)?;
-                            *cursor += 1;
+                    for i in 0..self.input_buffers {
+                        if input_buffers[i].is_empty() && cursors[i] < limits[i] {
+                            input_buffers[i]
+                                .read_page(self.input_file.as_mut().unwrap(), cursors[i])?;
+                            cursors[i] += 1;
                         }
                     }
 
                     // Write the output page if full. Otherwise just push the
                     // tuple.
                     if !self.output_buffer.can_fit(&tuple) {
+                        println!("{:?}", self.output_buffer.tuples);
                         self.output_buffer
                             .write_to(self.output_file.as_mut().unwrap())?;
                         self.output_buffer.clear();
-                        output_pages += 1;
+                        run += 1;
                     }
 
                     self.output_buffer.push(tuple);
@@ -2268,14 +2273,19 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
                 // Write last page.
                 if !self.output_buffer.is_empty() {
+                    println!("{:?}", self.output_buffer.tuples);
                     self.output_buffer
                         .write_to(self.output_file.as_mut().unwrap())?;
                     self.output_buffer.clear();
-                    output_pages += 1;
+                    run += 1;
                 }
 
+                output_pages += run;
+
+                runs.push_back(run)?;
+
                 // Now move to the next segment and repeat.
-                run += page_runs;
+                segment = limits[self.input_buffers - 1];
             }
 
             // Now swap the files. Previous output becomes the input for the
@@ -2338,6 +2348,116 @@ impl<F> Display for Sort<F> {
             .map(|i| &self.comparator.sort_schema.columns[*i].name);
 
         write!(f, "Sort ({})", join(sort_col_names, ", "))
+    }
+}
+
+/// Bookkeeping for the number of pages produced in each run.
+///
+/// This is a disk FIFO queue that makes sure we don't use too much memory on
+/// the initial passes of the external merge sort algorithm. When the number of
+/// pages produced in each run increases enough this struct will operate in
+/// memory only with no IO, but the first few runs that produce 2 or 4 pages
+/// depending on [`DEFAULT_SORT_INPUT_BUFFERS`] will use IO on large datasets.
+///
+/// TODO: This struct is very similar to [`Collect`], we can probably extract
+/// the similar functionality into a new struct called `FileBuffer` or something
+/// like that.
+struct PageRunsDiskFifo<F> {
+    page_size: usize,
+    input_buffer: VecDeque<u32>,
+    output_buffer: VecDeque<u32>,
+    work_dir: PathBuf,
+    read_page: usize,
+    written_pages: usize,
+    file: Option<F>,
+    file_path: PathBuf,
+}
+
+impl<F> PageRunsDiskFifo<F> {
+    fn new(page_size: usize, work_dir: &PathBuf) -> Self {
+        Self {
+            page_size,
+            input_buffer: VecDeque::with_capacity(page_size),
+            output_buffer: VecDeque::with_capacity(page_size),
+            work_dir: work_dir.clone(),
+            read_page: 0,
+            written_pages: 0,
+            file: None,
+            file_path: PathBuf::new(),
+        }
+    }
+}
+
+impl<F: Seek + Read + Write + FileOps> PageRunsDiskFifo<F> {
+    fn push_back(&mut self, run: usize) -> io::Result<()> {
+        let run = u32::try_from(run).expect("page run greater than u32::MAX");
+
+        if self.input_buffer.len() + 1 <= self.page_size / mem::size_of::<u32>() {
+            self.input_buffer.push_back(run);
+            return Ok(());
+        }
+
+        if self.file.is_none() {
+            let (path, file) = tmp_file::<F>(&self.work_dir, "mkdb.sort.runs")?;
+            self.file = Some(file);
+            self.file_path = path;
+        }
+
+        let slice = unsafe {
+            slice::from_raw_parts(
+                ptr::from_ref(&self.input_buffer.make_contiguous()[0]).cast(),
+                self.input_buffer.len() * mem::size_of::<u32>(),
+            )
+        };
+
+        let file = self.file.as_mut().unwrap();
+
+        file.seek(io::SeekFrom::End(0))?;
+        file.write(slice)?;
+        self.written_pages += 1;
+
+        self.input_buffer.clear();
+
+        self.input_buffer.push_back(run);
+
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> io::Result<Option<usize>> {
+        if let Some(run) = self.output_buffer.pop_front() {
+            return Ok(Some(run as usize));
+        }
+
+        if self.read_page >= self.written_pages {
+            return Ok(self.input_buffer.pop_front().map(|run| run as usize));
+        }
+
+        let Some(file) = self.file.as_mut() else {
+            return Ok(self.input_buffer.pop_front().map(|run| run as usize));
+        };
+
+        self.output_buffer
+            .resize(self.page_size / mem::size_of::<u32>(), 0);
+
+        let slice = unsafe {
+            slice::from_raw_parts_mut(
+                ptr::from_mut(&mut self.output_buffer.make_contiguous()[0]).cast(),
+                self.page_size,
+            )
+        };
+
+        file.seek(io::SeekFrom::Start(
+            (self.page_size * self.read_page) as u64,
+        ))?;
+        self.read_page += 1;
+
+        if file.read(slice)? == 0 {
+            self.file = None;
+            F::remove(&self.file_path)?;
+            return Ok(None);
+        }
+
+        Ok(self.output_buffer.pop_front().map(|run| run as usize))
     }
 }
 
