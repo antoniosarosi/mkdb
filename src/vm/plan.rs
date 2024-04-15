@@ -1303,6 +1303,11 @@ impl TupleBuffer {
 
         page_size
     }
+
+    /// Sorts the tuples using the `cmp` function.
+    pub fn sort_by(&mut self, cmp: impl FnMut(&Tuple, &Tuple) -> Ordering) {
+        self.tuples.make_contiguous().sort_by(cmp)
+    }
 }
 
 /// Similar to [`io::BufReader`] and [`io::BufWriter`].
@@ -2075,12 +2080,27 @@ impl TuplesComparator {
 }
 
 impl<F> Sort<F> {
-    /// Sorts the tuples in [`Self::output_buffer`].
-    fn sort_output_buffer(&mut self) {
-        self.output_buffer
-            .tuples
-            .make_contiguous()
-            .sort_by(|t1, t2| self.comparator.cmp(t1, t2));
+    fn find_min_tuple_index(&self, input_buffers: &[TupleBuffer]) -> usize {
+        let mut min = input_buffers
+            .iter()
+            .position(|buffer| !buffer.is_empty())
+            .unwrap();
+
+        for (i, input_buffer) in (min + 1..).zip(&input_buffers[min + 1..]) {
+            if input_buffer.is_empty() {
+                continue;
+            }
+
+            let cmp = self
+                .comparator
+                .cmp(&input_buffers[i][0], &input_buffers[min][0]);
+
+            if cmp == Ordering::Less {
+                min = i;
+            }
+        }
+
+        min
     }
 }
 
@@ -2109,6 +2129,56 @@ impl<F: FileOps> Sort<F> {
 }
 
 impl<F: Seek + Read + Write + FileOps> Sort<F> {
+    fn write_output_buffer(&mut self) -> io::Result<()> {
+        self.output_buffer
+            .write_to(self.output_file.as_mut().unwrap())?;
+        self.output_buffer.clear();
+
+        Ok(())
+    }
+
+    fn swap_files(&mut self) -> io::Result<()> {
+        let mut input_file = self.input_file.take().unwrap();
+        let output_file = self.output_file.take().unwrap();
+
+        input_file.truncate()?;
+
+        self.input_file = Some(output_file);
+        self.output_file = Some(input_file);
+
+        Ok(())
+    }
+
+    fn precompute_sorted_run(&mut self, input_buffers: &mut [TupleBuffer]) -> io::Result<usize> {
+        println!("\nPRECOMPUTED RUN\n");
+        let mut run = 0;
+
+        for input_buffer in &mut *input_buffers {
+            input_buffer.sort_by(|t1, t2| self.comparator.cmp(t1, t2));
+        }
+
+        while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
+            let min = self.find_min_tuple_index(&input_buffers);
+            let next_tuple = input_buffers[min].pop_front().unwrap();
+
+            if !self.output_buffer.can_fit(&next_tuple) {
+                println!("{:?}", self.output_buffer.tuples);
+                self.write_output_buffer()?;
+                run += 1;
+            }
+
+            self.output_buffer.push(next_tuple);
+        }
+
+        if !self.output_buffer.is_empty() {
+            println!("{:?}", self.output_buffer.tuples);
+            self.write_output_buffer()?;
+            run += 1;
+        }
+
+        Ok(run)
+    }
+
     /// Iterative implementation of the K-way external merge sort algorithm
     /// described in the documentation of [`Sort`].
     fn sort(&mut self) -> Result<(), DbError> {
@@ -2116,7 +2186,9 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
         // everything was as simple as this.
         if self.collection.reader.is_none() {
             self.output_buffer = mem::replace(&mut self.collection.mem_buf, TupleBuffer::empty());
-            self.sort_output_buffer();
+
+            self.output_buffer
+                .sort_by(|t1, t2| self.comparator.cmp(t1, t2));
 
             return Ok(());
         }
@@ -2136,51 +2208,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             self.page_size,
         );
 
-        // "Pass 0" or "1 page runs". Sort pages in memory and write them to the
-        // "input" file.
-        //
-        // TODO: We don't actually need a "1 page run" here, we can fill all
-        // the input buffers, sort them individually and merge them to skip
-        // not only "Pass 0" but also "Pass 1". It's not hard to do but requires
-        // figuring out exactly how to extract the "merge" behaviour written
-        // below into its own function considering that the first pass we would
-        // do here doesn't need to fill the input buffers from a file but
-        // rather from the buffered iterator source.
-        self.output_buffer =
-            TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
-
-        let mut runs = PageRunsFifo::<F>::new(self.page_size, &self.work_dir);
-
-        let mut input_pages = 0;
-
-        while let Some(tuple) = self.collection.try_next()? {
-            // Write output page if full.
-            if !self.output_buffer.can_fit(&tuple) {
-                self.sort_output_buffer();
-                self.output_buffer
-                    .write_to(self.input_file.as_mut().unwrap())?;
-                self.output_buffer.clear();
-                input_pages += 1;
-                runs.push_back(1)?;
-            }
-
-            self.output_buffer.push(tuple);
-        }
-
-        // Last page.
-        if !self.output_buffer.is_empty() {
-            self.sort_output_buffer();
-            self.output_buffer
-                .write_to(self.input_file.as_mut().unwrap())?;
-            self.output_buffer.clear();
-            input_pages += 1;
-            runs.push_back(1)?;
-        }
-
-        // Pass 0 completed, 1 page runs sort algorithm done. Now do the "merge"
-        // runs till fully sorted.
-        let mut page_runs = self.input_buffers;
-
+        // Prepare memory buffers.
         let mut input_buffers = Vec::from_iter(
             iter::repeat_with(|| {
                 TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false)
@@ -2188,6 +2216,43 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             .take(self.input_buffers),
         );
 
+        self.output_buffer =
+            TupleBuffer::new(self.page_size, self.comparator.sort_schema.clone(), false);
+
+        // Bookkeeping for the number of pages produced in each run.
+        let mut runs = PageRunsFifo::<F>::new(self.page_size, &self.work_dir);
+        let mut input_pages = 0;
+
+        // Pass 0. Here we fill all the input buffers with tuples from the
+        // source, sort all the buffers and then merge them into one
+        // pre-computed run. This will reduce the work necessary to do in the
+        // "merge" part of the algorithm.
+        while let Some(tuple) = self.collection.try_next()? {
+            if let Some(available) = input_buffers.iter().position(|buf| buf.can_fit(&tuple)) {
+                input_buffers[available].push(tuple);
+                continue;
+            }
+
+            let run = self.precompute_sorted_run(&mut input_buffers)?;
+            input_pages += run;
+            runs.push_back(run)?;
+
+            // All of them are empty, we can use whichever we want.
+            input_buffers[0].push(tuple);
+        }
+
+        // Input buffers still contain tuples. Produce one last run. Pass 0 ends
+        // here.
+        if input_buffers.iter().any(|buffer| !buffer.is_empty()) {
+            let run = self.precompute_sorted_run(&mut input_buffers)?;
+            input_pages += run;
+            runs.push_back(run)?;
+        }
+
+        self.swap_files()?;
+
+        // Cursors contains the "current page" of each input buffers and limits
+        // tells us where to stop.
         let mut cursors = vec![0; input_buffers.len()];
         let mut limits = vec![0; input_buffers.len()];
 
@@ -2197,7 +2262,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
             let mut output_pages = 0;
             let mut segment = 0;
 
-            println!("\nPAGE RUNS {page_runs}");
+            println!("\nNEXT RUN");
 
             while segment < input_pages {
                 println!("\nSEGMENT {segment}\n");
@@ -2214,7 +2279,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 }
 
                 for i in 0..self.input_buffers {
-                    if cursors[i] < input_pages {
+                    if cursors[i] < limits[i] {
                         input_buffers[i]
                             .read_page(self.input_file.as_mut().unwrap(), cursors[i])?;
                         cursors[i] += 1;
@@ -2224,26 +2289,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 let mut run = 0;
 
                 while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
-                    let mut min = input_buffers
-                        .iter()
-                        .position(|buffer| !buffer.is_empty())
-                        .unwrap();
-
-                    for (i, input_buffer) in (min + 1..).zip(&input_buffers[min + 1..]) {
-                        if input_buffer.is_empty() {
-                            continue;
-                        }
-
-                        let cmp = self
-                            .comparator
-                            .cmp(&input_buffers[i][0], &input_buffers[min][0]);
-
-                        if cmp == Ordering::Less {
-                            min = i;
-                        }
-                    }
-
-                    // Remove the tuple from the input page.
+                    let min = self.find_min_tuple_index(&input_buffers);
                     let tuple = input_buffers[min].pop_front().unwrap();
 
                     // Now check for empty pages. Load the next one if there
@@ -2260,9 +2306,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                     // tuple.
                     if !self.output_buffer.can_fit(&tuple) {
                         println!("{:?}", self.output_buffer.tuples);
-                        self.output_buffer
-                            .write_to(self.output_file.as_mut().unwrap())?;
-                        self.output_buffer.clear();
+                        self.write_output_buffer()?;
                         run += 1;
                     }
 
@@ -2272,14 +2316,11 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
                 // Write last page.
                 if !self.output_buffer.is_empty() {
                     println!("{:?}", self.output_buffer.tuples);
-                    self.output_buffer
-                        .write_to(self.output_file.as_mut().unwrap())?;
-                    self.output_buffer.clear();
+                    self.write_output_buffer()?;
                     run += 1;
                 }
 
                 output_pages += run;
-
                 runs.push_back(run)?;
 
                 // Now move to the next segment and repeat.
@@ -2288,15 +2329,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
             // Now swap the files. Previous output becomes the input for the
             // next pass and the previous input becomes the output.
-            let mut input_file = self.input_file.take().unwrap();
-            let output_file = self.output_file.take().unwrap();
-
-            input_file.truncate()?;
-
-            self.input_file = Some(output_file);
-            self.output_file = Some(input_file);
-
-            page_runs *= self.input_buffers;
+            self.swap_files()?;
             input_pages = output_pages;
         }
 

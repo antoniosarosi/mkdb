@@ -1952,6 +1952,50 @@ mod tests {
         Ok(())
     }
 
+    // Test for tuples of different sizes.
+    #[test]
+    fn select_order_by_var_length() -> Result<(), DbError> {
+        let mut db = init_database_with(DbConf {
+            page_size: 96,
+            cache_size: 1024,
+        })?;
+
+        db.exec("CREATE TABLE users (name VARCHAR(255));")?;
+
+        // Purposefully crafted to cause issues when sorting with 4 buffers (the
+        // default).
+        let mut var_length_records = vec![
+            String::from("04 var_length_tuple_").repeat(5),
+            String::from("09 var_length_tuple_").repeat(2),
+            String::from("06 var_length_tuple_").repeat(7),
+            String::from("00 var_length_tuple_").repeat(1),
+            String::from("08 var_length_tuple_").repeat(1),
+            String::from("03 var_length_tuple_").repeat(4),
+            String::from("01 var_length_tuple_").repeat(2),
+            String::from("02 var_length_tuple_").repeat(3),
+            String::from("05 var_length_tuple_").repeat(6),
+            String::from("07 var_length_tuple_").repeat(8),
+        ];
+
+        for user in var_length_records.iter() {
+            db.exec(&format!("INSERT INTO users VALUES ('{}');", user))?;
+        }
+
+        var_length_records.sort();
+
+        let query = db.exec("SELECT name FROM users ORDER BY name;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![Column::new("name", DataType::Varchar(255))]),
+            tuples: var_length_records
+                .into_iter()
+                .map(|name| vec![Value::String(name)])
+                .collect(),
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn select_order_by_expressions() -> Result<(), DbError> {
         let mut db = init_database_with(DbConf {
