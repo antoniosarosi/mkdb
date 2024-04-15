@@ -37,12 +37,12 @@
 //! That's because the scan plan holds an internal cursor and updating or
 //! deleting from the BTree would invalidate that cursor.
 //!
-//! So, in order to deal with such cases, there's a special type of iterator
-//! which is the [`Collect`]. The [`Collect`] contains an in-memory
+//! So, in order to deal with such cases, there's a special type of plan
+//! which is the [`Collect`] plan. The [`Collect`] plan contains an in-memory
 //! buffer of configurable size that is written to a file once it fills up.
-//! That way the [`Collect`] can collect as many tuples as necessary
-//! without memory concerns. Once all the tuples are collected, they are
-//! returned one by one just like any other normal iterator would return them.
+//! That way [`Collect`] can collect as many tuples as necessary without memory
+//! concerns. Once all the tuples are collected, they are returned one by one
+//! just like any other normal iterator would return them.
 use std::{
     cell::RefCell,
     cmp::{self, Ordering},
@@ -2138,7 +2138,7 @@ impl<F: Seek + Read + Write + FileOps> Sort<F> {
 
         // Merge all the tuples.
         while input_buffers.iter().any(|buffer| !buffer.is_empty()) {
-            let min = self.find_min_tuple_index(&input_buffers);
+            let min = self.find_min_tuple_index(input_buffers);
             let next_tuple = input_buffers[min].pop_front().unwrap();
 
             // Write output page.
@@ -2428,7 +2428,7 @@ impl<F: FileOps> PageRunsFifo<F> {
         Ok(())
     }
 
-    fn new(page_size: usize, work_dir: &PathBuf) -> Self {
+    fn new(page_size: usize, work_dir: &Path) -> Self {
         debug_assert!(
             page_size % mem::size_of::<u32>() == 0,
             "page_size must be a multiple of 4: {page_size}"
@@ -2438,7 +2438,7 @@ impl<F: FileOps> PageRunsFifo<F> {
             page_size,
             input_buffer: VecDeque::with_capacity(page_size),
             output_buffer: VecDeque::with_capacity(page_size),
-            work_dir: work_dir.clone(),
+            work_dir: work_dir.to_path_buf(),
             read_page: 0,
             written_pages: 0,
             len: 0,

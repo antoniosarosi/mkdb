@@ -457,7 +457,7 @@ fn analyze_integer_range(integer: &i128, data_type: &DataType) -> Result<(), Ana
         data_type
     {
         if !tuple::integer_is_within_range(integer, data_type) {
-            return Err(AnalyzerError::IntegerOutOfRange(*integer, *data_type).into());
+            return Err(AnalyzerError::IntegerOutOfRange(*integer, *data_type));
         }
     }
 
