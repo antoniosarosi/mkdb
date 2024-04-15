@@ -1960,36 +1960,36 @@ mod tests {
             cache_size: 1024,
         })?;
 
-        db.exec("CREATE TABLE users (name VARCHAR(255));")?;
+        db.exec("CREATE TABLE var_len (name VARCHAR(255));")?;
 
-        // Purposefully crafted to cause issues when sorting with 4 buffers (the
-        // default).
+        // Purposefully crafted to cause issues when sorting since the var
+        // length data will not produce the same amount of pages on each run.
         let mut var_length_records = vec![
-            String::from("04 var_length_tuple_").repeat(5),
-            String::from("09 var_length_tuple_").repeat(2),
-            String::from("06 var_length_tuple_").repeat(7),
-            String::from("00 var_length_tuple_").repeat(1),
-            String::from("08 var_length_tuple_").repeat(1),
-            String::from("03 var_length_tuple_").repeat(4),
-            String::from("01 var_length_tuple_").repeat(2),
-            String::from("02 var_length_tuple_").repeat(3),
-            String::from("05 var_length_tuple_").repeat(6),
-            String::from("07 var_length_tuple_").repeat(8),
+            format!("04 {}", "var_length_tuple_".repeat(5)),
+            format!("09 {}", "var_length_tuple_".repeat(2)),
+            format!("06 {}", "var_length_tuple_".repeat(7)),
+            format!("00 {}", "var_length_tuple_".repeat(1)),
+            format!("08 {}", "var_length_tuple_".repeat(1)),
+            format!("03 {}", "var_length_tuple_".repeat(4)),
+            format!("01 {}", "var_length_tuple_".repeat(2)),
+            format!("02 {}", "var_length_tuple_".repeat(3)),
+            format!("05 {}", "var_length_tuple_".repeat(6)),
+            format!("07 {}", "var_length_tuple_".repeat(8)),
         ];
 
-        for user in var_length_records.iter() {
-            db.exec(&format!("INSERT INTO users VALUES ('{}');", user))?;
+        for record in var_length_records.iter() {
+            db.exec(&format!("INSERT INTO var_len VALUES ('{}');", record))?;
         }
 
         var_length_records.sort();
 
-        let query = db.exec("SELECT name FROM users ORDER BY name;")?;
+        let query = db.exec("SELECT name FROM var_len ORDER BY name;")?;
 
         assert_eq!(query, QuerySet {
             schema: Schema::new(vec![Column::new("name", DataType::Varchar(255))]),
             tuples: var_length_records
                 .into_iter()
-                .map(|name| vec![Value::String(name)])
+                .map(|record| vec![Value::String(record)])
                 .collect(),
         });
 
