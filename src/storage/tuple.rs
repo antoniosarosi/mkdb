@@ -12,11 +12,16 @@
 //! All numbers are serialized in big endian format because that allows the
 //! BTree to compare them using a simple memcmp(). Normally only the first
 //! column of a tuple needs to be compared as that's where we store the
-//! [`RowId`], but for simplicity we just encode every number in big endian.
+//! primary key or [`RowId`], but for simplicity we just encode every number in
+//! big endian. This avoids the case "if number is PK then big endian else
+//! little endian". But that's what we *should* do (laziness wins again).
 //!
-//! Strings on the other hand are UTF-8 encoded with a 4 byte little endian
-//! prefix where we store the byte length of the string (number of bytes, not
-//! number of characters). So, putting it all together, a tuple like this one:
+//! Strings on the other hand are UTF-8 encoded with a 1, 2 or 4 byte little
+//! endian prefix where we store the byte length of the string (number of bytes,
+//! not number of characters). The amount of bytes required to store the length
+//! depends on the maximum character limit defined by `VARCHAR` types. See
+//! [`utf8_length_prefix_bytes`] for details. So, putting it all together, a
+//! tuple like this one:
 //!
 //! ```ignore
 //! [
@@ -35,14 +40,14 @@
 //! would serialize into the following bytes (not bits, bytes):
 //!
 //! ```text
-//! +-----------------+---------+---------------------+---------+
-//! | 0 0 0 0 0 0 0 1 | 5 0 0 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
-//! +-----------------+---------+---------------------+---------+
-//!  8 byte big endian  4 byte       String bytes       4 byte
-//!       BigInt        little                        big endian
-//!                     endian                            Int
-//!                     String
-//!                     length
+//! +-----------------+-----+---------------------+---------+
+//! | 0 0 0 0 0 0 0 1 | 5 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
+//! +-----------------+-----+---------------------+---------+
+//!      8 byte        2 byte    String bytes       4 byte
+//!    big endian      little                     big endian
+//!      BigInt        endian                         Int
+//!                    String
+//!                    length
 //! ```
 //!
 //! The only thing we're missing here is alignment. The page module already
@@ -82,6 +87,20 @@ pub(crate) fn byte_length_of_integer_type(data_type: &DataType) -> usize {
     }
 }
 
+/// Returns the number of bytes we need to store the length of a `VARCHAR` type.
+///
+/// UTF-8 encodes each character using anywhere from 1 to 4 bytes. So
+/// considering the worst case scenario where every single character in a string
+/// is 4 bytes, a `VARCHAR(255)` type would require 2 bytes to store 255
+/// characters unlike ASCII which only requires 1 byte.
+pub(crate) fn utf8_length_prefix_bytes(max_characters: usize) -> usize {
+    match max_characters {
+        0..64 => 1,
+        64..16384 => 2,
+        _ => 4,
+    }
+}
+
 /// Checks if we can store an integer using one of the SQL [`DataType`]
 /// variants.
 pub(crate) fn integer_is_within_range(integer: &i128, integer_type: &DataType) -> bool {
@@ -105,16 +124,16 @@ pub(crate) fn size_of(tuple: &[Value], schema: &Schema) -> usize {
         .map(|(i, col)| match col.data_type {
             DataType::Bool => 1,
 
-            DataType::Varchar(max) => {
+            DataType::Varchar(max_characters) => {
                 let Value::String(string) = &tuple[i] else {
                     panic!(
                         "expected data type {}, found value {}",
-                        DataType::Varchar(max),
+                        DataType::Varchar(max_characters),
                         tuple[i]
                     );
                 };
 
-                mem::size_of::<u32>() + string.as_bytes().len()
+                utf8_length_prefix_bytes(max_characters) + string.as_bytes().len()
             }
 
             integer_type => byte_length_of_integer_type(&integer_type),
@@ -164,14 +183,15 @@ pub(crate) fn serialize<'v>(
 /// TODO: Alignment.
 fn serialize_value_into(buf: &mut Vec<u8>, data_type: &DataType, value: &Value) {
     match (data_type, value) {
-        (DataType::Varchar(_), Value::String(string)) => {
+        (DataType::Varchar(max_characters), Value::String(string)) => {
             if string.as_bytes().len() > u32::MAX as usize {
                 todo!("strings longer than {} bytes are not handled", u32::MAX);
             }
 
-            let byte_length = string.as_bytes().len() as u32;
+            let byte_length = string.as_bytes().len().to_le_bytes();
+            let length_prefix_bytes = utf8_length_prefix_bytes(*max_characters);
 
-            buf.extend_from_slice(&byte_length.to_le_bytes());
+            buf.extend_from_slice(&byte_length[..length_prefix_bytes]);
             buf.extend_from_slice(string.as_bytes());
         }
 
@@ -206,10 +226,12 @@ pub fn deserialize(buf: &[u8], schema: &Schema) -> Vec<Value> {
 pub fn read_from(reader: &mut impl Read, schema: &Schema) -> io::Result<Vec<Value>> {
     let values = schema.columns.iter().map(|column| {
         Ok(match column.data_type {
-            DataType::Varchar(_) => {
-                let mut length_buffer = [0; mem::size_of::<u32>()];
-                reader.read_exact(&mut length_buffer)?;
-                let length = u32::from_le_bytes(length_buffer) as usize;
+            DataType::Varchar(max_characters) => {
+                let mut length_buffer = [0; mem::size_of::<usize>()];
+                let length_prefix_bytes = utf8_length_prefix_bytes(max_characters);
+
+                reader.read_exact(&mut length_buffer[..length_prefix_bytes])?;
+                let length = usize::from_le_bytes(length_buffer);
 
                 let mut string = vec![0; length];
                 reader.read_exact(&mut string)?;

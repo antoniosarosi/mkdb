@@ -11,7 +11,7 @@ use std::{
 
 use super::{
     page::{Cell, OverflowPage, Page, SlotId},
-    tuple::byte_length_of_integer_type,
+    tuple::{byte_length_of_integer_type, utf8_length_prefix_bytes},
 };
 use crate::{
     paging::{
@@ -150,7 +150,10 @@ impl From<&DataType> for Box<dyn BytesCmp> {
     /// types.
     fn from(data_type: &DataType) -> Self {
         match data_type {
-            DataType::Varchar(_) => Box::new(StringCmp(mem::size_of::<u32>())),
+            DataType::Varchar(max_characters) => {
+                Box::new(StringCmp(utf8_length_prefix_bytes(*max_characters)))
+            }
+
             fixed => Box::new(FixedSizeMemCmp(byte_length_of_integer_type(fixed))),
         }
     }
@@ -181,7 +184,10 @@ pub(crate) enum BTreeKeyComparator {
 impl From<&DataType> for BTreeKeyComparator {
     fn from(data_type: &DataType) -> Self {
         match data_type {
-            DataType::Varchar(_) => Self::StrCmp(StringCmp(mem::size_of::<u32>())),
+            DataType::Varchar(max_characters) => {
+                Self::StrCmp(StringCmp(utf8_length_prefix_bytes(*max_characters)))
+            }
+
             fixed => Self::MemCmp(FixedSizeMemCmp(byte_length_of_integer_type(fixed))),
         }
     }

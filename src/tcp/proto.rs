@@ -54,23 +54,27 @@
 //! | 5 0 0 0 |  '!'  | 9 0 0 0 |
 //! +---------+-------+---------+
 //!   4 bytes  1 byte   4 bytes
+//!   Little   ASCII    Little
+//!   Endian            Endian
 //! ```
 //!
 //! ## Error
 //!
-//! All error responses are just simple strings. The prefix for
-//! [`Response::Err`] is `-`. After the prefix there's a 2 byte little endian
-//! integer that encodes the length of the error message in bytes followed by
-//! the UTF-8 string itself. For a response error with the message
-//! `table "test" does not exist` the complete packet would be:
+//! All error responses are just simple UTF-8 strings. The prefix for
+//! [`Response::Err`] is `-` and it's directly followed by the UTF-8 string
+//! error itself. No length prefix needed since the packet only contains the
+//! string. For a response error with the message `table "test" does not exist`
+//! the complete packet would be:
 //!
 //! ```text
-//!   Payload   ASCII   Message
-//!     Len     Prefix  Length        Error Message
-//! +----------+-------+------+-----------------------------+
-//! | 30 0 0 0 |  '-'  | 27 0 | table "test" does not exist |
-//! +----------+-------+------+-----------------------------+
-//!   4 bytes   1 byte  2 bytes         27 bytes
+//!   Payload   ASCII
+//!     Len     Prefix          Error Message
+//! +----------+-------+-----------------------------+
+//! | 28 0 0 0 |  '-'  | table "test" does not exist |
+//! +----------+-------+-----------------------------+
+//!   4 bytes   1 byte           27 bytes
+//!   Little    ASCII             UTF-8
+//!   Endian
 //! ```
 //!
 //! ## Query Set
@@ -82,12 +86,14 @@
 //! the following format:
 //!
 //! ```text
-//!    Name     Column     Data
-//!    Len       Name      Type
-//! +-------+-------------+-----+
-//! |  5 0  | column name |  1  |
-//! +-------+-------------+-----+
-//! 2 bytes    N bytes     1 byte
+//!    Name      Column     Data
+//!    Len        Name      Type
+//! +--------+-------------+-----+
+//! |  11 0  | column name |  1  |
+//! +--------+-------------+-----+
+//!  2 bytes    N bytes     1 byte
+//!  Little     UTF-8
+//!  Endian
 //! ```
 //!
 //! The name of the column is a UTF-8 string prefixed by a 2 byte little endian
@@ -106,59 +112,76 @@
 //! }
 //! ```
 //!
-//! The maximum number of characters in `VARCHAR` types is not encoded anywhere.
-//! It's only used to check the length in characters of a string before
-//! inserting it into the database.
+//! If the data type is `VARCHAR` then the character limit is encoded as 4 byte
+//! little endian integer right after the data type byte:
+//!
+//! ```text
+//!    Name      Column     Data    Varchar
+//!    Len        Name      Type     Limit
+//! +--------+-------------+-----+-----------+
+//! |  11 0  | column name |  5  | 255 0 0 0 |
+//! +--------+-------------+-----+-----------+
+//!  2 bytes    N bytes    1 byte   4 bytes
+//!  Little      UTF-8              Little
+//!  Endian                         Endian
+//! ```
 //!
 //! Finally, after all the columns, the response packet encodes the tuple
 //! results prefixed by a 4 byte little endian integer that indicates the total
 //! number of tuples. Tuples are encoded using the exact same format that we
 //! use to store them in the database. Refer to [`crate::storage::tuple`] for
 //! details, but in a nutshell the tuple `(1, "hello", 3)` encoded with the
-//! data types `[BigInt, Varchar, Int]` looks like this:
+//! data types `[BigInt, Varchar(255), Int]` looks like this:
 //!
 //! ```text
-//! +-----------------+---------+---------------------+---------+
-//! | 0 0 0 0 0 0 0 1 | 5 0 0 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
-//! +-----------------+---------+---------------------+---------+
-//!  8 byte big endian  4 byte       String bytes       4 byte
-//!       BigInt        little                        big endian
-//!                     endian                            Int
-//!                     String
-//!                     length
+//! +-----------------+-----+---------------------+---------+
+//! | 0 0 0 0 0 0 0 1 | 5 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
+//! +-----------------+-----+---------------------+---------+
+//!      8 byte        2 byte    String bytes       4 byte
+//!    Big Endian      Little                     Big Endian
+//!      BigInt        Endian                         Int
+//!                    String
+//!                    Length
 //! ```
 //!
-//! So, putting it all together and assuming that the names of the columns
-//! for the data types mentioned above are `("id", "msg", "num")`, a complete
-//! packet that encodes the 2 tuples `[(1, "hello", 2), (2, "world", 4)]` would
-//! look like this:
+//! So, putting it all together and assuming that the names of the columns for
+//! the data types mentioned above are `("id", "msg", "num")`, a complete packet
+//! that encodes the tuples `[(1, "hello", 2), (2, "world", 4)]` would look
+//! like this:
 //!
 //! ```text
-//!   Payload   ASCII   Num of    Name            Name            Name              Num
-//!     Len     Prefix  Columns   Len     Name    Len     Name    Len     Name     Tuples
-//! +----------+-------+-------+-------+--------+-------+-------+-------+-------+---------+
-//! | 65 0 0 0 |  '+'  |  3 0  |  2 0  |  "id"  |  3 0  | "msg" |  3 0  | "num" | 2 0 0 0 |
-//! +----------+-------+-------+-------+--------+-------+-------+-------+-------+---------+
-//!   4 bytes   1 byte  4 bytes 2 bytes 2 bytes  2 bytes 3 bytes 2 bytes 3 bytes  4 bytes
+//!   Payload   ASCII   Num of    Name            Data
+//!     Len     Prefix  Columns   Len     Name    Type
+//! +----------+-------+-------+-------+--------+-----+
+//! | 68 0 0 0 |  '+'  |  3 0  |  2 0  |  "id"  |  3  |
+//! +----------+-------+-------+-------+--------+-----+
+//!   4 bytes   1 byte  4 bytes 2 bytes 2 bytes  1 byte
 //!
-//!     id column                msg column            num column
-//! +-----------------+---------+---------------------+---------+
-//! | 0 0 0 0 0 0 0 1 | 5 0 0 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
-//! +-----------------+---------+---------------------+---------+
-//!  8 byte big endian  4 bytes         5 bytes         4 byte
+//!   Name           Data    Varchar    Name            Data     Num
+//!   Len    Name    Type     Limit     Len     Name    Type    Tuples
+//! +------+-------+-----+-----------+-------+---------+-----+---------+
+//! | 3 0  | "msg" |  5  | 255 0 0 0 |  3 0  |  "msg"  |  1  | 2 0 0 0 |
+//! +------+-------+-----+-----------+-------+---------+-----+---------+
+//! 2 bytes 3 bytes 1 byte  4 bytes   2 bytes 3 bytes  1 byte  4 bytes
 //!
-//!     id column                msg column            num column
-//! +-----------------+---------+---------------------+---------+
-//! | 0 0 0 0 0 0 0 2 | 5 0 0 0 | 'w' 'o' 'r' 'l' 'd' | 0 0 0 4 |
-//! +-----------------+---------+---------------------+---------+
-//!  8 byte big endian  4 bytes         5 bytes         4 byte
+//!     id column            msg column            num column
+//! +-----------------+-----+---------------------+---------+
+//! | 0 0 0 0 0 0 0 1 | 5 0 | 'h' 'e' 'l' 'l' 'o' | 0 0 0 2 |
+//! +-----------------+-----+---------------------+---------+
+//!      8 bytes      2 bytes       5 bytes         4 byte
+//!
+//!     id column            msg column            num column
+//! +-----------------+-----+---------------------+---------+
+//! | 0 0 0 0 0 0 0 2 | 5 0 | 'w' 'o' 'r' 'l' 'd' | 0 0 0 4 |
+//! +-----------------+-----+---------------------+---------+
+//!      8 bytes      2 bytes       5 bytes         4 byte
 //! ```
 use std::{array::TryFromSliceError, fmt, num::TryFromIntError, string::FromUtf8Error};
 
 use crate::{
     db::{DbError, QuerySet},
     sql::statement::{Column, DataType},
-    storage::tuple,
+    storage::tuple::{self},
     Value,
 };
 
@@ -261,6 +284,9 @@ pub fn serialize(payload: &Response) -> Result<Vec<u8>, EncodingError> {
                     DataType::UnsignedBigInt => 4,
                     DataType::Varchar(_) => 5,
                 });
+                if let DataType::Varchar(max_characters) = col.data_type {
+                    packet.extend_from_slice(&(max_characters as u32).to_le_bytes());
+                }
             }
             packet.extend_from_slice(&(u32::try_from(query_set.tuples.len())?).to_le_bytes());
             for tuple in &query_set.tuples {
@@ -306,7 +332,15 @@ pub fn deserialize(payload: &[u8]) -> Result<Response, EncodingError> {
                     2 => DataType::UnsignedInt,
                     3 => DataType::BigInt,
                     4 => DataType::UnsignedBigInt,
-                    5 => DataType::Varchar(65535),
+                    5 => {
+                        let mut max_chars_buf = [0; 4];
+                        max_chars_buf.copy_from_slice(&payload[cursor + 1..cursor + 5]);
+
+                        let max_chars = u32::from_le_bytes(max_chars_buf) as usize;
+                        cursor += 4;
+
+                        DataType::Varchar(max_chars)
+                    }
                     invalid => Err(EncodingError::InvalidDataType(invalid))?,
                 };
                 cursor += 1;
@@ -345,8 +379,8 @@ mod test {
         let payload = Response::QuerySet(QuerySet::new(
             Schema::new(vec![
                 Column::new("id", DataType::UnsignedBigInt),
-                Column::new("name", DataType::Varchar(65535)),
-                Column::new("email", DataType::Varchar(65535)),
+                Column::new("name", DataType::Varchar(255)),
+                Column::new("email", DataType::Varchar(255)),
                 Column::new("age", DataType::UnsignedInt),
             ]),
             vec![

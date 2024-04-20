@@ -1650,6 +1650,36 @@ mod tests {
         Ok(())
     }
 
+    // These should use 4 bytes to store the length.
+    #[test]
+    fn insert_long_varchar_string() -> Result<(), DbError> {
+        let mut db = init_database()?;
+
+        let mut expected = Vec::new();
+
+        db.exec("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(65535));")?;
+
+        for i in 1..=3 {
+            let long_string = i.to_string().repeat(65535);
+            db.exec(&format!(
+                "INSERT INTO users(id, name) VALUES ({i}, '{long_string}');"
+            ))?;
+            expected.push(vec![Value::Number(i), Value::String(long_string)]);
+        }
+
+        let query = db.exec("SELECT * FROM users;")?;
+
+        assert_eq!(query, QuerySet {
+            schema: Schema::new(vec![
+                Column::primary_key("id", DataType::Int),
+                Column::new("name", DataType::Varchar(65535)),
+            ]),
+            tuples: expected,
+        });
+
+        Ok(())
+    }
+
     #[test]
     fn select_where() -> Result<(), DbError> {
         let mut db = init_database()?;
